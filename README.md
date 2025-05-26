@@ -24,6 +24,12 @@ system that outputs ninja like CMake, meson, premake, gn, etc.
 > unreleased version of Nix. Come help us get nix-ninja to be useful day-to-day
 > and working with an official Nix release!
 
+> [!WARNING]
+> macOS users: Currently not supported due to experimental feature propagation
+> issues during evaluation. You'll encounter `experimental Nix feature 'dynamic-derivations'
+> is disabled` errors when building examples, even with features enabled.
+> See [ca-derivations issue](https://github.com/NixOS/nix/issues/6065) and [multi-arch support](https://github.com/pdtpartners/nix-ninja/issues/14) tracking.
+
 - Parses `ninja.build` files and generates a derivation per compilation unit.
 - Stores build inputs & outputs in content-addressed derivations for granular
   and Nix-native incrementality.
@@ -38,7 +44,13 @@ First you need to use Nix 2.30 or later (newer than stable) and enable the
 following experimental features:
 
 ```sh
-experimental-features = ["nix-command" "dynamic-derivations" "ca-derivations" "recursive-nix"]
+export NIX_CONFIG="experimental-features = flakes nix-command dynamic-derivations ca-derivations recursive-nix"
+```
+
+Verify by running:
+```
+$ nix config show | grep experimental-features
+experimental-features = ca-derivations dynamic-derivations fetch-tree flakes nix-command recursive-nix
 ```
 
 Then you can try building the examples:
