@@ -143,7 +143,17 @@ pub fn create_symlinks(
         // inside the sandbox tree, where the siblings' own symlinks sit
         // beside it. (PYTHONPATH covers .py IMPORT siblings; this covers
         // data-file siblings, which no import path can redirect.)
-        if input.build_path.extension().is_some_and(|e| e == "py") {
+        // node_modules gets the same treatment for the same reason: node
+        // realpaths a required script (typescript's bin/tsc is a
+        // shebang file with no extension), and its own relative
+        // require('../lib/tsc.js') then resolves inside the store,
+        // where the module tree does not exist.
+        if input.build_path.extension().is_some_and(|e| e == "py")
+            || input
+                .build_path
+                .components()
+                .any(|c| c.as_os_str() == "node_modules")
+        {
             fs::copy(&source_path, &dest_path).map_err(|e| {
                 anyhow!(
                     "copy({:?} -> {}): {e}",
