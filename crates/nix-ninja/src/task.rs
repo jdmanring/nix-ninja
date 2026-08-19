@@ -1697,7 +1697,12 @@ fn upload_python_closure(
                                 let direct = sub.join(name);
                                 if direct.join("__init__.py").is_file() {
                                     cands.push(direct);
-                                } else if let Ok(subs2) = fs::read_dir(&sub) {
+                                }
+                                // No else: a direct hit must not hide a
+                                // deeper sibling copy of the same package
+                                // (4.9.3/bs4 sits BESIDE 4.9.3/py3k/bs4,
+                                // and only the deeper one is python 3).
+                                if let Ok(subs2) = fs::read_dir(&sub) {
                                     cands.extend(
                                         subs2
                                             .flatten()
