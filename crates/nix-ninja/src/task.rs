@@ -1406,6 +1406,34 @@ fn upload_referenced_file(
                     }
                 }
             }
+            // Imports the SIBLINGS cannot satisfy resolve one level up:
+            // chromium keeps single-module tools in their own directory
+            // (tools/json_comment_eater/json_comment_eater.py) and the
+            // importer inserts `../<name>` into sys.path itself
+            // (json_schema_compiler/json_parse.py does), so presence of
+            // the files is the whole requirement - no PYTHONPATH change.
+            // Names satisfied in-directory (a sibling module or package,
+            // stdlib resolving to neither) are skipped; a dot in the
+            // first segment cannot occur, import grammar forbids it.
+            if let Some(parent) = dir.parent() {
+                for name in python_import_names(dir)? {
+                    if dir.join(format!("{name}.py")).is_file()
+                        || dir.join(&name).is_dir()
+                    {
+                        continue;
+                    }
+                    let uncle = parent.join(&name);
+                    if uncle.is_dir() {
+                        match walk_dir_capped(rpc_client, build_dir, &uncle, 512)? {
+                            Some(files) => out.extend(files),
+                            None => println!(
+                                "nix-ninja: uncle module dir {} exceeds 512 files; skipped",
+                                uncle.display()
+                            ),
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(out)
