@@ -167,6 +167,10 @@ pub struct Runner {
     // measured in the wild (perfetto's touch_file.py); widen when a second
     // convention shows up.
     stamp_inputs: HashMap<FileId, Vec<FileId>>,
+    /// Every output of a multi-output task, keyed by each of its outputs:
+    /// a consumer depending on ONE of them gets the co-outputs too, since
+    /// tools follow a declared output to files written beside it.
+    co_outputs: HashMap<FileId, Vec<FileId>>,
 
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
@@ -226,6 +230,7 @@ impl Runner {
             build_dir_inputs: HashMap::new(),
             phony_aliases: HashMap::new(),
             stamp_inputs: HashMap::new(),
+            co_outputs: HashMap::new(),
             permits,
             tx,
             rx,
@@ -302,6 +307,15 @@ impl Runner {
             let ins: Vec<FileId> = build.dirtying_ins().to_vec();
             for fid in build.outs() {
                 self.stamp_inputs.insert(*fid, ins.clone());
+            }
+        }
+
+        // Record co-outputs BEFORE building the task, same ordering
+        // argument as the stamp edges above.
+        if build.outs().len() > 1 {
+            let outs: Vec<FileId> = build.outs().to_vec();
+            for fid in build.outs() {
+                self.co_outputs.insert(*fid, outs.clone());
             }
         }
 
@@ -467,6 +481,20 @@ impl Runner {
             // stamp fid itself continues below as a normal task-output dep.
             if let Some(extra) = self.stamp_inputs.get(&fid) {
                 worklist.extend(extra.iter().map(|f| (*f, true)));
+            }
+            // An input produced by a multi-output task pulls in its
+            // CO-OUTPUTS: tools follow one declared output to the files
+            // written beside it (tsc reads a project-referenced
+            // tsconfig.json, then the .d.ts files its producing task
+            // emitted next to it - MojoHandle's definition among them;
+            // upstream never declares those because a shared build dir
+            // makes following them free). Marked via_phony so the gcc
+            // header filter keeps TU closures lean and a co-output that
+            // is not yet a file drops silently rather than erroring.
+            if let Some(sibs) = self.co_outputs.get(&fid) {
+                worklist.extend(
+                    sibs.iter().filter(|s| **s != fid).map(|s| (*s, true)),
+                );
             }
             // For a compile (deps=gcc), a phony-EXPANDED order-only dep is
             // only a real input if it is header-shaped: expansion of GN's
