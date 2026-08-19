@@ -136,6 +136,24 @@ pub fn create_symlinks(
             fs::remove_file(&dest_path).map_err(|e| anyhow::anyhow!("remove_file({}): {e}", dest_path.display()))?;
         }
 
+        // Python scripts are COPIED, not symlinked: a script that takes
+        // realpath(__file__) - Chromium's version.py does, to find its
+        // sibling LASTCHANGE.dummy - resolves a symlink into the store,
+        // where its data siblings do not exist. A copy keeps __file__
+        // inside the sandbox tree, where the siblings' own symlinks sit
+        // beside it. (PYTHONPATH covers .py IMPORT siblings; this covers
+        // data-file siblings, which no import path can redirect.)
+        if input.build_path.extension().is_some_and(|e| e == "py") {
+            fs::copy(&source_path, &dest_path).map_err(|e| {
+                anyhow!(
+                    "copy({:?} -> {}): {e}",
+                    source_path,
+                    dest_path.display()
+                )
+            })?;
+            continue;
+        }
+
         symlink(&source_path, &dest_path).map_err(|e| {
             anyhow!(
                 "Failed to create symlink from {:?} to {}: {}",
