@@ -58,13 +58,14 @@ fn inline_or_pass_as_file(inline: Option<String>, name: &str) -> Result<String> 
     }
 }
 
+fn leading_ups(p: &std::path::Path) -> usize {
+    p.components()
+        .take_while(|c| matches!(c, std::path::Component::ParentDir))
+        .count()
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    fs::create_dir_all(&cli.build_dir)
-        .map_err(|e| anyhow::anyhow!("create_dir_all({}): {e}", cli.build_dir.display()))?;
-    std::env::set_current_dir(&cli.build_dir)
-        .map_err(|e| anyhow::anyhow!("set_current_dir({}): {e}", cli.build_dir.display()))?;
 
     let raw_inputs = inline_or_pass_as_file(cli.inputs.clone(), "NIX_NINJA_INPUTS")?;
     let raw_outputs = inline_or_pass_as_file(cli.outputs.clone(), "NIX_NINJA_OUTPUTS")?;
@@ -82,6 +83,41 @@ fn main() -> Result<()> {
         let output = DerivedFile::from_encoded(&cli.store_dir, encoded)?;
         outputs.push(output);
     }
+
+    // SELF-DEFENDING DEPTH: the driver computes a mirrored build dir from
+    // the inputs it can see, but discovered and dynamically-added inputs
+    // climb too, and every driver path that under-computed the depth sent
+    // a `..`-heavy input escaping the writable tree (mkdir /src, EACCES).
+    // The task knows its FINAL input list, so it deepens its own build
+    // dir with synthetic components until every climb stays under /build.
+    let build_dir = {
+        let max_up = inputs
+            .iter()
+            .map(|i| leading_ups(&i.build_path))
+            .max()
+            .unwrap_or(0);
+        let below_build = cli
+            .build_dir
+            .strip_prefix("/build")
+            .map(|r| r.components().count())
+            .unwrap_or(usize::MAX);
+        let mut b = cli.build_dir.clone();
+        if below_build != usize::MAX && max_up > below_build {
+            for i in 0..(max_up - below_build) {
+                b.push(format!("nnd{i}"));
+            }
+            println!(
+                "nix-ninja-task: deepened build dir to {} (inputs climb {max_up}, caller gave {below_build})",
+                b.display()
+            );
+        }
+        b
+    };
+
+    fs::create_dir_all(&build_dir)
+        .map_err(|e| anyhow::anyhow!("create_dir_all({}): {e}", build_dir.display()))?;
+    std::env::set_current_dir(&build_dir)
+        .map_err(|e| anyhow::anyhow!("set_current_dir({}): {e}", build_dir.display()))?;
 
     // Python resolves a script SYMLINK when computing sys.path[0]
     // (getpath realpaths it), so a wrapper script materialized as a
@@ -117,10 +153,10 @@ fn main() -> Result<()> {
     // symlinked while preserving the original directory hierarchy of the
     // sources. This ensures relative includes and other path-dependent
     // references remain valid.
-    create_symlinks(&cli.build_dir, &cli.store_dir, inputs, false)?;
+    create_symlinks(&build_dir, &cli.store_dir, inputs, false)?;
     println!(
         "nix-ninja-task: Setup source directory in {}",
-        cli.build_dir.display()
+        build_dir.display()
     );
 
     // Outputs are written to the same directory structure as the build
