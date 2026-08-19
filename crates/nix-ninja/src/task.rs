@@ -519,8 +519,21 @@ impl Runner {
         //
         // One way is to parse all the includes, then add it to our search
         // path above.
-        for input in self.build_dir_inputs.values() {
-            input_set.insert(input.build_path.clone(), input.clone());
+        //
+        // BOUNDED, because at Chromium scale this blanket is a memory
+        // bomb: injecting every configure-generated file into EVERY task
+        // makes each derivation's input map multi-megabyte, and the
+        // daemon's per-connection workers hold those derivations - seven
+        // workers at ~2 GiB RSS each, measured, squeezing the machine to
+        // 2.5 GiB available. Past the threshold the blanket is also
+        // redundant: explicit inputs, cmdline references (matched above)
+        // and depfile discovery carry the real dependencies. 512 covers
+        // the meson projects this hack was written for (dbus: dozens).
+        const IMPLICIT_INPUTS_LIMIT: usize = 512;
+        if self.build_dir_inputs.len() <= IMPLICIT_INPUTS_LIMIT {
+            for input in self.build_dir_inputs.values() {
+                input_set.insert(input.build_path.clone(), input.clone());
+            }
         }
 
         let mut inputs: Vec<DerivedFile> = input_set.into_values().collect();
