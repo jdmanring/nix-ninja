@@ -1378,7 +1378,32 @@ fn upload_referenced_dir(
 ) -> Result<Vec<DerivedFile>> {
     const DIR_UPLOAD_CAP: usize = 512;
     match walk_dir_capped(rpc_client, build_dir, dir, DIR_UPLOAD_CAP)? {
-        Some(files) => Ok(files),
+        Some(mut files) => {
+            // A package dir uploaded wholesale may import SIBLING
+            // packages the command never names: jinja2 does
+            // `from markupsafe import Markup`, dawn passes only
+            // --jinja2-path, and upstream finds markupsafe beside it on
+            // the shared filesystem. Scan the uploaded package's .py
+            // files for top-level import names and upload each sibling
+            // package they resolve to, one level (markupsafe imports
+            // nothing further; a deeper chain will name itself when it
+            // exists).
+            if dir.join("__init__.py").is_file() {
+                if let Some(parent) = dir.parent() {
+                    for name in python_import_names(dir)? {
+                        let sib = parent.join(&name);
+                        if sib != dir && sib.join("__init__.py").is_file() {
+                            if let Some(more) =
+                                walk_dir_capped(rpc_client, build_dir, &sib, DIR_UPLOAD_CAP)?
+                            {
+                                files.extend(more);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(files)
+        }
         None => {
             // Over the cap. Two conventions share this shape: dawn passes
             // the package dir itself (small, handled above), and
@@ -1420,6 +1445,46 @@ fn upload_referenced_dir(
             Ok(out)
         }
     }
+}
+
+/// Top-level module names imported by a python package's own files:
+/// `import X` and `from X import ...`, first path segment only. Line
+/// matching by prefix, which cannot see an import inside a try block's
+/// indentation - fine here, because an OPTIONAL import that fails is the
+/// pattern try blocks exist for.
+fn python_import_names(pkg: &Path) -> Result<Vec<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    let entries = fs::read_dir(pkg)
+        .map_err(|e| anyhow!("read_dir({}) for import scan: {e}", pkg.display()))?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.extension().is_some_and(|e| e == "py") {
+            continue;
+        }
+        let body = fs::read_to_string(&p)
+            .map_err(|e| anyhow!("read({}) for import scan: {e}", p.display()))?;
+        for line in body.lines() {
+            let rest = if let Some(r) = line.strip_prefix("import ") {
+                r
+            } else if let Some(r) = line.strip_prefix("from ") {
+                r
+            } else {
+                continue;
+            };
+            let first = rest
+                .split(|c: char| c == ' ' || c == '.' || c == ',')
+                .next()
+                .unwrap_or("");
+            if !first.is_empty()
+                && first
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                names.insert(first.to_string());
+            }
+        }
+    }
+    Ok(names.into_iter().collect())
 }
 
 /// Recursive regular-file upload of one directory, or None past the cap.
@@ -1559,6 +1624,28 @@ mod job_permits_tests {
         // If the panicking thread leaked its permit, this blocks forever
         // and the test times out; acquiring proves the Drop ran.
         let _permit = permits.acquire();
+    }
+}
+
+#[cfg(test)]
+mod python_import_names_tests {
+    use super::python_import_names;
+
+    #[test]
+    fn finds_import_and_from_first_segment() {
+        let d = std::env::temp_dir().join(format!("nn-imports-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("__init__.py"),
+            "import os\nfrom markupsafe import Markup\nfrom .environment import E\nimport sys, re\n",
+        )
+        .unwrap();
+        let names = python_import_names(&d).unwrap();
+        assert!(names.contains(&"markupsafe".to_string()));
+        assert!(names.contains(&"os".to_string()));
+        // relative import's first segment is empty and must not appear
+        assert!(!names.contains(&"".to_string()));
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }
 
