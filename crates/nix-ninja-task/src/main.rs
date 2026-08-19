@@ -126,31 +126,52 @@ fn main() -> Result<()> {
     // holds one file. Prepend every .py input's build-dir-relative
     // directory to PYTHONPATH; the symlink directories hold ALL the
     // sibling symlinks, so imports resolve there.
-    {
-        let mut py_dirs: Vec<String> = Vec::new();
+    let py_parents: Vec<std::path::PathBuf> = {
+        let mut v = Vec::new();
         for input in &inputs {
             if input.build_path.extension().is_some_and(|e| e == "py") {
                 if let Some(parent) = input.build_path.parent() {
-                    // Never put a package's INTERNALS on sys.path: a dir
-                    // with __init__.py climbs to its package root first.
-                    // mojom/parse/ holds an ast.py, and on the path it
-                    // shadows stdlib ast - fatal under python 3.14, where
-                    // argparse itself imports ast via _colorize. The
-                    // package root is also the semantically correct entry:
-                    // `import jinja2` wants third_party/, never
-                    // third_party/jinja2/.
-                    let mut root = parent;
-                    while root.join("__init__.py").is_file() {
-                        match root.parent() {
-                            Some(p) => root = p,
-                            None => break,
-                        }
-                    }
-                    let d = root.to_string_lossy().into_owned();
-                    if !d.is_empty() && !py_dirs.contains(&d) {
-                        py_dirs.push(d);
+                    if !v.contains(&parent.to_path_buf()) {
+                        v.push(parent.to_path_buf());
                     }
                 }
+            }
+        }
+        v
+    };
+
+    // The source directory of the derivation needs to have all build inputs
+    // symlinked while preserving the original directory hierarchy of the
+    // sources. This ensures relative includes and other path-dependent
+    // references remain valid.
+    create_symlinks(&build_dir, &cli.store_dir, inputs, false)?;
+    println!(
+        "nix-ninja-task: Setup source directory in {}",
+        build_dir.display()
+    );
+
+    // PYTHONPATH is assembled AFTER the tree is materialized, because the
+    // package-root climb reads __init__.py off the filesystem - run
+    // before create_symlinks it sees an empty tree and every check
+    // answers false (measured: mojom/parse/ stayed on the path and its
+    // ast.py shadowed stdlib ast under python 3.14). Never put a
+    // package's INTERNALS on sys.path: a dir with __init__.py climbs to
+    // its package root first, which is also the semantically correct
+    // entry - `import jinja2` wants third_party/, never
+    // third_party/jinja2/.
+    {
+        let mut py_dirs: Vec<String> = Vec::new();
+        for parent in &py_parents {
+            let mut root = parent.as_path();
+            while root.join("__init__.py").is_file() {
+                match root.parent() {
+                    Some(p) => root = p,
+                    None => break,
+                }
+            }
+            let d = root.to_string_lossy().into_owned();
+            if !d.is_empty() && !py_dirs.contains(&d) {
+                py_dirs.push(d);
             }
         }
         if !py_dirs.is_empty() {
@@ -163,16 +184,6 @@ fn main() -> Result<()> {
             println!("nix-ninja-task: PYTHONPATH={pp}");
         }
     }
-
-    // The source directory of the derivation needs to have all build inputs
-    // symlinked while preserving the original directory hierarchy of the
-    // sources. This ensures relative includes and other path-dependent
-    // references remain valid.
-    create_symlinks(&build_dir, &cli.store_dir, inputs, false)?;
-    println!(
-        "nix-ninja-task: Setup source directory in {}",
-        build_dir.display()
-    );
 
     // Outputs are written to the same directory structure as the build
     // directory because if the output is a shared library the filename must
