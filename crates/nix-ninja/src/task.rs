@@ -591,6 +591,7 @@ impl Runner {
         // step. We tracked files that existed in the build directory
         // beforehand, so we can see if there's anything that matches and add
         // it as an explicit input.
+        let mut node_args: Vec<FileId> = Vec::new();
         if let Some(cmdline) = &cmdline {
             let args = shell_words::split(cmdline)?;
             for arg in args {
@@ -663,7 +664,17 @@ impl Runner {
                         // other candidate here.
                         if let Some(outdir) = outputs_hint.as_deref() {
                             let rebased = lexical_join(outdir, Path::new(&arg));
-                            if rebased.is_file() {
+                            // A rebased arg naming a GRAPH NODE is a real
+                            // dependency edge, not an opaque source: route
+                            // it as a Built input (with co-outputs, below)
+                            // so the generated file comes from its
+                            // producing derivation rather than whatever
+                            // stale copy the host build dir holds.
+                            if let Some(rfid) =
+                                files.lookup(&rebased.to_string_lossy())
+                            {
+                                node_args.push(rfid);
+                            } else if rebased.is_file() {
                                 for input in upload_referenced_file(
                                     &self.rpc_client,
                                     &self.config.build_dir,
@@ -677,6 +688,7 @@ impl Runner {
                     }
                     continue;
                 };
+                node_args.push(fid);
                 let input = match self.derived_files.get(&fid) {
                     Some(derived_file) => derived_file.clone(),
                     None => match self.build_dir_inputs.get(&fid) {
@@ -706,6 +718,27 @@ impl Runner {
                     },
                 };
                 input_set.insert(input.build_path.clone(), input);
+            }
+        }
+
+        // Cmdline args that named graph nodes (directly or rebased) pull
+        // their producing task's co-outputs, same as ordering_ins do in
+        // the worklist above: tsc follows a project-referenced tsconfig
+        // to the .d.ts files written beside it.
+        {
+            let mut expand: Vec<FileId> = node_args;
+            let mut seen_na: std::collections::HashSet<FileId> =
+                std::collections::HashSet::new();
+            while let Some(nfid) = expand.pop() {
+                if !seen_na.insert(nfid) {
+                    continue;
+                }
+                if let Some(sibs) = self.co_outputs.get(&nfid) {
+                    expand.extend(sibs.iter().filter(|s| **s != nfid));
+                }
+                if let Some(df) = self.derived_files.get(&nfid) {
+                    input_set.insert(df.build_path.clone(), df.clone());
+                }
             }
         }
 
