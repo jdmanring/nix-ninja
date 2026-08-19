@@ -1358,6 +1358,21 @@ fn upload_referenced_file(
                 }
                 if p.extension().is_some_and(|e| e == "py") && p.is_file() {
                     out.push(new_opaque_file(rpc_client, build_dir, p)?);
+                } else if p.is_dir() && p.join("__init__.py").is_file() {
+                    // A sibling package DIRECTORY: grit.py is a launcher
+                    // whose first act is `import grit.grit_runner`,
+                    // expecting tools/grit/grit/ beside it (126 files,
+                    // measured). Over-cap siblings skip with a note
+                    // rather than failing - an unrelated giant package
+                    // beside a script must not kill the task; a needed
+                    // one names itself at import time.
+                    match walk_dir_capped(rpc_client, build_dir, &p, 512)? {
+                        Some(files) => out.extend(files),
+                        None => println!(
+                            "nix-ninja: sibling package {} exceeds 512 files; skipped",
+                            p.display()
+                        ),
+                    }
                 }
             }
         }
