@@ -1736,9 +1736,90 @@ fn upload_python_closure(
                     queue.push(sp);
                 }
             }
+            // A *_project.py file is catapult's convention for a
+            // vulcanize project definition: its os.path.join lines name
+            // the DATA roots the tool searches (tracing/, polymer
+            // components), assembled from attributes no import scan can
+            // see. Each join line's quoted segments resolve against the
+            // file's own dir, its parent, and the parent's third_party;
+            // existing directories upload, same bound as everything
+            // here.
+            let has_project_file = fs::read_dir(&dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .ends_with("_project.py")
+                });
+            if has_project_file {
+                let mut bases = vec![dir.clone()];
+                if let Some(par) = dir.parent() {
+                    bases.push(par.to_path_buf());
+                    bases.push(par.join("third_party"));
+                }
+                for seg_path in python_join_segments(&dir)? {
+                    for base in &bases {
+                        let cand = lexical_join(base, &seg_path);
+                        if cand.is_dir() && cand != dir {
+                            if upload_dir(&cand, 8192, out)? {
+                                queue.push(cand);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Quoted string segments of every os.path.join line in the *_project.py
+/// files of `dir`, each line yielding one relative path. Used only for
+/// catapult-style project definition files, whose join lines name data
+/// roots; the caller resolves against candidate bases and keeps what
+/// exists.
+fn python_join_segments(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let entries = fs::read_dir(dir)
+        .map_err(|e| anyhow!("read_dir({}) for project scan: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with("_project.py"))
+        {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&p) else { continue };
+        for line in body.lines() {
+            if !line.contains("os.path.join") {
+                continue;
+            }
+            let mut segs: Vec<&str> = Vec::new();
+            let mut rest = line;
+            while let Some(start) = rest.find(['\'', '"']) {
+                let quote = rest.as_bytes()[start] as char;
+                let after = &rest[start + 1..];
+                let Some(end) = after.find(quote) else { break };
+                let seg = &after[..end];
+                if !seg.is_empty() && !seg.contains(':') {
+                    segs.push(seg);
+                }
+                rest = &after[end + 1..];
+            }
+            if !segs.is_empty() {
+                let rel: PathBuf = segs.iter().collect();
+                if !found.contains(&rel) {
+                    found.push(rel);
+                }
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Directories the .py files in `dir` splice onto sys.path, read
