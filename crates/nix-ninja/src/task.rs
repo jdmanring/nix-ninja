@@ -1498,10 +1498,29 @@ fn upload_referenced_dir(
 /// directory, kept only where the file exists on disk (grd files also
 /// carry output filenames in the same attributes; existence is the
 /// discriminator, and a generated input would be a graph node already).
+///
+/// chrome_scaled_image structures resolve their file value through a
+/// per-scale context directory INSERTED between the manifest dir and the
+/// value (grit's ChromeScaledImage._FindInputFile), so a bare join misses
+/// every image asset. The context names come from the top-level grd's
+/// <output context="..."> nodes, which this per-file scan cannot see from
+/// a .grdp, so the conventional chromium scale dirs are tried as well;
+/// existence keeps the false candidates out, same as the base case.
 fn grd_references(grd: &Path) -> Result<Vec<PathBuf>> {
     let body = fs::read_to_string(grd)
         .map_err(|e| anyhow!("read({}) for grd scan: {e}", grd.display()))?;
     let dir = grd.parent().unwrap_or(Path::new(""));
+    let mut contexts: Vec<String> = ["default_100_percent", "default_200_percent", "default_300_percent"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for chunk in body.split("context=\"").skip(1) {
+        if let Some(val) = chunk.split('"').next() {
+            if !val.is_empty() && !contexts.iter().any(|c| c == val) {
+                contexts.push(val.to_string());
+            }
+        }
+    }
     let mut out = Vec::new();
     for attr in ["file=\"", "path=\""] {
         for chunk in body.split(attr).skip(1) {
@@ -1514,6 +1533,13 @@ fn grd_references(grd: &Path) -> Result<Vec<PathBuf>> {
             let p = dir.join(val);
             if p.is_file() {
                 out.push(p);
+                continue;
+            }
+            for ctx in &contexts {
+                let p = dir.join(ctx).join(val);
+                if p.is_file() {
+                    out.push(p);
+                }
             }
         }
     }
@@ -1798,6 +1824,31 @@ mod normalize_output_tests {
     #[test]
     fn spaces_and_unicode_are_sanitized() {
         assert_eq!(normalize_output("a b\u{e9}.c"), "a-b-.c");
+    }
+
+    #[test]
+    fn grd_scaled_image_resolves_through_context_dir() {
+        use super::grd_references;
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("grd-test-{}", std::process::id()));
+        let scaled = dir.join("default_100_percent/flags_ui");
+        fs::create_dir_all(&scaled).unwrap();
+        fs::write(scaled.join("favicon.png"), b"png").unwrap();
+        fs::write(dir.join("direct.xtb"), b"xtb").unwrap();
+        let grd = dir.join("res.grd");
+        fs::write(
+            &grd,
+            r#"<grit><outputs><output context="default_100_percent"/></outputs>
+               <file path="direct.xtb"/>
+               <structure type="chrome_scaled_image" file="flags_ui/favicon.png"/>
+               <structure type="chrome_scaled_image" file="flags_ui/absent.png"/></grit>"#,
+        )
+        .unwrap();
+        let refs = grd_references(&grd).unwrap();
+        assert!(refs.contains(&dir.join("direct.xtb")));
+        assert!(refs.contains(&scaled.join("favicon.png")));
+        assert_eq!(refs.len(), 2, "absent file must not be invented: {refs:?}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
 
