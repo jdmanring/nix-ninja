@@ -299,10 +299,18 @@ impl Runner {
         // Record stamp edges BEFORE building the task, so any later
         // consumer's expansion sees them (ninja emits producers before
         // consumers in the traversal order the driver walks).
+        // ts_library.py edges have the same shape as stamps from a
+        // consumer's viewpoint: the generated tsconfig lists its
+        // project's SOURCE .d.ts files (a definitions target compiles
+        // nothing - tsc passes .d.ts through), so following a project
+        // reference needs the producing edge's INPUTS beside the
+        // tsconfig. Same recording, same expansion; the via_phony
+        // not-a-file drop discards entries that are another task's
+        // unmaterialized outputs.
         if build
             .cmdline
             .as_deref()
-            .is_some_and(|c| c.contains("touch_file.py"))
+            .is_some_and(|c| c.contains("touch_file.py") || c.contains("ts_library.py"))
         {
             let ins: Vec<FileId> = build.dirtying_ins().to_vec();
             for fid in build.outs() {
