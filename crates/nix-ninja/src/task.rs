@@ -162,6 +162,11 @@ pub struct Runner {
     // output FileId to the phony's input FileIds; dependents expand these
     // (transitively) in new_task instead of demanding a derivation.
     phony_aliases: HashMap<FileId, Vec<FileId>>,
+    // Stamp-edge outputs -> that edge's own inputs. See the stamp comment
+    // in new_task's expansion loop. Detection is by the one stamp script
+    // measured in the wild (perfetto's touch_file.py); widen when a second
+    // convention shows up.
+    stamp_inputs: HashMap<FileId, Vec<FileId>>,
 
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
@@ -220,6 +225,7 @@ impl Runner {
             derived_files: HashMap::new(),
             build_dir_inputs: HashMap::new(),
             phony_aliases: HashMap::new(),
+            stamp_inputs: HashMap::new(),
             permits,
             tx,
             rx,
@@ -283,6 +289,20 @@ impl Runner {
             })
             .context("completing phony build")?;
             return Ok(());
+        }
+
+        // Record stamp edges BEFORE building the task, so any later
+        // consumer's expansion sees them (ninja emits producers before
+        // consumers in the traversal order the driver walks).
+        if build
+            .cmdline
+            .as_deref()
+            .is_some_and(|c| c.contains("touch_file.py"))
+        {
+            let ins: Vec<FileId> = build.dirtying_ins().to_vec();
+            for fid in build.outs() {
+                self.stamp_inputs.insert(*fid, ins.clone());
+            }
         }
 
         let tools = self.tools.clone();
@@ -435,6 +455,18 @@ impl Runner {
             if let Some(alias_ins) = self.phony_aliases.get(&fid) {
                 worklist.extend(alias_ins.iter().map(|f| (*f, true)));
                 continue;
+            }
+            // A stamp file certifies its edge's inputs EXIST; it carries no
+            // content. On a shared filesystem depending on the stamp is
+            // enough, but in the task sandbox the certified files must be
+            // materialized too: perfetto's trace_processor_table_generator
+            // stamps python package files that gen_tp_table_headers.py then
+            // imports from the repo root. So a stamp dependency also
+            // enqueues the stamp edge's own inputs, marked via_phony so the
+            // gcc header filter and the not-a-file drop still apply. The
+            // stamp fid itself continues below as a normal task-output dep.
+            if let Some(extra) = self.stamp_inputs.get(&fid) {
+                worklist.extend(extra.iter().map(|f| (*f, true)));
             }
             // For a compile (deps=gcc), a phony-EXPANDED order-only dep is
             // only a real input if it is header-shaped: expansion of GN's
