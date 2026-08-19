@@ -698,6 +698,37 @@ impl Runner {
             }
         }
 
+        // grit manifests include partials and translations TEXTUALLY
+        // (<part file="x.grdp">, <file path="y.xtb">), resolved relative
+        // to the manifest's own directory, and GN declares none of them -
+        // round 39 died at FileNotFound: address_input_strings.grdp. Same
+        // worklist shape as the python-sibling pass; .grdp partials nest,
+        // so found manifests re-enter the list.
+        let mut grd_list: Vec<PathBuf> = input_set
+            .keys()
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|e| e == "grd" || e == "grdp")
+            })
+            .cloned()
+            .collect();
+        while let Some(grd) = grd_list.pop() {
+            if !Path::new(&grd).is_file() {
+                continue;
+            }
+            for r in grd_references(&grd)? {
+                if input_set.contains_key(&r) {
+                    continue;
+                }
+                let up = new_opaque_file(&self.rpc_client, &self.config.build_dir, r.clone())?;
+                self.add_derived_file(files, up.clone());
+                input_set.insert(up.build_path.clone(), up);
+                if r.extension().is_some_and(|e| e == "grdp") {
+                    grd_list.push(r);
+                }
+            }
+        }
+
         let mut inputs: Vec<DerivedFile> = input_set.into_values().collect();
         inputs.sort();
 
@@ -1460,6 +1491,33 @@ fn upload_referenced_dir(
             Ok(out)
         }
     }
+}
+
+/// Files a grit manifest references textually: every file="..." and
+/// path="..." attribute value, resolved against the manifest's own
+/// directory, kept only where the file exists on disk (grd files also
+/// carry output filenames in the same attributes; existence is the
+/// discriminator, and a generated input would be a graph node already).
+fn grd_references(grd: &Path) -> Result<Vec<PathBuf>> {
+    let body = fs::read_to_string(grd)
+        .map_err(|e| anyhow!("read({}) for grd scan: {e}", grd.display()))?;
+    let dir = grd.parent().unwrap_or(Path::new(""));
+    let mut out = Vec::new();
+    for attr in ["file=\"", "path=\""] {
+        for chunk in body.split(attr).skip(1) {
+            let Some(val) = chunk.split('"').next() else {
+                continue;
+            };
+            if val.is_empty() || val.contains("://") {
+                continue;
+            }
+            let p = dir.join(val);
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Top-level module names imported by a python package's own files:
