@@ -217,32 +217,79 @@ impl BuilderRpcClient {
         store_dir: &StoreDir,
         paths: &[SingleDerivedPath],
     ) -> Result<Vec<StorePath>> {
-        let derived: Vec<DerivedPath> = paths
-            .iter()
-            .map(|p| match p {
-                SingleDerivedPath::Opaque(path) => DerivedPath::Opaque(path.clone()),
-                SingleDerivedPath::Built { drv_path, output } => DerivedPath::Built {
-                    drv_path: drv_path.clone(),
-                    outputs: OutputSpec::Named(std::iter::once(output.clone()).collect()),
-                },
-            })
-            .collect();
+        // Dedupe per derivation with MERGED output specs: requesting the
+        // same drv once per output (a codegen drv producing dozens of
+        // headers appears dozens of times among a task's inputs) makes
+        // the daemon merge them into one result whose DerivedPath key -
+        // carrying the merged spec - matches none of the single-output
+        // request keys, and every lookup then reports "no build result".
+        // Key results by the drv/opaque path alone instead.
+        let mut merged: Vec<DerivedPath> = Vec::new();
+        let mut drv_index: HashMap<String, usize> = HashMap::new();
+        for p in paths {
+            match p {
+                SingleDerivedPath::Opaque(path) => {
+                    let key = path.to_string();
+                    if !drv_index.contains_key(&key) {
+                        drv_index.insert(key, merged.len());
+                        merged.push(DerivedPath::Opaque(path.clone()));
+                    }
+                }
+                SingleDerivedPath::Built { drv_path, output } => {
+                    let key = format!("drv:{}", store_dir.display(drv_path.as_ref()));
+                    match drv_index.get(&key) {
+                        Some(&i) => {
+                            if let DerivedPath::Built { outputs, .. } = &mut merged[i] {
+                                if let OutputSpec::Named(set) = outputs {
+                                    set.insert(output.clone());
+                                }
+                            }
+                        }
+                        None => {
+                            drv_index.insert(key, merged.len());
+                            merged.push(DerivedPath::Built {
+                                drv_path: drv_path.clone(),
+                                outputs: OutputSpec::Named(
+                                    std::iter::once(output.clone()).collect(),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         let results = self.runtime.block_on(async {
             let mut guard = self.pool.acquire().await?;
             guard
-                .execute(|client| client.build_paths_with_results(&derived, BuildMode::Normal))
+                .execute(|client| client.build_paths_with_results(&merged, BuildMode::Normal))
                 .await
         })?;
 
-        let by_path: HashMap<_, _> = results.into_iter().map(|r| (r.path, r.result)).collect();
+        // Key by drv path (or opaque path), never by the full DerivedPath
+        // whose output spec need not match what was requested.
+        let mut by_key: HashMap<String, _> = HashMap::new();
+        for r in results {
+            let key = match &r.path {
+                DerivedPath::Opaque(path) => path.to_string(),
+                DerivedPath::Built { drv_path, .. } => {
+                    format!("drv:{}", store_dir.display(drv_path.as_ref()))
+                }
+            };
+            by_key.insert(key, r.result);
+        }
         paths
             .iter()
-            .zip(&derived)
-            .map(|(single, derived_path)| {
+            .map(|single| {
                 let display = store_dir.display(single).to_string();
-                let result = by_path
-                    .get(derived_path)
+                let key = match single {
+                    SingleDerivedPath::Opaque(path) => path.to_string(),
+                    SingleDerivedPath::Built { drv_path, .. } => {
+                        format!("drv:{}", store_dir.display(drv_path.as_ref()))
+                    }
+                };
+                let result = by_key
+                    .get(&key)
                     .ok_or_else(|| Error::MissingBuildResult(display.clone()))?;
                 let success = result.success().ok_or_else(|| Error::BuildFailed {
                     path: display.clone(),
