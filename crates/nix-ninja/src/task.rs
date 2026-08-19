@@ -797,7 +797,11 @@ fn build_task_derivation(
         let cmdline_binary = cmdline
             .split_whitespace()
             .find(|tok| *tok != ":" && *tok != "&&")
-            .ok_or_else(|| anyhow!("No command found in cmdline"))?;
+            .ok_or_else(|| anyhow!("No command found in cmdline"))?
+            // GN quotes interpreter paths ("…/python3.14"); the shell
+            // strips the quotes at exec time, so strip them here too or
+            // `which` is asked for a name with literal quote characters.
+            .trim_matches(|c| c == '"' || c == '\'');
 
         // A command resolving outside the store (e.g. a `../gen.sh` script
         // from the source tree) is a task input handled by
