@@ -306,7 +306,12 @@ impl BuilderRpcClient {
                         .built_outputs
                         .get(output)
                         .map(|realisation| realisation.out_path.clone())
-                        .ok_or_else(|| Error::MissingBuildResult(display)),
+                        .ok_or_else(|| {
+                            Error::MissingBuildResult(format!(
+                                "{display} (result found; its built_outputs lacks '{output}', has: {:?})",
+                                success.built_outputs.keys().take(6).collect::<Vec<_>>()
+                            ))
+                        }),
                 }
             })
             .collect()
