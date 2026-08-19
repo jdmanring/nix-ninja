@@ -514,6 +514,29 @@ impl Runner {
                         )?;
                         self.add_derived_file(files, input.clone());
                         input_set.insert(input.build_path.clone(), input);
+                        // A python script imports SIBLING modules from its
+                        // own directory (gcc_link_wrapper.py imports
+                        // wrapper_utils.py), so bring the directory's .py
+                        // files with it. One directory, non-recursive -
+                        // python's default import model for these wrappers.
+                        if arg.ends_with(".py") {
+                            if let Some(dir) = Path::new(&arg).parent() {
+                                for entry in fs::read_dir(dir).into_iter().flatten().flatten()
+                                {
+                                    let p = entry.path();
+                                    if p.extension().is_some_and(|e| e == "py") && p.is_file()
+                                    {
+                                        let sib = new_opaque_file(
+                                            &self.rpc_client,
+                                            &self.config.build_dir,
+                                            p,
+                                        )?;
+                                        self.add_derived_file(files, sib.clone());
+                                        input_set.insert(sib.build_path.clone(), sib);
+                                    }
+                                }
+                            }
+                        }
                     }
                     continue;
                 };
