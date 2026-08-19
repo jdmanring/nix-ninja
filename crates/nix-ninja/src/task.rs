@@ -677,47 +677,6 @@ fn build_task_derivation(
         .into(),
     );
 
-    // The sandbox build dir must be at least as DEEP as the longest
-    // `..` climb any input or command token makes: the default
-    // /build/source/build is 3 deep, and Chromium's GN graph references
-    // sources 5 levels up (../../../../../src/...), which escaped to
-    // filesystem root and died at mkdir /src. Mirror the trailing
-    // components of the REAL build dir so relative paths resolve to the
-    // same names on either side.
-    let cmd_climb = cmdline
-        .split_whitespace()
-        .map(|tok| leading_parent_components(Path::new(tok)))
-        .max()
-        .unwrap_or(0);
-    let max_up = task
-        .inputs
-        .iter()
-        .map(|i| leading_parent_components(&i.build_path))
-        .max()
-        .unwrap_or(0)
-        .max(cmd_climb);
-    if max_up > 0 {
-        let comps: Vec<_> = task.build_dir.components().collect();
-        if comps.len() < max_up {
-            return Err(anyhow!(
-                "inputs climb {} levels above build dir {}, which has only {} components",
-                max_up,
-                task.build_dir.display(),
-                comps.len()
-            ));
-        }
-        let mirrored: PathBuf = comps[comps.len() - max_up..].iter().collect();
-        let sandbox_build_dir = Path::new("/build/source").join(mirrored);
-        drv.args.push(b"--build-dir"[..].into());
-        drv.args.push(
-            sandbox_build_dir
-                .to_string_lossy()
-                .into_owned()
-                .into_bytes()
-                .into(),
-        );
-    }
-
     drv.args.push(cmdline.to_string().into_bytes().into());
 
     if let Some(desc) = &task.desc {
@@ -812,6 +771,55 @@ fn build_task_derivation(
                 discovered_inputs.push(derived_file);
             }
         }
+    }
+
+    // The sandbox build dir must be at least as DEEP as the longest
+    // `..` climb any input or command token makes: the default
+    // /build/source/build is 3 deep, and Chromium's GN graph references
+    // sources 5 levels up (../../../../../src/...), which escaped to
+    // filesystem root and died at mkdir /src. Mirror the trailing
+    // components of the REAL build dir so relative paths resolve to the
+    // same names on either side.
+    let cmd_climb = cmdline
+        .split_whitespace()
+        .map(|tok| leading_parent_components(Path::new(tok)))
+        .max()
+        .unwrap_or(0);
+    // Computed AFTER discovery merging: discovered includes (and python
+    // siblings) also climb, and a max_up taken before they were added
+    // left this task a 3-deep sandbox for 5-up inputs, escaping to /.
+    let max_up = task
+        .inputs
+        .iter()
+        .map(|i| leading_parent_components(&i.build_path))
+        .chain(
+            discovered_inputs
+                .iter()
+                .map(|i| leading_parent_components(&i.build_path)),
+        )
+        .max()
+        .unwrap_or(0)
+        .max(cmd_climb);
+    if max_up > 0 {
+        let comps: Vec<_> = task.build_dir.components().collect();
+        if comps.len() < max_up {
+            return Err(anyhow!(
+                "inputs climb {} levels above build dir {}, which has only {} components",
+                max_up,
+                task.build_dir.display(),
+                comps.len()
+            ));
+        }
+        let mirrored: PathBuf = comps[comps.len() - max_up..].iter().collect();
+        let sandbox_build_dir = Path::new("/build/source").join(mirrored);
+        drv.args.push(b"--build-dir"[..].into());
+        drv.args.push(
+            sandbox_build_dir
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes()
+                .into(),
+        );
     }
 
     // Sort NIX_NINJA_INPUTS to ensure determinism.
