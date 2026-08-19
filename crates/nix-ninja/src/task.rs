@@ -1535,117 +1535,169 @@ fn upload_referenced_file(
     let mut out = vec![main];
     if is_py {
         if let Some(dir) = path.parent() {
-            let entries = fs::read_dir(dir).map_err(|e| {
-                anyhow!("read_dir({}) for python siblings: {e}", dir.display())
-            })?;
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p == path {
-                    continue;
+            upload_python_closure(rpc_client, build_dir, dir, &path, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Python module names shipped with the interpreter: an import of one
+/// is satisfied by the runtime, so it must never trigger the ancestor
+/// and vendored-tree probes below. Incomplete by design - a missed name
+/// costs a few stats and a failed directory probe, never a wrong file.
+const PY_STDLIB: &[&str] = &[
+    "abc", "argparse", "ast", "base64", "binascii", "bisect", "codecs",
+    "collections", "contextlib", "copy", "csv", "ctypes", "dataclasses",
+    "datetime", "difflib", "enum", "errno", "fnmatch", "functools",
+    "getopt", "glob", "gzip", "hashlib", "heapq", "html", "http", "io",
+    "importlib", "inspect", "itertools", "json", "keyword", "locale",
+    "logging", "math", "multiprocessing", "operator", "optparse", "os",
+    "pathlib", "pickle", "platform", "posixpath", "pprint", "queue",
+    "random", "re", "shlex", "shutil", "signal", "site", "socket",
+    "stat", "string", "struct", "subprocess", "sys", "tempfile",
+    "textwrap", "threading", "time", "traceback", "types", "typing",
+    "unittest", "urllib", "uuid", "warnings", "xml", "zipfile", "zlib",
+];
+
+/// Upload the TRANSITIVE python dependency closure rooted at a script's
+/// directory. Chromium's build scripts resolve imports through every
+/// mechanism python has - sibling modules, sibling packages, uncle
+/// directories whose names need not match the module, sys.path splices
+/// assembled across statements, and vendored version-suffixed trees
+/// (beautifulsoup4-4.9.3/py3k/bs4) - and they do it TRANSITIVELY:
+/// parse_html_deps.py, itself two packages deep, imports bs4. So every
+/// uploaded package directory gets the same scan its referencing script
+/// got, until the closure is dry. Bounded by a directory-count cap and
+/// a visited set; existence discriminates every candidate.
+fn upload_python_closure(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    start_dir: &Path,
+    main: &Path,
+    out: &mut Vec<DerivedFile>,
+) -> Result<()> {
+    const CLOSURE_DIR_CAP: usize = 64;
+    let mut visited: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+    let mut queue: Vec<PathBuf> = vec![start_dir.to_path_buf()];
+    let mut upload_dir =
+        |dir: &Path, cap: usize, out: &mut Vec<DerivedFile>| -> Result<bool> {
+            match walk_dir_capped(rpc_client, build_dir, dir, cap)? {
+                Some(files) => {
+                    out.extend(files);
+                    Ok(true)
                 }
-                if p.extension().is_some_and(|e| e == "py") && p.is_file() {
-                    out.push(new_opaque_file(rpc_client, build_dir, p)?);
-                } else if p.is_dir()
-                    && p.file_name().is_some_and(|n| n == "node_modules")
-                {
-                    // chromium's node.py resolves node_modules as its own
-                    // sibling via __file__ (tsc lives at
-                    // node_modules/typescript/bin/tsc), so the tree must
-                    // travel with the script. Measured 4,616 files at
-                    // qtwebengine 6.11.1 - over the package cap by design,
-                    // so it gets its own bound; one store upload, shared
-                    // by hash across every node task after the first.
-                    match walk_dir_capped(rpc_client, build_dir, &p, 8192)? {
-                        Some(files) => out.extend(files),
-                        None => println!(
-                            "nix-ninja: node_modules {} exceeds 8192 files; skipped",
-                            p.display()
-                        ),
-                    }
-                } else if p.is_dir() && p.join("__init__.py").is_file() {
-                    // A sibling package DIRECTORY: grit.py is a launcher
-                    // whose first act is `import grit.grit_runner`,
-                    // expecting tools/grit/grit/ beside it (126 files,
-                    // measured). Over-cap siblings skip with a note
-                    // rather than failing - an unrelated giant package
-                    // beside a script must not kill the task; a needed
-                    // one names itself at import time.
-                    match walk_dir_capped(rpc_client, build_dir, &p, 512)? {
-                        Some(files) => out.extend(files),
-                        None => println!(
-                            "nix-ninja: sibling package {} exceeds 512 files; skipped",
-                            p.display()
-                        ),
-                    }
+                None => {
+                    println!(
+                        "nix-ninja: python dep dir {} exceeds {} files; skipped",
+                        dir.display(),
+                        cap
+                    );
+                    Ok(false)
                 }
             }
-            // Imports the SIBLINGS cannot satisfy resolve one level up:
-            // chromium keeps shared modules in uncle directories and the
-            // importer inserts `../<dir>` into sys.path itself
-            // (json_schema_compiler/json_parse.py imports from
-            // ../json_comment_eater/, histograms' configuration model
-            // imports `models` from ../common/), so presence of the
-            // files is the whole requirement - no PYTHONPATH change.
-            // The uncle's NAME need not match the import name (common/
-            // holds models.py), so every uncle is probed for <name>.py.
-            // Names satisfied in-directory (a sibling module or package,
-            // stdlib resolving to neither) are skipped; a dot in the
-            // first segment cannot occur, import grammar forbids it.
-            if let Some(parent) = dir.parent() {
-                let unsatisfied: Vec<String> = python_import_names(dir)?
-                    .into_iter()
-                    .filter(|name| {
-                        !dir.join(format!("{name}.py")).is_file()
-                            && !dir.join(name).is_dir()
-                    })
-                    .collect();
-                if !unsatisfied.is_empty() {
-                    for uncle in fs::read_dir(parent)
-                        .map_err(|e| {
-                            anyhow!("read_dir({}) for uncle modules: {e}", parent.display())
-                        })?
-                        .flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.is_dir() && *p != dir)
-                    {
-                        if !unsatisfied
-                            .iter()
-                            .any(|n| uncle.join(format!("{n}.py")).is_file())
-                        {
-                            continue;
-                        }
-                        match walk_dir_capped(rpc_client, build_dir, &uncle, 512)? {
-                            Some(files) => out.extend(files),
-                            None => println!(
-                                "nix-ninja: uncle module dir {} exceeds 512 files; skipped",
-                                uncle.display()
-                            ),
-                        }
+        };
+    while let Some(dir) = queue.pop() {
+        if !visited.insert(dir.clone()) || visited.len() > CLOSURE_DIR_CAP {
+            continue;
+        }
+        // Siblings: every .py module, node_modules for node.py, and
+        // package directories - which recurse, because their own files
+        // import too.
+        let entries = fs::read_dir(&dir).map_err(|e| {
+            anyhow!("read_dir({}) for python closure: {e}", dir.display())
+        })?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p == main {
+                continue;
+            }
+            if p.extension().is_some_and(|e| e == "py") && p.is_file() {
+                out.push(new_opaque_file(rpc_client, build_dir, p)?);
+            } else if p.is_dir()
+                && p.file_name().is_some_and(|n| n == "node_modules")
+            {
+                upload_dir(&p, 8192, out)?;
+            } else if p.is_dir() && p.join("__init__.py").is_file() {
+                if upload_dir(&p, 512, out)? {
+                    queue.push(p);
+                }
+            }
+        }
+        // Imports this directory's files make that nothing here satisfies.
+        let unsatisfied: Vec<String> = python_import_names(&dir)?
+            .into_iter()
+            .filter(|name| {
+                !PY_STDLIB.contains(&name.as_str())
+                    && !dir.join(format!("{name}.py")).is_file()
+                    && !dir.join(name).is_dir()
+            })
+            .collect();
+        if let Some(parent) = dir.parent() {
+            if !unsatisfied.is_empty() {
+                // Uncles: a directory beside this one holding <name>.py
+                // (common/ holds models.py) or BEING the named package
+                // (tracing/tracing_build/ answers import tracing_build).
+                for uncle in fs::read_dir(parent)
+                    .map_err(|e| {
+                        anyhow!("read_dir({}) for uncle modules: {e}", parent.display())
+                    })?
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir() && *p != dir)
+                {
+                    let hit = unsatisfied.iter().any(|n| {
+                        uncle.join(format!("{n}.py")).is_file()
+                            || (uncle.file_name().is_some_and(|f| f == n.as_str())
+                                && uncle.join("__init__.py").is_file())
+                    });
+                    if hit && upload_dir(&uncle, 512, out)? {
+                        queue.push(uncle);
                     }
-                    // Higher ancestors, by chromium's own layout: a
-                    // shared python tool lives at <root>/third_party/
-                    // <name>/<name>.py (polymer's css_to_wrapper builds
-                    // that path across two statements, so no textual
-                    // sys.path scan can see it). Probe each ancestor's
-                    // <name>/ and third_party/<name>/ for <name>.py,
-                    // four levels up, first hit wins per name.
-                    for name in &unsatisfied {
-                        let mut anc = parent;
-                        'levels: for _ in 0..4 {
-                            let Some(up) = anc.parent() else { break };
-                            anc = up;
-                            for cand in
-                                [anc.join(name), anc.join("third_party").join(name)]
-                            {
-                                if cand.join(format!("{name}.py")).is_file() {
-                                    match walk_dir_capped(
-                                        rpc_client, build_dir, &cand, 8192,
-                                    )? {
-                                        Some(files) => out.extend(files),
-                                        None => println!(
-                                            "nix-ninja: ancestor module dir {} exceeds 8192 files; skipped",
-                                            cand.display()
-                                        ),
+                }
+                // Ancestors, by chromium's layout: <root>/<name>/,
+                // <root>/third_party/<name>/, and the vendored deep
+                // shape <root>/third_party/<pkg-x.y.z>[/<subdir>]/<name>/
+                // (beautifulsoup4-4.9.3/py3k/bs4). Four levels up, first
+                // hit per name; the deep scan runs only when the cheap
+                // probes miss, and only over third_party.
+                for name in &unsatisfied {
+                    let mut anc = parent.to_path_buf();
+                    'levels: for _ in 0..4 {
+                        let Some(up) = anc.parent() else { break };
+                        anc = up.to_path_buf();
+                        for cand in
+                            [anc.join(name), anc.join("third_party").join(name)]
+                        {
+                            let module = cand.join(format!("{name}.py")).is_file();
+                            let package = cand.join("__init__.py").is_file();
+                            if module || package {
+                                if upload_dir(&cand, 8192, out)? && package {
+                                    queue.push(cand);
+                                }
+                                break 'levels;
+                            }
+                        }
+                        let tp = anc.join("third_party");
+                        if let Ok(subs) = fs::read_dir(&tp) {
+                            for sub in subs.flatten().map(|e| e.path()) {
+                                if !sub.is_dir() {
+                                    continue;
+                                }
+                                let direct = sub.join(name);
+                                let found = if direct.join("__init__.py").is_file() {
+                                    Some(direct)
+                                } else if let Ok(subs2) = fs::read_dir(&sub) {
+                                    subs2
+                                        .flatten()
+                                        .map(|e| e.path().join(name))
+                                        .find(|d| d.join("__init__.py").is_file())
+                                } else {
+                                    None
+                                };
+                                if let Some(pkg) = found {
+                                    if upload_dir(&pkg, 8192, out)? {
+                                        queue.push(pkg);
                                     }
                                     break 'levels;
                                 }
@@ -1654,26 +1706,16 @@ fn upload_referenced_file(
                     }
                 }
             }
-            // Directories the scripts splice onto sys.path THEMSELVES
-            // resolve wherever the quoted segments say, not at any fixed
-            // level: polymer's css_to_wrapper.py appends
-            // ('..', '..', 'third_party', 'node') and imports node from
-            // the grand-uncle the sibling and uncle rules cannot see.
-            // The segments are read textually from sys.path lines,
-            // resolved against the script's own directory, and uploaded
-            // only where the directory exists.
-            for sp in python_syspath_dirs(dir)? {
-                match walk_dir_capped(rpc_client, build_dir, &sp, 8192)? {
-                    Some(files) => out.extend(files),
-                    None => println!(
-                        "nix-ninja: sys.path dir {} exceeds 8192 files; skipped",
-                        sp.display()
-                    ),
+            // sys.path splices readable on one line still help for the
+            // shapes the structural probes miss.
+            for sp in python_syspath_dirs(&dir)? {
+                if upload_dir(&sp, 8192, out)? {
+                    queue.push(sp);
                 }
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Directories the .py files in `dir` splice onto sys.path, read
