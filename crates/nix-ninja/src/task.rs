@@ -415,8 +415,21 @@ impl Runner {
         // pure-ordering token that is not a file (CMake emits `phony || .`,
         // the build dir itself) is silently dropped there, whereas a
         // missing DIRECT input stays a loud error as before.
+        // A deps=gcc compile takes only dirtying inputs (explicit +
+        // implicit): its order-only deps are generated headers, and
+        // include discovery pulls exactly the ones the source #includes,
+        // as Built inputs with their own ordering. Expanding order-only
+        // phonies into inputs dragged perfetto's entire generated-object
+        // world into ONE TU's derivation closure. Non-gcc tasks (actions)
+        // keep the full ordering set: they rely on order-only files
+        // existing without naming them.
+        let task_ins: &[FileId] = if build.deps.as_deref() == Some("gcc") {
+            build.dirtying_ins()
+        } else {
+            build.ordering_ins()
+        };
         let mut worklist: Vec<(FileId, bool)> =
-            build.ordering_ins().iter().map(|f| (*f, false)).collect();
+            task_ins.iter().map(|f| (*f, false)).collect();
         let mut seen: std::collections::HashSet<FileId> = std::collections::HashSet::new();
         while let Some((fid, via_phony)) = worklist.pop() {
             if !seen.insert(fid) {
