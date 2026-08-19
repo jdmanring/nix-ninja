@@ -127,6 +127,11 @@
             "crates/nix-{libstore,ninja-task}/**/*.rs"
             "crates/deps-infer/Cargo.toml"
             "crates/deps-infer/**/*.rs"
+            # deps-infer's n2 is the vendored copy since the rspfile fix;
+            # this allowlist is why an untracked or unlisted vendor dir
+            # fails only in the flake build while cargo builds fine.
+            "vendor-n2/Cargo.toml"
+            "vendor-n2/**/*.rs"
           ];
         };
       });
