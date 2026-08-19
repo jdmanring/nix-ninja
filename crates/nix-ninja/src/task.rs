@@ -375,7 +375,12 @@ impl Runner {
         Ok(())
     }
 
-    pub fn wait(&mut self, files: &mut graph::GraphFiles) -> Result<BuildId> {
+    /// Returns the finished build and whether it SUCCEEDED. A failure is
+    /// fully reported here (error chain to stderr); the scheduler decides
+    /// whether it is fatal - under keep-going it abandons the failed
+    /// subtree and drains the rest, so one round surfaces every
+    /// independent failure instead of the first.
+    pub fn wait(&mut self, files: &mut graph::GraphFiles) -> Result<(BuildId, bool)> {
         let result = self.rx.recv().unwrap();
         if let Some(err) = result.err {
             eprintln!("Error: {err}");
@@ -385,8 +390,6 @@ impl Runner {
                 eprintln!("    {cause}");
             }
 
-            eprintln!("Backtrace: {}", err.backtrace());
-
             let debug_info = if let Some(derived_path) = &result.derived_path {
                 format!(
                     "derivation: {}",
@@ -395,19 +398,16 @@ impl Runner {
             } else {
                 format!("build_id: {:?}", result.bid)
             };
+            eprintln!("Failed to build task derivation for {}", debug_info);
 
-            return Err(anyhow!(
-                "Failed to build task derivation for {}: {}",
-                debug_info,
-                err
-            ));
+            return Ok((result.bid, false));
         }
 
         for derived_file in result.derived_files {
             self.add_derived_file(files, derived_file.clone());
         }
 
-        Ok(result.bid)
+        Ok((result.bid, true))
     }
 
     fn add_derived_file(

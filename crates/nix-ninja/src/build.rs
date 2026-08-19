@@ -289,13 +289,22 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&mut self) -> Result<()> {
+        // NIX_NINJA_KEEP_GOING=1 is ninja's -k: a failed task abandons its
+        // dependents (they stay unready forever) while every independent
+        // subtree drains, so ONE run surfaces every distinct failure -
+        // built for the qtwebengine campaign, where each run otherwise
+        // costs a round trip per undeclared-input convention. The run
+        // still exits nonzero, with the failure count.
+        let keep_going = std::env::var("NIX_NINJA_KEEP_GOING").as_deref() == Ok("1");
+        let mut running = 0usize;
+        let mut failed = 0usize;
         while self.build_states.unfinished() {
             let mut made_progress = false;
             while let Some(bid) = self.build_states.pop_ready() {
                 let build = &self.graph.builds[bid];
                 self.build_states.set(bid, BuildState::Running);
-                // println!("Writing derivation for {:?} at {:?}", &bid, &build.location);
                 self.runner.start(&mut self.graph.files, bid, build)?;
+                running += 1;
                 made_progress = true;
             }
 
@@ -303,11 +312,28 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
 
-            let bid = self.runner.wait(&mut self.graph.files)?;
-            // println!("Derivation for build {:?} has been written", &bid);
-            self.ready_dependents(bid);
+            // Nothing ready and nothing running: every remaining Want is
+            // downstream of a failure. Only reachable with failures
+            // recorded, since success always readies dependents.
+            if running == 0 {
+                break;
+            }
+
+            let (bid, ok) = self.runner.wait(&mut self.graph.files)?;
+            running -= 1;
+            if ok {
+                self.ready_dependents(bid);
+            } else {
+                failed += 1;
+                if !keep_going {
+                    anyhow::bail!("a task failed (set NIX_NINJA_KEEP_GOING=1 to collect all failures in one run)");
+                }
+            }
         }
 
+        if failed > 0 {
+            anyhow::bail!("{failed} task(s) failed under keep-going; each is reported above");
+        }
         Ok(())
     }
 }
