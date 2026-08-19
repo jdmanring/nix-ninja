@@ -133,7 +133,7 @@ pub fn create_symlinks(
         }
 
         if overwrite && dest_path.exists() {
-            fs::remove_file(&dest_path)?;
+            fs::remove_file(&dest_path).map_err(|e| anyhow::anyhow!("remove_file({}): {e}", dest_path.display()))?;
         }
 
         symlink(&source_path, &dest_path).map_err(|e| {

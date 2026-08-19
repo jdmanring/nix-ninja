@@ -8,7 +8,7 @@ use std::process::Command;
 
 pub fn fix_rpaths(store_dir: &Path, outputs: &[DerivedFile]) -> Result<()> {
     for output in outputs {
-        let canonical_path = fs::canonicalize(&output.build_path)?;
+        let canonical_path = fs::canonicalize(&output.build_path).map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", output.build_path.display()))?;
         if is_elf_dynamic(&canonical_path)? {
             fix_rpath(store_dir, &canonical_path)?;
             println!(
@@ -24,7 +24,7 @@ pub fn fix_rpaths(store_dir: &Path, outputs: &[DerivedFile]) -> Result<()> {
 // Check if this is an executable or shared library that can have RPATH.
 // Skip object files (.o) or non-ELF files.
 fn is_elf_dynamic(path: &Path) -> Result<bool> {
-    let data = fs::read(path)?;
+    let data = fs::read(path).map_err(|e| anyhow::anyhow!("read({}): {e}", path.display()))?;
 
     let elf = match ElfBytes::<AnyEndian>::minimal_parse(&data) {
         Ok(elf) => elf,
@@ -163,7 +163,7 @@ fn resolve_needed(lib_name: &str, rpath: &[PathBuf], store_dir: &Path) -> Result
         }
 
         if lib_path.exists() {
-            let canonical_path = fs::canonicalize(&lib_path)?;
+            let canonical_path = fs::canonicalize(&lib_path).map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", lib_path.display()))?;
             return Ok(Some(canonical_path));
         }
     }
