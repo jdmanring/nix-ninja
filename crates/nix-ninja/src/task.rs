@@ -307,7 +307,16 @@ impl Runner {
                         &config,
                     ) {
                         Ok(final_derived_path) => (Some(final_derived_path), None),
-                        Err(err) => (None, Some(err.context(format!("Failed to handle derivation result for task (derivation: {})\nDerivation JSON:\n{}", drv.name, serde_json::to_string_pretty(&drv).unwrap_or_else(|_| "Failed to serialize derivation".to_string()))))),
+                        Err(err) => {
+                            // Cause FIRST and no multi-megabyte JSON dump:
+                            // at Chromium scale the dump swallowed the cause
+                            // chain and cost blind debugging rounds.
+                            (None, Some(err.context(format!(
+                                "Failed to handle derivation result for task (derivation: {}, {} inputs)",
+                                drv.name,
+                                task.inputs.len()
+                            ))))
+                        }
                     },
                     Err(err) => (None, Some(err.context("Failed to build task derivation for task".to_string()))),
                 };
