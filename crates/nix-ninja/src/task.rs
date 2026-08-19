@@ -521,8 +521,10 @@ impl Runner {
                         // python's default import model for these wrappers.
                         if arg.ends_with(".py") {
                             if let Some(dir) = Path::new(&arg).parent() {
-                                for entry in fs::read_dir(dir).into_iter().flatten().flatten()
-                                {
+                                let entries = fs::read_dir(dir).map_err(|e| {
+                                    anyhow!("read_dir({}) for python siblings: {e}", dir.display())
+                                })?;
+                                for entry in entries.flatten() {
                                     let p = entry.path();
                                     if p.extension().is_some_and(|e| e == "py") && p.is_file()
                                     {
@@ -541,15 +543,52 @@ impl Runner {
                     continue;
                 };
                 let input = match self.derived_files.get(&fid) {
-                    Some(derived_file) => derived_file,
+                    Some(derived_file) => derived_file.clone(),
                     None => match self.build_dir_inputs.get(&fid) {
-                        Some(derived_file) => derived_file,
+                        Some(derived_file) => derived_file.clone(),
                         None => {
+                            // A graph NODE with no derived file yet is the
+                            // same case as a non-node: if it names a real
+                            // source file, it is a task input (the silent
+                            // `continue` here dropped gcc_link_wrapper.py
+                            // whenever another rule declared it as a node).
+                            if !arg.starts_with('-')
+                                && !arg.starts_with('/')
+                                && arg.contains('/')
+                                && Path::new(&arg).is_file()
+                            {
+                                let input = new_opaque_file(
+                                    &self.rpc_client,
+                                    &self.config.build_dir,
+                                    PathBuf::from(&arg),
+                                )?;
+                                self.add_derived_file(files, input.clone());
+                                input_set.insert(input.build_path.clone(), input.clone());
+                                if arg.ends_with(".py") {
+                                    if let Some(dir) = Path::new(&arg).parent() {
+                                        let entries = fs::read_dir(dir).map_err(|e| {
+                                            anyhow!("read_dir({}) for python siblings: {e}", dir.display())
+                                        })?;
+                                        for entry in entries.flatten() {
+                                            let p = entry.path();
+                                            if p.extension().is_some_and(|e| e == "py") && p.is_file() {
+                                                let sib = new_opaque_file(
+                                                    &self.rpc_client,
+                                                    &self.config.build_dir,
+                                                    p,
+                                                )?;
+                                                self.add_derived_file(files, sib.clone());
+                                                input_set.insert(sib.build_path.clone(), sib);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             continue;
                         }
                     },
                 };
-                input_set.insert(input.build_path.clone(), input.clone());
+                input_set.insert(input.build_path.clone(), input);
             }
         }
 
