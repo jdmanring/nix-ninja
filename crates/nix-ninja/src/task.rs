@@ -505,17 +505,20 @@ impl Runner {
         // sandbox, where inputs are symlinked at their build-dir-relative
         // locations, so rewrite in-tree absolute paths to relative ones
         // (mirroring `relative_from` in `new_opaque_file`).
-        let cmdline = build.cmdline.as_ref().map(|cmdline| {
-            let mut cmdline = cmdline.clone();
-            let build_dir = &self.config.build_dir;
-            if let Some(dir) = build_dir.to_str() {
-                cmdline = cmdline.replace(&format!("{dir}/"), "");
-            }
-            if let Some(dir) = build_dir.parent().and_then(|p| p.to_str()) {
-                cmdline = cmdline.replace(&format!("{dir}/"), "../");
-            }
-            cmdline
-        });
+        // GN goes further than meson: it bakes absolute paths to ANY
+        // ancestor of the build dir (qtwebengine's gen_icui18n_shim passes
+        // --headers-root five levels up, and the script computes
+        // relpath(root, source_tree) from it, silently writing its outputs
+        // outside the declared tree when root is a host-absolute path). So
+        // rewrite every ancestor prefix, deepest first - each occurrence of
+        // "<ancestor>/" becomes the "../" chain that reaches it from the
+        // build dir. Deepest-first matters: a deeper prefix contains every
+        // shallower one. Stop above 3 components so "/home/", "/nix/" and
+        // "/" are never rewritten.
+        let cmdline = build
+            .cmdline
+            .as_ref()
+            .map(|cmdline| rewrite_ancestor_paths(cmdline, &self.config.build_dir));
 
         // TODO: Can we avoid this? Technically the build rule isn't complete.
         //
@@ -1230,6 +1233,33 @@ fn new_opaque_file(
 /// escapes it rather than silently relocating an unknown path.
 /// Number of leading `..` components of a relative path: how many
 /// levels above its base directory it reaches before descending.
+/// Rewrite absolute paths under any ancestor of the build dir into
+/// build-dir-relative ones. Meson bakes `files(...)` results and GN bakes
+/// arguments like gen_icui18n_shim's `--headers-root` as absolute host
+/// paths; neither exists inside the task sandbox, where the source tree is
+/// materialized at build-dir-relative locations. Each occurrence of
+/// "<ancestor>/" becomes the "../" chain reaching it from the build dir.
+/// Deepest first, because a deeper prefix contains every shallower one;
+/// stops above 3 path components so "/home/", "/nix/" and "/" are never
+/// rewritten. The cmd_climb scan below the discovery loop keeps the sandbox
+/// deep enough for whatever "../" chains this emits.
+fn rewrite_ancestor_paths(cmdline: &str, build_dir: &Path) -> String {
+    let mut cmdline = cmdline.to_string();
+    let mut ups = 0usize;
+    let mut ancestor = Some(build_dir);
+    while let Some(dir) = ancestor {
+        if dir.components().count() < 3 {
+            break;
+        }
+        if let Some(dir) = dir.to_str() {
+            cmdline = cmdline.replace(&format!("{dir}/"), &"../".repeat(ups));
+        }
+        ups += 1;
+        ancestor = dir.parent();
+    }
+    cmdline
+}
+
 fn leading_parent_components(p: &Path) -> usize {
     p.components()
         .take_while(|c| matches!(c, std::path::Component::ParentDir))
@@ -1375,6 +1405,40 @@ mod job_permits_tests {
         // If the panicking thread leaked its permit, this blocks forever
         // and the test times out; acquiring proves the Drop ran.
         let _permit = permits.acquire();
+    }
+}
+
+#[cfg(test)]
+mod rewrite_ancestor_paths_tests {
+    use super::rewrite_ancestor_paths;
+    use std::path::Path;
+
+    // The gen_icui18n_shim shape: build dir 5 deep under the work root,
+    // an argument pointing at the work root's src tree.
+    #[test]
+    fn deep_ancestor_becomes_up_chain() {
+        let bd = Path::new("/work/qtwe/build/src/core/Release/x86_64");
+        let cmd = "python3 gen.py --headers-root /work/qtwe/src/3p/icu/unicode --out gen";
+        assert_eq!(
+            rewrite_ancestor_paths(cmd, bd),
+            "python3 gen.py --headers-root ../../../../../src/3p/icu/unicode --out gen"
+        );
+    }
+
+    #[test]
+    fn build_dir_itself_strips_to_relative() {
+        let bd = Path::new("/work/qtwe/build/out");
+        assert_eq!(
+            rewrite_ancestor_paths("cp /work/qtwe/build/out/a.h b.h", bd),
+            "cp a.h b.h"
+        );
+    }
+
+    #[test]
+    fn store_and_system_paths_untouched() {
+        let bd = Path::new("/work/qtwe/build/out");
+        let cmd = "/nix/store/abc-python/bin/python3 /bin/sh /home/x";
+        assert_eq!(rewrite_ancestor_paths(cmd, bd), cmd);
     }
 }
 
