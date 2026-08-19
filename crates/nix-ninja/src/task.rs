@@ -581,6 +581,29 @@ impl Runner {
             }
         }
 
+        // Post-pass, closing the class: a .py input must ALWAYS travel
+        // with its same-directory siblings, no matter which of the input
+        // paths (ordering-ins, cmdline node, cmdline non-node, or a
+        // derived_files HIT from an earlier task's upload) put it in the
+        // set. The per-branch versions of this rule missed the HIT case:
+        // the second link task found gcc_link_wrapper.py already
+        // registered and attached it alone. Uploads are content-cached,
+        // so re-encountering a directory is cheap.
+        let py_inputs: Vec<PathBuf> = input_set
+            .values()
+            .filter(|i| i.build_path.extension().is_some_and(|e| e == "py"))
+            .map(|i| i.build_path.clone())
+            .collect();
+        for py in py_inputs {
+            if !Path::new(&py).is_file() {
+                continue;
+            }
+            for sib in upload_referenced_file(&self.rpc_client, &self.config.build_dir, py)? {
+                self.add_derived_file(files, sib.clone());
+                input_set.entry(sib.build_path.clone()).or_insert(sib);
+            }
+        }
+
         let mut inputs: Vec<DerivedFile> = input_set.into_values().collect();
         inputs.sort();
 
