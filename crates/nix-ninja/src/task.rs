@@ -1678,30 +1678,48 @@ fn upload_python_closure(
                                 break 'levels;
                             }
                         }
+                        // A vendored tree can hold SEVERAL copies of one
+                        // package - catapult carries a legacy
+                        // beautifulsoup4/ AND beautifulsoup4-4.9.3/py3k/,
+                        // and its own sys.path assembly picks the py3 one
+                        // across three statements no scan can chase. So
+                        // collect every candidate and prefer the
+                        // python-3, version-suffixed copy: the legacy one
+                        // imports interfaces that no longer exist
+                        // (html5lib.treebuilders._base, measured).
                         let tp = anc.join("third_party");
+                        let mut cands: Vec<PathBuf> = Vec::new();
                         if let Ok(subs) = fs::read_dir(&tp) {
                             for sub in subs.flatten().map(|e| e.path()) {
                                 if !sub.is_dir() {
                                     continue;
                                 }
                                 let direct = sub.join(name);
-                                let found = if direct.join("__init__.py").is_file() {
-                                    Some(direct)
+                                if direct.join("__init__.py").is_file() {
+                                    cands.push(direct);
                                 } else if let Ok(subs2) = fs::read_dir(&sub) {
-                                    subs2
-                                        .flatten()
-                                        .map(|e| e.path().join(name))
-                                        .find(|d| d.join("__init__.py").is_file())
-                                } else {
-                                    None
-                                };
-                                if let Some(pkg) = found {
-                                    if upload_dir(&pkg, 8192, out)? {
-                                        queue.push(pkg);
-                                    }
-                                    break 'levels;
+                                    cands.extend(
+                                        subs2
+                                            .flatten()
+                                            .map(|e| e.path().join(name))
+                                            .filter(|d| d.join("__init__.py").is_file()),
+                                    );
                                 }
                             }
+                        }
+                        let score = |p: &Path| -> u32 {
+                            let s = p.to_string_lossy().into_owned();
+                            let versioned = s.split('/').any(|c| {
+                                c.contains('-')
+                                    && c.chars().any(|ch| ch.is_ascii_digit())
+                            });
+                            u32::from(versioned) * 2 + u32::from(s.contains("py3"))
+                        };
+                        if let Some(pkg) = cands.into_iter().max_by_key(|p| score(p)) {
+                            if upload_dir(&pkg, 8192, out)? {
+                                queue.push(pkg);
+                            }
+                            break 'levels;
                         }
                     }
                 }
