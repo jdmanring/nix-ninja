@@ -266,10 +266,23 @@ impl BuilderRpcClient {
                 .await
         })?;
 
-        // Key by drv path (or opaque path), never by the full DerivedPath
-        // whose output spec need not match what was requested.
+        // The daemon replies keyed by the RESOLVED drv path while the
+        // request carries the unresolved one (CA derivations), so no
+        // path-keyed map can match in general. Pool every returned
+        // realisation by OUTPUT NAME - names derive from file paths and
+        // are unique within one request - and keep the path-keyed map
+        // as a first-chance failure reporter where paths do agree.
         let mut by_key: HashMap<String, _> = HashMap::new();
+        let mut out_pool: HashMap<OutputName, StorePath> = HashMap::new();
+        let mut any_failure: Option<String> = None;
         for r in results {
+            if let Some(success) = r.result.success() {
+                for (name, realisation) in &success.built_outputs {
+                    out_pool.insert(name.clone(), realisation.out_path.clone());
+                }
+            } else if let BuildResultInner::Failure(f) = &r.result.inner {
+                any_failure = Some(String::from_utf8_lossy(&f.error_msg).into_owned());
+            }
             let key = match &r.path {
                 DerivedPath::Opaque(path) => path.to_string(),
                 DerivedPath::Built { drv_path, .. } => {
@@ -288,30 +301,52 @@ impl BuilderRpcClient {
                         format!("drv:{}", store_dir.display(drv_path.as_ref()))
                     }
                 };
-                let result = by_key
-                    .get(&key)
-                    .ok_or_else(|| Error::MissingBuildResult(display.clone()))?;
-                let success = result.success().ok_or_else(|| Error::BuildFailed {
-                    path: display.clone(),
-                    error_msg: match &result.inner {
-                        BuildResultInner::Failure(f) => {
-                            String::from_utf8_lossy(&f.error_msg).into_owned()
-                        }
-                        _ => String::new(),
-                    },
-                })?;
                 match single {
-                    SingleDerivedPath::Opaque(path) => Ok(path.clone()),
-                    SingleDerivedPath::Built { output, .. } => success
-                        .built_outputs
-                        .get(output)
-                        .map(|realisation| realisation.out_path.clone())
-                        .ok_or_else(|| {
+                    SingleDerivedPath::Opaque(path) => {
+                        // An opaque path either matched by key or was a
+                        // no-op; failures still surface below.
+                        match by_key.get(&key) {
+                            Some(result) if result.success().is_none() => {
+                                return Err(Error::BuildFailed {
+                                    path: display,
+                                    error_msg: match &result.inner {
+                                        BuildResultInner::Failure(f) => {
+                                            String::from_utf8_lossy(&f.error_msg).into_owned()
+                                        }
+                                        _ => String::new(),
+                                    },
+                                }
+                                .into());
+                            }
+                            _ => Ok(path.clone()),
+                        }
+                    }
+                    SingleDerivedPath::Built { output, .. } => {
+                        if let Some(result) = by_key.get(&key) {
+                            if result.success().is_none() {
+                                return Err(Error::BuildFailed {
+                                    path: display,
+                                    error_msg: match &result.inner {
+                                        BuildResultInner::Failure(f) => {
+                                            String::from_utf8_lossy(&f.error_msg).into_owned()
+                                        }
+                                        _ => String::new(),
+                                    },
+                                }
+                                .into());
+                            }
+                        }
+                        out_pool.get(output).cloned().ok_or_else(|| {
                             Error::MissingBuildResult(format!(
-                                "{display} (result found; its built_outputs lacks '{output}', has: {:?})",
-                                success.built_outputs.keys().take(6).collect::<Vec<_>>()
+                                "{display} (no realisation named '{output}' in {} pooled outputs{})",
+                                out_pool.len(),
+                                any_failure
+                                    .as_deref()
+                                    .map(|f| format!("; a result failed: {f}"))
+                                    .unwrap_or_default()
                             ))
-                        }),
+                        })
+                    }
                 }
             })
             .collect()
