@@ -585,6 +585,14 @@ impl Runner {
                     } else if !arg.starts_with('-')
                         && !arg.starts_with('/')
                         && arg.starts_with("../")
+                        // A pure ../ chain names a ROOT, not a directory of
+                        // interest: GN passes the source root itself as an
+                        // argument (round 35's ../../../.. hit the upload
+                        // cap, which is the cap doing its job). Require a
+                        // named component after the climb.
+                        && Path::new(&arg)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::Normal(_)))
                         && Path::new(&arg).is_dir()
                     {
                         // A relative arg naming a real SOURCE-TREE directory
