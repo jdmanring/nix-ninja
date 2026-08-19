@@ -1377,7 +1377,59 @@ fn upload_referenced_dir(
     dir: &Path,
 ) -> Result<Vec<DerivedFile>> {
     const DIR_UPLOAD_CAP: usize = 512;
-    let mut out = Vec::new();
+    match walk_dir_capped(rpc_client, build_dir, dir, DIR_UPLOAD_CAP)? {
+        Some(files) => Ok(files),
+        None => {
+            // Over the cap. Two conventions share this shape: dawn passes
+            // the package dir itself (small, handled above), and
+            // inspector_protocol passes the package's PARENT - all of
+            // chromium's third_party, 310 entries - to sys.path.insert it
+            // and import jinja2. Measured: only 6 of those 310 are python
+            // packages, ~50 files. So the over-cap fallback uploads just
+            // the immediate subdirectories that are importable packages
+            // (an __init__.py at their root), each itself capped; a
+            // package that ALSO busts the cap is a hard error, because a
+            // partial package import fails stranger than a named refusal.
+            let mut out = Vec::new();
+            let entries = fs::read_dir(dir)
+                .map_err(|e| anyhow!("read_dir({}) for dir arg: {e}", dir.display()))?;
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() && p.join("__init__.py").is_file() {
+                    match walk_dir_capped(rpc_client, build_dir, &p, DIR_UPLOAD_CAP)? {
+                        Some(files) => out.extend(files),
+                        None => {
+                            return Err(anyhow!(
+                                "python package {} holds more than {} files; \
+                                 declare its files as inputs or raise \
+                                 DIR_UPLOAD_CAP deliberately",
+                                p.display(),
+                                DIR_UPLOAD_CAP
+                            ))
+                        }
+                    }
+                }
+            }
+            println!(
+                "nix-ninja: dir arg {} exceeds {} files; uploaded only its \
+                 python packages ({} files)",
+                dir.display(),
+                DIR_UPLOAD_CAP,
+                out.len()
+            );
+            Ok(out)
+        }
+    }
+}
+
+/// Recursive regular-file upload of one directory, or None past the cap.
+fn walk_dir_capped(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    dir: &Path,
+    cap: usize,
+) -> Result<Option<Vec<DerivedFile>>> {
+    let mut paths = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let entries = fs::read_dir(&d)
@@ -1387,20 +1439,20 @@ fn upload_referenced_dir(
             if p.is_dir() {
                 stack.push(p);
             } else if p.is_file() {
-                if out.len() >= DIR_UPLOAD_CAP {
-                    return Err(anyhow!(
-                        "directory arg {} holds more than {} files; refusing to \
-                         upload it wholesale - declare its files as inputs or \
-                         raise DIR_UPLOAD_CAP deliberately",
-                        dir.display(),
-                        DIR_UPLOAD_CAP
-                    ));
+                if paths.len() >= cap {
+                    return Ok(None);
                 }
-                out.push(new_opaque_file(rpc_client, build_dir, p)?);
+                paths.push(p);
             }
         }
     }
-    Ok(out)
+    // Upload only after the whole walk fits the cap, so an over-cap dir
+    // costs a directory scan and zero store writes.
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        out.push(new_opaque_file(rpc_client, build_dir, p)?);
+    }
+    Ok(Some(out))
 }
 
 fn normalize_build_path(build_dir: &Path, p: PathBuf) -> Result<PathBuf> {
