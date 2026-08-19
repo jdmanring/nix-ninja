@@ -1622,6 +1622,36 @@ fn upload_referenced_file(
                             ),
                         }
                     }
+                    // Higher ancestors, by chromium's own layout: a
+                    // shared python tool lives at <root>/third_party/
+                    // <name>/<name>.py (polymer's css_to_wrapper builds
+                    // that path across two statements, so no textual
+                    // sys.path scan can see it). Probe each ancestor's
+                    // <name>/ and third_party/<name>/ for <name>.py,
+                    // four levels up, first hit wins per name.
+                    for name in &unsatisfied {
+                        let mut anc = parent;
+                        'levels: for _ in 0..4 {
+                            let Some(up) = anc.parent() else { break };
+                            anc = up;
+                            for cand in
+                                [anc.join(name), anc.join("third_party").join(name)]
+                            {
+                                if cand.join(format!("{name}.py")).is_file() {
+                                    match walk_dir_capped(
+                                        rpc_client, build_dir, &cand, 8192,
+                                    )? {
+                                        Some(files) => out.extend(files),
+                                        None => println!(
+                                            "nix-ninja: ancestor module dir {} exceeds 8192 files; skipped",
+                                            cand.display()
+                                        ),
+                                    }
+                                    break 'levels;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             // Directories the scripts splice onto sys.path THEMSELVES
