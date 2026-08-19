@@ -1420,6 +1420,23 @@ fn upload_referenced_file(
                 }
                 if p.extension().is_some_and(|e| e == "py") && p.is_file() {
                     out.push(new_opaque_file(rpc_client, build_dir, p)?);
+                } else if p.is_dir()
+                    && p.file_name().is_some_and(|n| n == "node_modules")
+                {
+                    // chromium's node.py resolves node_modules as its own
+                    // sibling via __file__ (tsc lives at
+                    // node_modules/typescript/bin/tsc), so the tree must
+                    // travel with the script. Measured 4,616 files at
+                    // qtwebengine 6.11.1 - over the package cap by design,
+                    // so it gets its own bound; one store upload, shared
+                    // by hash across every node task after the first.
+                    match walk_dir_capped(rpc_client, build_dir, &p, 8192)? {
+                        Some(files) => out.extend(files),
+                        None => println!(
+                            "nix-ninja: node_modules {} exceeds 8192 files; skipped",
+                            p.display()
+                        ),
+                    }
                 } else if p.is_dir() && p.join("__init__.py").is_file() {
                     // A sibling package DIRECTORY: grit.py is a launcher
                     // whose first act is `import grit.grit_runner`,
