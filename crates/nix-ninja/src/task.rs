@@ -1624,9 +1624,70 @@ fn upload_referenced_file(
                     }
                 }
             }
+            // Directories the scripts splice onto sys.path THEMSELVES
+            // resolve wherever the quoted segments say, not at any fixed
+            // level: polymer's css_to_wrapper.py appends
+            // ('..', '..', 'third_party', 'node') and imports node from
+            // the grand-uncle the sibling and uncle rules cannot see.
+            // The segments are read textually from sys.path lines,
+            // resolved against the script's own directory, and uploaded
+            // only where the directory exists.
+            for sp in python_syspath_dirs(dir)? {
+                match walk_dir_capped(rpc_client, build_dir, &sp, 8192)? {
+                    Some(files) => out.extend(files),
+                    None => println!(
+                        "nix-ninja: sys.path dir {} exceeds 8192 files; skipped",
+                        sp.display()
+                    ),
+                }
+            }
         }
     }
     Ok(out)
+}
+
+/// Directories the .py files in `dir` splice onto sys.path, read
+/// textually: every line containing "sys.path" contributes its quoted
+/// string segments, joined in order and resolved lexically against the
+/// script directory. Existence-discriminated by the caller; a segment
+/// list that is not a real relative path simply resolves to nothing.
+fn python_syspath_dirs(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let entries = fs::read_dir(dir)
+        .map_err(|e| anyhow!("read_dir({}) for sys.path scan: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.extension().is_some_and(|e| e == "py") {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&p) else { continue };
+        for line in body.lines() {
+            if !line.contains("sys.path") {
+                continue;
+            }
+            let mut segs: Vec<&str> = Vec::new();
+            let mut rest = line;
+            while let Some(start) = rest.find(['\'', '"']) {
+                let quote = rest.as_bytes()[start] as char;
+                let after = &rest[start + 1..];
+                let Some(end) = after.find(quote) else { break };
+                let seg = &after[..end];
+                if !seg.is_empty() && !seg.contains(':') {
+                    segs.push(seg);
+                }
+                rest = &after[end + 1..];
+            }
+            if segs.is_empty() {
+                continue;
+            }
+            let rel: PathBuf = segs.iter().collect();
+            let cand = lexical_join(dir, &rel);
+            if cand.is_dir() && cand != dir && !found.contains(&cand) {
+                found.push(cand);
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// Upload every regular file under a directory the command names as an
@@ -2042,6 +2103,25 @@ mod normalize_output_tests {
     #[test]
     fn spaces_and_unicode_are_sanitized() {
         assert_eq!(normalize_output("a b\u{e9}.c"), "a-b-.c");
+    }
+
+    #[test]
+    fn syspath_dirs_read_quoted_segments() {
+        use super::python_syspath_dirs;
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("sp-test-{}", std::process::id()));
+        let tools = root.join("tools/polymer");
+        let node = root.join("third_party/node");
+        fs::create_dir_all(&tools).unwrap();
+        fs::create_dir_all(&node).unwrap();
+        fs::write(
+            tools.join("css_to_wrapper.py"),
+            "import sys, os\nsys.path.append(os.path.join(_HERE_PATH, '..', '..', 'third_party', 'node'))\nimport node\n",
+        )
+        .unwrap();
+        let dirs = python_syspath_dirs(&tools).unwrap();
+        assert_eq!(dirs, vec![node]);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
