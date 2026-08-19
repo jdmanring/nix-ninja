@@ -415,21 +415,9 @@ impl Runner {
         // pure-ordering token that is not a file (CMake emits `phony || .`,
         // the build dir itself) is silently dropped there, whereas a
         // missing DIRECT input stays a loud error as before.
-        // A deps=gcc compile takes only dirtying inputs (explicit +
-        // implicit): its order-only deps are generated headers, and
-        // include discovery pulls exactly the ones the source #includes,
-        // as Built inputs with their own ordering. Expanding order-only
-        // phonies into inputs dragged perfetto's entire generated-object
-        // world into ONE TU's derivation closure. Non-gcc tasks (actions)
-        // keep the full ordering set: they rely on order-only files
-        // existing without naming them.
-        let task_ins: &[FileId] = if build.deps.as_deref() == Some("gcc") {
-            build.dirtying_ins()
-        } else {
-            build.ordering_ins()
-        };
+        let is_gcc_task = build.deps.as_deref() == Some("gcc");
         let mut worklist: Vec<(FileId, bool)> =
-            task_ins.iter().map(|f| (*f, false)).collect();
+            build.ordering_ins().iter().map(|f| (*f, false)).collect();
         let mut seen: std::collections::HashSet<FileId> = std::collections::HashSet::new();
         while let Some((fid, via_phony)) = worklist.pop() {
             if !seen.insert(fid) {
@@ -438,6 +426,23 @@ impl Runner {
             if let Some(alias_ins) = self.phony_aliases.get(&fid) {
                 worklist.extend(alias_ins.iter().map(|f| (*f, true)));
                 continue;
+            }
+            // For a compile (deps=gcc), a phony-EXPANDED order-only dep is
+            // only a real input if it is header-shaped: expansion of GN's
+            // inputdeps phonies otherwise drags generated OBJECTS and
+            // SOURCES (perfetto's entire .gen.o world, measured) into one
+            // TU's closure. Directly declared order-only deps (a generated
+            // buildflags header on the edge itself) are never filtered.
+            if via_phony && is_gcc_task {
+                let name = &files.by_id[fid].name;
+                let header_like = name.ends_with(".h")
+                    || name.ends_with(".hpp")
+                    || name.ends_with(".hh")
+                    || name.ends_with(".inc")
+                    || name.ends_with(".ipp");
+                if !header_like {
+                    continue;
+                }
             }
             let input = match self.derived_files.get(&fid) {
                 Some(df) => df.to_owned(),
