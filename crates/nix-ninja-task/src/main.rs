@@ -131,8 +131,23 @@ fn main() -> Result<()> {
         for input in &inputs {
             if input.build_path.extension().is_some_and(|e| e == "py") {
                 if let Some(parent) = input.build_path.parent() {
-                    let d = parent.to_string_lossy().into_owned();
-                    if !py_dirs.contains(&d) {
+                    // Never put a package's INTERNALS on sys.path: a dir
+                    // with __init__.py climbs to its package root first.
+                    // mojom/parse/ holds an ast.py, and on the path it
+                    // shadows stdlib ast - fatal under python 3.14, where
+                    // argparse itself imports ast via _colorize. The
+                    // package root is also the semantically correct entry:
+                    // `import jinja2` wants third_party/, never
+                    // third_party/jinja2/.
+                    let mut root = parent;
+                    while root.join("__init__.py").is_file() {
+                        match root.parent() {
+                            Some(p) => root = p,
+                            None => break,
+                        }
+                    }
+                    let d = root.to_string_lossy().into_owned();
+                    if !d.is_empty() && !py_dirs.contains(&d) {
                         py_dirs.push(d);
                     }
                 }
