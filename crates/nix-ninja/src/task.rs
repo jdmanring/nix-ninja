@@ -582,6 +582,30 @@ impl Runner {
                             self.add_derived_file(files, input.clone());
                             input_set.insert(input.build_path.clone(), input);
                         }
+                    } else if !arg.starts_with('-')
+                        && !arg.starts_with('/')
+                        && arg.starts_with("../")
+                        && Path::new(&arg).is_dir()
+                    {
+                        // A relative arg naming a real SOURCE-TREE directory
+                        // is the command asking for that directory's
+                        // contents: dawn passes --jinja2-path, a
+                        // --template-dir of jinja templates, and
+                        // --markupsafe-path, and declares none of their
+                        // files (upstream relies on the depfile from a
+                        // PREVIOUS run plus a shared filesystem; a first
+                        // run in a sandbox has neither). Bounded walk, and
+                        // only for dirs that climb out of the build dir -
+                        // in-build-dir args (`gen`, output dirs) are the
+                        // task's own output space, not inputs.
+                        for input in upload_referenced_dir(
+                            &self.rpc_client,
+                            &self.config.build_dir,
+                            Path::new(&arg),
+                        )? {
+                            self.add_derived_file(files, input.clone());
+                            input_set.insert(input.build_path.clone(), input);
+                        }
                     }
                     continue;
                 };
@@ -1327,6 +1351,44 @@ fn upload_referenced_file(
                 if p.extension().is_some_and(|e| e == "py") && p.is_file() {
                     out.push(new_opaque_file(rpc_client, build_dir, p)?);
                 }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Upload every regular file under a directory the command names as an
+/// argument (recursive), capped so a mistaken match cannot ingest a
+/// source tree: past the cap the walk STOPS AND FAILS rather than
+/// silently truncating - a partial package import fails stranger than a
+/// named refusal. 512 covers dawn's jinja2 (~60 files incl. templates);
+/// raise it deliberately if a real consumer needs more.
+fn upload_referenced_dir(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    dir: &Path,
+) -> Result<Vec<DerivedFile>> {
+    const DIR_UPLOAD_CAP: usize = 512;
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries = fs::read_dir(&d)
+            .map_err(|e| anyhow!("read_dir({}) for dir arg: {e}", d.display()))?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.is_file() {
+                if out.len() >= DIR_UPLOAD_CAP {
+                    return Err(anyhow!(
+                        "directory arg {} holds more than {} files; refusing to \
+                         upload it wholesale - declare its files as inputs or \
+                         raise DIR_UPLOAD_CAP deliberately",
+                        dir.display(),
+                        DIR_UPLOAD_CAP
+                    ));
+                }
+                out.push(new_opaque_file(rpc_client, build_dir, p)?);
             }
         }
     }
