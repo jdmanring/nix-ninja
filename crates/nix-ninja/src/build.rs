@@ -15,6 +15,7 @@ pub struct BuildConfig {
     pub build_dir: PathBuf,
     pub store_dir: StoreDir,
     pub is_output_derivation: bool,
+    pub jobs: usize,
 }
 
 pub fn build(
@@ -35,6 +36,7 @@ pub fn build(
             build_dir: config.build_dir,
             store_dir: config.store_dir,
             is_output_derivation: config.is_output_derivation,
+            jobs: config.jobs,
         },
     )?;
     runner.read_build_dir(&mut loader.graph.files)?;

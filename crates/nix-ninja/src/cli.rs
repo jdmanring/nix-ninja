@@ -33,7 +33,7 @@ pub struct Cli {
     #[arg(short = 't')]
     pub tool: Option<String>,
 
-    /// Run N jobs in parallel (0 means infinity)
+    /// Run N jobs in parallel (0 means auto: the core count)
     #[arg(short = 'j', default_value = "0", hide = true)]
     pub jobs: usize,
 
@@ -132,6 +132,17 @@ fn build(cli: &Cli, build_dir: &Path, rpc_client: &Arc<BuilderRpcClient>) -> Res
         build_dir: build_dir.to_path_buf(),
         store_dir: cli.store_dir.clone(),
         is_output_derivation: cli.is_output_derivation,
+        // -j0 means "auto": the machine's core count. The old reading of
+        // 0 as "infinity" is what let one TU's codegen fan-out spawn
+        // hundreds of concurrent tasks; unbounded is no longer
+        // expressible.
+        jobs: if cli.jobs == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+        } else {
+            cli.jobs
+        },
     };
 
     build::build(

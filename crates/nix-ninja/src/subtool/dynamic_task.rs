@@ -80,8 +80,20 @@ fn prepare_build_environment(store_dir: &StoreDir) -> Result<(PathBuf, HashMap<P
     // Get NIX_NINJA_INPUTS from process environment, these are the built
     // inputs to a derivation that may have discovered inputs and should be
     // scanned.
-    let inputs = env::var("NIX_NINJA_INPUTS")
-        .map_err(|_| anyhow!("NIX_NINJA_INPUTS not found in process environment"))?;
+    // Inline, or via nix's passAsFile (NIX_NINJA_INPUTSPath) when the
+    // encoded set is too large for an env var - see build_task_derivation.
+    let inputs = match env::var("NIX_NINJA_INPUTS") {
+        Ok(v) => v,
+        Err(_) => match env::var("NIX_NINJA_INPUTSPath") {
+            Ok(p) => std::fs::read_to_string(&p)
+                .map_err(|e| anyhow!("reading NIX_NINJA_INPUTSPath={p}: {e}"))?,
+            Err(_) => {
+                return Err(anyhow!(
+                    "neither NIX_NINJA_INPUTS nor NIX_NINJA_INPUTSPath in process environment"
+                ))
+            }
+        },
+    };
 
     // Get built inputs for dynamic dependency discovery
     let derived_files: Vec<DerivedFile> = inputs

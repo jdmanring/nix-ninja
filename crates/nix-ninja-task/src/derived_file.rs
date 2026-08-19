@@ -114,9 +114,15 @@ pub fn create_symlinks(
         let source_path = input.absolute_path(store_dir);
         let dest_path = prefix.join(&input.build_path);
 
-        // Create parent directories if they don't exist
+        // Create parent directories if they don't exist. An ABSOLUTE
+        // build_path silently discards `prefix` in the join above (Rust
+        // Path::join semantics) and escapes the build dir, so name the
+        // path in the error - a bare EACCES here cost a diagnosis cycle.
         if let Some(parent) = dest_path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!("create_dir_all({}) for input {}: {e}",
+                    parent.display(), input.build_path.display())
+            })?;
         }
 
         if !source_path.exists() {

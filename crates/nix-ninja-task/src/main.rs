@@ -23,33 +23,61 @@ pub struct Cli {
     #[arg(long)]
     pub description: Option<String>,
 
-    // Encoded derived files to prepare the source directory.
+    // Encoded derived files to prepare the source directory. Optional
+    // because at scale the value arrives via nix's passAsFile as a
+    // NIX_NINJA_INPUTSPath file instead: a multi-megabyte env var dies
+    // at exec with "Argument list too long" (measured on Chromium's
+    // graph, where every task inherits the configure-generated set).
     #[arg(long, env = "NIX_NINJA_INPUTS")]
-    pub inputs: String,
+    pub inputs: Option<String>,
 
     // Encoded derived files that build outputs should be copied to.
+    // Same passAsFile fallback as inputs.
     #[arg(long, env = "NIX_NINJA_OUTPUTS")]
-    pub outputs: String,
+    pub outputs: Option<String>,
 
     // Command to run.
     pub cmdline: String,
 }
 
+/// Resolve an attr that may arrive inline or via passAsFile. Absence of
+/// BOTH is an error, not an empty list: a task with no inputs at all is
+/// a malformed derivation, and treating it as empty would let a plumbing
+/// regression read as a clean build.
+fn inline_or_pass_as_file(inline: Option<String>, name: &str) -> Result<String> {
+    if let Some(v) = inline {
+        return Ok(v);
+    }
+    let path_var = format!("{name}Path");
+    match env::var(&path_var) {
+        Ok(p) => Ok(fs::read_to_string(&p)
+            .map_err(|e| anyhow::anyhow!("reading {path_var}={p}: {e}"))?),
+        Err(_) => Err(anyhow::anyhow!(
+            "neither {name} nor {path_var} is set; the driving nix-ninja and this nix-ninja-task disagree about attr passing"
+        )),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    fs::create_dir_all(&cli.build_dir)?;
-    std::env::set_current_dir(&cli.build_dir)?;
+    fs::create_dir_all(&cli.build_dir)
+        .map_err(|e| anyhow::anyhow!("create_dir_all({}): {e}", cli.build_dir.display()))?;
+    std::env::set_current_dir(&cli.build_dir)
+        .map_err(|e| anyhow::anyhow!("set_current_dir({}): {e}", cli.build_dir.display()))?;
+
+    let raw_inputs = inline_or_pass_as_file(cli.inputs.clone(), "NIX_NINJA_INPUTS")?;
+    let raw_outputs = inline_or_pass_as_file(cli.outputs.clone(), "NIX_NINJA_OUTPUTS")?;
 
     let mut inputs = Vec::new();
-    for encoded in cli.inputs.split_whitespace() {
+    for encoded in raw_inputs.split_whitespace() {
         // println!("Processing input {}", encoded);
         let input = DerivedFile::from_encoded(&cli.store_dir, encoded)?;
         inputs.push(input);
     }
 
     let mut outputs = Vec::new();
-    for encoded in cli.outputs.split_whitespace() {
+    for encoded in raw_outputs.split_whitespace() {
         // println!("Processing output {}", encoded);
         let output = DerivedFile::from_encoded(&cli.store_dir, encoded)?;
         outputs.push(output);
@@ -70,6 +98,27 @@ fn main() -> Result<()> {
     // match the soname and it must be in a directory to add to the linking
     // binary's RUNPATH.
     create_output_dirs(&outputs)?;
+
+    // Ninja rspfile: the runner contract says this file exists before
+    // the command runs. Content may arrive inline or via passAsFile
+    // (rsp files exist because their content outgrows command lines).
+    if let Ok(rsp_path) = env::var("NIX_NINJA_RSPFILE_PATH") {
+        let content = inline_or_pass_as_file(
+            env::var("NIX_NINJA_RSPFILE_CONTENT").ok(),
+            "NIX_NINJA_RSPFILE_CONTENT",
+        )?;
+        let rsp = PathBuf::from(&rsp_path);
+        if let Some(parent) = rsp.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    anyhow::anyhow!("create_dir_all({}) for rspfile: {e}", parent.display())
+                })?;
+            }
+        }
+        fs::write(&rsp, &content)
+            .map_err(|e| anyhow::anyhow!("writing rspfile {rsp_path}: {e}"))?;
+        println!("nix-ninja-task: wrote rspfile {rsp_path} ({} bytes)", content.len());
+    }
 
     if let Some(desc) = cli.description {
         println!("nix-ninja-task: {desc}");
@@ -104,9 +153,17 @@ fn copy_outputs_to_placeholders(store_dir: &StoreDir, outputs: &[DerivedFile]) -
     for output in outputs {
         let target_path = output.absolute_path(store_dir);
         if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!("create_dir_all({}) for output: {e}", parent.display())
+            })?;
         }
-        fs::copy(&output.build_path, &target_path)?;
+        fs::copy(&output.build_path, &target_path).map_err(|e| {
+            anyhow::anyhow!(
+                "copy({} -> {}): {e}",
+                output.build_path.display(),
+                target_path.display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -118,7 +175,13 @@ fn create_output_dirs(outputs: &Vec<DerivedFile>) -> Result<()> {
             if dirs.contains(&parent) {
                 continue;
             }
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!(
+                    "create_dir_all({}) for output {}: {e}",
+                    parent.display(),
+                    output.build_path.display()
+                )
+            })?;
             dirs.push(parent);
         }
     }

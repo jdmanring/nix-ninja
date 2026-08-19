@@ -22,7 +22,7 @@ use std::{
     env, fs,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, Condvar, Mutex},
 };
 use walkdir::WalkDir;
 use which::which;
@@ -67,6 +67,10 @@ struct Task {
     cmdline: Option<String>,
     desc: Option<String>,
     deps: Option<String>,
+    // Ninja rspfile: (path, content) the runner must write before the
+    // command runs. GN emits one per action rule; a task without it gets
+    // an empty argument where the command expects the file.
+    rspfile: Option<(PathBuf, String)>,
 
     files: HashMap<FileId, File>,
     inputs: Vec<DerivedFile>,
@@ -95,12 +99,69 @@ pub struct RunnerConfig {
     pub build_dir: PathBuf,
     pub store_dir: StoreDir,
     pub is_output_derivation: bool,
+    /// Maximum tasks in flight. The `-j` flag parsed this and nothing
+    /// consumed it; the runner spawned one thread per ready task,
+    /// unbounded. On a graph with codegen fan-out (Chromium: one TU's
+    /// order-only deps expand to hundreds of generated-header tasks)
+    /// that produced a load average of 553 on a 24-thread machine.
+    pub jobs: usize,
+}
+
+/// Counting semaphore bounding concurrent tasks. Permits release on
+/// Drop, so a panicking task thread cannot leak a slot.
+struct JobPermits {
+    inner: Arc<(Mutex<usize>, Condvar)>,
+    cap: usize,
+}
+
+struct JobPermit {
+    inner: Arc<(Mutex<usize>, Condvar)>,
+}
+
+impl JobPermits {
+    fn new(cap: usize) -> Self {
+        JobPermits {
+            inner: Arc::new((Mutex::new(0), Condvar::new())),
+            cap,
+        }
+    }
+
+    /// Blocks until a slot frees. Blocking in the scheduler's start()
+    /// is deliberate backpressure: running task threads complete and
+    /// release without needing the main loop, so this cannot deadlock.
+    fn acquire(&self) -> JobPermit {
+        let (lock, cvar) = &*self.inner;
+        let mut count = lock.lock().unwrap();
+        while *count >= self.cap {
+            count = cvar.wait(count).unwrap();
+        }
+        *count += 1;
+        JobPermit {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl Drop for JobPermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.inner;
+        let mut count = lock.lock().unwrap();
+        *count -= 1;
+        cvar.notify_one();
+    }
 }
 
 /// Runner is an async runtime that spawns threads for each task.
 pub struct Runner {
     pub derived_files: HashMap<FileId, DerivedFile>,
     build_dir_inputs: HashMap<FileId, DerivedFile>,
+    // A phony build produces no artifact: it is an alias for its inputs.
+    // CMake emits one per target (`cmake_object_order_depends_target_X:
+    // phony || .`) as an order-only input of every TU, so without this
+    // map every CMake-generated graph is unbuildable. Maps each phony
+    // output FileId to the phony's input FileIds; dependents expand these
+    // (transitively) in new_task instead of demanding a derivation.
+    phony_aliases: HashMap<FileId, Vec<FileId>>,
 
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
@@ -110,6 +171,7 @@ pub struct Runner {
     wrapper_vars: HashMap<String, String>,
     wrapper_store_paths: Vec<StorePath>,
     store_regex: Regex,
+    permits: JobPermits,
 }
 
 impl Runner {
@@ -153,9 +215,12 @@ impl Runner {
         }
 
         let (tx, rx) = mpsc::channel();
+        let permits = JobPermits::new(config.jobs.max(1));
         Ok(Runner {
             derived_files: HashMap::new(),
             build_dir_inputs: HashMap::new(),
+            phony_aliases: HashMap::new(),
+            permits,
             tx,
             rx,
             tools,
@@ -201,12 +266,37 @@ impl Runner {
     ) -> Result<()> {
         let tx = self.tx.clone();
 
+        // A phony rule has no command: record the alias and complete the
+        // build immediately, spawning nothing. Ordering falls out of the
+        // nix model for free - dependents inherit the phony's inputs as
+        // their own derivation inputs via the expansion in new_task.
+        if build.cmdline.is_none() {
+            let ins: Vec<FileId> = build.ordering_ins().to_vec();
+            for fid in build.outs() {
+                self.phony_aliases.insert(*fid, ins.clone());
+            }
+            tx.send(BuildResult {
+                bid,
+                derived_path: None,
+                derived_files: Vec::new(),
+                err: None,
+            })
+            .context("completing phony build")?;
+            return Ok(());
+        }
+
         let tools = self.tools.clone();
         let task = self.new_task(files, build)?;
+
+        // Acquire before spawning: bounds thread count AND daemon load.
+        // Phony builds returned above and never consume a slot. The
+        // permit moves into the thread and releases on drop, panic-safe.
+        let permit = self.permits.acquire();
 
         let config = self.config.clone();
         let rpc_client = self.rpc_client.clone();
         std::thread::spawn(move || {
+            let _permit = permit;
             let (derived_path, err) =
                 match build_task_derivation(tools.clone(), &rpc_client, task.clone()) {
                     Ok(drv) => match handle_derivation_result(
@@ -227,9 +317,17 @@ impl Runner {
                 let mut drv_outputs: Vec<DerivedFile> = Vec::new();
                 for fid in task.outs() {
                     let file = &task.files[fid];
-                    let built_file =
-                        new_built_file(final_derived_path.clone(), file.name.clone().into());
-                    drv_outputs.push(built_file);
+                    // Normalization already happened in new_task for
+                    // task.outputs; apply the same here so the recorded
+                    // DerivedFile agrees with what the task wrote.
+                    match normalize_build_path(&config.build_dir, file.name.clone().into()) {
+                        Ok(p) => {
+                            drv_outputs.push(new_built_file(final_derived_path.clone(), p))
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                        }
+                    }
                 }
                 drv_outputs
             } else {
@@ -312,12 +410,29 @@ impl Runner {
         // Iterate over all explict, implicit and order-only dependencies as
         // they must all be linked into the derivation's source directory.
         let mut input_set: HashMap<PathBuf, DerivedFile> = HashMap::new();
-        for fid in build.ordering_ins() {
-            // TODO: what about phony inputs?
-            let input = match self.derived_files.get(fid) {
+        // Expand phony aliases (transitively) into the real inputs behind
+        // them. `via_phony` marks fids reached through an expansion: a
+        // pure-ordering token that is not a file (CMake emits `phony || .`,
+        // the build dir itself) is silently dropped there, whereas a
+        // missing DIRECT input stays a loud error as before.
+        let mut worklist: Vec<(FileId, bool)> =
+            build.ordering_ins().iter().map(|f| (*f, false)).collect();
+        let mut seen: std::collections::HashSet<FileId> = std::collections::HashSet::new();
+        while let Some((fid, via_phony)) = worklist.pop() {
+            if !seen.insert(fid) {
+                continue;
+            }
+            if let Some(alias_ins) = self.phony_aliases.get(&fid) {
+                worklist.extend(alias_ins.iter().map(|f| (*f, true)));
+                continue;
+            }
+            let input = match self.derived_files.get(&fid) {
                 Some(df) => df.to_owned(),
                 None => {
-                    let file = &files.by_id[*fid];
+                    let file = &files.by_id[fid];
+                    if via_phony && !Path::new(&file.name).is_file() {
+                        continue;
+                    }
                     if file.name.starts_with(&store_dir) {
                         // TODO: Perhaps need to add this as inputSrc? But
                         // will also have to change DerivedFile to have source
@@ -345,7 +460,12 @@ impl Runner {
         let mut outputs: Vec<PathBuf> = Vec::new();
         for fid in build.outs() {
             let file = &files.by_id[*fid];
-            outputs.push(PathBuf::from(&file.name));
+            // See normalize_build_path: an absolute output escapes the
+            // task sandbox via Path::join's prefix-discarding semantics.
+            outputs.push(normalize_build_path(
+                &self.config.build_dir,
+                PathBuf::from(&file.name),
+            )?);
         }
 
         // Meson resolves `files(...)` in custom_target commands to absolute
@@ -424,6 +544,10 @@ impl Runner {
             cmdline,
             desc: build.desc.clone(),
             deps: build.deps.clone(),
+            rspfile: build
+                .rspfile
+                .as_ref()
+                .map(|r| (r.path.clone(), r.content.clone())),
             files: build_files,
             inputs,
             outputs,
@@ -453,6 +577,48 @@ fn build_task_derivation(
         .into_bytes()
         .into(),
     );
+
+    // The sandbox build dir must be at least as DEEP as the longest
+    // `..` climb any input or command token makes: the default
+    // /build/source/build is 3 deep, and Chromium's GN graph references
+    // sources 5 levels up (../../../../../src/...), which escaped to
+    // filesystem root and died at mkdir /src. Mirror the trailing
+    // components of the REAL build dir so relative paths resolve to the
+    // same names on either side.
+    let cmd_climb = cmdline
+        .split_whitespace()
+        .map(|tok| leading_parent_components(Path::new(tok)))
+        .max()
+        .unwrap_or(0);
+    let max_up = task
+        .inputs
+        .iter()
+        .map(|i| leading_parent_components(&i.build_path))
+        .max()
+        .unwrap_or(0)
+        .max(cmd_climb);
+    if max_up > 0 {
+        let comps: Vec<_> = task.build_dir.components().collect();
+        if comps.len() < max_up {
+            return Err(anyhow!(
+                "inputs climb {} levels above build dir {}, which has only {} components",
+                max_up,
+                task.build_dir.display(),
+                comps.len()
+            ));
+        }
+        let mirrored: PathBuf = comps[comps.len() - max_up..].iter().collect();
+        let sandbox_build_dir = Path::new("/build/source").join(mirrored);
+        drv.args.push(b"--build-dir"[..].into());
+        drv.args.push(
+            sandbox_build_dir
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes()
+                .into(),
+        );
+    }
+
     drv.args.push(cmdline.to_string().into_bytes().into());
 
     if let Some(desc) = &task.desc {
@@ -587,6 +753,35 @@ fn build_task_derivation(
         outputs.join(" ").into_bytes().into(),
     );
 
+    // Ninja rspfile support: the task writes this file (relative to its
+    // build dir) before spawning the command. Content rides passAsFile
+    // beside the input map - rsp files exist precisely because their
+    // content is too large for a command line.
+    let mut pass_as_file = String::from("NIX_NINJA_INPUTS NIX_NINJA_OUTPUTS");
+    if let Some((rsp_path, rsp_content)) = &task.rspfile {
+        drv.env.insert(
+            b"NIX_NINJA_RSPFILE_PATH"[..].into(),
+            rsp_path.to_string_lossy().into_owned().into_bytes().into(),
+        );
+        drv.env.insert(
+            b"NIX_NINJA_RSPFILE_CONTENT"[..].into(),
+            rsp_content.clone().into_bytes().into(),
+        );
+        pass_as_file.push_str(" NIX_NINJA_RSPFILE_CONTENT");
+    }
+
+    // At Chromium scale the encoded input map is megabytes, and an env
+    // var over the kernel's per-string exec limit kills the task with
+    // "Argument list too long" before it starts. passAsFile is nix's
+    // own mechanism for oversized attrs: the daemon writes the value
+    // to a file AFTER placeholder substitution (so derived-path
+    // placeholders still resolve) and hands the builder
+    // NIX_NINJA_INPUTSPath / NIX_NINJA_OUTPUTSPath instead.
+    drv.env.insert(
+        b"passAsFile"[..].into(),
+        pass_as_file.into_bytes().into(),
+    );
+
     {
         // Prepare $PATH to have coreutils.
         let mut path: Vec<String> = vec![
@@ -595,9 +790,13 @@ fn build_task_derivation(
             format!("{}/bin", task.store_dir.display(&tools.patchelf)),
         ];
 
+        // CMake emits link and custom commands wrapped in shell no-op
+        // guards: `: && <real command> && :`. The `:` is a shell builtin,
+        // fine at execution time, but it is not a binary to resolve - skip
+        // leading no-op tokens to find the real tool.
         let cmdline_binary = cmdline
             .split_whitespace()
-            .next()
+            .find(|tok| *tok != ":" && *tok != "&&")
             .ok_or_else(|| anyhow!("No command found in cmdline"))?;
 
         // A command resolving outside the store (e.g. a `../gen.sh` script
@@ -661,6 +860,12 @@ fn build_dynamic_task_derivation(
     drv.env.insert(
         b"NIX_NINJA_INPUTS"[..].into(),
         inputs.join(" ").into_bytes().into(),
+    );
+    // Same E2BIG hazard as the task derivation: see the passAsFile
+    // comment in build_task_derivation.
+    drv.env.insert(
+        b"passAsFile"[..].into(),
+        b"NIX_NINJA_INPUTS"[..].into(),
     );
 
     drv.outputs.insert(
@@ -878,9 +1083,13 @@ fn new_opaque_file(
     // AddTempRoot which the daemon refuses. Upload as a NAR-hashed CA
     // object instead, which (unlike a text-CA object) preserves the file
     // mode, notably the executable bit.
+    // Route through normalize_output: a raw file_name() containing a
+    // character outside the store-name grammar (e.g. `@`) is refused by
+    // AddToStore. See normalize_output for the grammar and why the lossy
+    // map is sound.
     let name = canonical_path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
+        .map(|n| normalize_output(&n.to_string_lossy()))
         .unwrap_or_else(|| "source".to_string());
     let store_path = rpc_client.add_to_store_nar(&name, &canonical_path)?;
 
@@ -889,6 +1098,36 @@ fn new_opaque_file(
         build_path: relative_path,
         rel_path: None, // None for opaque files - store path points directly to file
     })
+}
+
+/// An ABSOLUTE build_path is a sandbox escape: nix-ninja-task joins it
+/// onto its build dir with Path::join, whose semantics DISCARD the
+/// prefix for absolute paths, so the task then mkdirs the host path
+/// inside the sandbox and dies EACCES (CMake's ${cmake_ninja_workdir}
+/// and GN actions both emit absolute workdir paths; meson never does,
+/// which is why five packages built before Chromium's graph hit this).
+/// Relativize against the build dir; refuse LOUDLY anything that
+/// escapes it rather than silently relocating an unknown path.
+/// Number of leading `..` components of a relative path: how many
+/// levels above its base directory it reaches before descending.
+fn leading_parent_components(p: &Path) -> usize {
+    p.components()
+        .take_while(|c| matches!(c, std::path::Component::ParentDir))
+        .count()
+}
+
+fn normalize_build_path(build_dir: &Path, p: PathBuf) -> Result<PathBuf> {
+    if p.is_relative() {
+        return Ok(p);
+    }
+    match relative_from(&p, build_dir) {
+        Some(rel) if rel.is_relative() => Ok(rel),
+        _ => Err(anyhow!(
+            "absolute path {} does not resolve under build dir {}; refusing to relocate it silently",
+            p.display(),
+            build_dir.display()
+        )),
+    }
 }
 
 fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> DerivedFile {
@@ -904,9 +1143,129 @@ fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> Deriv
 }
 
 // Derivation outputs cannot have `/` in them as its suffixed to the derivation
-// store path.
+// store path. More generally, nix store-path names admit only
+// [A-Za-z0-9+._?=-] and must not start with a period: anything else
+// (npm scope dirs like node_modules/@babel, mac assets like icon@2x.png,
+// gettext's sr@latin.po) makes the daemon's AddToStore refuse the path,
+// which poisons every target that transitively snapshots the file. The
+// name is only a label - identity is the content hash - so a lossy map
+// is sound; two names colliding after the map still yield distinct
+// store paths unless their content is also identical.
 fn normalize_output(output: &str) -> String {
-    output.replace('/', "-")
+    let mapped: String = output
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '.' | '_' | '?' | '=' => c,
+            _ => '-',
+        })
+        .collect();
+    if mapped.is_empty() {
+        "source".to_string()
+    } else if mapped.starts_with('.') {
+        format!("-{mapped}")
+    } else {
+        mapped
+    }
+}
+
+#[cfg(test)]
+mod job_permits_tests {
+    use super::JobPermits;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn concurrency_never_exceeds_cap() {
+        let permits = Arc::new(JobPermits::new(3));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let permits = permits.clone();
+            let running = running.clone();
+            let peak = peak.clone();
+            handles.push(std::thread::spawn(move || {
+                let _permit = permits.acquire();
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                running.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(running.load(Ordering::SeqCst), 0, "all tasks completed");
+        assert!(
+            peak.load(Ordering::SeqCst) <= 3,
+            "peak concurrency {} exceeded cap 3",
+            peak.load(Ordering::SeqCst)
+        );
+        assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "peak {} suspiciously low - the test exercised no parallelism",
+            peak.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn permit_released_on_panic() {
+        let permits = Arc::new(JobPermits::new(1));
+        let p2 = permits.clone();
+        let _ = std::thread::spawn(move || {
+            let _permit = p2.acquire();
+            panic!("task died");
+        })
+        .join();
+        // If the panicking thread leaked its permit, this blocks forever
+        // and the test times out; acquiring proves the Drop ran.
+        let _permit = permits.acquire();
+    }
+}
+
+#[cfg(test)]
+mod normalize_output_tests {
+    use super::normalize_output;
+
+    #[test]
+    fn slash_still_maps_to_dash() {
+        assert_eq!(normalize_output("src/main.o"), "src-main.o");
+    }
+
+    #[test]
+    fn at_sign_is_sanitized() {
+        // The three shapes measured in the wild: mac asset suffixes,
+        // npm scope directories, gettext locale variants.
+        assert_eq!(normalize_output("icon@2x.png"), "icon-2x.png");
+        assert_eq!(
+            normalize_output("node_modules/@babel/core/lib/index.js"),
+            "node_modules--babel-core-lib-index.js"
+        );
+        assert_eq!(normalize_output("sr@latin.po"), "sr-latin.po");
+    }
+
+    #[test]
+    fn allowed_charset_passes_through() {
+        assert_eq!(
+            normalize_output("libfoo+bar_1.2-r3?x=y.so"),
+            "libfoo+bar_1.2-r3?x=y.so"
+        );
+    }
+
+    #[test]
+    fn leading_period_is_prefixed() {
+        assert_eq!(normalize_output(".hidden.c"), "-.hidden.c");
+    }
+
+    #[test]
+    fn empty_falls_back() {
+        assert_eq!(normalize_output(""), "source");
+    }
+
+    #[test]
+    fn spaces_and_unicode_are_sanitized() {
+        assert_eq!(normalize_output("a b\u{e9}.c"), "a-b-.c");
+    }
 }
 
 /// Discovers C include dependencies from a command line and input files.
