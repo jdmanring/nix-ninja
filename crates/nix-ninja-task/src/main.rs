@@ -83,6 +83,36 @@ fn main() -> Result<()> {
         outputs.push(output);
     }
 
+    // Python resolves a script SYMLINK when computing sys.path[0]
+    // (getpath realpaths it), so a wrapper script materialized as a
+    // symlink to a single-file store object cannot import its sibling
+    // modules - python looks inside the store object's directory, which
+    // holds one file. Prepend every .py input's build-dir-relative
+    // directory to PYTHONPATH; the symlink directories hold ALL the
+    // sibling symlinks, so imports resolve there.
+    {
+        let mut py_dirs: Vec<String> = Vec::new();
+        for input in &inputs {
+            if input.build_path.extension().is_some_and(|e| e == "py") {
+                if let Some(parent) = input.build_path.parent() {
+                    let d = parent.to_string_lossy().into_owned();
+                    if !py_dirs.contains(&d) {
+                        py_dirs.push(d);
+                    }
+                }
+            }
+        }
+        if !py_dirs.is_empty() {
+            let mut pp = py_dirs.join(":");
+            if let Ok(existing) = env::var("PYTHONPATH") {
+                pp.push(':');
+                pp.push_str(&existing);
+            }
+            env::set_var("PYTHONPATH", &pp);
+            println!("nix-ninja-task: PYTHONPATH={pp}");
+        }
+    }
+
     // The source directory of the derivation needs to have all build inputs
     // symlinked while preserving the original directory hierarchy of the
     // sources. This ensures relative includes and other path-dependent
