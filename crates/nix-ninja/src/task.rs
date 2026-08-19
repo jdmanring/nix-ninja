@@ -445,13 +445,18 @@ impl Runner {
                         continue;
                     }
 
-                    let input = new_opaque_file(
+                    let uploaded = upload_referenced_file(
                         &self.rpc_client,
                         &self.config.build_dir,
-                        file.name.clone().into(),
+                        PathBuf::from(&file.name),
                     )?;
-                    self.add_derived_file(files, input.clone().to_owned());
-                    input.to_owned()
+                    for extra in &uploaded[1..] {
+                        self.add_derived_file(files, extra.clone());
+                        input_set.insert(extra.build_path.clone(), extra.clone());
+                    }
+                    let input = uploaded.into_iter().next().unwrap();
+                    self.add_derived_file(files, input.clone());
+                    input
                 }
             };
             input_set.insert(input.build_path.clone(), input.clone());
@@ -507,37 +512,13 @@ impl Runner {
                         && arg.contains('/')
                         && Path::new(&arg).is_file()
                     {
-                        let input = new_opaque_file(
+                        for input in upload_referenced_file(
                             &self.rpc_client,
                             &self.config.build_dir,
                             PathBuf::from(&arg),
-                        )?;
-                        self.add_derived_file(files, input.clone());
-                        input_set.insert(input.build_path.clone(), input);
-                        // A python script imports SIBLING modules from its
-                        // own directory (gcc_link_wrapper.py imports
-                        // wrapper_utils.py), so bring the directory's .py
-                        // files with it. One directory, non-recursive -
-                        // python's default import model for these wrappers.
-                        if arg.ends_with(".py") {
-                            if let Some(dir) = Path::new(&arg).parent() {
-                                let entries = fs::read_dir(dir).map_err(|e| {
-                                    anyhow!("read_dir({}) for python siblings: {e}", dir.display())
-                                })?;
-                                for entry in entries.flatten() {
-                                    let p = entry.path();
-                                    if p.extension().is_some_and(|e| e == "py") && p.is_file()
-                                    {
-                                        let sib = new_opaque_file(
-                                            &self.rpc_client,
-                                            &self.config.build_dir,
-                                            p,
-                                        )?;
-                                        self.add_derived_file(files, sib.clone());
-                                        input_set.insert(sib.build_path.clone(), sib);
-                                    }
-                                }
-                            }
+                        )? {
+                            self.add_derived_file(files, input.clone());
+                            input_set.insert(input.build_path.clone(), input);
                         }
                     }
                     continue;
@@ -557,31 +538,13 @@ impl Runner {
                                 && arg.contains('/')
                                 && Path::new(&arg).is_file()
                             {
-                                let input = new_opaque_file(
+                                for input in upload_referenced_file(
                                     &self.rpc_client,
                                     &self.config.build_dir,
                                     PathBuf::from(&arg),
-                                )?;
-                                self.add_derived_file(files, input.clone());
-                                input_set.insert(input.build_path.clone(), input.clone());
-                                if arg.ends_with(".py") {
-                                    if let Some(dir) = Path::new(&arg).parent() {
-                                        let entries = fs::read_dir(dir).map_err(|e| {
-                                            anyhow!("read_dir({}) for python siblings: {e}", dir.display())
-                                        })?;
-                                        for entry in entries.flatten() {
-                                            let p = entry.path();
-                                            if p.extension().is_some_and(|e| e == "py") && p.is_file() {
-                                                let sib = new_opaque_file(
-                                                    &self.rpc_client,
-                                                    &self.config.build_dir,
-                                                    p,
-                                                )?;
-                                                self.add_derived_file(files, sib.clone());
-                                                input_set.insert(sib.build_path.clone(), sib);
-                                            }
-                                        }
-                                    }
+                                )? {
+                                    self.add_derived_file(files, input.clone());
+                                    input_set.insert(input.build_path.clone(), input);
                                 }
                             }
                             continue;
@@ -1213,6 +1176,41 @@ fn leading_parent_components(p: &Path) -> usize {
     p.components()
         .take_while(|c| matches!(c, std::path::Component::ParentDir))
         .count()
+}
+
+/// Upload one referenced source file, plus - for a python script - its
+/// same-directory .py siblings (gcc_link_wrapper.py imports
+/// wrapper_utils.py; python resolves sibling imports from the script's
+/// own directory). Returns every DerivedFile created, main file first.
+/// This is THE upload path for referenced files: the ordering-ins loop,
+/// the cmdline scan's node branch and its non-node branch all route
+/// here, because the sibling rule was first added to only two of the
+/// three and the third is where GN's declared `| script` inputs go.
+fn upload_referenced_file(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    path: PathBuf,
+) -> Result<Vec<DerivedFile>> {
+    let is_py = path.extension().is_some_and(|e| e == "py");
+    let main = new_opaque_file(rpc_client, build_dir, path.clone())?;
+    let mut out = vec![main];
+    if is_py {
+        if let Some(dir) = path.parent() {
+            let entries = fs::read_dir(dir).map_err(|e| {
+                anyhow!("read_dir({}) for python siblings: {e}", dir.display())
+            })?;
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p == path {
+                    continue;
+                }
+                if p.extension().is_some_and(|e| e == "py") && p.is_file() {
+                    out.push(new_opaque_file(rpc_client, build_dir, p)?);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn normalize_build_path(build_dir: &Path, p: PathBuf) -> Result<PathBuf> {
