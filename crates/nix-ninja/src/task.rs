@@ -807,6 +807,37 @@ fn build_task_derivation(
         );
     }
 
+    // Ambient environment a build system deliberately hands its tools:
+    // qtwebengine invokes ninja under `cmake -E env NODEJS_EXECUTABLE=...`
+    // and chromium's node.py asserts on the variable. A task derivation
+    // starts from an empty environment, so the caller names what to
+    // forward in NIX_NINJA_PASS_ENV (space-separated variable names) -
+    // an allowlist, never the whole environment, because the whole
+    // environment would put the invoking shell's noise into every drv
+    // hash. A value inside the store also becomes an input so the
+    // sandbox can actually exec it.
+    if let Ok(pass) = env::var("NIX_NINJA_PASS_ENV") {
+        for name in pass.split_whitespace() {
+            let Ok(value) = env::var(name) else { continue };
+            if let Ok(rel) = Path::new(&value)
+                .strip_prefix(AsRef::<Path>::as_ref(&task.store_dir))
+            {
+                if let Some(root) = rel.components().next() {
+                    let full = AsRef::<Path>::as_ref(&task.store_dir).join(root.as_os_str());
+                    if let Some(s) = full.to_str() {
+                        if let Ok(sp) = task.store_dir.parse(s) {
+                            drv.inputs.insert(SingleDerivedPath::Opaque(sp));
+                        }
+                    }
+                }
+            }
+            drv.env.insert(
+                name.to_string().into_bytes().into(),
+                value.into_bytes().into(),
+            );
+        }
+    }
+
     // Add pre-extracted store paths from cmdline and wrapper vars
     for store_path in &task.input_srcs {
         drv.inputs
