@@ -495,6 +495,26 @@ impl Runner {
             let args = shell_words::split(cmdline)?;
             for arg in args {
                 let Some(fid) = files.lookup(&arg) else {
+                    // Not a graph node - but GN commands reference source
+                    // scripts the graph never declares (gcc_link_wrapper.py
+                    // in every host link rule), assuming the runner shares
+                    // the filesystem. A relative arg naming a real file is
+                    // a task input; upload it. is_file skips -I dirs and
+                    // not-yet-existing outputs; absolute and flag-shaped
+                    // args never reach the check.
+                    if !arg.starts_with('-')
+                        && !arg.starts_with('/')
+                        && arg.contains('/')
+                        && Path::new(&arg).is_file()
+                    {
+                        let input = new_opaque_file(
+                            &self.rpc_client,
+                            &self.config.build_dir,
+                            PathBuf::from(&arg),
+                        )?;
+                        self.add_derived_file(files, input.clone());
+                        input_set.insert(input.build_path.clone(), input);
+                    }
                     continue;
                 };
                 let input = match self.derived_files.get(&fid) {
