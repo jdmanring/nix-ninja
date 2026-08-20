@@ -370,8 +370,13 @@ impl Runner {
         }
         if n_tasks % 500 == 0 {
             eprintln!(
-                "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time",
-                RESOLVE_MS.load(Ordering::Relaxed) / 1000
+                "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
+                 (worklist {} s, cmdline {} s, py {} s, grd {} s)",
+                RESOLVE_MS.load(Ordering::Relaxed) / 1000,
+                NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
+                NT_CMDLINE_MS.load(Ordering::Relaxed) / 1000,
+                NT_PY_MS.load(Ordering::Relaxed) / 1000,
+                NT_GRD_MS.load(Ordering::Relaxed) / 1000,
             );
         }
 
@@ -527,6 +532,18 @@ impl Runner {
     }
 
     fn new_task(&mut self, files: &mut graph::GraphFiles, build: &Build) -> Result<Task> {
+        // Section clocks for the serial-resolution bottleneck, read by
+        // the heartbeat in start(). Wall time between checkpoints lands
+        // in the named section's bucket.
+        let mut sec_t = std::time::Instant::now();
+        let mut lap = |bucket: &std::sync::atomic::AtomicU64| {
+            let now = std::time::Instant::now();
+            bucket.fetch_add(
+                (now - sec_t).as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            sec_t = now;
+        };
         let store_dir = self.config.store_dir.to_string();
 
         // Provide the task access to all the original files for explicit
@@ -663,6 +680,8 @@ impl Runner {
                 PathBuf::from(&file.name),
             )?);
         }
+
+        lap(&NT_WORKLIST_MS);
 
         // Meson resolves `files(...)` in custom_target commands to absolute
         // paths at configure time. Those paths do not exist inside the task
@@ -872,6 +891,8 @@ impl Runner {
             }
         }
 
+        lap(&NT_CMDLINE_MS);
+
         // Post-pass, closing the class: a .py input must ALWAYS travel
         // with its same-directory siblings, no matter which of the input
         // paths (ordering-ins, cmdline node, cmdline non-node, or a
@@ -901,6 +922,8 @@ impl Runner {
         // round 39 died at FileNotFound: address_input_strings.grdp. Same
         // worklist shape as the python-sibling pass; .grdp partials nest,
         // so found manifests re-enter the list.
+        lap(&NT_PY_MS);
+
         let mut grd_list: Vec<PathBuf> = input_set
             .keys()
             .filter(|p| {
@@ -955,6 +978,8 @@ impl Runner {
         inputs.sort();
 
         // Extract store paths from cmdline and add pre-extracted wrapper store paths
+        lap(&NT_GRD_MS);
+
         let mut input_srcs = self.wrapper_store_paths.clone();
         if let Some(cmdline) = &cmdline {
             let found_store_paths =
@@ -1959,6 +1984,14 @@ fn grd_reference_candidates(grd: &Path) -> Result<Vec<PathBuf>> {
 /// `generate_grd.py`), so the function is tree-layout-independent.
 /// Existence-filtered: a name that resolves nowhere is a manifest entry
 /// for a GENERATED file, which the edge's declared inputs already carry.
+// Section buckets for new_task's serial-resolution cost, printed by the
+// heartbeat in start(): worklist expansion, cmdline scan (incl. the
+// implicit-inputs blanket), the py sibling post-pass, and the grd pass.
+static NT_WORKLIST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NT_CMDLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NT_PY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NT_GRD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn generate_grd_input_files(cmdline: &str) -> Vec<PathBuf> {
     const TOOL_SUFFIX: &str = "ui/webui/resources/tools/generate_grd.py";
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
