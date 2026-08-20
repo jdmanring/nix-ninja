@@ -150,7 +150,14 @@ def subtree_totals(
 
 
 def read_ticks(pids: list[int]) -> dict[int, int]:
-    """Back-compat wrapper: subtree totals keyed by the roots given."""
+    """SUPERSEDED, and kept only for the selftest. See classify().
+
+    Nothing in the live path calls this, nor `descendants`, nor `wedged_pids`,
+    nor `wedged_nodes`. They are each a previous generation of this oracle, and
+    they stay because the selftest asserts what each of them answers on the
+    same fixture. That record is the only thing documenting why the unit
+    changed three times, and deleting it as dead code would delete the reason.
+    """
     ticks, parent = proc_tree(pids)
     totals = subtree_totals(ticks, parent)
     return {pid: totals[pid] for pid in pids if pid in totals}

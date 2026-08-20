@@ -1,15 +1,18 @@
 # DRAFT PR split for nix-ninja
 
-Not sent. The fork is 93 files and about +14,000 lines against `9a07e67`,
-72 of those files and about two thirds of those lines being the vendored n2
-tree. That is not a pull
+Not sent. The fork is most of a hundred files against `9a07e67`, roughly three
+quarters of them the vendored n2 tree. That is not a pull
 request, it is a pile, and sending it as one guarantees it is never reviewed.
 This is the split.
 
-Regenerate the figures at send time (`git diff --shortstat 9a07e67..HEAD`)
-rather than trusting the ones above: they moved twice while these drafts were
-being written, and a stale count in a PR description is the first thing a
-reviewer checks and the cheapest thing to get wrong.
+Generate the exact figures at send time:
+
+    git diff --shortstat 9a07e67..HEAD
+    git diff --name-only 9a07e67..HEAD -- vendor-n2 | wc -l
+
+They moved three times while these drafts were being written and were caught
+stale by every audit round. A stale count in a PR description is the first
+thing a reviewer checks and the cheapest thing to get wrong.
 
 Ordering principle: each PR must be reviewable without the next one, and must
 be defensible on its own even if every later PR is rejected.
@@ -22,12 +25,14 @@ reason. Real ninja does not sandbox, so a generator that reads a file nobody
 declared still works, and its build file is never corrected. Under nix-ninja
 each of those is a hard failure thousands of tasks in.
 
-91 commits in the range, 66 of them touching `crates/nix-ninja` or
-`crates/deps-infer` (`git log --oneline 9a07e67..HEAD -- crates/nix-ninja
-crates/deps-infer | wc -l`), most of which are one inference rule each, found
-by a failure rather than by design. They are NOT nine tidy classes, and they
-are not "about forty" either - this file has now said both, and an audit
-falsified each in turn. Re-run the command rather than trusting this sentence. Grouped by the ecosystem whose
+Most commits in the range are one inference rule each, found by a failure
+rather than by design. NO COUNT IS WRITTEN HERE, deliberately. This file has
+said "nine classes" and then "about forty", and an audit falsified each in
+turn; the third audit then caught the corrected figure stale again, because
+the number moves every time anyone commits to this fork. A count of our own
+commits is stale by construction, so the command is the statement:
+
+    git log --oneline 9a07e67..HEAD -- crates/nix-ninja crates/deps-infer | wc -l Grouped by the ecosystem whose
 generators needed them:
 
 - **python import resolution** - the largest group and the one with real depth.

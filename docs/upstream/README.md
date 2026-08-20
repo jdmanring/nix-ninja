@@ -46,7 +46,8 @@ carrying no numbers, and we have two profiler samples with a stated method. Answ
 unsolicited PR does not.
 
 **6 is deliberately NOT a nix-ninja PR.** This fork vendored n2 wholesale to
-get `${rspfile}` bound in commands, which is 72 of its 93 changed files and a
+get `${rspfile}` bound in commands, which is roughly three quarters of its
+changed files and a
 standing merge liability against an upstream that has live n2 movement (their
 issue #41). The correct destination for that one feature is `hinshun/n2`, after
 which this fork returns to a git dependency and the vendored tree is deleted.
@@ -57,9 +58,11 @@ Offering the vendored tree to nix-ninja would be offering them our liability.
 Honesty here is what makes the rest credible.
 
 - **A concurrency threshold for the wedge.** It was bisected on 2026-08-20 and
-  did not reproduce at seven levels between 2 and 32, across two request
-  shapes. `../daemon-wedge.md` has the table, the exact coverage of each shape,
-  and the three instrument defects found on the way. The incident is reported as an incident; the mechanism is reported
+  did not reproduce at N = 2, 4, 8, 12, 16, 20, 24 and 32 in the shape the
+  incident describes, nor at N = 2, 8, 12, 16, 20 and 24 in the contrasting
+  shape. `../daemon-wedge.md` has both tables and the canonical list of instrument
+  defects found on the way. Do not restate that count anywhere else; it has
+  been wrong in three files across three audit rounds. The incident is reported as an incident; the mechanism is reported
   as open.
 - **Alternate linkers (their #52, `CC_LD`/`CXX_LD`, mold as the example).**
   Unhandled here. We will hit it the first

@@ -16,7 +16,9 @@ The body asks why nix-ninja comes out about the same as ninja. #4
 from the other.
 
 > We have profiler numbers from a much larger graph than the examples here, in
-> case they are useful: qtwebengine 6.11.1, at least 16,077 tasks (the highest task index the round-82 driver log reaches; the graph was never driven to completion, so treat it as a floor).
+> case they are useful: qtwebengine 6.11.1, at least 16,077 tasks. That is the
+> highest task index our driver log reaches rather than a total, since we have
+> not yet driven the graph to completion.
 >
 > Two hotspots dominated the driver, both found with `perf` against the live
 > driver rather than by reading, and both in the same place - the include scan.
@@ -170,35 +172,32 @@ thing we can add is the collision, so that is all this says.
 
 ## Audit
 
-Round 1: 2026-08-20, adversarial review against the tree. NOT a sign-off.
-Findings applied to this file:
+Three adversarial rounds, 2026-08-20. None signed off. Applied to this file:
 
 - **the 44 s / 5 s net-effect figure does not exist anywhere in the tree** and
-  was deleted. `git log --all` has no such reading. Worse, the large measured
-  wins in this area come from commits that are NOT in the proposed perf PR, so
-  a maintainer who merged it and benchmarked would have failed to reproduce our
-  headline number - falsified by the reviewer's own measurement, which is the
-  worst way to lose a PR;
+  was deleted. Worse, the large measured wins in that area come from commits
+  NOT in the proposed perf PR, so a maintainer who merged it and benchmarked
+  would have failed to reproduce our headline number. The reply now offers an
+  isolated before/after run rather than quoting one we cannot attribute;
 - **"matching what the driver's other hot maps already use" was false against
-  UPSTREAM's tree.** There is no FxHash anywhere in their crates; the other hot
-  maps are ours. One grep and the reader stops reading. Reworded, and the added
-  `rustc-hash` dependency is now disclosed rather than left in the diff;
+  UPSTREAM's tree.** There is no FxHash anywhere in their crates. One grep and
+  the reader stops. Reworded, and the added `rustc-hash` dependency is now
+  disclosed rather than left in the diff;
 - the 25% and one-third figures are `perf` samples from a single run, not a
-  controlled A/B, and now say so inline. Both come from bare one-line commits
-  with no recorded method, which is a weakness in our own record, not just in
-  the prose;
-- #7 was quoted under a title it does not have. Real title restored;
-- the #52 reply handed the reporter back his own diagnosis and his own proposed
-  fix, which is the one condescending passage in the set. Cut to the single
-  thing we actually add, the merge collision;
-- PR 43's CMake half now gets an acknowledgment instead of silence, and PR 56
-  is credited to amaanq rather than to obsidiansystems, which is only the head
-  repo.
+  controlled A/B, and now say so inline. Both trace to bare one-line commits
+  with no recorded method, which is a weakness in our own record;
+- #7 was quoted under a title it does not have;
+- the #52 reply handed the reporter back his own diagnosis and his own
+  proposed fix, the one condescending passage in the set. Cut to the single
+  thing we add;
+- credit: PR 56 to amaanq rather than to obsidiansystems, which is only the
+  head repo; PR 43's CMake half acknowledged rather than passed over; and the
+  `want_file` fix attributed to their diff, where an earlier version of our own
+  commit message had claimed it in passing.
 
-Verified clean in the same pass: the claim that PR 43 already changes
-`want_file` to `?` is TRUE against their current diff; every design claim in
-the #5 reply exists in `task.rs`; #43's age and comment count are accurate.
+Verified clean across the rounds: that PR 43 already changes `want_file` to
+`?`; every design claim in the #5 reply against `task.rs`; #43's age and
+comment count.
 
-Status: NOT SENDABLE until a second round. The perf reply in particular should
-not go out until we decide whether to do the isolated before/after run it now
-offers.
+Status: NOT SENDABLE. The perf reply should not go out until we decide whether
+to do the isolated before/after run it now offers, and a fourth round is owed.

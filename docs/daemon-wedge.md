@@ -20,7 +20,8 @@ against nix-daemon 2.35.2:
   semaphore;
 - the stuck children can outlive their supervisor. On 2026-08-20 seventeen of
   them survived as init-reparented root orphans holding roughly 20 GiB of RSS
-  between them, one at 7.5 GiB. `SIGTERM` did not clear them, and neither did
+  between them, one at 7.5 GiB. That is one `ps` reading summed across the
+  seventeen, not a sampled peak. `SIGTERM` did not clear them, and neither did
   `s6-svc -kr`, which kills only the supervised parent. `pkill -9 -x
   nix-daemon` did.
 
@@ -37,7 +38,10 @@ fixed (see below); every verdict recorded before that fix is void and is not
 reproduced here.
 
 Host: 24-thread Ryzen 9 7900X3D, 30.5 GiB RAM, nix-daemon 2.35.2, no other
-build running, swap drained to zero.
+build running. The host was not under memory pressure during these runs, but
+neither ladder log records a memory reading, so treat that as context rather
+than as a measurement - and note that it matters, since memory pressure is the
+leading untested hypothesis below.
 
 **One client issuing N concurrent `build_paths`** - the shape the incident
 describes:
@@ -82,17 +86,19 @@ below, and it is the column that would expose the next instrument defect the
 way it exposed the first three. A verdict without its population is not a
 reading.
 
-## Four defects in the instrument, and one choice that avoided a fifth
+## Five defects in the instrument, and one choice that avoided a sixth
 
-Counted carefully, because the count itself has been wrong in this document
-three times, and an instrument whose own history is told inconsistently invites
-the one reading a negative result cannot survive: that it was never trusted.
+**This section is the canonical count. Every other document links here rather
+than restating it**, because the count has now been wrong in three separate
+files across three audit rounds, and an instrument whose own history is told
+inconsistently invites the one reading a negative result cannot survive: that
+it was never trusted.
 
-They did NOT all fail the same way. Two produced a false HEALTHY, one produced
-a false WEDGE, one measured the wrong request shape entirely. Item 2 is not a
-defect at all; it is the choice that kept the fix to item 1 from creating a
-false wedge by construction, and it is listed because getting it wrong was the
-obvious move.
+They did NOT all fail the same way. Three produced a false HEALTHY, one
+produced a false WEDGE, one measured the wrong request shape entirely. Item 2
+is not a defect at all; it is the choice that kept the fix to item 1 from
+creating a false wedge by construction, and it is listed because getting it
+wrong was the obvious move.
 
 1. **The workload could not hold a daemon child open.** The stress derivation
    wrote a file and exited inside the settle window, so the tick oracle never
@@ -138,11 +144,49 @@ obvious move.
    the reported shape; measured, it yields one daemon child forking all N
    builders.
 
-The pattern across 1, 3 and 4 is one pattern: **the UNIT of the reading was
-wrong three times, twice in opposite directions**, and each wrong unit returned
-a confident verdict rather than an error. Three of them were visible only
-because the script prints the population it sampled; the fourth needed an
-outside reader, which is the argument for having one.
+6. **Subtracting one subtree TOTAL from another put the false healthy back, in
+   the incident's own shape.** A wedged parent whose builder exits between the
+   samples has a shrinking total, so its delta is negative and an `== 0` test
+   never fires - and a parent outliving its builder is exactly what the
+   2026-08-20 orphans were. PID reuse lands in the same hole. The repair is not
+   `<= 0`, which trades it for a false wedge on every completing build; the
+   arithmetic was wrong. Deltas are computed PER PROCESS and then summed.
+   A subtree that accrued nothing and also LOST a member is now reported
+   INDETERMINATE with its own exit code, since it ran for an unknown part of
+   the window and forcing it into either verdict is how a false all-clear gets
+   published.
+
+The pattern across 1, 3, 4 and 6 is one pattern: **the UNIT or the ARITHMETIC
+of the reading was wrong four times, in opposite directions**, and every wrong
+one returned a confident verdict rather than an error. Three were visible only
+because the script prints the population it sampled. The other two needed an
+outside reader, which is the argument for having one: an instrument cannot
+report the blind spot it has, and the two it could not report were both found
+by someone told to attack it.
+
+## What this oracle can still get wrong
+
+Stated because three of its defects were found by someone attacking it and
+none by the instrument itself, and because the first thing a maintainer will
+do with a future WEDGE verdict is look for a benign explanation. These are the
+benign explanations.
+
+- **A finished but unreaped builder is flagged.** Any process that legitimately
+  does no work across the sampling window reads identically to a stuck one.
+  Harmless while every round comes back healthy; it is the leading alternative
+  explanation the day one does not.
+- **The child list is captured once, before the first sample.** A daemon child
+  forked after the settle window is invisible to both samples, and only round
+  completion would catch a fault in it.
+- **A subtree that both accrued nothing and lost a member is INDETERMINATE**,
+  not healthy and not wedged. It ran for an unknown part of the window. The
+  round reports it separately and exits nonzero rather than picking a verdict.
+- **One window, one reading.** A process stuck for less than `--interval`
+  is indistinguishable from a fast one, and a process that wedges after the
+  second sample is only caught by the completion check.
+- **There is no positive control.** This script has never produced a wedge, so
+  it has never demonstrated that it CAN. The fixtures in `--selftest` are the
+  only evidence the verdict logic fires at all, and a fixture is not a daemon.
 
 ## What the negative result licenses, and what it does not
 
@@ -215,6 +259,9 @@ Exit codes: 0 healthy, 3 wedge observed, 1 the round could not run. The script
 refuses to start while a nix-ninja campaign build is live, because it is the
 trigger condition and the campaign is what it would trigger against.
 
-**Read the "processes sampled" number on every round.** If it is not N+1 in
-one-client mode, or N-ish in multi-client mode, the oracle is not seeing the
-builders and the verdict means nothing, whatever it says.
+**Read the "processes sampled" number on every round.** It must be N+1 in
+one-client mode (one daemon child plus N builders) and 2N in multi-client mode
+(N children, one builder each). Anything less and the oracle is not seeing the
+builders, so the verdict means nothing whatever it says. An earlier version of
+this line said "N-ish" for the multi-client case, which passes on exactly the
+reading that would mean the builders are invisible: the guard defeated itself.

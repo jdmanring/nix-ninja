@@ -81,22 +81,26 @@ Two caveats we would rather state than have found:
   that it now resolves individual workers: each one-client round samples N+1
   processes, one daemon child plus its N builders, and the verdict is computed
   per process rather than over the round.
-- **An earlier version of it could not have seen this bug even if it had
-  happened.** It judged each daemon child by the CPU its whole subtree
-  accumulated, and under one client there is a single child forking every
-  builder, so one dead worker among N live siblings was masked by theirs. Since
-  the failure we are reporting is partial - some workers stuck while the build
-  moved - that is precisely the case it was blind to. Fixed, and the whole
-  ladder above was re-run afterwards; we mention it because it is the kind of
-  thing that should make you discount a negative result, and you would be right
-  to.
+- **Earlier versions of it could not have seen this bug even if it had
+  happened**, twice over, and both times in the direction that reports healthy.
+  It judged each daemon child by the CPU its whole subtree accumulated, and
+  under one client there is a single child forking every builder, so one dead
+  worker among N live siblings was masked by theirs - and the failure we are
+  reporting is partial, some workers stuck while the build moved, which is
+  precisely that case. Then, having fixed the unit, it still subtracted one
+  subtree total from another, so a stuck parent whose builder EXITED between
+  samples had a shrinking total and a negative delta and was never flagged -
+  which is what our orphans actually were. Both fixed, deltas are now computed
+  per process, and the ladder was re-run from scratch after each. We volunteer
+  this because it is the kind of thing that should make you discount a negative
+  result, and you would be right to.
 
 So we are explicitly NOT claiming a concurrency threshold, and not claiming the
 daemon is fine at these levels either. Concurrency alone does not appear to be
 the trigger. The reproducer and the full table are at
 `scripts/daemon-stress-bisect.py` and `docs/daemon-wedge.md` in our fork, where
-the negative result is written up with the four instrument defects found on the
-way to it.
+the negative result is written up with every instrument defect found on the way
+to it, of which there were more than we would like.
 
 Our leading untested hypothesis is memory pressure, because it is the only
 candidate that explains both datasets rather than merely differing between
@@ -145,31 +149,30 @@ still needs the real workload to show up.
 
 ## Audit
 
-Round 1: 2026-08-20, adversarial review against the tree. NOT a sign-off - it
-returned ten blocking findings across this directory, four of them in this
-file. Applied here:
+Three adversarial rounds, 2026-08-20, all against the tree rather than the
+prose. None signed off. Rounds 2 and 3 each found a LIVE defect in the
+reproducer rather than in a sentence, and both were false-healthy holes in the
+shape this report describes; both are fixed and both re-runs are in
+`../daemon-wedge.md`.
 
-- the memory figure said "14 GiB apiece" where the measurement is seven workers
-  at ~2 GiB each, machine down to 2.5 GiB available. A 7x inflation in the
-  number the whole memory hypothesis rests on, taken from a commit SUBJECT
-  where the in-code comment carried the real reading;
-- "six concurrency levels from 2 to 32, in both request shapes" - neither shape
-  spans that range. Now states the coverage of each shape separately;
-- "four defects, each produced a convincing healthy" - there are three, one
-  produced a false healthy, one a false WEDGE, and the fourth item was a design
-  choice rather than a defect. The issue and its linked evidence disagreed
-  about the instrument's own history, which invites exactly the reading a
-  negative result cannot survive;
-- the ordering argument in `README.md` leaned on async `nix store add` raising
-  concurrency into the wedge, which is a different RPC plus a mechanism this
-  report exists to disclaim. Replaced with the orphan behavior.
+Applied to this file across the three rounds: the memory figure (stated
+"apiece" where the measurement is per-worker across seven, a 7x error, and
+citing the pre-fix reading when the post-fix one is later and larger); the
+coverage claim (three different wrong totals in three rounds, now enumerated
+per shape and never counted); the instrument-defect count (now stated once, in
+`daemon-wedge.md`, and linked from here); the task count, unsourced in four
+places; and the two caveats a reader deserves without having to derive them -
+that there is no positive control, and that earlier oracles were blind to this
+exact bug.
 
-STILL OPEN before filing, and each needs a measurement rather than an edit:
+STILL OPEN, and each needs a measurement rather than an edit:
 
-- "no kernel flock waiter" - say how that was determined, or drop it;
+- "no kernel `flock` waiter" - say how that was determined, or drop it;
 - "verified per kill" - name how many kills, or soften it;
-- the 20 GiB orphan figure is a sum over seventeen processes from a single `ps`
-  reading and should say so;
+- the 20 GiB / 7.5 GiB orphan figures are one `ps` reading summed across
+  seventeen processes and should say so;
+- "swap drained" and the free-memory figures for the ladder host are not in
+  either run log; either record them on a re-run or drop them;
 - search their tracker for duplicates. Not done: it is part of filing.
 
-Status: NOT SENDABLE. Needs a second audit round after the open items above.
+Status: NOT SENDABLE. A fourth round is owed after the open items.
