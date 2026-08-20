@@ -48,6 +48,11 @@ pub enum Error {
     BuildFailed { path: String, error_msg: String },
     #[error("daemon returned no build result for {0}")]
     MissingBuildResult(String),
+    #[error(
+        "daemon gave no reply to a build request through {attempts} attempts \
+         (final allowance {last_allowance_s}s); daemon-side wedge"
+    )]
+    DaemonStalled { attempts: u32, last_allowance_s: u64 },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -307,11 +312,54 @@ impl BuilderRpcClient {
             })
             .collect();
 
+        // Watchdog against a daemon-side wedge, measured 2026-08-20 on the
+        // qtwebengine graph: under ~20 concurrent build requests, daemon
+        // children go dead-asleep mid-build - build locks held, zero CPU,
+        // zero context switches over 20s, no kernel lock waiters, no
+        // builder processes, nothing in the daemon log - while the client
+        // side parks forever awaiting the reply. Root cause is on the
+        // daemon side of the socket and unreachable from here; what IS
+        // reachable is the connection: closing it kills the stuck daemon
+        // child, which releases its locks (verified - every driver kill
+        // unwedged the daemon). So: bound the wait, drop the wedged
+        // connection (the guard is dirty mid-execute, so drop discards
+        // rather than recirculates it), and retry on a fresh one. Builds
+        // are idempotent daemon-side. The allowance escalates 4x per
+        // attempt so a genuinely long single build (the terminal link)
+        // that trips a false positive still converges: killed once at
+        // 300s, it gets 1200s, then 4800s.
         let results = self.runtime.block_on(async {
-            let mut guard = self.pool.acquire().await?;
-            guard
-                .execute(|client| client.build_paths_with_results(&merged, BuildMode::Normal))
+            let mut attempt: u32 = 0;
+            loop {
+                let allowance_s: u64 = 300u64 << (2 * attempt.min(2));
+                let mut guard = self.pool.acquire().await.map_err(Error::from)?;
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(allowance_s),
+                    guard.execute(|client| {
+                        client.build_paths_with_results(&merged, BuildMode::Normal)
+                    }),
+                )
                 .await
+                {
+                    Ok(res) => break res.map_err(Error::from),
+                    Err(_elapsed) => {
+                        drop(guard);
+                        attempt += 1;
+                        if attempt > 3 {
+                            break Err(Error::DaemonStalled {
+                                attempts: attempt,
+                                last_allowance_s: allowance_s,
+                            });
+                        }
+                        eprintln!(
+                            "nix-ninja: no daemon reply to a build request in \
+                             {allowance_s}s; dropped the wedged connection \
+                             (frees the stuck daemon child's locks) and \
+                             retrying, attempt {attempt}"
+                        );
+                    }
+                }
+            }
         })?;
 
         // The daemon replies keyed by the RESOLVED drv path while the

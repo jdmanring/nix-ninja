@@ -2147,7 +2147,7 @@ fn upload_python_closure_uncached(
     let mut visited: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
     let mut queue: Vec<PathBuf> = vec![start_dir.to_path_buf()];
-    let mut upload_dir =
+    let upload_dir =
         |dir: &Path, cap: usize, out: &mut Vec<DerivedFile>| -> Result<bool> {
             match walk_dir_capped(rpc_client, build_dir, dir, cap)? {
                 Some(files) => {
