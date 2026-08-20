@@ -328,10 +328,25 @@ impl BuilderRpcClient {
         // attempt so a genuinely long single build (the terminal link)
         // that trips a false positive still converges: killed once at
         // 300s, it gets 1200s, then 4800s.
+        // The retry path needs its own concurrency cap, measured round 81:
+        // the wedge is load-triggered (~20 concurrent build requests), and
+        // a mass timeout retries all ~20 requests SIMULTANEOUSLY - the
+        // recovery recreates the trigger, the fresh daemon children wedge
+        // on contact (19 attempt-2 timeouts in a row, children born
+        // 08:03:27 dead-asleep by 08:04), and the loop converges only on
+        // its own attempt budget. First-attempt traffic arrives naturally
+        // staggered and stays uncapped; retries queue through this gate so
+        // recovering requests trickle back below the wedge threshold.
+        static RETRY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
         let results = self.runtime.block_on(async {
             let mut attempt: u32 = 0;
             loop {
                 let allowance_s: u64 = 300u64 << (2 * attempt.min(2));
+                let _gate = if attempt > 0 {
+                    Some(RETRY_GATE.acquire().await.expect("retry gate is never closed"))
+                } else {
+                    None
+                };
                 // A connect can also fail transiently: right after a mass
                 // wedge recovery the daemon is busy reaping ~20 killed
                 // children and fresh accepts time out (measured round 80:
