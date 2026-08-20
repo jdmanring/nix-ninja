@@ -338,6 +338,17 @@ impl BuilderRpcClient {
         // staggered and stays uncapped; retries queue through this gate so
         // recovering requests trickle back below the wedge threshold.
         static RETRY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        // Gauge of build requests currently awaiting a daemon reply. The
+        // wedge is load-triggered and every log line so far has said
+        // "~20 concurrent" from inference; printing the gauge at timeout
+        // time makes the trigger a measurement and prices the gate size.
+        static IN_FLIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        fn now_s() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }
         let results = self.runtime.block_on(async {
             let mut attempt: u32 = 0;
             loop {
@@ -368,15 +379,32 @@ impl BuilderRpcClient {
                         continue;
                     }
                 };
-                match tokio::time::timeout(
+                IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let started = std::time::Instant::now();
+                let outcome = tokio::time::timeout(
                     std::time::Duration::from_secs(allowance_s),
                     guard.execute(|client| {
                         client.build_paths_with_results(&merged, BuildMode::Normal)
                     }),
                 )
-                .await
-                {
-                    Ok(res) => break res.map_err(Error::from),
+                .await;
+                let in_flight = IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                match outcome {
+                    Ok(res) => {
+                        // Recovery success was silent before this line, so
+                        // the only readable verdict on a retry policy was
+                        // the absence of the next timeout - a weak signal.
+                        if attempt > 0 {
+                            eprintln!(
+                                "nix-ninja: [{}] retry succeeded on attempt {attempt} \
+                                 after {}s ({} requests in flight)",
+                                now_s(),
+                                started.elapsed().as_secs(),
+                                in_flight,
+                            );
+                        }
+                        break res.map_err(Error::from);
+                    }
                     Err(_elapsed) => {
                         drop(guard);
                         attempt += 1;
@@ -387,10 +415,12 @@ impl BuilderRpcClient {
                             });
                         }
                         eprintln!(
-                            "nix-ninja: no daemon reply to a build request in \
-                             {allowance_s}s; dropped the wedged connection \
-                             (frees the stuck daemon child's locks) and \
-                             retrying, attempt {attempt}"
+                            "nix-ninja: [{}] no daemon reply to a build request in \
+                             {allowance_s}s ({} requests in flight); dropped the \
+                             wedged connection (frees the stuck daemon child's \
+                             locks) and retrying, attempt {attempt}",
+                            now_s(),
+                            in_flight,
                         );
                     }
                 }
