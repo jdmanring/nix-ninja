@@ -1681,7 +1681,7 @@ fn upload_referenced_file(
     let mut out = vec![main];
     if is_py {
         if let Some(dir) = path.parent() {
-            upload_python_closure(rpc_client, build_dir, dir, &path, &mut out)?;
+            upload_python_closure(rpc_client, build_dir, dir, &mut out)?;
         }
     }
     Ok(out)
@@ -1719,29 +1719,30 @@ fn upload_python_closure(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &Path,
     start_dir: &Path,
-    main: &Path,
     out: &mut Vec<DerivedFile>,
 ) -> Result<()> {
-    // Memoized on (script dir, script): the walk memo alone was not
-    // enough, because the UNCLE and third_party deep scans issue
-    // hundreds of read_dirs per unresolved name per task - an optional
-    // or python-2 import that never resolves re-paid the full scan on
-    // every task referencing the same script (measured: one driver
-    // thread at two-thirds KERNEL time while the build sat idle). The
-    // closure's result for a directory is deterministic within a run,
-    // so the whole outcome caches.
+    // Memoized on the script DIRECTORY alone. The key was
+    // (script dir, script) and that coarseness was the whole serial
+    // bottleneck at Chromium scale: the walk depends on the script only
+    // through a skip of the script's own file, so every script in a
+    // shared directory (mojom, grit: hundreds per dir) re-paid the full
+    // tree walk under a fresh key. perf on round 60: Path::join plus
+    // malloc churn under upload_python_closure_uncached at ~50% of all
+    // driver cycles. The skip is gone (the script re-uploads as one
+    // more content-cached file and the consumer's input_set dedupes by
+    // path), so the result is script-independent and one walk per
+    // directory serves every script in it.
     static CLOSURE_MEMO: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<(PathBuf, PathBuf), Vec<DerivedFile>>>,
+        std::sync::Mutex<HashMap<PathBuf, Vec<DerivedFile>>>,
     > = std::sync::OnceLock::new();
     let memo = CLOSURE_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let key = (start_dir.to_path_buf(), main.to_path_buf());
-    if let Some(hit) = memo.lock().unwrap().get(&key) {
+    if let Some(hit) = memo.lock().unwrap().get(start_dir) {
         out.extend(hit.iter().cloned());
         return Ok(());
     }
     let mut fresh: Vec<DerivedFile> = Vec::new();
-    upload_python_closure_uncached(rpc_client, build_dir, start_dir, main, &mut fresh)?;
-    memo.lock().unwrap().insert(key, fresh.clone());
+    upload_python_closure_uncached(rpc_client, build_dir, start_dir, &mut fresh)?;
+    memo.lock().unwrap().insert(start_dir.to_path_buf(), fresh.clone());
     out.extend(fresh);
     Ok(())
 }
@@ -1750,7 +1751,6 @@ fn upload_python_closure_uncached(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &Path,
     start_dir: &Path,
-    main: &Path,
     out: &mut Vec<DerivedFile>,
 ) -> Result<()> {
     const CLOSURE_DIR_CAP: usize = 64;
@@ -1786,9 +1786,6 @@ fn upload_python_closure_uncached(
         })?;
         for entry in entries.flatten() {
             let p = entry.path();
-            if p == main {
-                continue;
-            }
             if p.extension().is_some_and(|e| e == "py") && p.is_file() {
                 out.push(new_opaque_file(rpc_client, build_dir, p)?);
             } else if p.is_dir()
