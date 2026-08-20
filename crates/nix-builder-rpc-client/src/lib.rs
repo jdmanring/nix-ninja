@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use harmonia_protocol::daemon_wire::types2::{BuildMode, BuildResultInner};
 use harmonia_protocol::store_path::StoreDir;
-use harmonia_protocol::types::{DaemonError, DaemonStore};
+use harmonia_protocol::types::{DaemonError, DaemonErrorKind, DaemonStore};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
 use harmonia_store_derivation::derivation::Derivation;
 use harmonia_store_derivation::derived_path::{
@@ -48,14 +48,46 @@ pub enum Error {
     BuildFailed { path: String, error_msg: String },
     #[error("daemon returned no build result for {0}")]
     MissingBuildResult(String),
+    // The variant name leads the Display text deliberately: the shell
+    // monitors grep the LOG for "DaemonStalled", and the log only ever
+    // sees this error through Display - a message without the name is a
+    // stall the monitoring cannot match.
     #[error(
-        "daemon gave no reply to a build request through {attempts} attempts \
-         (final allowance {last_allowance_s}s); daemon-side wedge"
+        "DaemonStalled: no useful daemon reply through {attempts} stall attempts \
+         and {connect_failures} connect failures (final allowance \
+         {last_allowance_s}s); daemon-side wedge"
     )]
-    DaemonStalled { attempts: u32, last_allowance_s: u64 },
+    DaemonStalled {
+        attempts: u32,
+        connect_failures: u32,
+        last_allowance_s: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Watchdog allowance for the Nth stall retry: 300s, 1200s, 4800s, then
+/// 4800s again for the final attempt. The `.min(2)` cap is load-bearing:
+/// without it a large attempt count shifts past the u64 width.
+fn stall_allowance_s(stall_attempts: u32) -> u64 {
+    300u64 << (2 * stall_attempts.min(2))
+}
+
+#[cfg(test)]
+mod watchdog_policy_tests {
+    use super::stall_allowance_s;
+
+    #[test]
+    fn allowance_schedule_is_pinned() {
+        assert_eq!(stall_allowance_s(0), 300);
+        assert_eq!(stall_allowance_s(1), 1200);
+        assert_eq!(stall_allowance_s(2), 4800);
+        // The cap: every later attempt stays at 4800, and in particular
+        // an attempt count >= 32 must not shift into nonsense.
+        assert_eq!(stall_allowance_s(3), 4800);
+        assert_eq!(stall_allowance_s(64), 4800);
+    }
+}
 
 pub struct BuilderRpcClient {
     /// Multi-thread so the pool's RAII drop tasks can complete asynchronously.
@@ -327,7 +359,7 @@ impl BuilderRpcClient {
         // are idempotent daemon-side. The allowance escalates 4x per
         // attempt so a genuinely long single build (the terminal link)
         // that trips a false positive still converges: killed once at
-        // 300s, it gets 1200s, then 4800s.
+        // 300s, it gets 1200s, then 4800s twice (attempts 0-3).
         // The retry path needs its own concurrency cap, measured round 81:
         // the wedge is load-triggered (~20 concurrent build requests), and
         // a mass timeout retries all ~20 requests SIMULTANEOUSLY - the
@@ -338,22 +370,34 @@ impl BuilderRpcClient {
         // staggered and stays uncapped; retries queue through this gate so
         // recovering requests trickle back below the wedge threshold.
         static RETRY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-        // Gauge of build requests currently awaiting a daemon reply. The
-        // wedge is load-triggered and every log line so far has said
-        // "~20 concurrent" from inference; printing the gauge at timeout
-        // time makes the trigger a measurement and prices the gate size.
+        // Gauge of build requests currently awaiting a daemon reply,
+        // counted AFTER the pool grants a connection - it reads daemon-side
+        // concurrency (bounded by pool size) and is blind to pool-queued
+        // requests, which is the concurrency the wedge cares about. The
+        // peak logs once per new high-water mark: the wedge trigger
+        // ("~20 concurrent") was inference for three days because the
+        // gauge only ever printed after the fact.
         static IN_FLIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        static PEAK_IN_FLIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         fn now_s() -> u64 {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0)
         }
+        use std::sync::atomic::Ordering::Relaxed;
         let results = self.runtime.block_on(async {
-            let mut attempt: u32 = 0;
+            // Two counters, deliberately not one: with a shared budget,
+            // three stalls plus one connect failure would surface as a
+            // plain connect error (the wedge evidence discarded), and
+            // three connect failures would consume the allowance
+            // escalation a genuinely long build depends on.
+            let mut stall_attempts: u32 = 0;
+            let mut connect_failures: u32 = 0;
             loop {
-                let allowance_s: u64 = 300u64 << (2 * attempt.min(2));
-                let _gate = if attempt > 0 {
+                let retrying = stall_attempts + connect_failures > 0;
+                let allowance_s = stall_allowance_s(stall_attempts);
+                let mut _gate = if retrying {
                     Some(RETRY_GATE.acquire().await.expect("retry gate is never closed"))
                 } else {
                     None
@@ -362,25 +406,37 @@ impl BuilderRpcClient {
                 // wedge recovery the daemon is busy reaping ~20 killed
                 // children and fresh accepts time out (measured round 80:
                 // one "timeout: connecting to daemon" ended the round a
-                // minute after the recovery worked). Same retry budget,
-                // short backoff.
+                // minute after the recovery worked).
                 let mut guard = match self.pool.acquire().await {
                     Ok(g) => g,
                     Err(e) => {
-                        attempt += 1;
-                        if attempt > 3 {
+                        connect_failures += 1;
+                        if connect_failures > 3 {
+                            eprintln!(
+                                "nix-ninja: [{}] WATCHDOG giving-up: connect failed \
+                                 {connect_failures} times ({stall_attempts} stalls before it)",
+                                now_s(),
+                            );
                             break Err(Error::from(e));
                         }
                         eprintln!(
-                            "nix-ninja: daemon connection failed ({e}); \
-                             retrying in 10s, attempt {attempt}"
+                            "nix-ninja: [{}] WATCHDOG connect-fail ({e}); retrying in 10s \
+                             (connect failures {connect_failures}, stalls {stall_attempts})",
+                            now_s(),
                         );
+                        // Sleep OUTSIDE the gate permit: holding one of the
+                        // two recovery lanes through a 10s nap starves the
+                        // other retryers for no reason.
+                        _gate = None;
                         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                         continue;
                     }
                 };
-                IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let started = std::time::Instant::now();
+                let in_now = IN_FLIGHT.fetch_add(1, Relaxed) + 1;
+                if in_now > PEAK_IN_FLIGHT.fetch_max(in_now, Relaxed) {
+                    eprintln!("nix-ninja: [{}] WATCHDOG peak in-flight {in_now}", now_s());
+                }
+                let started_wall = now_s();
                 let outcome = tokio::time::timeout(
                     std::time::Duration::from_secs(allowance_s),
                     guard.execute(|client| {
@@ -388,39 +444,76 @@ impl BuilderRpcClient {
                     }),
                 )
                 .await;
-                let in_flight = IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let others = IN_FLIGHT.fetch_sub(1, Relaxed).saturating_sub(1);
                 match outcome {
-                    Ok(res) => {
+                    Ok(Ok(res)) => {
                         // Recovery success was silent before this line, so
                         // the only readable verdict on a retry policy was
                         // the absence of the next timeout - a weak signal.
-                        if attempt > 0 {
+                        if retrying {
                             eprintln!(
-                                "nix-ninja: [{}] retry succeeded on attempt {attempt} \
-                                 after {}s ({} requests in flight)",
+                                "nix-ninja: [{}] WATCHDOG recovered after {stall_attempts} \
+                                 stall(s) and {connect_failures} connect failure(s), \
+                                 {}s this attempt ({others} others in flight)",
                                 now_s(),
-                                started.elapsed().as_secs(),
-                                in_flight,
+                                now_s().saturating_sub(started_wall),
                             );
                         }
-                        break res.map_err(Error::from);
+                        break Ok(res);
                     }
-                    Err(_elapsed) => {
+                    Ok(Err(e)) => {
+                        // A mid-execute CONNECTION error is the wedge family
+                        // wearing an error instead of a hang, and recovery
+                        // itself inflicts it on siblings: dropping a wedged
+                        // connection kills a daemon child, and the reaping
+                        // daemon resets its neighbours. Retry those on a
+                        // fresh connection exactly like a timeout. A daemon-
+                        // REPORTED error (Remote) is a real verdict about
+                        // the request and stays terminal.
+                        let connection_level = matches!(
+                            e.kind(),
+                            DaemonErrorKind::IO(_)
+                                | DaemonErrorKind::WrongMagic(_)
+                                | DaemonErrorKind::UnsupportedVersion(_)
+                                | DaemonErrorKind::NoSinkForLoggerWrite
+                                | DaemonErrorKind::NoSourceForLoggerRead
+                        );
+                        if !connection_level {
+                            break Err(Error::from(e));
+                        }
                         drop(guard);
-                        attempt += 1;
-                        if attempt > 3 {
+                        stall_attempts += 1;
+                        if stall_attempts > 3 {
                             break Err(Error::DaemonStalled {
-                                attempts: attempt,
+                                attempts: stall_attempts,
+                                connect_failures,
                                 last_allowance_s: allowance_s,
                             });
                         }
                         eprintln!(
-                            "nix-ninja: [{}] no daemon reply to a build request in \
-                             {allowance_s}s ({} requests in flight); dropped the \
-                             wedged connection (frees the stuck daemon child's \
-                             locks) and retrying, attempt {attempt}",
+                            "nix-ninja: [{}] WATCHDOG conn-error ({e}) after {}s; dropped \
+                             the connection and retrying (stalls {stall_attempts})",
                             now_s(),
-                            in_flight,
+                            now_s().saturating_sub(started_wall),
+                        );
+                    }
+                    Err(_elapsed) => {
+                        drop(guard);
+                        stall_attempts += 1;
+                        if stall_attempts > 3 {
+                            break Err(Error::DaemonStalled {
+                                attempts: stall_attempts,
+                                connect_failures,
+                                last_allowance_s: allowance_s,
+                            });
+                        }
+                        eprintln!(
+                            "nix-ninja: [{}] WATCHDOG timeout: no daemon reply in \
+                             {allowance_s}s, waited since [{started_wall}] ({others} \
+                             others in flight); dropped the wedged connection (frees \
+                             the stuck daemon child's locks) and retrying \
+                             (stalls {stall_attempts})",
+                            now_s(),
                         );
                     }
                 }
@@ -435,14 +528,18 @@ impl BuilderRpcClient {
         // as a first-chance failure reporter where paths do agree.
         let mut by_key: HashMap<String, _> = HashMap::new();
         let mut out_pool: HashMap<OutputName, StorePath> = HashMap::new();
-        let mut any_failure: Option<String> = None;
+        // ALL failures, not the last one: with two failed derivations a
+        // single slot names one of them nondeterministically, and the
+        // missing-result classification below needs to know whether ANY
+        // failure occurred, not which arrived last.
+        let mut failures: Vec<String> = Vec::new();
         for r in results {
             if let Some(success) = r.result.success() {
                 for (name, realisation) in &success.built_outputs {
                     out_pool.insert(name.clone(), realisation.out_path.clone());
                 }
             } else if let BuildResultInner::Failure(f) = &r.result.inner {
-                any_failure = Some(String::from_utf8_lossy(&f.error_msg).into_owned());
+                failures.push(String::from_utf8_lossy(&f.error_msg).into_owned());
             }
             let key = match &r.path {
                 DerivedPath::Opaque(path) => path.to_string(),
@@ -498,14 +595,22 @@ impl BuilderRpcClient {
                             }
                         }
                         out_pool.get(output).cloned().ok_or_else(|| {
-                            Error::MissingBuildResult(format!(
-                                "{display} (no realisation named '{output}' in {} pooled outputs{})",
-                                out_pool.len(),
-                                any_failure
-                                    .as_deref()
-                                    .map(|f| format!("; a result failed: {f}"))
-                                    .unwrap_or_default()
-                            ))
+                            // A CA derivation's reply is keyed by the RESOLVED
+                            // path, so a genuine build failure misses both maps
+                            // and used to surface as MissingBuildResult - the
+                            // right facts under the wrong error. When any
+                            // failure exists, report it as the failure it is.
+                            if failures.is_empty() {
+                                Error::MissingBuildResult(format!(
+                                    "{display} (no realisation named '{output}' in {} pooled outputs)",
+                                    out_pool.len(),
+                                ))
+                            } else {
+                                Error::BuildFailed {
+                                    path: display.clone(),
+                                    error_msg: failures.join("; "),
+                                }
+                            }
                         })
                     }
                 }
