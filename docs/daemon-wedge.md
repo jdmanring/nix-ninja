@@ -98,7 +98,12 @@ obvious move.
    wrote a file and exited inside the settle window, so the tick oracle never
    had a subject and only build-completion was doing any work. The first three
    rounds returned "healthy" while observing ZERO daemon children. The builder
-   now burns CPU for `--spin` iterations.
+   now burns CPU for `--spin` iterations. The default of 15,000,000 was
+   calibrated on this host and nowhere else: 3,000,000 iterations timed at
+   4.1 s, so 15,000,000 is about 20 s, comfortably past `--settle` plus
+   `--interval`. It is a shell loop, so it will time differently on other
+   hardware; the property that matters is that a builder outlive the sampling
+   window, and the `processes sampled` column is what shows whether it did.
 
 2. **Not a defect: it burns rather than sleeps, deliberately.** The obvious
    repair for item 1 is a sleeping builder, and a sleeping child reads zero
