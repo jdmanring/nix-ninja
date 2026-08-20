@@ -2007,6 +2007,24 @@ fn grd_references(grd: &Path) -> Result<Vec<PathBuf>> {
 /// indentation - fine here, because an OPTIONAL import that fails is the
 /// pattern try blocks exist for.
 fn python_import_names(pkg: &Path) -> Result<Vec<String>> {
+    // Memoized like walk_dir_capped and for the same reason: the
+    // closure runs per task and re-reads the same directories' file
+    // bodies thousands of times otherwise.
+    static NAMES_MEMO: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, Vec<String>>>,
+    > = std::sync::OnceLock::new();
+    let memo = NAMES_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(hit) = memo.lock().unwrap().get(pkg) {
+        return Ok(hit.clone());
+    }
+    let result = python_import_names_uncached(pkg)?;
+    memo.lock()
+        .unwrap()
+        .insert(pkg.to_path_buf(), result.clone());
+    Ok(result)
+}
+
+fn python_import_names_uncached(pkg: &Path) -> Result<Vec<String>> {
     let mut names = std::collections::BTreeSet::new();
     let entries = fs::read_dir(pkg)
         .map_err(|e| anyhow!("read_dir({}) for import scan: {e}", pkg.display()))?;
@@ -2043,6 +2061,33 @@ fn python_import_names(pkg: &Path) -> Result<Vec<String>> {
 
 /// Recursive regular-file upload of one directory, or None past the cap.
 fn walk_dir_capped(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    dir: &Path,
+    cap: usize,
+) -> Result<Option<Vec<DerivedFile>>> {
+    // Memoized process-wide: the python closure runs per TASK, and at
+    // Chromium scale the same directories recur thousands of times -
+    // including over-cap refusals, which cost a full capped walk each
+    // (the chromium root was being re-walked to 8192 entries per task,
+    // measured as the driver pinning a core while the build sat idle).
+    // Store dedup makes repeat uploads cheap; this makes them free, and
+    // makes the NEGATIVE result free too, which is the half that
+    // mattered.
+    static WALK_MEMO: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(PathBuf, usize), Option<Vec<DerivedFile>>>>,
+    > = std::sync::OnceLock::new();
+    let memo = WALK_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let key = (dir.to_path_buf(), cap);
+    if let Some(hit) = memo.lock().unwrap().get(&key) {
+        return Ok(hit.clone());
+    }
+    let result = walk_dir_capped_uncached(rpc_client, build_dir, dir, cap)?;
+    memo.lock().unwrap().insert(key, result.clone());
+    Ok(result)
+}
+
+fn walk_dir_capped_uncached(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &Path,
     dir: &Path,
