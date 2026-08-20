@@ -259,6 +259,54 @@ impl BuilderRpcClient {
             }
         }
 
+        // The wire writer formats each DerivedPath through a bounded
+        // display buffer (harmonia's display_buf_size, 8 KiB, no public
+        // setter on DaemonClientBuilder): one Built entry whose merged
+        // output set prints as `drv^o1,o2,...` past that bound fails the
+        // whole request as `io error: an error occurred when formatting
+        // an argument` - fmt::Error with the real cause erased. A task
+        // inheriting hundreds of outputs of ONE producer drv (the
+        // configure set) crosses it. Split any oversized entry into
+        // several Built entries for the same drv, budgeted by the
+        // PRINTED length; the daemon accepts duplicates and the reply
+        // handling below pools realisations by output name anyway.
+        const MAX_SPEC_CHARS: usize = 4096;
+        let merged: Vec<DerivedPath> = merged
+            .into_iter()
+            .flat_map(|p| match p {
+                DerivedPath::Built { drv_path, outputs: OutputSpec::Named(set) }
+                    if set.iter().map(|o| o.as_ref().len() + 1).sum::<usize>()
+                        > MAX_SPEC_CHARS =>
+                {
+                    let mut chunks: Vec<DerivedPath> = Vec::new();
+                    let mut cur: Vec<_> = Vec::new();
+                    let mut cur_len = 0usize;
+                    for o in set {
+                        let l = o.as_ref().len() + 1;
+                        if cur_len + l > MAX_SPEC_CHARS && !cur.is_empty() {
+                            chunks.push(DerivedPath::Built {
+                                drv_path: drv_path.clone(),
+                                outputs: OutputSpec::Named(
+                                    std::mem::take(&mut cur).into_iter().collect(),
+                                ),
+                            });
+                            cur_len = 0;
+                        }
+                        cur_len += l;
+                        cur.push(o);
+                    }
+                    if !cur.is_empty() {
+                        chunks.push(DerivedPath::Built {
+                            drv_path,
+                            outputs: OutputSpec::Named(cur.into_iter().collect()),
+                        });
+                    }
+                    chunks
+                }
+                other => vec![other],
+            })
+            .collect();
+
         let results = self.runtime.block_on(async {
             let mut guard = self.pool.acquire().await?;
             guard
