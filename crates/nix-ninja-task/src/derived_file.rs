@@ -148,7 +148,14 @@ pub fn create_symlinks(
         // shebang file with no extension), and its own relative
         // require('../lib/tsc.js') then resolves inside the store,
         // where the module tree does not exist.
-        if input.build_path.extension().is_some_and(|e| e == "py")
+        // .mjs/.js/.cjs get the same treatment: node realpaths a module
+        // before resolving its relative imports, so a symlinked
+        // eslint.config.mjs resolved ../../third_party/... from inside
+        // /nix/store and landed on /third_party (measured).
+        if input
+            .build_path
+            .extension()
+            .is_some_and(|e| e == "py" || e == "mjs" || e == "js" || e == "cjs")
             || input
                 .build_path
                 .components()
