@@ -355,8 +355,27 @@ impl Runner {
                 || c.contains("ts_library.py")
                 || c.contains("generate_grd.py")
         }) {
+            let mut record = task.inputs.clone();
+            // generate_grd's SOURCE files exist only on its cmdline, as
+            // bare names relative to --input-files-base-dir under the
+            // repo root (never as edge inputs - the tool only writes a
+            // manifest naming them). grit reads their CONTENT two edges
+            // downstream (grd -> grdp -> file), so resolve and upload
+            // them into the record here; the consumer's worklist walks
+            // grd -> stamp_inputs -> grdp fids -> this record.
+            if build
+                .cmdline
+                .as_deref()
+                .is_some_and(|c| c.contains("generate_grd.py"))
+            {
+                for p in generate_grd_input_files(build.cmdline.as_deref().unwrap()) {
+                    let up =
+                        new_opaque_file(&self.rpc_client, &self.config.build_dir, p)?;
+                    record.push(up);
+                }
+            }
             for fid in build.outs() {
-                self.stamp_input_files.insert(*fid, task.inputs.clone());
+                self.stamp_input_files.insert(*fid, record.clone());
             }
         }
 
@@ -1904,6 +1923,49 @@ fn grd_reference_candidates(grd: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Source files a generate_grd.py invocation names on its cmdline:
+/// `--input-files f1 f2 ...` relative to `--input-files-base-dir base`,
+/// where base is relative to the repo root. The root is derived from the
+/// tool's own path token (it always ends `ui/webui/resources/tools/`
+/// `generate_grd.py`), so the function is tree-layout-independent.
+/// Existence-filtered: a name that resolves nowhere is a manifest entry
+/// for a GENERATED file, which the edge's declared inputs already carry.
+fn generate_grd_input_files(cmdline: &str) -> Vec<PathBuf> {
+    const TOOL_SUFFIX: &str = "ui/webui/resources/tools/generate_grd.py";
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let Some(tool) = toks.iter().find(|t| t.ends_with(TOOL_SUFFIX)) else {
+        return Vec::new();
+    };
+    let root = &tool[..tool.len() - TOOL_SUFFIX.len()];
+    let mut base: Option<&str> = None;
+    let mut files: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        match toks[i] {
+            "--input-files-base-dir" => {
+                base = toks.get(i + 1).copied();
+                i += 2;
+            }
+            "--input-files" => {
+                i += 1;
+                while i < toks.len() && !toks[i].starts_with("--") {
+                    files.push(toks[i]);
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    let Some(base) = base else {
+        return Vec::new();
+    };
+    files
+        .into_iter()
+        .map(|f| PathBuf::from(format!("{root}{base}/{f}")))
+        .filter(|p| p.is_file())
+        .collect()
+}
+
 /// Quoted string segments of every os.path.join line in the *_project.py
 /// files of `dir`, each line yielding one relative path. Used only for
 /// catapult-style project definition files, whose join lines name data
@@ -2469,6 +2531,30 @@ mod normalize_output_tests {
         .unwrap();
         let dirs = python_syspath_dirs(&tools).unwrap();
         assert_eq!(dirs, vec![node]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn generate_grd_cmdline_files_resolve_against_tool_root() {
+        use super::generate_grd_input_files;
+        use std::fs;
+        let root = std::env::temp_dir().join("nn-grd-input-files-test");
+        let imgs = root.join("ui/webui/resources/images");
+        fs::create_dir_all(&imgs).unwrap();
+        fs::create_dir_all(root.join("ui/webui/resources/tools")).unwrap();
+        fs::write(imgs.join("add.svg"), "<svg/>").unwrap();
+        let cmd = format!(
+            "python3 {r}/ui/webui/resources/tools/generate_grd.py \
+             --out-grd gen/x/resources.grdp --grd-prefix webui_images \
+             --root-gen-dir gen --input-files-base-dir ui/webui/resources/images \
+             --input-files add.svg missing.svg --resource-path-prefix images",
+            r = root.display()
+        );
+        let got = generate_grd_input_files(&cmd);
+        // missing.svg fails the existence filter; add.svg resolves.
+        assert_eq!(got, vec![imgs.join("add.svg")]);
+        // No --input-files at all (the .grd aggregation edges): empty.
+        assert!(generate_grd_input_files("python3 x/generate_grd.py --out-grd y").is_empty());
         fs::remove_dir_all(&root).unwrap();
     }
 
