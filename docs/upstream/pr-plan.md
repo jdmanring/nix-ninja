@@ -1,7 +1,8 @@
 # DRAFT PR split for nix-ninja
 
 Not sent. The fork is 93 files and about +14,000 lines against `9a07e67`,
-roughly three quarters of that being the vendored n2 tree. That is not a pull
+72 of those files and about two thirds of those lines being the vendored n2
+tree. That is not a pull
 request, it is a pile, and sending it as one guarantees it is never reviewed.
 This is the split.
 
@@ -21,9 +22,12 @@ reason. Real ninja does not sandbox, so a generator that reads a file nobody
 declared still works, and its build file is never corrected. Under nix-ninja
 each of those is a hard failure thousands of tasks in.
 
-About forty commits, each one a rule, each found by a failure rather than by
-design. They are NOT nine tidy classes - an earlier draft of this file said
-nine and an audit against the log falsified it. Grouped by the ecosystem whose
+91 commits in the range, 66 of them touching `crates/nix-ninja` or
+`crates/deps-infer` (`git log --oneline 9a07e67..HEAD -- crates/nix-ninja
+crates/deps-infer | wc -l`), most of which are one inference rule each, found
+by a failure rather than by design. They are NOT nine tidy classes, and they
+are not "about forty" either - this file has now said both, and an audit
+falsified each in turn. Re-run the command rather than trusting this sentence. Grouped by the ecosystem whose
 generators needed them:
 
 - **python import resolution** - the largest group and the one with real depth.
@@ -121,3 +125,17 @@ it recovers, since its own action is a load spike.
 `${rspfile}` support belongs in `hinshun/n2`. Sending our vendored n2 tree here
 would transfer our own merge liability to them; see `README.md` in this
 directory.
+
+## Audit
+
+Round 1 (2026-08-20) falsified this file's class list: it said nine classes
+where the log carries 66 commits over the two crates. Round 2 falsified the
+replacement, "about forty", the same way - a count written from memory twice in
+a row, in the file whose whole job is to describe a diff accurately. It also
+found the file's diff stats stale and the phony work promised by PR 1 to PR 3
+and refused by PR 3.
+
+All are fixed, and the class list now carries the command that regenerates it
+rather than a number. Run the command; do not trust the sentence.
+
+Round 3 is owed. Status: NOT SENDABLE.

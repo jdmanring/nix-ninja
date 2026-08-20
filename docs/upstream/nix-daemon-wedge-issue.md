@@ -64,30 +64,55 @@ does not clean up after itself.
 
 ### What we could NOT establish
 
-We wrote a standalone reproducer and it does not reproduce. Seven distinct
-concurrency levels between 2 and 32, across two request shapes - N clients
-issuing one `build_paths` each (2 through 24), and one client issuing N
-concurrently (4 through 32) - against a freshly restarted daemon on an idle
-24-thread host with swap drained: every round healthy, every build completed,
-no child ever read zero ticks.
+We wrote a standalone reproducer and it has not reproduced the wedge at any
+level we have run it at.
 
-So we are explicitly NOT claiming a concurrency threshold. Concurrency alone
-does not appear to be the trigger. The reproducer and its result table are at
-`scripts/daemon-stress-bisect.py` and `docs/daemon-wedge.md` in our fork, and
-the negative result is written up there as carefully as the positive one,
-including three defects in the instrument itself that we had to fix before any
-round meant anything - one of which produced a convincing "healthy" over zero
-observed children, and one of which produced a convincing WEDGE on a round
-where both builds completed.
+In the shape this report describes - one client issuing N concurrent
+`build_paths` - that is N = 2 (negative control), 4, 8, 12, 16, 20, 24 and 32,
+each against a freshly restarted daemon on an idle 24-thread host with 30.5 GiB
+and swap drained. We also ran the contrasting shape, N clients issuing one
+request each, at N = 2, 8, 12, 16, 20 and 24. Every round completed and no
+process went dead.
+
+Two caveats we would rather state than have found:
+
+- **We have no positive control.** The reproducer has never once produced a
+  wedge, so we cannot demonstrate that it WOULD detect one. What we can show is
+  that it now resolves individual workers: each one-client round samples N+1
+  processes, one daemon child plus its N builders, and the verdict is computed
+  per process rather than over the round.
+- **An earlier version of it could not have seen this bug even if it had
+  happened.** It judged each daemon child by the CPU its whole subtree
+  accumulated, and under one client there is a single child forking every
+  builder, so one dead worker among N live siblings was masked by theirs. Since
+  the failure we are reporting is partial - some workers stuck while the build
+  moved - that is precisely the case it was blind to. Fixed, and the whole
+  ladder above was re-run afterwards; we mention it because it is the kind of
+  thing that should make you discount a negative result, and you would be right
+  to.
+
+So we are explicitly NOT claiming a concurrency threshold, and not claiming the
+daemon is fine at these levels either. Concurrency alone does not appear to be
+the trigger. The reproducer and the full table are at
+`scripts/daemon-stress-bisect.py` and `docs/daemon-wedge.md` in our fork, where
+the negative result is written up with the four instrument defects found on the
+way to it.
 
 Our leading untested hypothesis is memory pressure, because it is the only
 candidate that explains both datasets rather than merely differing between
-them: the real build's daemon workers were measured at roughly 2 GiB RSS each,
-seven of them, taking the machine down to 2.5 GiB available, before we bounded
-what we were sending them; and the wedge coincided with the machine in swap,
-while the reproducer's builders hold a shell loop counter. A reclaim-driven
-wedge would fire at any concurrency once memory is tight, and at none while it
-is not, which is the shape of both datasets. We have not tested it yet.
+them.
+
+Two readings, in order. Before we bounded what we were sending them, seven
+daemon workers measured at roughly 2 GiB RSS each, with the machine down to
+2.5 GiB available. We bounded it, and the wedge described above happened
+AFTER that: seventeen orphans, one of them at 7.5 GiB. So the pressure did not
+go away with the fix, and the post-fix reading is the larger one. Meanwhile
+the reproducer's builders hold a shell loop counter and the host had 25 GiB
+free throughout.
+
+A reclaim-driven wedge would fire at any concurrency once memory is tight, and
+at none while it is not, which is the shape of both datasets. We have not
+tested it yet.
 
 If a maintainer can say "that region takes lock X and can block on Y", that
 would very likely be faster than us continuing to bisect from the outside.

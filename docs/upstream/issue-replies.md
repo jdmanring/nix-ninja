@@ -16,7 +16,7 @@ The body asks why nix-ninja comes out about the same as ninja. #4
 from the other.
 
 > We have profiler numbers from a much larger graph than the examples here, in
-> case they are useful: qtwebengine 6.11.1, about 15,800 tasks.
+> case they are useful: qtwebengine 6.11.1, at least 16,077 tasks (the highest task index the round-82 driver log reaches; the graph was never driven to completion, so treat it as a floor).
 >
 > Two hotspots dominated the driver, both found with `perf` against the live
 > driver rather than by reading, and both in the same place - the include scan.
@@ -135,15 +135,16 @@ by a different route.
 > argument order. We had a single-target TODO in the same place and your shape
 > is the right one; credited in our commit.
 >
-> One thing we changed while porting it, which may be worth folding in here
-> regardless of what happens to the phony half of this PR: the existing
-> `let _ = scheduler.want_file(fid)` discards a `Result`, and `want_file` is
-> what detects a dependency cycle. So the one error it exists to raise was
+> One thing in your diff worth calling out explicitly in the description,
+> regardless of what happens to the phony half: your target loop replaces the
+> existing `let _ = scheduler.want_file(fid)` with `?`. That discarded
+> `Result` matters more than it looks, because `want_file` is what detects a
+> dependency cycle. So the one error it exists to raise was
 > being thrown away, and a cyclic build proceeded and failed later somewhere
-> less obvious. Your diff already changes that line to `?` as a side effect of
-> the loop; we think it is worth calling out in the description, because it is
-> a behavior change rather than a refactor - a graph that previously built
-> will now fail early, which is correct but will surprise someone.
+> less obvious. So that line is a behavior change rather than a refactor: a
+> graph that previously built will now fail early, which is correct and will
+> surprise someone. We hit the same thing porting your target loop and kept
+> your fix.
 >
 > On the phony mechanism we went a different way, for reasons that only show up
 > under sandboxing; written up in #5 rather than here, since it is a design

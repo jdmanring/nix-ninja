@@ -5,9 +5,10 @@ James files. Nothing here has been posted, and no draft is "ready" until it
 carries an audit sign-off line naming who attacked it and when
 (`~/.claude/CLAUDE.md` rule 10).
 
-The fork exists because a real build needed it: qtwebengine 6.11.1, about
-15,800 tasks, which is one to two orders of magnitude past what the examples in
-this repository reach. Most of what follows is not a feature request. It is a
+The fork exists because a real build needed it: qtwebengine 6.11.1, at least
+16,077 tasks (the highest index the driver log reaches; the graph has not been
+driven to completion, so that is a floor), which is one to two orders of
+magnitude past what the examples in this repository reach. Most of what follows is not a feature request. It is a
 report of what breaks at that scale, with the fix that was needed to get past
 it.
 
@@ -85,3 +86,32 @@ Honesty here is what makes the rest credible.
    this fork's base.
 3. No draft is finished before an adversarial reader has tried to reject it and
    failed. Record the audit beside the draft.
+
+## Audit
+
+Round 1 (2026-08-20): ten blocking findings, no sign-off. Round 2, after the
+fixes: **NOT SIGNED OFF** again, on three independent grounds, one of which was
+a live defect in the instrument rather than in any sentence.
+
+- **The reproducer's oracle could not see the failure being reported.** It
+  summed CPU ticks over each daemon child's whole subtree, and under
+  `--one-client` there is exactly one child forking every builder, so one
+  dead-asleep worker among N burning siblings was masked. The incident is a
+  PARTIAL wedge, so the shape the drafts call the matching shape was the shape
+  the oracle was blind in. Fixed: the unit is now every process in the tree,
+  judged by whether its own subtree is entirely dead, and the ladder was re-run
+  from scratch. A selftest fixture pins it by asserting the old reading calls
+  the masking case healthy.
+- **The coverage count contradicted its own table in three files.** Round 1
+  replaced one uncheckable count with another. Coverage is now enumerated per
+  shape rather than counted.
+- **The script's docstring still carried the overclaim the prose had retired**,
+  and the issue draft links that script by path, so a maintainer following the
+  link read the disclaimed sentence.
+
+Two further findings worth naming: the memory hypothesis cited the PRE-fix
+reading of a figure whose fix predates the wedge, when the post-fix reading is
+both later and larger; and the task count appeared in four places, including an
+outward-facing reply, with no source at all.
+
+Round 3 is owed. Status: NOT SENDABLE.

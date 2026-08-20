@@ -7,7 +7,7 @@ report is only as strong as the weaker of the two.
 
 ## What was observed, during the build
 
-Measured during a ~15,800 task qtwebengine 6.11.1 build driven by nix-ninja
+Measured during a qtwebengine 6.11.1 build of at least 16,077 tasks driven by nix-ninja
 against nix-daemon 2.35.2:
 
 - daemon child processes stop making progress while holding their locks: zero
@@ -30,76 +30,100 @@ it does not clean up after itself.
 
 ## What the reproducer measured
 
-`scripts/daemon-stress-bisect.py` drives N concurrent trivial builds and reads
-each daemon child's CPU ticks to separate a working child from a dead-asleep
-one. The bisect ladder was run on 2026-08-20 against a freshly restarted
-nix-daemon 2.35.2, on a 24-thread Ryzen 9 7900X3D with 30.5 GiB of RAM, no
-other build running, swap drained to zero:
+`scripts/daemon-stress-bisect.py` drives N concurrent builds against a freshly
+restarted daemon and reads CPU ticks from `/proc` to separate a working process
+from a dead-asleep one. Re-run in full on 2026-08-20 after the oracle was
+fixed (see below); every verdict recorded before that fix is void and is not
+reproduced here.
 
-| concurrency | multi-client mode | one-client mode |
-|---|---|---|
-| 2  | healthy (control) | not run |
-| 4  | -       | healthy |
-| 8  | healthy | healthy |
-| 12 | healthy | healthy |
-| 16 | healthy | healthy |
-| 20 | healthy | healthy |
-| 24 | healthy | healthy |
-| 32 | -       | healthy |
+Host: 24-thread Ryzen 9 7900X3D, 30.5 GiB RAM, nix-daemon 2.35.2, no other
+build running, swap drained to zero.
 
-Every rung: all builds completed, and no child read zero ticks across the
-sampling interval. **No wedge was reproduced.** Read the coverage exactly as
-the table gives it: seven distinct levels between 2 and 32, and NEITHER shape
-spans the whole range on its own - multi-client ran 2 to 24, one-client ran 4
-to 32. The negative control is multi-client N=2; one-client N=2 was never run.
-N=20 appears in both because it is the concurrency the incident was attributed
-to.
+**One client issuing N concurrent `build_paths`** - the shape the incident
+describes:
 
-## Three defects in the instrument, and one choice that avoided a fourth
+| N | processes sampled | fully-dead subtrees | verdict |
+|---|---|---|---|
+| 2 (control) | 3 | 0 | healthy |
+| 4  | 5  | 0 | healthy |
+| 8  | 9  | 0 | healthy |
+| 12 | 13 | 0 | healthy |
+| 16 | 17 | 0 | healthy |
+| 20 | 21 | 0 | healthy |
+| 24 | 25 | 0 | healthy |
+| 32 | 33 | 0 | healthy |
 
-Counted carefully, because the count itself was wrong in three places until an
-audit caught it, and an instrument whose own history is told inconsistently
-invites the one reading a negative result cannot survive: that it was never
-trusted.
+**N clients issuing one `build_paths` each** - kept as the contrast, since the
+pair is what would separate a per-connection fault from a per-daemon one:
+N = 2 (control), 8, 12, 16, 20, 24, all healthy.
 
-Three defects, and they did NOT all fail the same way. One produced a false
-HEALTHY, one produced a false WEDGE, one measured the wrong request shape
-entirely. Item 2 below is not a defect at all - it is the choice that kept the
-fix to item 1 from creating a second false wedge by construction, and it is
-listed because getting it wrong was the obvious move.
+Read the coverage from the rows rather than from a count: this document has
+twice carried a total that contradicted its own table. Neither shape spans the
+whole range on its own, and each has its own N=2 negative control.
 
-The first three rounds returned "healthy" while observing **zero** daemon
-children, and the zero was the finding rather than the background.
+**The "processes sampled" column is the load-bearing one.** It is N+1 in every
+one-client row: one daemon child plus its N builders. That is the evidence the
+oracle can see individual workers at all, which it could not before the fix
+below, and it is the column that would expose the next instrument defect the
+way it exposed the first three. A verdict without its population is not a
+reading.
+
+## Four defects in the instrument, and one choice that avoided a fifth
+
+Counted carefully, because the count itself has been wrong in this document
+three times, and an instrument whose own history is told inconsistently invites
+the one reading a negative result cannot survive: that it was never trusted.
+
+They did NOT all fail the same way. Two produced a false HEALTHY, one produced
+a false WEDGE, one measured the wrong request shape entirely. Item 2 is not a
+defect at all; it is the choice that kept the fix to item 1 from creating a
+false wedge by construction, and it is listed because getting it wrong was the
+obvious move.
 
 1. **The workload could not hold a daemon child open.** The stress derivation
    wrote a file and exited inside the settle window, so the tick oracle never
-   had a subject and only build-completion was doing any work. The builder now
-   burns CPU for `--spin` iterations, about twenty seconds by default.
+   had a subject and only build-completion was doing any work. The first three
+   rounds returned "healthy" while observing ZERO daemon children. The builder
+   now burns CPU for `--spin` iterations.
 
 2. **Not a defect: it burns rather than sleeps, deliberately.** The obvious
    repair for item 1 is a sleeping builder, and a sleeping child reads zero
-   ticks, which is the wedge signature itself - so that repair would have
-   reported every healthy round as a wedge. Recorded because the wrong version
-   is the one a reader would reach for.
+   ticks, which is the wedge signature itself, so that repair would have
+   reported every healthy round as a wedge.
 
-3. **The tick oracle read the wrong process, and this one produced a false
-   WEDGE rather than a false healthy.** With children finally visible, N=2
-   reported both as zero-tick while both builds completed. A daemon child
-   does not run the build: it forks the sandboxed builder and blocks in
-   `wait()`, so its own utime and stime stay flat for the entire build, and a
-   healthy child is indistinguishable from a wedged one at that level.
-   `read_ticks` now sums each child's whole subtree.
+3. **The oracle read the wrong process, and this one produced a false WEDGE.**
+   With children finally visible, N=2 reported both as zero-tick while both
+   builds completed. A daemon child does not run the build: it forks the
+   sandboxed builder and blocks in `wait()`, so its own ticks stay flat for the
+   whole build and a healthy child is indistinguishable from a wedged one at
+   that level.
 
-4. **The default mode drives the wrong shape.** Launching N separate `nix
+4. **Reading each child's SUBTREE SUM fixed item 3 and made the reported
+   failure invisible.** Under `--one-client` there is exactly ONE daemon child,
+   forking every builder, so the round collapses to a single sum over N burning
+   processes: one dead-asleep worker among live siblings is masked by their
+   CPU, and the verdict can only trip if every builder stops at once. The
+   incident is PARTIAL - seventeen children wedged while the rest of the build
+   moved - so the shape that matches the incident was exactly the shape the
+   oracle was blind in, and "no child read zero ticks" was a statement over a
+   population of one. Found by an adversarial audit rather than by the
+   instrument. The unit is now every process in the tree, judged by whether its
+   own subtree is entirely dead: a parked child with a burning builder is not
+   flagged, a dead builder among live siblings is. A selftest fixture pins it
+   by asserting both readings.
+
+5. **The default mode drives the wrong SHAPE.** Launching N separate `nix
    build` processes opens N daemon *connections* carrying one `build_paths`
-   each. The incident describes ~20 concurrent `build_paths` from ONE client,
-   and prescribes dropping the client connection as the recovery, which only
-   means anything when many requests share a connection. `--one-client` runs a
-   single nix process building N derivations with `--max-jobs N`; measured, it
-   yields one daemon child that forks all N builders, which is the process
-   shape that was watched going dead-asleep. The multi-client mode is kept as
-   the negative control: the pair is what would separate a per-connection fault
-   from a per-daemon one.
+   each, while the incident describes many requests on ONE connection and
+   prescribes dropping that connection as the recovery. `--one-client` drives
+   the reported shape; measured, it yields one daemon child forking all N
+   builders.
+
+The pattern across 1, 3 and 4 is one pattern: **the UNIT of the reading was
+wrong three times, twice in opposite directions**, and each wrong unit returned
+a confident verdict rather than an error. Three of them were visible only
+because the script prints the population it sampled; the fourth needed an
+outside reader, which is the argument for having one.
 
 ## What the negative result licenses, and what it does not
 
@@ -111,14 +135,19 @@ It says **concurrency alone is not the trigger**, and therefore that
 upstream. Something present in the campaign and absent from the reproducer is
 load-bearing. The candidates, none yet tested:
 
-- **Memory pressure.** The strongest one. `a2c003e` measured seven daemon
-  workers at roughly 2 GiB RSS each, squeezing the machine to 2.5 GiB
-  available, before it bounded the blanket build-dir injection, and the wedge
-  coincided with the machine in swap. (That commit's SUBJECT says "14 GiB",
-  which is the seven-worker TOTAL; its in-code comment carries the per-worker
-  reading, and the drafts staged from the subject alone said "apiece" until an
-  audit caught it. Cite the comment, not the subject.) The
-  reproducer's builders hold a shell loop counter. A wedge driven by RSS
+- **Memory pressure.** The strongest one, and the two readings must be kept in
+  their right order. On 2026-08-19 `a2c003e` measured seven daemon workers at
+  roughly 2 GiB RSS each, squeezing the machine to 2.5 GiB available, and then
+  BOUNDED the blanket build-dir injection that caused it - so that figure
+  describes the state before its own fix. The wedge on 2026-08-20 came AFTER
+  that bound, and its orphans were larger still: one child at 7.5 GiB, about
+  20 GiB across seventeen, with the machine in swap. So memory pressure did
+  not go away when the injection was bounded, and the later, post-fix reading
+  is the one that supports the hypothesis. An earlier draft cited only the
+  pre-bound figure, which is both superseded and the weaker of the two.
+  (`a2c003e`'s SUBJECT says "14 GiB", the seven-worker TOTAL; its in-code
+  comment carries the per-worker reading. Cite the comment.)
+  The reproducer's builders hold a shell loop counter. A wedge driven by RSS
   pressure or reclaim would reproduce at *any* N once memory is tight, and at
   *no* N while it is not - which is exactly the pattern of these two datasets.
 - **Dynamic derivations and `ca-derivations`.** The campaign builds through
@@ -137,17 +166,36 @@ healthy and raise the per-builder RSS until the machine is under reclaim.
 ## How to run it
 
 ```
-python3 scripts/daemon-stress-bisect.py --selftest      # 6 assertions, touches nothing
-for N in 2 8 12 16 20 24; do
-  # a fresh daemon per round: a wedged child from round k is
-  # indistinguishable from a fresh wedge in round k+1
+python3 scripts/daemon-stress-bisect.py --selftest    # 11 assertions, touches nothing
+
+# The reported shape. Run its control in the SAME mode as its ladder -
+# borrowing the control from the other mode is how this shape went a whole
+# round with no negative control of its own.
+for N in 2 4 8 12 16 20 24 32; do
   doas s6-svc -r /run/service/nix-daemon
   python3 scripts/daemon-stress-bisect.py -n $N --one-client
 done
+
+# The contrast: N connections carrying one request each.
+for N in 2 8 12 16 20 24; do
+  doas s6-svc -r /run/service/nix-daemon
+  python3 scripts/daemon-stress-bisect.py -n $N
+done
 ```
 
-A fresh daemon is only strictly required after a round that wedged; a healthy
-round leaves no stuck child to confound its successor. Exit codes: 0 healthy,
-3 wedge observed, 1 the round could not run. The script refuses to run while a
-nix-ninja campaign build is live, because it is the trigger condition and would
-take the campaign down with it.
+N=2 is the negative control in both modes and must exit 0; if it does not, the
+oracle is reading something other than the wedge.
+
+A fresh daemon is needed after any round that WEDGED, because a stuck child
+from round k is indistinguishable from a fresh wedge in round k+1. A healthy
+round leaves nothing to confound its successor, so the restart can be skipped
+between healthy rounds; it is in the loop above because the person running it
+does not know in advance which rounds those are.
+
+Exit codes: 0 healthy, 3 wedge observed, 1 the round could not run. The script
+refuses to start while a nix-ninja campaign build is live, because it is the
+trigger condition and the campaign is what it would trigger against.
+
+**Read the "processes sampled" number on every round.** If it is not N+1 in
+one-client mode, or N-ish in multi-client mode, the oracle is not seeing the
+builders and the verdict means nothing, whatever it says.
