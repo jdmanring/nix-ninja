@@ -32,8 +32,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 const FILE_NAME: &str = ".nix-ninja-resolve-cache.v1";
-/// Bumped with task.rs's DIR_UPLOAD_CAP so cap changes invalidate.
-const HEADER: &str = "nix-ninja-resolve-cache v1 cap=1024";
+/// Bumped with task.rs's DIR_UPLOAD_CAP so cap changes invalidate, and
+/// with any change to what an upload CONTAINS: v2 discards entries
+/// recorded before env-shebang patching, whose store paths hold the
+/// unpatched bytes and would otherwise replay forever.
+const HEADER: &str = "nix-ninja-resolve-cache v2 cap=1024";
 /// Separates encoded DerivedFiles within one line; never appears in a
 /// store path or a build-relative path.
 const SEP: char = '\x1f';

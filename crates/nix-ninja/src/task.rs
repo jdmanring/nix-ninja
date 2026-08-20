@@ -1645,13 +1645,89 @@ fn new_opaque_file(
         .file_name()
         .map(|n| normalize_output(&n.to_string_lossy()))
         .unwrap_or_else(|| "source".to_string());
-    let store_path = rpc_client.add_to_store_nar(&name, &canonical_path)?;
+    // An executable whose shebang is `#!/usr/bin/env <prog>` cannot be
+    // EXEC'd inside the task sandbox, which has no /usr/bin/env: protoc
+    // execs protoc-gen-ts_proto.py as a plugin and reports "not found
+    // or is not executable" (round 70). This is nixpkgs' patchShebangs
+    // problem, solved the same way at the same layer: upload a copy
+    // whose shebang names the interpreter's resolved store path. Done
+    // here rather than in nix-ninja-task deliberately - the task binary
+    // is part of every banked derivation's identity - and only the
+    // affected store objects re-key. Scripts INVOKED as `python3 x.py`
+    // never read their shebang, so the rewrite is inert for them.
+    let upload_src = patched_env_shebang(&canonical_path)?;
+    let store_path =
+        rpc_client.add_to_store_nar(&name, upload_src.as_deref().unwrap_or(&canonical_path))?;
 
     Ok(DerivedFile {
         derived_path: SingleDerivedPath::Opaque(store_path),
         build_path: relative_path,
         rel_path: None, // None for opaque files - store path points directly to file
     })
+}
+
+/// Where `path` is an executable regular file opening with
+/// `#!/usr/bin/env <prog>` (single word, no env options), write a copy
+/// whose shebang is the PATH-resolved absolute location of <prog> and
+/// return it; None leaves the upload untouched. Resolution failure and
+/// exotic shebangs (`env -S`, arguments) fail toward the original file,
+/// whose failure names itself in the task log; a wrong rewrite would
+/// fail strangely. The copy keeps the executable bit, which is the
+/// property the whole exercise exists to make usable.
+fn patched_env_shebang(path: &Path) -> Result<Option<PathBuf>> {
+    use std::os::unix::fs::PermissionsExt;
+    let md = fs::metadata(path)?;
+    if !md.is_file() || md.permissions().mode() & 0o111 == 0 {
+        return Ok(None);
+    }
+    let body = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let Some(first_nl) = body.iter().position(|&b| b == b'\n') else {
+        return Ok(None);
+    };
+    let Ok(first) = std::str::from_utf8(&body[..first_nl]) else {
+        return Ok(None);
+    };
+    let Some(prog) = first.strip_prefix("#!/usr/bin/env ") else {
+        return Ok(None);
+    };
+    let prog = prog.trim();
+    if prog.is_empty() || prog.contains(' ') || prog.starts_with('-') {
+        return Ok(None);
+    }
+    let Some(resolved) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|d| {
+            let c = d.join(prog);
+            c.is_file().then_some(c)
+        })
+    }) else {
+        return Ok(None);
+    };
+    // Memoized per source path: the same script is uploaded once per
+    // walk memo miss, but several scripts share interpreters and the
+    // tmp copies are tiny; keyed by source so repeat calls are free.
+    static SHEBANG_MEMO: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, PathBuf>>,
+    > = std::sync::OnceLock::new();
+    let memo = SHEBANG_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(hit) = memo.lock().unwrap().get(path) {
+        return Ok(Some(hit.clone()));
+    }
+    let dir = std::env::temp_dir().join(format!("nix-ninja-shebang-{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    let out = dir.join(format!(
+        "{}-{}",
+        memo.lock().unwrap().len(),
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("script")
+    ));
+    let mut patched = format!("#!{}\n", resolved.display()).into_bytes();
+    patched.extend_from_slice(&body[first_nl + 1..]);
+    fs::write(&out, patched)?;
+    fs::set_permissions(&out, fs::Permissions::from_mode(0o755))?;
+    memo.lock().unwrap().insert(path.to_path_buf(), out.clone());
+    Ok(Some(out))
 }
 
 /// An ABSOLUTE build_path is a sandbox escape: nix-ninja-task joins it
@@ -2619,6 +2695,37 @@ mod python_import_names_tests {
         assert!(names.contains(&"os".to_string()));
         // relative import's first segment is empty and must not appear
         assert!(!names.contains(&"".to_string()));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // The protoc-gen-ts_proto.py shape: an executable env-shebang
+    // script exec'd directly inside a sandbox with no /usr/bin/env.
+    // The negative half matters as much: a non-executable file and an
+    // exotic shebang must both pass through unpatched.
+    #[test]
+    fn env_shebang_patched_only_when_exec_and_simple() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("nn-shebang-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let exec = d.join("plugin.py");
+        std::fs::write(&exec, "#!/usr/bin/env sh\nbody\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let patched = super::patched_env_shebang(&exec).unwrap().expect("patched");
+        let out = std::fs::read_to_string(&patched).unwrap();
+        assert!(out.starts_with("#!/") && !out.contains("/usr/bin/env"));
+        assert!(out.ends_with("body\n"));
+        assert_ne!(
+            std::fs::metadata(&patched).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        let plain = d.join("data.py");
+        std::fs::write(&plain, "#!/usr/bin/env sh\nbody\n").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(super::patched_env_shebang(&plain).unwrap().is_none());
+        let exotic = d.join("exotic.py");
+        std::fs::write(&exotic, "#!/usr/bin/env -S sh -e\nbody\n").unwrap();
+        std::fs::set_permissions(&exotic, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::patched_env_shebang(&exotic).unwrap().is_none());
         std::fs::remove_dir_all(&d).unwrap();
     }
 
