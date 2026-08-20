@@ -37,7 +37,19 @@ pub struct Cli {
     #[arg(short = 'j', default_value = "0", hide = true)]
     pub jobs: usize,
 
-    /// Do not start new jobs if the load average is greater than N
+    /// Accepted for ninja compatibility and IGNORED, with a warning.
+    ///
+    /// Ninja's -l throttles on load average. Nothing here reads it, and that
+    /// was silent until 2026-08-20: the field had exactly one occurrence in
+    /// the tree, its own declaration. Wiring it would be worse than leaving
+    /// it inert, because load average is not a usable signal on this
+    /// workload - measured the same day, the machine sat at load 20.6 with
+    /// PSI cpu full at 0.00, so the load was entirely uninterruptible I/O
+    /// from memory thrash and a load-keyed governor would have been reading
+    /// swap pressure through the wrong instrument. Erroring is also wrong:
+    /// generators pass -l unprompted and a hard failure would break them.
+    /// So it warns, which is the one behaviour that is neither a lie nor a
+    /// regression.
     #[arg(short = 'l', default_value = "0.0", hide = true)]
     pub load_average: f64,
 
@@ -72,6 +84,22 @@ pub struct Cli {
 /// -j0 means "auto": the machine's core count. The old reading of 0 as
 /// "infinity" is what let one TU's codegen fan-out spawn hundreds of
 /// concurrent tasks; unbounded is no longer expressible.
+/// Warn once about flags this accepts and does not implement.
+///
+/// An accepted-and-ignored flag is indistinguishable from a working one from
+/// the caller's side, which is how -l survived unnoticed. The warning is the
+/// whole fix.
+fn warn_ignored_flags(cli: &Cli) {
+    if cli.load_average != 0.0 {
+        eprintln!(
+            "nix-ninja: warning: -l {} is accepted for ninja compatibility and IGNORED. \
+             Concurrency here is bounded by -j and by the nix daemon's max-jobs; load \
+             average is not consulted.",
+            cli.load_average,
+        );
+    }
+}
+
 fn resolved_jobs(cli: &Cli) -> usize {
     if cli.jobs == 0 {
         std::thread::available_parallelism()
@@ -84,6 +112,7 @@ fn resolved_jobs(cli: &Cli) -> usize {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    warn_ignored_flags(&cli);
 
     if cli.print_version {
         // For compatibility with meson, it expects >= 1.8.2.
@@ -284,3 +313,22 @@ mod tests {
         assert!(resolved_jobs(&cli_with(&[])) > 0);
     }
 }
+
+#[cfg(test)]
+mod ignored_flag_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// -l parses and is readable. The defect it guards is not a parse
+    /// failure but a SILENT one: the field had a single occurrence in the
+    /// whole tree, its own declaration, so every caller passing it got the
+    /// ninja behaviour it names and none of it.
+    #[test]
+    fn dash_l_parses_and_is_not_silently_dropped() {
+        let cli = Cli::parse_from(["nix-ninja", "-l", "4.5"]);
+        assert_eq!(cli.load_average, 4.5);
+        // default stays 0.0 so warn_ignored_flags says nothing unprompted
+        assert_eq!(Cli::parse_from(["nix-ninja"]).load_average, 0.0);
+    }
+}
+
