@@ -753,6 +753,17 @@ impl Runner {
             } else {
                 0
             };
+            // json_schema_compiler resolves a cross-namespace type
+            // (extensionTypes.InjectDetails from web_view_internal.json) by
+            // loading the referenced namespace's schema from the same api
+            // dir by NAMING CONVENTION - files no edge declares (upstream
+            // relies on a shared filesystem). The round-73 rule gated on
+            // .idl/.webidl and sat below the plain file-upload branch that
+            // catches every existing file first, so a schema arg uploaded
+            // only itself. The right discriminator is the TOOL, not the
+            // extension: any schema arg to compiler.py implies its schema
+            // directory.
+            let schema_tool = cmdline.contains("json_schema_compiler/compiler.py");
             for arg in args {
                 let Some(fid) = files.lookup(&arg) else {
                     // A `@file` argument is a response file the tool reads
@@ -864,6 +875,25 @@ impl Runner {
                         )? {
                             self.add_derived_file(files, input.clone());
                             input_set.insert(input.build_path.clone(), input);
+                        }
+                        // Schema file to the schema compiler: also upload
+                        // its directory (see schema_tool above). Bounded by
+                        // upload_referenced_dir's own cap.
+                        if schema_tool
+                            && Path::new(&arg).extension().is_some_and(|e| {
+                                e == "json" || e == "idl" || e == "webidl"
+                            })
+                        {
+                            if let Some(dir) = Path::new(&arg).parent() {
+                                for input in upload_referenced_dir(
+                                    &self.rpc_client,
+                                    &self.config.build_dir,
+                                    dir,
+                                )? {
+                                    self.add_derived_file(files, input.clone());
+                                    input_set.insert(input.build_path.clone(), input);
+                                }
+                            }
                         }
                     } else if !arg.starts_with('-')
                         && !arg.starts_with('/')
