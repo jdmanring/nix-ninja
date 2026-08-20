@@ -191,12 +191,15 @@ where
     PathBuf: Borrow<P>,
     P: Hash + Eq,
 {
-    // Check virtual paths first if provided
+    // Check virtual paths first if provided. Keyed lookup, not a pairwise
+    // scan: PathBuf's Hash agrees with the Eq the scan used, and the map
+    // grows with every materialized output, so the scan made each include
+    // lookup O(V) - measured 25% of driver CPU in Components::next_back at
+    // task 10,500 of the qtwebengine graph, the superlinear resolve climb.
     if let Some(virtual_paths) = virtual_paths {
-        for (build_path, actual_path) in virtual_paths {
-            if build_path.as_path() == path.as_ref() {
-                return Ok(Some(actual_path.clone()));
-            }
+        let key: &Path = path.as_ref();
+        if let Some(actual_path) = virtual_paths.get::<Path>(key) {
+            return Ok(Some(actual_path.clone()));
         }
     }
 
@@ -219,4 +222,24 @@ where
     cache.insert(path.as_ref().to_path_buf(), result.clone());
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The virtual-path check moved from a pairwise Path == scan to a keyed
+    // HashMap get. Those are equivalent only because PathBuf hashes over the
+    // same components its Eq compares, which is what makes "a/./b" find an
+    // entry keyed "a/b". This pins that: a differently spelled probe must
+    // still hit, and a genuinely different path must miss.
+    #[test]
+    fn virtual_path_lookup_matches_scan_semantics() {
+        let mut vp = HashMap::new();
+        vp.insert(PathBuf::from("gen/a/b.h"), PathBuf::from("/store/x-b.h"));
+        let hit = canonicalize_cached(PathBuf::from("gen/./a/b.h"), Some(&vp)).unwrap();
+        assert_eq!(hit, Some(PathBuf::from("/store/x-b.h")));
+        let miss = canonicalize_cached(PathBuf::from("gen/a/c.h"), Some(&vp)).unwrap();
+        assert_eq!(miss, None);
+    }
 }
