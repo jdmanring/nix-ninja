@@ -1009,7 +1009,31 @@ impl Runner {
         }
 
         let mut inputs: Vec<DerivedFile> = input_set.into_values().collect();
+        // Normalize away `.` components and dedup exact repeats: the same
+        // file can enter input_set under two spellings of one destination
+        // (`../../x` from a resolver walk, `./../../x` from an edge
+        // declaration), and input_set's key cannot see they are one path.
+        // nix-ninja-task then copies the file twice; fs::copy preserves
+        // the store's 0444 mode, so the second copy dies EACCES on the
+        // first's read-only result (css-tree/cjs/tokenizer/index.cjs,
+        // round 69). Dedup is full-equality only: two DIFFERENT sources
+        // claiming one destination is a real conflict and must keep
+        // failing loudly rather than silently dropping one.
+        for df in &mut inputs {
+            if df
+                .build_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::CurDir))
+            {
+                df.build_path = df
+                    .build_path
+                    .components()
+                    .filter(|c| !matches!(c, std::path::Component::CurDir))
+                    .collect();
+            }
+        }
         inputs.sort();
+        inputs.dedup();
 
         // Extract store paths from cmdline and add pre-extracted wrapper store paths
         lap(&NT_GRD_MS);
