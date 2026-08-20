@@ -6,6 +6,7 @@ description = "Dependency inference for C/C++"
 license = "MIT"
 
 [dependencies]
+rustc-hash = "1.1.0"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 n2 = { path = "../../vendor-n2", default-features = false }

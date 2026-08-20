@@ -27,7 +27,7 @@ fn bfs_parse_includes(
     include_dirs: &[PathBuf],
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
-    let mut visited = HashSet::new();
+    let mut visited = rustc_hash::FxHashSet::default();
     let mut result = Vec::new();
     let mut queue = VecDeque::new();
 
@@ -179,7 +179,10 @@ fn try_resolve(
     canonicalize_cached(head.join(tail), virtual_paths).ok()?
 }
 
-type PathCache = Arc<RwLock<HashMap<PathBuf, Option<PathBuf>>>>;
+// FxHash rather than SipHash: keys are long PathBufs probed a few times per
+// include per include-dir, and hashing was 32% of driver CPU on the
+// qtwebengine graph. Not DoS-facing - every key is a build-local path.
+type PathCache = Arc<RwLock<rustc_hash::FxHashMap<PathBuf, Option<PathBuf>>>>;
 static PATH_CACHE: LazyLock<PathCache> = LazyLock::new(Default::default);
 
 pub fn canonicalize_cached<P>(

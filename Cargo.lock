@@ -507,6 +507,7 @@ dependencies = [
  "clap",
  "n2",
  "regex",
+ "rustc-hash",
  "shell-words",
  "tracing",
  "tracing-subscriber",
