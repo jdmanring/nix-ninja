@@ -824,13 +824,19 @@ impl Runner {
                                     &self.config.build_dir,
                                     cd_depth,
                                 );
-                                extra_rspfile = Some((PathBuf::from(rsp_rel), content));
-                                if cd_depth > 0 {
-                                    arg_rewrites.push((
-                                        arg.clone(),
-                                        format!("@{}{rsp_rel}", "../".repeat(cd_depth)),
-                                    ));
-                                }
+                                // Write under a FRESH name: the original is
+                                // usually also a declared input, materialized
+                                // as a read-only store symlink the task's
+                                // rspfile write would then die on (EACCES,
+                                // round 74 attempt 2). The @ argument is
+                                // respelled to match, so nothing reads the
+                                // original name.
+                                let shipped = format!("{rsp_rel}.nn-rsp");
+                                extra_rspfile = Some((PathBuf::from(&shipped), content));
+                                arg_rewrites.push((
+                                    arg.clone(),
+                                    format!("@{}{shipped}", "../".repeat(cd_depth)),
+                                ));
                             }
                         }
                         continue;
