@@ -100,6 +100,11 @@ def parse_stat_starttime(stat_line: str) -> int:
     return int(stat_line.rsplit(")", 1)[1].split()[19])
 
 
+def parse_stat_state(stat_line: str) -> str:
+    """Field 3, the single-letter process state. 'Z' is a zombie."""
+    return stat_line.rsplit(")", 1)[1].split()[0]
+
+
 def read_activity(pid: int) -> tuple[int, int] | None:
     """(activity counter, starttime) for one process, or None if unreadable.
 
@@ -113,6 +118,18 @@ def read_activity(pid: int) -> tuple[int, int] | None:
     try:
         with open(f"/proc/{pid}/stat") as f:
             stat = f.read()
+        if parse_stat_state(stat) == "Z":
+            # A ZOMBIE IS NOT A WEDGE, and to a counter-delta oracle the two
+            # are byte-identical: a reaped-pending child accrues no ticks and
+            # no context switches because it is dead, not because it is stuck.
+            # The composite metric does not separate them - a zombie is zero on
+            # every counter there is. Measured 2026-08-20 against the live
+            # daemon during a real qtwebengine round: the oracle's first real
+            # detection was pid 17695, State Z, RSS 0, a defunct
+            # nix-ninja-task, and it would have been reported upstream as a
+            # wedged worker. Excluded here rather than in classify, so no
+            # caller can forget.
+            return None
         ticks = parse_stat_ticks(stat)
         started = parse_stat_starttime(stat)
         switches = 0
@@ -615,6 +632,11 @@ def selftest() -> int:
     mine = read_activity(os.getpid())
     assert mine is not None and mine[0] > 0, mine
     assert read_activity(2**22) is None
+
+    # --- a zombie must not read as a wedge -----------------------------------
+    zline = "999 (nix-ninja-task) Z 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 7 0 0"
+    assert parse_stat_state(zline) == "Z", parse_stat_state(zline)
+    assert parse_stat_state(line) == "S", parse_stat_state(line)
 
     # Count the assertions by PARSING this function rather than by carrying a
     # literal. The literal said 19 over 18 assertions and the documentation
