@@ -1126,6 +1126,38 @@ impl Runner {
             }
         }
 
+        // A .template input implies its same-directory .template
+        // siblings: inspector_protocol's code_generator.py loads
+        // templates through a jinja FileSystemLoader rooted at the
+        // module dir, and GN's per-generator input list is
+        // hand-maintained - round 82 died at TemplateNotFound:
+        // lib/Protocol_cpp.template, the one of eight lib templates
+        // the edge forgot to declare. Same class as the schema-dir
+        // rule: a declared file argument implies the directory the
+        // tool actually resolves from.
+        let tmpl_dirs: rustc_hash::FxHashSet<PathBuf> = input_set
+            .values()
+            .filter(|i| {
+                i.build_path.extension().is_some_and(|e| e == "template")
+                    && Path::new(&i.build_path).is_file()
+            })
+            .filter_map(|i| i.build_path.parent().map(Path::to_path_buf))
+            .collect();
+        for dir in tmpl_dirs {
+            for entry in std::fs::read_dir(&dir)?.flatten() {
+                let p = dir.join(entry.file_name());
+                if !p.extension().is_some_and(|e| e == "template")
+                    || input_set.contains_key(&p)
+                    || !p.is_file()
+                {
+                    continue;
+                }
+                let up = new_opaque_file(&self.rpc_client, &self.config.build_dir, p)?;
+                self.add_derived_file(files, up.clone());
+                input_set.insert(up.build_path.clone(), up);
+            }
+        }
+
         // grit manifests include partials and translations TEXTUALLY
         // (<part file="x.grdp">, <file path="y.xtb">), resolved relative
         // to the manifest's own directory, and GN declares none of them -
