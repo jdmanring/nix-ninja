@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Probe the nix-daemon for the concurrent-build_paths wedge.
 
-RESULT SO FAR, 2026-08-20: this script does NOT reproduce the wedge, at any
-concurrency from 2 to 32, in either shape it can drive. Read
-docs/daemon-wedge.md before using it or quoting it. The incident is real and
+RESULT SO FAR, 2026-08-20: this script has not reproduced the wedge at any
+level it has been run at. Read docs/daemon-wedge.md for the exact coverage of
+each shape before using or quoting that - it is NOT "any concurrency in either
+shape", and an earlier version of this line said so wrongly. The incident is real and
 separately evidenced; concurrency alone is not its trigger, so it is not a
 threshold-finder today and the name "bisect" describes its protocol rather
 than a result it has ever produced.
@@ -55,7 +56,10 @@ Protocol (run by hand - daemon restarts need root, so a person drives them):
   successor.
 
 --selftest exercises the /proc parsing, the subtree walk and the verdict
-logic on fixtures, and touches neither the daemon nor the store.
+logic on fixtures, and touches neither the daemon nor the store. One fixture
+is the masking case the per-child oracle could not see: it asserts that the
+old reading calls that round healthy and the current one names the dead
+builder.
 """
 
 import argparse
@@ -99,35 +103,95 @@ def descendants(pid: int) -> list[int]:
     return seen
 
 
-def read_ticks(pids: list[int]) -> dict[int, int]:
-    """Ticks per daemon child, summed over its whole SUBTREE.
+def proc_tree(roots: list[int]) -> tuple[dict[int, int], dict[int, int]]:
+    """Own ticks per process, and each process's parent, over every subtree.
 
-    A daemon child does not run the build: it forks the sandboxed builder and
-    blocks in wait(), so its OWN utime+stime stays flat for the entire build.
-    Reading the child alone therefore reports a perfectly healthy round as a
-    wedge - measured 2026-08-20, N=2 with a CPU-burning builder returned
-    "zero-tick: 2" while both builds completed. The load lives in the
-    descendants, so the subtree is the unit that distinguishes working from
-    dead-asleep.
+    Returns (ticks_by_pid, parent_by_pid). Roots map to parent -1.
     """
-    ticks = {}
-    for pid in pids:
-        total, alive = 0, False
-        for member in descendants(pid):
-            try:
-                with open(f"/proc/{member}/stat") as f:
-                    total += parse_stat_ticks(f.read())
-                alive = True
-            except OSError:
-                pass  # exited between listing and reading
-        if alive:
-            ticks[pid] = total
-    return ticks
+    ticks: dict[int, int] = {}
+    parent: dict[int, int] = {}
+    for root in roots:
+        frontier = [root]
+        parent.setdefault(root, -1)
+        while frontier:
+            nxt = []
+            for pid in frontier:
+                try:
+                    with open(f"/proc/{pid}/stat") as f:
+                        ticks[pid] = parse_stat_ticks(f.read())
+                except OSError:
+                    continue  # exited between listing and reading
+                for kid in daemon_children(pid):
+                    if kid not in parent:
+                        parent[kid] = pid
+                        nxt.append(kid)
+            frontier = nxt
+    return ticks, parent
+
+
+def subtree_totals(
+    ticks: dict[int, int], parent: dict[int, int]
+) -> dict[int, int]:
+    """Each pid's own ticks plus every descendant's, from the parent map."""
+    totals = dict(ticks)
+    for pid in ticks:
+        p = parent.get(pid, -1)
+        while p != -1 and p in totals:
+            totals[p] += ticks[pid]
+            p = parent.get(p, -1)
+    return totals
+
+
+def read_ticks(pids: list[int]) -> dict[int, int]:
+    """Back-compat wrapper: subtree totals keyed by the roots given."""
+    ticks, parent = proc_tree(pids)
+    totals = subtree_totals(ticks, parent)
+    return {pid: totals[pid] for pid in pids if pid in totals}
 
 
 def wedged_pids(t0: dict[int, int], t1: dict[int, int]) -> list[int]:
-    """Alive at both samples, zero tick delta: the dead-asleep signature."""
+    """Alive at both samples, zero SUBTREE tick delta: the dead-asleep
+    signature. Zero over the subtree rather than over the process itself,
+    because a daemon child blocks in wait() while its builder burns."""
     return [pid for pid, v in t1.items() if pid in t0 and v - t0[pid] == 0]
+
+
+def wedged_nodes(
+    t0: dict[int, int],
+    t1: dict[int, int],
+    parent: dict[int, int],
+) -> list[int]:
+    """Every process whose ENTIRE subtree went dead, outermost ones only.
+
+    This is the whole oracle, and getting its UNIT wrong has now produced a
+    wrong verdict twice in opposite directions.
+
+    Reading a daemon child's OWN ticks calls a healthy round a wedge: the
+    child forks the sandboxed builder and blocks in wait(), so its own ticks
+    stay flat all build.
+
+    Reading each top-level child's SUBTREE SUM fixes that and then cannot see
+    the failure actually being reported. Under --one-client there is exactly
+    ONE daemon child forking all N builders, so the round collapses to a
+    single sum: one dead-asleep worker among N burning siblings is masked by
+    its siblings' CPU, and the verdict can only trip if every builder stops at
+    once. The incident is PARTIAL - some workers wedged while the rest of the
+    build moved - so the shape that matches the incident was the shape the
+    oracle was blind in.
+
+    So the unit is every process in the tree, judged by whether its own
+    subtree is entirely dead. A parked child with a burning builder is not
+    flagged (a descendant accrues time); a dead builder among live siblings
+    is. Only the outermost dead node of a dead region is reported, since
+    naming a stuck child and each of its stuck children is one fault, not
+    several.
+    """
+    dead = {
+        pid
+        for pid, v in t1.items()
+        if pid in t0 and v - t0[pid] == 0
+    }
+    return sorted(p for p in dead if parent.get(p, -1) not in dead)
 
 
 BUILDER_ARGS = (
@@ -226,13 +290,19 @@ def run_round(args: argparse.Namespace) -> int:
 
     time.sleep(args.settle)  # let the daemon fork its children
     kids = daemon_children(daemon_pid)
-    t0 = read_ticks(kids)
+    ticks0, parent0 = proc_tree(kids)
+    t0 = subtree_totals(ticks0, parent0)
     time.sleep(args.interval)
-    t1 = read_ticks(list(t0))
-    wedged = wedged_pids(t0, t1)
+    ticks1, parent1 = proc_tree(kids)
+    t1 = subtree_totals(ticks1, parent1)
+    wedged = wedged_nodes(t0, t1, parent1)
+    # Print the POPULATION, not only the verdict. Three of this script's four
+    # instrument defects were visible only because the sampled counts sit
+    # beside the result: a bare "healthy" over zero observed processes reads
+    # exactly like a healthy daemon.
     print(
-        f"daemon children observed: {len(t0)}; "
-        f"zero-tick over {args.interval}s: {len(wedged)} {wedged or ''}"
+        f"daemon children: {len(kids)}; processes sampled: {len(ticks1)}; "
+        f"fully-dead subtrees over {args.interval}s: {len(wedged)} {wedged or ''}"
     )
 
     deadline = time.time() + args.timeout
@@ -270,7 +340,38 @@ def selftest() -> int:
     # (a pid reachable from itself) must not loop forever
     me = os.getpid()
     assert descendants(me)[0] == me
-    print("selftest: 6 assertions passed")
+
+    # THE BLIND SPOT THAT COST ROUND 2 OF THE AUDIT. One daemon child forking
+    # N builders, one of them dead-asleep and the rest burning. The old
+    # per-child subtree sum reports the round healthy, because the siblings'
+    # CPU masks the dead one. Fixture: child 10 with builders 11 (dead), 12
+    # and 13 (burning).
+    parent = {10: -1, 11: 10, 12: 10, 13: 10}
+    ticks_a = {10: 5, 11: 100, 12: 200, 13: 300}
+    ticks_b = {10: 5, 11: 100, 12: 260, 13: 380}
+    tot_a = subtree_totals(ticks_a, parent)
+    tot_b = subtree_totals(ticks_b, parent)
+    # the masking is real: the child's own subtree total DID move
+    assert tot_b[10] - tot_a[10] > 0
+    assert wedged_pids({10: tot_a[10]}, {10: tot_b[10]}) == []
+    # and the per-node oracle still finds the dead builder
+    assert wedged_nodes(tot_a, tot_b, parent) == [11]
+
+    # a parked child with a burning builder is NOT flagged, and when the whole
+    # region dies only the outermost node is named
+    parent2 = {20: -1, 21: 20}
+    assert wedged_nodes(
+        subtree_totals({20: 7, 21: 50}, parent2),
+        subtree_totals({20: 7, 21: 90}, parent2),
+        parent2,
+    ) == []
+    assert wedged_nodes(
+        subtree_totals({20: 7, 21: 50}, parent2),
+        subtree_totals({20: 7, 21: 50}, parent2),
+        parent2,
+    ) == [20]
+
+    print("selftest: 11 assertions passed")
     return 0
 
 
