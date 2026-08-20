@@ -145,8 +145,14 @@ pub fn init(store_dir: StoreDir, build_dir: PathBuf) {
                     );
                 }
             } else {
+                // Remove, don't just ignore: flush() writes the header only
+                // when the file is absent, so appending under a stale header
+                // strands every entry this run banks - measured round 71,
+                // which banked 11,000 tasks' memos that round 72 then threw
+                // away unread.
+                let _ = fs::remove_file(&path);
                 println!(
-                    "nix-ninja: resolve cache {} has a different version/cap header; ignored",
+                    "nix-ninja: resolve cache {} had a different version/cap header; removed",
                     path.display()
                 );
             }
