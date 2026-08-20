@@ -2194,7 +2194,12 @@ fn upload_referenced_dir_uncached(
     build_dir: &Path,
     dir: &Path,
 ) -> Result<Vec<DerivedFile>> {
-    const DIR_UPLOAD_CAP: usize = 512;
+    // 1024, raised from 512 on 2026-08-20: v8/tools is an importable
+    // package (has __init__.py) holding 823 files, reached through the
+    // over-cap parent fallback below, and the round-66 hard error asked
+    // for exactly this deliberate raise. 512 covered dawn's jinja2
+    // (~60 files); the cap still refuses a mistaken source-tree match.
+    const DIR_UPLOAD_CAP: usize = 1024;
     match walk_dir_capped(rpc_client, build_dir, dir, DIR_UPLOAD_CAP)? {
         Some(mut files) => {
             // A package dir uploaded wholesale may import SIBLING
@@ -2319,10 +2324,14 @@ fn grd_references(grd: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Top-level module names imported by a python package's own files:
-/// `import X` and `from X import ...`, first path segment only. Line
-/// matching by prefix, which cannot see an import inside a try block's
-/// indentation - fine here, because an OPTIONAL import that fails is the
-/// pattern try blocks exist for.
+/// `import X` and `from X import ...`, first path segment only. Lines
+/// are trimmed before matching, so INDENTED imports count too: this
+/// scanner once matched column 0 only, reasoning that a try-block import
+/// is optional - and chromium's json_parse.py disproved it with a
+/// MANDATORY import inside try/finally whose only job is restoring
+/// sys.path around it (import json_comment_eater, 65 task failures in
+/// round 66). Over-collecting fails toward extra uploads, which the
+/// per-dir caps bound; under-collecting fails the build.
 fn python_import_names(pkg: &Path) -> Result<Vec<String>> {
     // Memoized like walk_dir_capped and for the same reason: the
     // closure runs per task and re-reads the same directories' file
@@ -2353,6 +2362,7 @@ fn python_import_names_uncached(pkg: &Path) -> Result<Vec<String>> {
         let body = fs::read_to_string(&p)
             .map_err(|e| anyhow!("read({}) for import scan: {e}", p.display()))?;
         for line in body.lines() {
+            let line = line.trim_start();
             let rest = if let Some(r) = line.strip_prefix("import ") {
                 r
             } else if let Some(r) = line.strip_prefix("from ") {
@@ -2561,6 +2571,23 @@ mod python_import_names_tests {
         assert!(names.contains(&"os".to_string()));
         // relative import's first segment is empty and must not appear
         assert!(!names.contains(&"".to_string()));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // The json_parse.py shape: a MANDATORY import indented inside a
+    // try/finally whose only job is restoring sys.path around it. The
+    // column-0-only scanner missed it (65 task failures, round 66).
+    #[test]
+    fn finds_indented_import_in_try_block() {
+        let d = std::env::temp_dir().join(format!("nn-imports-ind-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("json_parse.py"),
+            "import sys\ntry:\n  sys.path.insert(0, p)\n  import json_comment_eater\nfinally:\n  sys.path = s\n",
+        )
+        .unwrap();
+        let names = python_import_names(&d).unwrap();
+        assert!(names.contains(&"json_comment_eater".to_string()));
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
