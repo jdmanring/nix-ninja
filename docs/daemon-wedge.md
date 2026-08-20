@@ -11,7 +11,7 @@ Measured during a qtwebengine 6.11.1 build of at least 16,077 tasks driven by ni
 against nix-daemon 2.35.2:
 
 - daemon child processes stop making progress while holding their locks: zero
-  CPU ticks, zero context switches, no kernel flock waiter, and no reply ever
+  CPU ticks, zero context switches, and no reply ever
   sent;
 - dropping the client connection kills the stuck child and frees its locks.
   That is the recovery `nix-builder-rpc-client`'s watchdog implements;
@@ -37,11 +37,40 @@ from a dead-asleep one. Re-run in full on 2026-08-20 after the oracle was
 fixed (see below); every verdict recorded before that fix is void and is not
 reproduced here.
 
+The table below comes from the instrument as it now ships. It was produced
+twice: once after the fix to defect 6, and again after the fix to defect 7,
+and the two runs agree on every cell. That agreement is worth exactly what it
+costs and no more - defect 7 was a false-HEALTHY hole, and fixing one cannot
+turn a healthy rung into a wedge, only an unseen wedge into a reported one. So
+identical numbers say the earlier table was not hiding a wedge; they say
+nothing about whether the current oracle can see one, which is the caveat this
+document keeps returning to.
+
 Host: 24-thread Ryzen 9 7900X3D, 30.5 GiB RAM, nix-daemon 2.35.2, no other
-build running. The host was not under memory pressure during these runs, but
-neither ladder log records a memory reading, so treat that as context rather
-than as a measurement - and note that it matters, since memory pressure is the
-leading untested hypothesis below.
+build running.
+
+Neither ladder log records a memory reading, so the ladder's own rows carry no
+memory evidence. That gap was closed separately rather than asserted away: the
+top rung of the reported shape was re-run on 2026-08-20 with `/proc/meminfo`
+sampled before, during and after.
+
+    [before] MemAvailable 25.12 GiB; swap used 4.64 GiB of 39.09 GiB
+    [during] MemAvailable 24.87 GiB; swap used 4.64 GiB of 39.09 GiB
+    [after]  MemAvailable 25.06 GiB; swap used 4.64 GiB of 39.09 GiB
+    daemon children: 1; processes sampled: 33; fully-dead subtrees over 8s: 0
+
+Two things follow, and the second is the one that matters. The host had roughly
+25 GiB available throughout, so these rounds are not evidence about a daemon
+under memory pressure. And 32 concurrent builders moved MemAvailable by about a
+quarter of a gibibyte, because each holds a shell loop counter - so the ladder
+never approached the condition the real build was in when it wedged, where
+single workers were measured in gibibytes. The ladder is a concurrency
+instrument and it is not a memory instrument, which is the honest reason its
+negative result does not reach the leading hypothesis below.
+
+Recorded because an earlier draft of the upstream issue said "swap drained" of
+this host. It was not: 4.64 GiB of swap was in use for the whole run and did
+not move. Nobody measured it until the claim was challenged.
 
 **One client issuing N concurrent `build_paths`** - the shape the incident
 describes:
@@ -86,7 +115,7 @@ below, and it is the column that would expose the next instrument defect the
 way it exposed the first three. A verdict without its population is not a
 reading.
 
-## Six defects in the instrument, and one choice that avoided a seventh
+## Six defects in the instrument, and one choice that avoided another
 
 **This section is the canonical count. Every other document links here rather
 than restating it**, because the count has now been wrong in three separate

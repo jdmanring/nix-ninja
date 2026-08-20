@@ -31,7 +31,6 @@ The stuck children show, consistently:
 - zero CPU ticks and zero voluntary/involuntary context switches over a 20 s
   sampling window, while alive;
 - their build locks still held;
-- no kernel `flock` waiter recorded against them;
 - nothing written to the daemon log.
 
 The client sees only that `build_paths` never returns. Every worker thread in
@@ -47,14 +46,17 @@ Three independent readings, all pointing the same way:
    debugger's own child, since yama blocked attach) put all 20 runner threads
    in `build_paths`.
 3. Closing the client connection immediately kills the stuck child and
-   releases its locks. Verified per kill. That is the recovery we implemented,
-   and it works every time.
+   releases its locks. That is the recovery we implemented and it has not yet
+   failed for us, though we did not record a per-kill count, so read it as
+   consistent behaviour rather than as a tally.
 
 ### The part that outlives the build
 
 On 2026-08-20, after a run that hit this, seventeen wedged children survived as
-init-reparented orphans owned by root, holding roughly 20 GiB of RSS between
-them, the largest at 7.5 GiB. `SIGTERM` did not clear them. Restarting the
+init-reparented orphans owned by root. A single `ps` reading, summed across
+the seventeen, put them at roughly 20 GiB of RSS with the largest at 7.5 GiB;
+that is one sample rather than a peak or a mean, and RSS double-counts shared
+pages, so treat it as an order of magnitude. `SIGTERM` did not clear them. Restarting the
 supervised daemon did not clear them, because that kills the listener and not
 its orphaned children. Only `kill -9` on the process name did.
 
@@ -70,7 +72,9 @@ level we have run it at.
 In the shape this report describes - one client issuing N concurrent
 `build_paths` - that is N = 2 (negative control), 4, 8, 12, 16, 20, 24 and 32,
 each against a freshly restarted daemon on an idle 24-thread host with 30.5 GiB
-and swap drained. We also ran the contrasting shape, N clients issuing one
+RAM, roughly 25 GiB of it available throughout (sampled from `/proc/meminfo`
+before, during and after the top rung; 4.64 GiB of swap was in use and did not
+move). We also ran the contrasting shape, N clients issuing one
 request each, at N = 2, 8, 12, 16, 20 and 24. Every round completed and no
 process went dead.
 
@@ -110,9 +114,10 @@ Two readings, in order. Before we bounded what we were sending them, seven
 daemon workers measured at roughly 2 GiB RSS each, with the machine down to
 2.5 GiB available. We bounded it, and the wedge described above happened
 AFTER that: seventeen orphans, one of them at 7.5 GiB. So the pressure did not
-go away with the fix, and the post-fix reading is the larger one. Meanwhile
-the reproducer's builders hold a shell loop counter and the host had 25 GiB
-free throughout.
+go away with the fix, and the post-fix reading is the larger one. Meanwhile the reproducer cannot reach that state: its builders hold a shell
+loop counter, and 32 of them concurrently moved `MemAvailable` by about a
+quarter of a gibibyte on a host with 25 GiB free. So our negative result is a
+concurrency result, and it does not test this hypothesis at all.
 
 A reclaim-driven wedge would fire at any concurrency once memory is tight, and
 at none while it is not, which is the shape of both datasets. We have not
@@ -165,14 +170,30 @@ places; and the two caveats a reader deserves without having to derive them -
 that there is no positive control, and that earlier oracles were blind to this
 exact bug.
 
-STILL OPEN, and each needs a measurement rather than an edit:
+Round 4 (2026-08-20) closed the four measurable items round 3 left open. Three
+of the four were closed by DELETING a claim rather than by supporting one,
+which is the honest ratio for a set of sentences nobody had measured:
 
-- "no kernel `flock` waiter" - say how that was determined, or drop it;
-- "verified per kill" - name how many kills, or soften it;
-- the 20 GiB / 7.5 GiB orphan figures are one `ps` reading summed across
-  seventeen processes and should say so;
-- "swap drained" and the free-memory figures for the ladder host are not in
-  either run log; either record them on a re-run or drop them;
-- search their tracker for duplicates. Not done: it is part of filing.
+- **"no kernel `flock` waiter" is gone.** A search for its origin found the
+  phrase in three of our own files and in no record anywhere - no `/proc/locks`
+  capture, no log. It had propagated purely by restatement. It was the most
+  specific-sounding line in the symptom list, which is exactly why it would
+  have been the first thing a maintainer tried to use;
+- **"verified per kill" is softened** to consistent behaviour, for the same
+  reason: no count was recorded, so the tally was an invention;
+- **the orphan RSS figures now carry their method** - one `ps` sample, summed,
+  RSS double-counting shared pages;
+- **the host memory state is now measured rather than asserted.** The claim was
+  "swap drained". It was false: 4.64 GiB of swap was in use throughout and did
+  not move. `/proc/meminfo` was sampled before, during and after a re-run of the
+  top rung, and the figures replace the assertion. That re-run also produced the
+  number that makes the memory hypothesis legible - 32 concurrent builders cost
+  about a quarter of a gibibyte - and therefore sharpens the caveat rather than
+  the claim.
 
-Status: NOT SENDABLE. A fourth round is owed after the open items.
+STILL OPEN:
+
+- search their tracker for duplicates. Not done, and not doable from here: it
+  is part of filing.
+
+Status: NOT SENDABLE, on the tracker search alone.

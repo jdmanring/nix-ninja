@@ -12,7 +12,7 @@ than a result it has ever produced.
 Background (observed during a qtwebengine build of at least 16,077 tasks -
 the highest index the driver log reaches, the graph never having been driven
 to completion - against nix-daemon 2.35.2): daemon child processes go dead-asleep
-while holding their locks - 0 CPU ticks, 0 context switches, no kernel flock
+while holding their locks - 0 CPU ticks, 0 context switches, no kernel
 waiters - and never reply. Closing the client connection kills the stuck
 child and frees its locks, which is the recovery nix-ninja's watchdog
 implements. A mass retry that re-issues every outstanding request at once
