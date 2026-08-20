@@ -2125,6 +2125,30 @@ fn upload_referenced_dir(
     build_dir: &Path,
     dir: &Path,
 ) -> Result<Vec<DerivedFile>> {
+    // Memoized by directory, same reasoning as CLOSURE_MEMO above: the
+    // result depends only on the directory's contents, and at Chromium
+    // scale one dir arg (the chromium root, passed by thousands of
+    // inspector_protocol-style edges) was re-walked 2,093 times in one
+    // round, 327 files per walk, dominating the py resolve bucket after
+    // the closure memo landed (round 63: 100s cumulative at task 8,000,
+    // 397s at 9,000 - the marginal cost was this walk).
+    static DIR_MEMO: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, Vec<DerivedFile>>>,
+    > = std::sync::OnceLock::new();
+    let memo = DIR_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(hit) = memo.lock().unwrap().get(dir) {
+        return Ok(hit.clone());
+    }
+    let fresh = upload_referenced_dir_uncached(rpc_client, build_dir, dir)?;
+    memo.lock().unwrap().insert(dir.to_path_buf(), fresh.clone());
+    Ok(fresh)
+}
+
+fn upload_referenced_dir_uncached(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    dir: &Path,
+) -> Result<Vec<DerivedFile>> {
     const DIR_UPLOAD_CAP: usize = 512;
     match walk_dir_capped(rpc_client, build_dir, dir, DIR_UPLOAD_CAP)? {
         Some(mut files) => {
