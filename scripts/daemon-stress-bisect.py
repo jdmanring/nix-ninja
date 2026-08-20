@@ -9,8 +9,9 @@ separately evidenced; concurrency alone is not its trigger, so it is not a
 threshold-finder today and the name "bisect" describes its protocol rather
 than a result it has ever produced.
 
-Background (observed during a ~15,800 task qtwebengine build driven by
-nix-ninja against nix-daemon 2.35.2): daemon child processes go dead-asleep
+Background (observed during a qtwebengine build of at least 16,077 tasks -
+the highest index the driver log reaches, the graph never having been driven
+to completion - against nix-daemon 2.35.2): daemon child processes go dead-asleep
 while holding their locks - 0 CPU ticks, 0 context switches, no kernel flock
 waiters - and never reply. Closing the client connection kills the stuck
 child and frees its locks, which is the recovery nix-ninja's watchdog
@@ -29,12 +30,18 @@ One invocation runs ONE round at one concurrency level N:
      derivations, which is one connection carrying N concurrent requests
      and is the shape the incident describes. Keep both: the pair is what
      separates a per-connection fault from a per-daemon one;
-  3. samples each daemon child's SUBTREE utime+stime from /proc/<pid>/stat
-     twice, --interval apart. The subtree is the unit because a daemon
-     child forks the sandboxed builder and blocks in wait(), so its own
-     ticks stay flat all build and a healthy child would read as wedged;
-  4. reports children whose tick delta is zero while still alive - the
-     wedge signature - and whether the round completed in --timeout.
+  3. samples utime+stime for EVERY process under the daemon, twice,
+     --interval apart, and computes each process's delta individually;
+  4. reports every process whose own SUBTREE accrued nothing - the wedge
+     signature - and whether the round completed in --timeout. The unit is
+     the subtree because a daemon child forks the sandboxed builder and
+     blocks in wait(), so its own ticks stay flat all build and reading it
+     alone makes a healthy child look wedged. The unit is EVERY process
+     rather than each top-level child because one client's requests are
+     served by a single child forking N builders, and a per-child total
+     hides one dead builder behind its live siblings. A subtree that
+     accrued nothing AND lost a member is reported INDETERMINATE, not
+     healthy: it ran for an unknown part of the window.
 
 The stress builder BURNS CPU rather than sleeping, and for long enough to
 outlive --settle. Both properties are load-bearing and both were absent
@@ -150,10 +157,62 @@ def read_ticks(pids: list[int]) -> dict[int, int]:
 
 
 def wedged_pids(t0: dict[int, int], t1: dict[int, int]) -> list[int]:
-    """Alive at both samples, zero SUBTREE tick delta: the dead-asleep
-    signature. Zero over the subtree rather than over the process itself,
-    because a daemon child blocks in wait() while its builder burns."""
+    """The SUPERSEDED per-root reading, kept only so the selftest can assert
+    what it used to answer. Do not use it for a verdict."""
     return [pid for pid, v in t1.items() if pid in t0 and v - t0[pid] == 0]
+
+
+def classify(
+    ticks0: dict[int, int],
+    ticks1: dict[int, int],
+    parent1: dict[int, int],
+) -> tuple[list[int], list[int]]:
+    """(fully dead subtrees, indeterminate subtrees), outermost nodes only.
+
+    Deltas are computed PER PROCESS and then summed over the subtree. Summing
+    each subtree's total and subtracting is not the same arithmetic and has a
+    silent hole: a wedged parent whose builder EXITS between the samples has a
+    shrinking total, so its delta is negative, so an `== 0` test never fires -
+    and a parent outliving its builder is precisely the shape of the orphans
+    this script exists to look for. PID reuse lands in the same hole, the new
+    occupant of a recycled pid reading fewer ticks than the old.
+
+    A member present at both samples contributes what it accrued. A member
+    that appeared contributes everything it has, since it did that work inside
+    the window. A member that EXITED contributes nothing measurable: it ran for
+    an unknown part of the window and its ticks are gone. That last case is
+    genuinely unknown rather than zero, so a subtree that accrued nothing AND
+    lost a member is reported as INDETERMINATE rather than as either verdict.
+    Calling it healthy would be the false-healthy hole again; calling it wedged
+    would flag every builder that simply finished.
+    """
+    dead: list[int] = []
+    unknown: list[int] = []
+    delta: dict[int, int] = {}
+    for pid, v1 in ticks1.items():
+        delta[pid] = v1 - ticks0[pid] if pid in ticks0 else v1
+
+    members: dict[int, list[int]] = {}
+    for pid in ticks1:
+        node = pid
+        while node != -1:
+            members.setdefault(node, []).append(pid)
+            node = parent1.get(node, -1)
+
+    for root, kin in members.items():
+        if sum(delta[k] for k in kin) != 0:
+            continue
+        # nothing accrued anywhere beneath it: dead, unless a member vanished
+        lost = [p for p in ticks0 if p not in ticks1]
+        (unknown if lost else dead).append(root)
+
+    dead_set = set(dead)
+    outer_dead = sorted(p for p in dead if parent1.get(p, -1) not in dead_set)
+    unknown_set = set(unknown)
+    outer_unknown = sorted(
+        p for p in unknown if parent1.get(p, -1) not in unknown_set
+    )
+    return outer_dead, outer_unknown
 
 
 def wedged_nodes(
@@ -161,36 +220,13 @@ def wedged_nodes(
     t1: dict[int, int],
     parent: dict[int, int],
 ) -> list[int]:
-    """Every process whose ENTIRE subtree went dead, outermost ones only.
+    """Superseded subtree-total reading. See classify() for the live oracle.
 
-    This is the whole oracle, and getting its UNIT wrong has now produced a
-    wrong verdict twice in opposite directions.
-
-    Reading a daemon child's OWN ticks calls a healthy round a wedge: the
-    child forks the sandboxed builder and blocks in wait(), so its own ticks
-    stay flat all build.
-
-    Reading each top-level child's SUBTREE SUM fixes that and then cannot see
-    the failure actually being reported. Under --one-client there is exactly
-    ONE daemon child forking all N builders, so the round collapses to a
-    single sum: one dead-asleep worker among N burning siblings is masked by
-    its siblings' CPU, and the verdict can only trip if every builder stops at
-    once. The incident is PARTIAL - some workers wedged while the rest of the
-    build moved - so the shape that matches the incident was the shape the
-    oracle was blind in.
-
-    So the unit is every process in the tree, judged by whether its own
-    subtree is entirely dead. A parked child with a burning builder is not
-    flagged (a descendant accrues time); a dead builder among live siblings
-    is. Only the outermost dead node of a dead region is reported, since
-    naming a stuck child and each of its stuck children is one fault, not
-    several.
+    Kept because the selftest asserts what each generation of this oracle
+    answers on the same fixture, which is the only record of why the unit
+    changed three times.
     """
-    dead = {
-        pid
-        for pid, v in t1.items()
-        if pid in t0 and v - t0[pid] == 0
-    }
+    dead = {pid for pid, v in t1.items() if pid in t0 and v - t0[pid] == 0}
     return sorted(p for p in dead if parent.get(p, -1) not in dead)
 
 
@@ -290,12 +326,10 @@ def run_round(args: argparse.Namespace) -> int:
 
     time.sleep(args.settle)  # let the daemon fork its children
     kids = daemon_children(daemon_pid)
-    ticks0, parent0 = proc_tree(kids)
-    t0 = subtree_totals(ticks0, parent0)
+    ticks0, _parent0 = proc_tree(kids)
     time.sleep(args.interval)
     ticks1, parent1 = proc_tree(kids)
-    t1 = subtree_totals(ticks1, parent1)
-    wedged = wedged_nodes(t0, t1, parent1)
+    wedged, unknown = classify(ticks0, ticks1, parent1)
     # Print the POPULATION, not only the verdict. Three of this script's four
     # instrument defects were visible only because the sampled counts sit
     # beside the result: a bare "healthy" over zero observed processes reads
@@ -303,6 +337,7 @@ def run_round(args: argparse.Namespace) -> int:
     print(
         f"daemon children: {len(kids)}; processes sampled: {len(ticks1)}; "
         f"fully-dead subtrees over {args.interval}s: {len(wedged)} {wedged or ''}"
+        + (f"; INDETERMINATE: {len(unknown)} {unknown}" if unknown else "")
     )
 
     deadline = time.time() + args.timeout
@@ -321,6 +356,12 @@ def run_round(args: argparse.Namespace) -> int:
     if wedged or pending:
         print(f"VERDICT: WEDGE at N={args.n}")
         return 3
+    if unknown:
+        # A subtree that accrued nothing and also lost a member ran for an
+        # unknown part of the window. Not healthy, not wedged, and reporting
+        # it as either is how a false all-clear gets published.
+        print(f"VERDICT: INDETERMINATE at N={args.n}")
+        return 1
     print(f"VERDICT: healthy at N={args.n}")
     return 0
 
@@ -371,7 +412,35 @@ def selftest() -> int:
         parent2,
     ) == [20]
 
-    print("selftest: 11 assertions passed")
+    # THE HOLE ROUND 3 FOUND, and it is the incident's own shape: a wedged
+    # parent whose builder EXITS between the samples. Subtree TOTALS shrink,
+    # so the delta goes negative and an == 0 test never fires. Per-process
+    # deltas do not have the hole. Both readings asserted, because the record
+    # of why the unit changed is the only thing that stops it changing back.
+    parent_x = {10: -1, 11: 10}
+    t0_x = {10: 5, 11: 100}
+    t1_x = {10: 5}  # builder gone, parent flat
+    assert wedged_nodes(
+        subtree_totals(t0_x, parent_x), subtree_totals(t1_x, {10: -1}), {10: -1}
+    ) == [], "the superseded reading must be shown missing it"
+    dead_x, unknown_x = classify(t0_x, t1_x, {10: -1})
+    assert dead_x == [] and unknown_x == [10], (dead_x, unknown_x)
+
+    # A parent that accrued nothing with NO member lost is dead, not unknown.
+    dead_y, unknown_y = classify({10: 5}, {10: 5}, {10: -1})
+    assert dead_y == [10] and unknown_y == []
+
+    # A burning builder keeps its parked parent off both lists.
+    parent_z = {20: -1, 21: 20}
+    dead_z, unknown_z = classify({20: 7, 21: 50}, {20: 7, 21: 90}, parent_z)
+    assert dead_z == [] and unknown_z == []
+
+    # A process that APPEARED inside the window counts its whole reading as
+    # work: it cannot have accrued those ticks before it existed.
+    dead_w, unknown_w = classify({20: 7}, {20: 7, 21: 40}, parent_z)
+    assert dead_w == [] and unknown_w == []
+
+    print("selftest: 17 assertions passed")
     return 0
 
 
