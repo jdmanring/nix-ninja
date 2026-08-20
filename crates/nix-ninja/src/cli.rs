@@ -61,6 +61,27 @@ pub struct Cli {
     pub targets: Vec<String>,
 }
 
+/// The job count `-j` resolves to, with 0 meaning the core count.
+///
+/// One definition, because it now has two consumers that must agree: the
+/// runner's task semaphore and the daemon connection pool. They were
+/// independent, and only the semaphore followed `-j`; the pool sat at
+/// `available_parallelism() + 1` whatever was asked for, so any `-j` above
+/// that silently ran at that number instead.
+///
+/// -j0 means "auto": the machine's core count. The old reading of 0 as
+/// "infinity" is what let one TU's codegen fan-out spawn hundreds of
+/// concurrent tasks; unbounded is no longer expressible.
+fn resolved_jobs(cli: &Cli) -> usize {
+    if cli.jobs == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+    } else {
+        cli.jobs
+    }
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -82,7 +103,7 @@ pub fn run() -> Result<()> {
         return subtool(&build_dir, &cli.store_dir, &tool, cli.targets.clone());
     }
 
-    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env()?);
+    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(resolved_jobs(&cli)))?);
     let derived_files = build(&cli, &build_dir, &rpc_client)?;
     if cli.is_output_derivation {
         // One output derivation, by construction: $out is a single path, so
@@ -146,13 +167,7 @@ fn build(cli: &Cli, build_dir: &Path, rpc_client: &Arc<BuilderRpcClient>) -> Res
         // 0 as "infinity" is what let one TU's codegen fan-out spawn
         // hundreds of concurrent tasks; unbounded is no longer
         // expressible.
-        jobs: if cli.jobs == 0 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(8)
-        } else {
-            cli.jobs
-        },
+        jobs: resolved_jobs(cli),
     };
 
     build::build(
@@ -187,7 +202,7 @@ fn subtool(
         }
         "drv" => {
             let cli = Cli::parse();
-            let rpc_client = Arc::new(BuilderRpcClient::connect_from_env()?);
+            let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(resolved_jobs(&cli)))?);
             let derived_files = build(&cli, build_dir, &rpc_client)?;
             // `drv` prints ONE derivation. Same reasoning as above: refusing
             // is the only honest answer to several targets here.
@@ -233,5 +248,39 @@ fn subtool(
                 "Unknown subtool '{subtool_name}'. Use '-t list' to get a list of available subtools."
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn cli_with(args: &[&str]) -> Cli {
+        let mut v = vec!["nix-ninja"];
+        v.extend_from_slice(args);
+        Cli::parse_from(v)
+    }
+
+    /// The pool and the semaphore must resolve to the SAME number. They were
+    /// two independent bounds and the smaller one won silently, so the check
+    /// that matters is the agreement, not either value alone.
+    #[test]
+    fn resolved_jobs_follows_dash_j() {
+        assert_eq!(resolved_jobs(&cli_with(&["-j", "6"])), 6);
+        assert_eq!(resolved_jobs(&cli_with(&["-j", "64"])), 64);
+    }
+
+    #[test]
+    fn resolved_jobs_zero_means_cores_not_infinity() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        assert_eq!(resolved_jobs(&cli_with(&["-j", "0"])), cores);
+        // The default is 0, so a bare invocation takes the same path. An
+        // unbounded runner is what spawned hundreds of concurrent tasks off
+        // one TU's codegen fan-out.
+        assert_eq!(resolved_jobs(&cli_with(&[])), cores);
+        assert!(resolved_jobs(&cli_with(&[])) > 0);
     }
 }

@@ -22,7 +22,7 @@ pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
     let mut drv: Derivation = serde_json::from_str(&drv_json)?;
     println!("nix-ninja-dynamic-task: Processing derivation {}", drv.name);
 
-    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env()?);
+    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(None)?);
 
     // Stage 1: Prepare build environment
     let (build_dir, built_paths) = prepare_build_environment(store_dir)?;

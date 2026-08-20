@@ -120,7 +120,7 @@ pub struct BuilderRpcClient {
 
 impl BuilderRpcClient {
     /// Connect to `$NIX_REMOTE` if set, otherwise the standard daemon
-    pub fn connect_from_env() -> Result<Self> {
+    pub fn connect_from_env(pool_max: Option<usize>) -> Result<Self> {
         let path = match std::env::var(SOCKET_ENV) {
             Ok(remote) => parse_unix_remote(&remote)?,
             Err(_) => PathBuf::from(DEFAULT_DAEMON_SOCKET),
@@ -134,12 +134,29 @@ impl BuilderRpcClient {
         // and has no purpose outside a nix derivation.
         let in_drv = std::env::var_os("NIX_BUILD_TOP").is_some();
 
-        Self::connect_unix(&path, in_drv)
+        Self::connect_unix_sized(&path, in_drv, pool_max.unwrap_or(PoolConfig::default().max_size))
     }
 
     pub fn connect_unix(path: &Path, in_drv: bool) -> Result<Self> {
+        Self::connect_unix_sized(path, in_drv, PoolConfig::default().max_size)
+    }
+
+    /// `pool_max` connections to the daemon. Each in-flight build occupies
+    /// one, so this is a concurrency bound in its own right and it must not
+    /// be left to sit below `-j`: `PoolConfig::default()` is
+    /// `available_parallelism() + 1`, a number nobody chose, and a `-j`
+    /// above it silently becomes that instead. Measured 2026-08-20 on a
+    /// 24-thread machine: the default is 25, so every `-j` from 26 up ran
+    /// at 25 with no message.
+    pub fn connect_unix_sized(path: &Path, in_drv: bool, pool_max: usize) -> Result<Self> {
         let runtime = RuntimeBuilder::new_multi_thread().enable_all().build()?;
-        let pool = ConnectionPool::new(path, PoolConfig::default());
+        let pool = ConnectionPool::new(
+            path,
+            PoolConfig {
+                max_size: pool_max.max(1),
+                ..PoolConfig::default()
+            },
+        );
         Ok(Self {
             runtime,
             pool,
