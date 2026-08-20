@@ -86,7 +86,7 @@ below, and it is the column that would expose the next instrument defect the
 way it exposed the first three. A verdict without its population is not a
 reading.
 
-## Five defects in the instrument, and one choice that avoided a sixth
+## Six defects in the instrument, and one choice that avoided a seventh
 
 **This section is the canonical count. Every other document links here rather
 than restating it**, because the count has now been wrong in three separate
@@ -156,13 +156,30 @@ wrong was the obvious move.
    the window and forcing it into either verdict is how a false all-clear gets
    published.
 
-The pattern across 1, 3, 4 and 6 is one pattern: **the UNIT or the ARITHMETIC
-of the reading was wrong four times, in opposite directions**, and every wrong
-one returned a confident verdict rather than an error. Three were visible only
-because the script prints the population it sampled. The other two needed an
-outside reader, which is the argument for having one: an instrument cannot
-report the blind spot it has, and the two it could not report were both found
-by someone told to attack it.
+7. **The lost-member test was global.** `classify` asked "did anything
+   anywhere exit" and applied the answer to every zero-delta subtree, so one
+   unrelated builder finishing would mark a genuinely dead subtree
+   INDETERMINATE instead of WEDGED - a real finding masked by a bystander.
+   That is the same aggregate-answering-for-a-member error as 3 and 4, made
+   INSIDE the function written to fix them, with the subject fresh. Membership
+   for a process gone at the second sample has to come from the FIRST sample's
+   parent map, which is now a required argument rather than an optional one:
+   with an empty map the ancestry walk stops at the exited process itself and
+   its parent is never marked, restoring the false healthy. The optional
+   parameter was the trap, and the fixture that should have caught it was
+   passing while testing nothing.
+   Found by re-reading the fix rather than by an audit, and it never reached a
+   published table: the branch is reachable only when a zero-delta subtree
+   exists, and no round has ever produced one.
+
+The pattern across 1, 3, 4, 6 and 7 is one pattern: **the UNIT or the ARITHMETIC
+of the reading was wrong five times, in both directions**, and every wrong one
+returned a confident verdict rather than an error. Three were visible only
+because the script prints the population it sampled. Two needed an outside
+reader, which is the argument for having one: an instrument cannot report the
+blind spot it has. The last was caught by re-reading a fix immediately after
+writing it, which is the cheapest of the three methods and the one most easily
+skipped, since a fix feels finished the moment its test goes green.
 
 ## What this oracle can still get wrong
 
