@@ -42,8 +42,9 @@ from the other.
 > about a third of driver CPU in hashing. We switched these maps to `FxHash`
 > (`rustc-hash`): the keys are long paths, and adversarial input is not a
 > concern here, so the default hasher is paying for a property this code does
-> not need. That does add one dependency, which we would understand you
-> wanting to weigh against the gain.
+> not need. This is a direct-dependency promotion rather than a new entry in
+> your tree: `rustc-hash` is already in `Cargo.lock` at 9a07e67, pulled in by
+> n2 itself, so it is compiled in your build today.
 >
 > We are deliberately not quoting an end-to-end number for these two. We have
 > one from our own tree, but our tree carries other performance work in the
@@ -180,9 +181,12 @@ Three adversarial rounds, 2026-08-20. None signed off. Applied to this file:
   would have failed to reproduce our headline number. The reply now offers an
   isolated before/after run rather than quoting one we cannot attribute;
 - **"matching what the driver's other hot maps already use" was false against
-  UPSTREAM's tree.** There is no FxHash anywhere in their crates. One grep and
-  the reader stops. Reworded, and the added `rustc-hash` dependency is now
-  disclosed rather than left in the diff;
+  UPSTREAM's tree.** No crate under their `crates/` uses FxHash. One grep and
+  the reader stops. Reworded. Round 4 then corrected the correction: the
+  reply called this an added dependency, and `rustc-hash` is already in their
+  `Cargo.lock` as a dependency of n2, so it is a direct-dep promotion and not
+  a new tree entry. Saying otherwise overstates the cost of our own patch,
+  which a maintainer checks in one grep;
 - the 25% and one-third figures are `perf` samples from a single run, not a
   controlled A/B, and now say so inline. Both trace to bare one-line commits
   with no recorded method, which is a weakness in our own record;
@@ -199,5 +203,30 @@ Verified clean across the rounds: that PR 43 already changes `want_file` to
 `?`; every design claim in the #5 reply against `task.rs`; #43's age and
 comment count.
 
-Status: NOT SENDABLE. The perf reply should not go out until we decide whether
-to do the isolated before/after run it now offers, and a fourth round is owed.
+Round 5 (2026-08-20), read from the maintainer's chair, sorted these by whether
+they help the person in the thread:
+
+- **#7/#4 and #52 are sendable today.** #7 answers the maintainer's own open
+  question with a stated method and refuses to quote a number it cannot
+  attribute; #52 is one fact the reporter does not have. Both were called out
+  as the right shape;
+- **the PR 43 reply needs its opening cut.** "We independently needed multiple
+  targets and ended up adopting your approach" is our status, not the
+  contributor's business. Lead with the `want_file` finding, which is the part
+  that helps them;
+- **#17 should be trimmed to the header-mismatch trap.** The first two thirds
+  describe a mechanism that lives only in our fork and that nothing else can
+  consume, posted into an issue about a feature we chose not to build. As
+  written it reads as "here is what we did instead of your issue";
+- **the #5 reply should be cut to its last two sentences, or not posted.** Read
+  as its author, it gives their design one sentence and ours four paragraphs,
+  in a thread where their PR has sat since February with no maintainer comment.
+  "We are not claiming ours should win" does not undo that; it is the tell. The
+  only part they can act on is the closing point that whichever lands should be
+  checked against the order-only and stamp cases. Send that.
+- **the dependency claim was corrected**, see above. `rustc-hash` is already in
+  their lock via n2.
+
+Status: NOT SENDABLE as a set. The perf reply still owes a decision on the
+isolated before/after run it offers, and the #5 and #17 replies need cutting
+before anyone posts them.

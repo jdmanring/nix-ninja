@@ -1362,20 +1362,48 @@ fn build_task_derivation(
     // environment would put the invoking shell's noise into every drv
     // hash. A value inside the store also becomes an input so the
     // sandbox can actually exec it.
+    // Every failure below is LOUD. The first version of this block skipped an
+    // unset variable, a non-UTF-8 store path and an unparseable one, all in
+    // silence, and set the environment variable regardless of whether the
+    // matching input was added. Each of those produces a derivation that looks
+    // correct and fails inside the sandbox somewhere unrelated, which is the
+    // most expensive shape a build error can have.
     if let Ok(pass) = env::var("NIX_NINJA_PASS_ENV") {
         for name in pass.split_whitespace() {
-            let Ok(value) = env::var(name) else { continue };
-            if let Ok(rel) = Path::new(&value)
-                .strip_prefix(AsRef::<Path>::as_ref(&task.store_dir))
-            {
-                if let Some(root) = rel.components().next() {
+            let value = env::var(name).map_err(|_| {
+                anyhow!(
+                    "NIX_NINJA_PASS_ENV names {name}, which is not set. \
+                     An allowlist entry is a request to forward something; \
+                     silently skipping it is how a typo becomes a sandbox \
+                     failure thousands of tasks later."
+                )
+            })?;
+            match Path::new(&value).strip_prefix(AsRef::<Path>::as_ref(&task.store_dir)) {
+                Ok(rel) => {
+                    let root = rel.components().next().ok_or_else(|| {
+                        anyhow!("{name}={value} is the store root itself, not a store path")
+                    })?;
                     let full = AsRef::<Path>::as_ref(&task.store_dir).join(root.as_os_str());
-                    if let Some(s) = full.to_str() {
-                        if let Ok(sp) = task.store_dir.parse(s) {
-                            drv.inputs.insert(SingleDerivedPath::Opaque(sp));
-                        }
-                    }
+                    let s = full.to_str().ok_or_else(|| {
+                        anyhow!("{name}={value} resolves to a non-UTF-8 store path")
+                    })?;
+                    let sp = task.store_dir.parse(s).map_err(|e| {
+                        anyhow!("{name}={value} is under the store but unparseable: {e}")
+                    })?;
+                    drv.inputs.insert(SingleDerivedPath::Opaque(sp));
                 }
+                Err(_) if Path::new(&value).is_absolute() => {
+                    // An absolute path outside the store can never be reached
+                    // from inside the sandbox. Forwarding it produces a task
+                    // that names a file it cannot open.
+                    return Err(anyhow!(
+                        "NIX_NINJA_PASS_ENV names {name}={value}, an absolute path \
+                         outside {}. It would be forwarded into the task with no \
+                         corresponding input, and the sandbox has no such file.",
+                        AsRef::<Path>::as_ref(&task.store_dir).display()
+                    ));
+                }
+                Err(_) => {} // not a path; forwarded as a plain value
             }
             drv.env.insert(
                 name.to_string().into_bytes().into(),

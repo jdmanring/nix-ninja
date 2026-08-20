@@ -11,3 +11,7 @@ out/
 # Aider
 .aider*
 vendor/
+
+# python bytecode from scripts/
+__pycache__/
+*.pyc

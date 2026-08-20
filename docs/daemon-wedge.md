@@ -115,16 +115,109 @@ below, and it is the column that would expose the next instrument defect the
 way it exposed the first three. A verdict without its population is not a
 reading.
 
-## Six defects in the instrument, and one choice that avoided another
+8. **The root set could not contain the incident.** Roots were the live
+   daemon's direct children, re-enumerated at both samples. A wedged child
+   whose parent dies is reparented to init, which removes it from
+   `pgrep -P daemon` entirely - so the one process the script exists to find
+   leaves the population, and the verdict is healthy over what remains. The
+   incident this models was seventeen such orphans. Found by the round-5 audit,
+   which built the first positive control and demonstrated the hole: population
+   0, verdict healthy. The fix carries the first sample's pid set forward, and
+   a reparented process is now reported by name.
 
-**This section is the canonical count. Every other document links here rather
-than restating it**, because the count has now been wrong in three separate
+9. **A zero-size population still returned healthy.** Defect 1 arriving through
+   a second door. The repair for defect 1 was to PRINT the population and rely
+   on a person noticing, which is a hope rather than a gate; the round-5 fix
+   makes an empty sample return "could not run" instead of a verdict.
+
+10. **The daemon was selected with `pgrep -o`, the OLDEST match.** The protocol
+    restarts the daemon between rounds, so the fresh listener is always younger
+    than any wedged survivor, and `-o` returns the survivor. Every later round
+    would enumerate the orphan's children, find none, and report healthy. The
+    script now refuses to run at all when more than one `nix-daemon` is alive:
+    aiming the instrument is not a tiebreak.
+
+11. **The metric was CPU ticks, and the reported condition is ticks AND context
+    switches.** A builder legitimately blocked on I/O accrues no ticks either,
+    so the two were indistinguishable and the published negative was a claim
+    about a weaker property than the one being reported. The counter now sums
+    utime, stime and both context-switch counts. Every component is monotonic,
+    so a zero delta means all of them were zero, which is the reported
+    condition rather than a proxy for it.
+
+Round 5 also closed three quieter ones: a transient `/proc` read failure pruned
+the whole subtree beneath it, in the healthy direction; `pgrep`'s exit status
+was ignored, so an enumeration FAILURE and "no children" were the same empty
+list; and the guard that stops the script perturbing a live build failed OPEN on
+any `pgrep` error. Plus a pid-reuse guard, which the previous docstring claimed
+by implication and no code provided: a recycled pid reads fewer ticks than its
+predecessor, which is a negative delta - the exact arithmetic that produced
+defect 6. `starttime` now discriminates.
+
+## Does the published table survive the round-5 fixes?
+
+Yes, and by argument rather than by re-running, which is worth writing out
+because "we fixed the instrument, the numbers stand" is exactly the sentence
+that should not be taken on trust.
+
+- **The activity metric got STRICTER.** It was CPU ticks; it is now ticks plus
+  both context-switch counters. A subtree is dead only when every one of those
+  is unchanged, so the new metric reports a subset of what the old one would.
+  The ladder reported ZERO dead subtrees under the looser test, so the stricter
+  test cannot report more. The direction of that change is the whole argument:
+  had the metric become looser, every rung would need re-running.
+- **The orphan hole cannot have fired.** It requires a sampled process to lose
+  its parent mid-window. Every ladder round ran against a freshly restarted
+  daemon that stayed up, and each one-client row sampled exactly N+1 processes,
+  which is the full expected population with nothing missing.
+- **The empty-population gate cannot have fired**, for the same reason: no row
+  sampled zero.
+- **The daemon-selection fix cannot have fired.** It matters only when more
+  than one `nix-daemon` is alive, and the ladder protocol restarts a single
+  supervised daemon between rounds.
+
+What the fixes DO change is what a future round can see, which is the point of
+making them. They do not retroactively make this negative result stronger: it
+was taken with an instrument that had a hole in the incident's own shape, and
+that is now recorded rather than quietly repaired.
+
+## The positive control, at last
+
+Every earlier version of this document said the instrument had never once been
+demonstrated to detect anything. That was true and it was the strongest reason
+to discount the negative result. It is no longer true.
+
+A control builds a real process tree, `parent -> {builder burning, builder
+SIGSTOPped}`, and calls the shipped `daemon_children`, `proc_tree` and
+`classify` exactly as a round does. Run in the incident's own shape - the
+victim's parent is then killed, so the victim reparents to init:
+
+    child 18837 kids [18838, 18839] tree [18837, 18838, 18839]
+    SIGSTOP -> 18838
+    victim ppid now: 1
+    OLD root-selection population: 0
+    NEW population: 2 FULLY-DEAD: [18838] INDETERMINATE: []
+    ORACLE VERDICT: WEDGE
+
+Both directions in one run. The superseded root selection sampled NOTHING and
+would have returned healthy; the shipped one finds the stopped process and
+returns a wedge. A control that only demonstrated the second half would not
+have shown that the hole was real.
+
+## The defects in the instrument, and one choice that avoided another
+
+**This section is the canonical list. Every other document links here rather
+than restating it, and it is NUMBERED so the count can be read off it rather
+than asserted beside it**, because the count has now been wrong in three separate
 files across three audit rounds, and an instrument whose own history is told
 inconsistently invites the one reading a negative result cannot survive: that
 it was never trusted.
 
-They did NOT all fail the same way. Three produced a false HEALTHY, one
-produced a false WEDGE, one measured the wrong request shape entirely. Item 2
+They did NOT all fail the same way, and this sentence is not a tally of the
+list below - it is a grouping, and defect 1 belongs to none of these groups
+because it made every verdict vacuous rather than wrong. Of the rest: four
+produced a false HEALTHY, one produced a false WEDGE, one measured the wrong
+request shape entirely. Item 2
 is not a defect at all; it is the choice that kept the fix to item 1 from
 creating a false wedge by construction, and it is listed because getting it
 wrong was the obvious move.
@@ -275,7 +368,7 @@ healthy and raise the per-builder RSS until the machine is under reclaim.
 ## How to run it
 
 ```
-python3 scripts/daemon-stress-bisect.py --selftest    # 11 assertions, touches nothing
+python3 scripts/daemon-stress-bisect.py --selftest   # assertions, self-counted, touches nothing
 
 # The reported shape. Run its control in the SAME mode as its ladder -
 # borrowing the control from the other mode is how this shape went a whole
@@ -301,7 +394,11 @@ round leaves nothing to confound its successor, so the restart can be skipped
 between healthy rounds; it is in the loop above because the person running it
 does not know in advance which rounds those are.
 
-Exit codes: 0 healthy, 3 wedge observed, 1 the round could not run. The script
+Exit codes: 0 healthy, 3 wedge observed, 1 EITHER an indeterminate verdict or
+a round that could not run. Those are different things sharing a code, and a
+reader who takes 1 as "instrument failed" discards a real indeterminate finding
+as noise - so read the printed VERDICT line, which distinguishes them, rather
+than the status alone. The script
 refuses to start while a nix-ninja campaign build is live, because it is the
 trigger condition and the campaign is what it would trigger against.
 

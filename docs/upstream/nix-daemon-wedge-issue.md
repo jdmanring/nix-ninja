@@ -15,8 +15,13 @@ rather than part of staging.
 
 ## Title
 
-nix-daemon 2.35.2: worker children stop responding under sustained concurrent
-`build_paths`, holding their locks, with no error and no log line
+nix-daemon 2.35.2: worker children stop responding while holding their locks,
+and survive as init-reparented root orphans
+
+The previous title asserted "under sustained concurrent `build_paths`", which
+the body then withdraws - we never reproduced it at any concurrency. A title
+stating a condition the body retracts is triaged against our own published
+table showing healthy at every rung, and closed. Title what was observed.
 
 ## Body
 
@@ -126,6 +131,28 @@ tested it yet.
 If a maintainer can say "that region takes lock X and can block on Y", that
 would very likely be faster than us continuing to bisect from the outside.
 
+### What we should have measured and did not
+
+Stated plainly because it is the first thing a maintainer will ask for, and we
+had the specimens in hand:
+
+Seventeen wedged processes were alive on the machine and the only reading taken
+off them was `ps` RSS. No `/proc/<pid>/stack`, no `wchan`, no `syscall`, no
+`status` signal masks, no `gdb -p` or `eu-stack` backtrace, no `strace`. Each of
+those is one command against a pid, needs no reproducer and no positive control,
+and any one of them would likely have been worth more than the entire bisect
+that followed. The debugger WAS attached during the incident - to the client,
+which was the half already understood.
+
+There is also a confound in the comparison, and it is not a minor one: the real
+build ran with dynamic derivations and `ca-derivations` throughout, and the
+reproducer ran with neither. Those are different code paths. So the negative
+result is not a bisect of the incident; it is a separate experiment that shares
+a symptom description. We would not blame anyone for stopping reading there.
+
+If this recurs, the first action is a stack from one specimen, before anything
+else.
+
 ### Environment
 
 - `nix-daemon` 2.35.2, multi-user, store owned `root:nixbld`
@@ -152,11 +179,21 @@ still needs the real workload to show up.
 
 ---
 
+**Everything below this line is OUR record and is not part of the filed text.**
+Two rounds of hostile review said the same thing about it: a large block about
+defects in our own instrument, inside an issue body, reads to a maintainer as
+"these measurements are unreliable" and discounts the primary observation along
+with the rest. One sentence carries what a reader needs, and it is already in
+the body: the reproducer has no positive control for the incident's shape, so
+treat its negative as no evidence.
+
+---
+
 ## Audit
 
 Three adversarial rounds, 2026-08-20, all against the tree rather than the
 prose. None signed off. Rounds 2 and 3 each found a LIVE defect in the
-reproducer rather than in a sentence, and both were false-healthy holes in the
+reproducer rather than in a sentence, and round 5 found four more, and both were false-healthy holes in the
 shape this report describes; both are fixed and both re-runs are in
 `../daemon-wedge.md`.
 
@@ -191,9 +228,46 @@ which is the honest ratio for a set of sentences nobody had measured:
   about a quarter of a gibibyte - and therefore sharpens the caveat rather than
   the claim.
 
-STILL OPEN:
+Round 5 (2026-08-20) was four independent hostile reviews and none signed off.
+It found four more live defects in the instrument, listed in
+`../daemon-wedge.md`, one of them the reason this report's negative result was
+weaker than it read: an init-reparented wedged child left the sampled
+population entirely, which is this incident's own shape. That round also built
+the first positive control, so the "we have no positive control" caveat above
+is now narrower than it was and is stated as it stands.
 
-- search their tracker for duplicates. Not done, and not doable from here: it
-  is part of filing.
+The tracker search is DONE, and it was doable from here after all - the forge
+CLI reads issues without filing anything. Saying otherwise was a hedge. Related
+open issues on NixOS/nix, checked 2026-08-20:
 
-Status: NOT SENDABLE, on the tracker search alone.
+- **#11979**, "Concurrent instances of the same store hang on
+  `LocalStore::createTempRootsFile()`" - an flock deadlock under concurrent
+  store access. Reported without a daemon, so not the same configuration, but
+  it is the nearest named mechanism and it is in the lock path. Whether ours is
+  the same is exactly what a `/proc/<pid>/stack` would have answered;
+- **#16222**, "nix-daemon leaks GC temproots files per connection" - a
+  regression introduced in 2.34.0, fixed by PR 16223 merged 2026-07-27. The
+  mechanism is that the per-connection worker in `daemonLoop()` exits via
+  `exit(0)`, so `~LocalStore()` never runs. That is a daemon worker not
+  cleaning up after itself, in the version range we are on, and our own machine
+  shows 77 stale temproots files with no daemon children alive. Not the wedge,
+  but it is the same worker-lifecycle code and it should be ruled in or out
+  before filing;
+- **#7297**, "Hang on large set of recursive-nix builds" - three years open,
+  same family of symptom at scale;
+- **#16005**, an `!awake.empty()` assertion in `Worker::run()` with `buildPaths`
+  in the trace, which is the loop that would go quiet.
+
+STILL OPEN, and these now block rather than the search:
+
+- no stack, wchan or syscall reading from any wedged process. Everything else
+  here is secondary to that;
+- the `ca-derivations` / dynamic-derivations confound between the incident and
+  the reproducer;
+- whether the orphan half should be filed separately. Two reviewers said yes
+  independently: it stands alone with no hypothesis and no reproducer, it is
+  actionable whatever causes the wedge, and it is the half a maintainer would
+  triage rather than close.
+
+Status: NOT SENDABLE. Not on the tracker search, which is done, but on the
+missing specimen readings and the confound above.

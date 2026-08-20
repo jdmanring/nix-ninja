@@ -89,11 +89,53 @@ def parse_stat_ticks(stat_line: str) -> int:
     return int(after[11]) + int(after[12])
 
 
+def parse_stat_starttime(stat_line: str) -> int:
+    """Field 22, the process's start time in clock ticks since boot.
+
+    The pid-reuse discriminator. Two samples can show the same pid holding two
+    different processes, and the second reads fewer ticks than the first, which
+    is a negative delta - the exact shape that produced defect 6. A pid whose
+    starttime moved is a different process and its counter is not comparable.
+    """
+    return int(stat_line.rsplit(")", 1)[1].split()[19])
+
+
+def read_activity(pid: int) -> tuple[int, int] | None:
+    """(activity counter, starttime) for one process, or None if unreadable.
+
+    The counter sums utime, stime and BOTH context-switch counts. The failure
+    being reported is a process with zero CPU ticks AND zero context switches;
+    a ticks-only reading cannot tell that from a builder legitimately blocked
+    on I/O, which accrues no ticks either. Every component is a monotonic
+    counter, so the sum is zero across an interval only when all of them are,
+    which is the reported condition and not a weaker proxy for it.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        ticks = parse_stat_ticks(stat)
+        started = parse_stat_starttime(stat)
+        switches = 0
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith(("voluntary_ctxt_switches", "nonvoluntary_ctxt")):
+                    switches += int(line.split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+    return ticks + switches, started
+
+
 def daemon_children(daemon_pid: int) -> list[int]:
-    out = subprocess.run(
-        ["pgrep", "-P", str(daemon_pid)], capture_output=True, text=True
-    ).stdout
-    return [int(p) for p in out.split()]
+    """Direct children of one pid. Raises rather than reporting none on error.
+
+    pgrep exits 1 for "no matches" and >1 for a real failure, and collapsing
+    those into an empty list is how an enumeration failure becomes a healthy
+    verdict over a population of zero.
+    """
+    r = subprocess.run(["pgrep", "-P", str(daemon_pid)], capture_output=True, text=True)
+    if r.returncode > 1:
+        raise SystemExit(f"pgrep failed enumerating children of {daemon_pid}: {r.stderr.strip()}")
+    return [int(p) for p in r.stdout.split()]
 
 
 def descendants(pid: int) -> list[int]:
@@ -110,6 +152,10 @@ def descendants(pid: int) -> list[int]:
     return seen
 
 
+UNREADABLE: set[int] = set()
+STARTED: dict[int, int] = {}
+
+
 def proc_tree(roots: list[int]) -> tuple[dict[int, int], dict[int, int]]:
     """Own ticks per process, and each process's parent, over every subtree.
 
@@ -123,11 +169,16 @@ def proc_tree(roots: list[int]) -> tuple[dict[int, int], dict[int, int]]:
         while frontier:
             nxt = []
             for pid in frontier:
-                try:
-                    with open(f"/proc/{pid}/stat") as f:
-                        ticks[pid] = parse_stat_ticks(f.read())
-                except OSError:
-                    continue  # exited between listing and reading
+                got = read_activity(pid)
+                if got is None:
+                    # Exited between listing and reading, OR a transient read
+                    # failure. Do not `continue` past the walk: dropping the
+                    # node silently drops every descendant with it, shrinking
+                    # the population toward a healthy verdict. Record it as
+                    # unreadable and keep walking.
+                    UNREADABLE.add(pid)
+                else:
+                    ticks[pid], STARTED[pid] = got
                 for kid in daemon_children(pid):
                     if kid not in parent:
                         parent[kid] = pid
@@ -304,19 +355,40 @@ def one_client_argv(nix: str, n: int) -> list[str]:
 
 
 def campaign_live() -> bool:
-    return (
-        subprocess.run(["pgrep", "-x", "nix-ninja"], capture_output=True).returncode
-        == 0
-    )
+    """True if a real build is running. Fails CLOSED: this guard exists to stop
+    the script perturbing a live campaign, so any pgrep failure must read as
+    "something is running", never as permission to proceed."""
+    r = subprocess.run(["pgrep", "-x", "nix-ninja"], capture_output=True)
+    return r.returncode != 1
 
 
 def find_daemon_pid() -> int:
-    out = subprocess.run(
-        ["pgrep", "-o", "-x", "nix-daemon"], capture_output=True, text=True
-    ).stdout.strip()
-    if not out:
+    """The one live nix-daemon listener, or a refusal.
+
+    This used to be `pgrep -o`, "least recently started", which is the WRONG
+    end after exactly the event this script studies: the protocol restarts the
+    daemon between rounds, so the fresh listener is always younger than any
+    wedged survivor, and `-o` hands back the orphan. Every later round then
+    enumerates the orphan's children, finds none, and reports healthy over an
+    empty population.
+
+    More than one nix-daemon means a survivor is still around, and that is a
+    reason to stop rather than to choose. Aiming the instrument is not a
+    tiebreak.
+    """
+    r = subprocess.run(["pgrep", "-x", "nix-daemon"], capture_output=True, text=True)
+    if r.returncode > 1:
+        raise SystemExit(f"pgrep failed looking for nix-daemon: {r.stderr.strip()}")
+    pids = [int(p) for p in r.stdout.split()]
+    if not pids:
         raise SystemExit("no nix-daemon process found")
-    return int(out)
+    if len(pids) > 1:
+        raise SystemExit(
+            f"{len(pids)} nix-daemon processes alive ({pids}); a survivor from an "
+            "earlier round makes every reading ambiguous. Clear them "
+            "(pkill -9 -x nix-daemon), restart the daemon, and re-run."
+        )
+    return pids[0]
 
 
 def run_round(args: argparse.Namespace) -> int:
@@ -355,10 +427,29 @@ def run_round(args: argparse.Namespace) -> int:
 
     time.sleep(args.settle)  # let the daemon fork its children
     kids = daemon_children(daemon_pid)
+    UNREADABLE.clear()
     ticks0, parent0 = proc_tree(kids)
+    started0 = dict(STARTED)
     time.sleep(args.interval)
-    ticks1, parent1 = proc_tree(kids)
+    # Re-walk from the daemon's children AND from every pid seen in the first
+    # sample. A wedged child whose parent dies is reparented to init, which
+    # takes it out of `pgrep -P daemon` entirely - so walking only the live
+    # daemon's children loses exactly the process this script exists to find,
+    # and reports healthy over the smaller population. The incident it is
+    # modelled on was seventeen such orphans. Carrying the pid set forward
+    # keeps a reparented process in view for as long as it is alive.
+    UNREADABLE.clear()
+    ticks1, parent1 = proc_tree(sorted(set(kids) | set(ticks0)))
+    # A pid whose starttime moved is a DIFFERENT process. Dropping it from the
+    # first sample makes classify treat it as newly appeared and credit it with
+    # everything it has, instead of subtracting an unrelated process's counter
+    # and producing a negative delta.
+    recycled = [p for p, t in STARTED.items() if p in started0 and started0[p] != t]
+    for pid in recycled:
+        del ticks0[pid]
     wedged, unknown = classify(ticks0, ticks1, parent1, parent0)
+    orphaned = sorted(set(ticks1) - set(kids) - set(parent1) | (set(ticks0) - set(ticks1)))
+    reparented = [p for p in ticks1 if p not in kids and parent1.get(p, -1) == -1]
     # Print the POPULATION, not only the verdict. Three of this script's four
     # instrument defects were visible only because the sampled counts sit
     # beside the result: a bare "healthy" over zero observed processes reads
@@ -367,7 +458,17 @@ def run_round(args: argparse.Namespace) -> int:
         f"daemon children: {len(kids)}; processes sampled: {len(ticks1)}; "
         f"fully-dead subtrees over {args.interval}s: {len(wedged)} {wedged or ''}"
         + (f"; INDETERMINATE: {len(unknown)} {unknown}" if unknown else "")
+        + (f"; REPARENTED (lost their parent, still sampled): {reparented}" if reparented else "")
+        + (f"; recycled pids: {recycled}" if recycled else "")
+        + (f"; UNREADABLE: {len(UNREADABLE)}" if UNREADABLE else "")
     )
+    if not ticks1:
+        # Defect 1 arriving by a second door. A verdict over an empty
+        # population is not a healthy reading, it is no reading, and the whole
+        # point of printing the count was that a human would notice - which is
+        # a hope, not a gate. This is the gate.
+        print("VERDICT: could not run - sampled no processes at all")
+        return 1
 
     deadline = time.time() + args.timeout
     pending = list(procs)
@@ -483,7 +584,53 @@ def selftest() -> int:
     assert dead_b == [10], (dead_b, unknown_b)
     assert unknown_b == [30], (dead_b, unknown_b)
 
-    print("selftest: 19 assertions passed")
+    # --- defect 8: an orphaned subtree must still be classified -------------
+    # A reparented process arrives as its own root (parent -1). The bug being
+    # hunted is a wedged child whose parent died, so if a root-parented node
+    # cannot be classified the instrument is blind to the incident's own shape.
+    orphan_t0 = {900: 50}
+    orphan_t1 = {900: 50}
+    orphan_par = {900: -1}
+    dead, unk = classify(orphan_t0, orphan_t1, orphan_par, orphan_par)
+    assert dead == [900], dead
+    assert unk == []
+
+    # An orphan that is still working is not wedged.
+    dead, _ = classify({900: 50}, {900: 90}, orphan_par, orphan_par)
+    assert dead == []
+
+    # --- defect 8: context switches count as activity -----------------------
+    # A builder blocked on I/O accrues no CPU ticks and DOES accrue context
+    # switches. Under the superseded ticks-only reading it was indistinguishable
+    # from a wedge; the composite counter separates them. This fixture pins the
+    # separation so the metric cannot quietly narrow back to ticks.
+    dead, _ = classify({901: 100}, {901: 104}, {901: -1}, {901: -1})
+    assert dead == [], "activity in the interval must not read as dead"
+
+    # starttime parses from the same awkward line the tick parser handles.
+    assert parse_stat_starttime(line) == 5, parse_stat_starttime(line)
+
+    # read_activity answers for a live process and is None for a pid that
+    # cannot exist. An unreadable process must not silently become healthy.
+    mine = read_activity(os.getpid())
+    assert mine is not None and mine[0] > 0, mine
+    assert read_activity(2**22) is None
+
+    # Count the assertions by PARSING this function rather than by carrying a
+    # literal. The literal said 19 over 18 assertions and the documentation
+    # said 11, which is a count wrong in both directions at once - in a script
+    # whose subject is readings that are confidently wrong.
+    import ast as _ast
+
+    with open(__file__) as _f:
+        _tree = _ast.parse(_f.read())
+    _n = sum(
+        isinstance(node, _ast.Assert)
+        for fn in _tree.body
+        if isinstance(fn, _ast.FunctionDef) and fn.name == "selftest"
+        for node in _ast.walk(fn)
+    )
+    print(f"selftest: {_n} assertions passed")
     return 0
 
 

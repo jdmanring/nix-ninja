@@ -61,8 +61,23 @@ what made the rest findable: the error path printing its cause instead of a
 multi-megabyte derivation dump that swallowed it, distinct messages for the two
 no-result failure modes, and names on the last bare io errors.
 
-**`NIX_NINJA_PASS_ENV` must be called out in the description, not discovered in
-the diff.** It is an allowlist of ambient environment variables forwarded into
+**`NIX_NINJA_PASS_ENV` needed a code fix, not just a disclosure, and got one.**
+Round 5's review rejected the mechanism rather than its presentation, and was
+right: naming a thing in a PR description does not make it reviewable. As
+written it had three silent failure paths in nineteen lines - an unset variable,
+a non-UTF-8 store path and an unparseable one were all skipped without a word,
+while the environment variable was set regardless of whether the matching input
+had been added. An absolute path outside the store was forwarded into a task
+that could never open it. All four are now hard errors naming the variable.
+
+What remains open is the design objection, which no amount of error handling
+answers: the values land in `drv.env`, so **the derivation hash depends on the
+invoking environment**, which is the property this project exists to have. The
+right shape is a DECLARED allowlist - a flag or a config entry that is itself
+recorded - rather than `env::var` read at derivation-construction time. Do not
+send this in PR 1. Either fix the shape first or drop it from the offer.
+
+**And it must be called out in the description, not discovered in the diff.** It is an allowlist of ambient environment variables forwarded into
 the task derivation, and it is the one thing in this PR a nix-minded reviewer
 will rightly want to argue about, since it lets the invoking environment reach
 into a build. It is an allowlist rather than a blanket pass-through, and
@@ -78,6 +93,39 @@ The one thing to say plainly in the description: these rules are heuristics
 recovering information the build file failed to declare. They are not a general
 solution, and the general solution is depfiles (their #17). Say that first, or
 a reviewer will say it for us.
+
+### The question that comes before PR 1
+
+Round 5's hostile read of this plan, from the maintainer's chair, landed one
+objection the plan had no answer to, and it is not about size.
+
+We are proposing that a general ninja-to-nix compiler absorb an unbounded,
+adversarially-discovered, largely chromium-shaped rule set - `.grd` scaled
+images through a context directory, vulcanize project files, jinja
+`FileSystemLoader` siblings, ancestor probing by chromium's layout - while the
+plan's own description says the general solution is depfiles, which is their
+open #17. Read back, that is asking someone to take permanent maintenance of
+heuristics that can only grow, that fire on graphs nobody tested them against,
+and that fail by ADDING inputs, which is invisible until it is not.
+
+So the first thing to send is not a PR. It is a question: **would you take a
+dependency-inference layer in-tree at all, or would you rather have the SEAM -
+a hook where a downstream carries its own rule set - plus depfiles as the
+general path?** If the answer is the seam, most of PR 1 should never be
+written, and the small pluggable hook is a PR a maintainer merges in a day.
+
+Ask before writing it, not after. The generic members do not depend on that
+answer and can go separately whatever it is: `#embed` (already amaanq's PR 56),
+quoted interpreter tokens, `@`-files, and the error-reporting fixes. Those last
+are BUG fixes and should not be bundled with heuristics at all - "they are what
+made the rest findable" is a reason they exist, not a reason to make taking
+them conditional on taking the rest.
+
+State the real size in the description too. The vendored-n2 proportion is
+honest by files (72 of 94) and flattering: what is actually being offered is
+roughly 3.7k lines across 13 files in their crates, with +2582 of it in
+`task.rs` alone. That is the figure that decides reviewability, and this plan
+never stated it.
 
 ## PR 2 - driver performance
 
@@ -143,4 +191,4 @@ and refused by PR 3.
 All are fixed, and the class list now carries the command that regenerates it
 rather than a number. Run the command; do not trust the sentence.
 
-Round 3 is owed. Status: NOT SENDABLE.
+Status: NOT SENDABLE, and round 5 raised the more basic question below.

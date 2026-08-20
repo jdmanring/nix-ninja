@@ -7,8 +7,9 @@ carries an audit sign-off line naming who attacked it and when
 
 The fork exists because a real build needed it: qtwebengine 6.11.1, at least
 16,077 tasks (the highest index the driver log reaches; the graph has not been
-driven to completion, so that is a floor), which is one to two orders of
-magnitude past what the examples in this repository reach. Most of what follows is not a feature request. It is a
+driven to completion, so that is a floor), which is three or more orders of
+magnitude past the examples in this repository - six meson projects, the
+largest of them four source files. Most of what follows is not a feature request. It is a
 report of what breaks at that scale, with the fix that was needed to get past
 it.
 
@@ -40,9 +41,11 @@ trigger, so that bridge is two inferences wide and made of something we just
 finished disproving.
 
 **3 goes before 2** even though 2 is the larger body of work, because their #7
-("Add benchmarks for end-to-end compilation", whose body asks why nix-ninja
-comes out about the same as ninja) and #4 are open maintainer questions
-carrying no numbers, and we have two profiler samples with a stated method. Answering an open question earns the read that a large
+("Add benchmarks for end-to-end compilation of NixOS/Nix for perf work", whose
+body asks why nix-ninja comes out about the same as ninja) and #4 ("Add
+benchmarks for nix-ninja generating derivations to compile NixOS/Nix") are open
+maintainer questions carrying no numbers, and we have two profiler samples with
+a stated method. Answering an open question earns the read that a large
 unsolicited PR does not.
 
 **6 is deliberately NOT a nix-ninja PR.** This fork vendored n2 wholesale to
@@ -73,12 +76,38 @@ Honesty here is what makes the rest credible.
   `issue-replies.md` so the author gets an argument rather than silence. Their
   multi-target support is taken, credited, and rebased onto this fork's phony
   model. Note when writing that PR: the `want_file` `Result` fix is THEIRS, not
-  ours - our own commit `02cd1aa` describes it as fixed in passing, which is
-  wrong, and a description written from that commit would claim their work.
+  ours. Our commit `81b67e3` describes it as fixed in passing, which is wrong,
+  and a description written from that commit would claim their work. The commit
+  body still says it: a `git notes` annotation on `81b67e3` carries the
+  correction, since rebasing to fix a message would destroy the record of
+  having got it wrong. An earlier draft here cited `02cd1aa`, which is not in
+  this history at all - it was a pre-amend object, so the citation looked
+  precise and resolved to nothing.
 - **An end-to-end number for the two performance commits.** We have one from
   our tree, but our tree carries other work in the same area, so it cannot be
   attributed to those two commits without an isolated re-run. Offered as a run
   we will do on request rather than quoted.
+
+## Where these go, verified rather than assumed
+
+Checked against the forge on 2026-08-20 rather than carried from memory, because
+an issue number is the one thing in a draft that is both trivially checkable and
+silently wrong if nobody checks:
+
+- upstream is **`pdtpartners/nix-ninja`** (260 stars, issues enabled), which is
+  also this fork's `origin`. `hinshun/nix-ninja` and `obsidiansystems/nix-ninja`
+  are both FORKS of it with issues DISABLED, so a comment aimed at either has
+  nowhere to land. Every `hinshun` reference in these drafts is about **n2**,
+  which genuinely does live at `hinshun/n2` - `Cargo.lock` resolves n2 to
+  `git+https://github.com/hinshun/n2?branch=feature/minimal-pub`;
+- the issues we reply into are opened by **elpdt852**, the maintainer. #43 is
+  **RCoeurjoly**'s, #56 is **amaanq**'s, #52 is **andrewgazelka**'s, #41 is
+  **theoparis**'s. Address the person, not the project;
+- every cited number resolved with a matching title on 2026-08-20: 4, 5, 7, 17,
+  20, 41, 43, 52, 56.
+
+Re-read each thread the hour you post. These are other people's repositories and
+the state moves without telling us.
 
 ## Ground rules for anything added here
 
@@ -117,4 +146,5 @@ reading of a figure whose fix predates the wedge, when the post-fix reading is
 both later and larger; and the task count appeared in four places, including an
 outward-facing reply, with no source at all.
 
-Round 3 is owed. Status: NOT SENDABLE.
+Status: NOT SENDABLE. Five rounds are recorded; the blocking findings are in
+each draft's own audit block.
