@@ -715,7 +715,7 @@ impl Runner {
         let cmdline = build
             .cmdline
             .as_ref()
-            .map(|cmdline| rewrite_ancestor_paths(cmdline, &self.config.build_dir));
+            .map(|cmdline| rewrite_cmdline(cmdline, &self.config.build_dir));
 
         // The rebase root for arguments GN wrote relative to the target's
         // own gen dir: the first output's directory.
@@ -767,10 +767,17 @@ impl Runner {
                     // pinned task binary's rspfile slot ships the
                     // rewritten content; edges with a real ninja rspfile
                     // keep it - this fills the slot only when free.
-                    if let Some(rsp_rel) = arg.strip_prefix('@') {
+                    if let Some(rsp_arg) = arg.strip_prefix('@') {
+                        // The blanket rewrite already compensated this token
+                        // for the cd depth; strip that prefix back off to
+                        // get the build-root-relative file the driver reads.
+                        let rsp_rel = rsp_arg
+                            .strip_prefix(&"../".repeat(cd_depth))
+                            .unwrap_or(rsp_arg);
                         if !rsp_rel.is_empty()
                             && !rsp_rel.starts_with('/')
                             && !rsp_rel.starts_with('-')
+                            && !rsp_rel.starts_with("../")
                             && build.rspfile.is_none()
                             && extra_rspfile.is_none()
                             && self.config.build_dir.join(rsp_rel).is_file()
@@ -828,15 +835,12 @@ impl Runner {
                                 // usually also a declared input, materialized
                                 // as a read-only store symlink the task's
                                 // rspfile write would then die on (EACCES,
-                                // round 74 attempt 2). The @ argument is
-                                // respelled to match, so nothing reads the
-                                // original name.
-                                let shipped = format!("{rsp_rel}.nn-rsp");
-                                extra_rspfile = Some((PathBuf::from(&shipped), content));
-                                arg_rewrites.push((
-                                    arg.clone(),
-                                    format!("@{}{shipped}", "../".repeat(cd_depth)),
-                                ));
+                                // round 74 attempt 2). The @ argument keeps
+                                // its (already cd-compensated) spelling plus
+                                // the suffix, so nothing reads the original.
+                                extra_rspfile =
+                                    Some((PathBuf::from(format!("{rsp_rel}.nn-rsp")), content));
+                                arg_rewrites.push((arg.clone(), format!("{arg}.nn-rsp")));
                             }
                         }
                         continue;
@@ -1907,6 +1911,32 @@ fn rewrite_ancestor_paths(cmdline: &str, build_dir: &Path) -> String {
     rewrite_ancestor_paths_ups(cmdline, build_dir, 0)
 }
 
+/// The whole-command rewrite. A CMake custom command opens with
+/// `cd <subdir> && rest`, and every path in `rest` - arguments, @-files,
+/// `cmake -E touch` targets - resolves from that subdir, not the build
+/// root (round 74: syncqt's @-file and then the touch beside it, one
+/// re-launch each). Rewrite the cd target root-relative and the rest
+/// with the subdir's depth compensated; commands with no cd prologue
+/// keep the plain rewrite.
+fn rewrite_cmdline(cmdline: &str, build_dir: &Path) -> String {
+    if let Some(after_cd) = cmdline.strip_prefix("cd ") {
+        if let Some((dir, tail)) = after_cd.split_once(" && ") {
+            let rel = rewrite_ancestor_paths(dir, build_dir);
+            if !rel.starts_with('/') && !rel.starts_with("../") {
+                let depth = Path::new(&rel)
+                    .components()
+                    .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                    .count();
+                return format!(
+                    "cd {rel} && {}",
+                    rewrite_ancestor_paths_ups(tail, build_dir, depth)
+                );
+            }
+        }
+    }
+    rewrite_ancestor_paths(cmdline, build_dir)
+}
+
 /// Like rewrite_ancestor_paths, but every emitted `../` chain gets
 /// `extra_ups` more levels. For content resolved by a process whose cwd
 /// is `extra_ups` components BELOW the build dir (a `cd <subdir> &&`
@@ -2973,6 +3003,19 @@ mod python_import_names_tests {
             rewrite_ancestor_paths(raw, bd),
             "src/core/api/x\n../src/core/api\n"
         );
+        // The whole-command form: cd target root-relative, everything
+        // after the && compensated by its depth (the syncqt-then-touch
+        // chain that cost round 74 two re-launches).
+        use super::rewrite_cmdline;
+        assert_eq!(
+            rewrite_cmdline(
+                "cd /work/qt/build/src/core/api && tool @/work/qt/build/src/core/api/a && touch /work/qt/build/src/core/api/ts",
+                bd
+            ),
+            "cd src/core/api && tool @../../../src/core/api/a && touch ../../../src/core/api/ts"
+        );
+        // No cd prologue: plain rewrite.
+        assert_eq!(rewrite_cmdline("tool /work/qt/build/x", bd), "tool x");
     }
 
     // The idl_parser shape: sys.path.insert into the importer's OWN
