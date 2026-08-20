@@ -38,7 +38,7 @@ other build running, swap drained to zero:
 
 | concurrency | multi-client mode | one-client mode |
 |---|---|---|
-| 2  | healthy | (control, see below) |
+| 2  | healthy (control) | not run |
 | 4  | -       | healthy |
 | 8  | healthy | healthy |
 | 12 | healthy | healthy |
@@ -48,28 +48,43 @@ other build running, swap drained to zero:
 | 32 | -       | healthy |
 
 Every rung: all builds completed, and no child read zero ticks across the
-sampling interval. **No wedge was reproduced at any concurrency, in either
-shape.** N=20 is included explicitly because it is the concurrency the incident
-was attributed to.
+sampling interval. **No wedge was reproduced.** Read the coverage exactly as
+the table gives it: seven distinct levels between 2 and 32, and NEITHER shape
+spans the whole range on its own - multi-client ran 2 to 24, one-client ran 4
+to 32. The negative control is multi-client N=2; one-client N=2 was never run.
+N=20 appears in both because it is the concurrency the incident was attributed
+to.
 
-## Three defects in the instrument, found before those numbers meant anything
+## Three defects in the instrument, and one choice that avoided a fourth
+
+Counted carefully, because the count itself was wrong in three places until an
+audit caught it, and an instrument whose own history is told inconsistently
+invites the one reading a negative result cannot survive: that it was never
+trusted.
+
+Three defects, and they did NOT all fail the same way. One produced a false
+HEALTHY, one produced a false WEDGE, one measured the wrong request shape
+entirely. Item 2 below is not a defect at all - it is the choice that kept the
+fix to item 1 from creating a second false wedge by construction, and it is
+listed because getting it wrong was the obvious move.
 
 The first three rounds returned "healthy" while observing **zero** daemon
-children, and the zero was the finding rather than the background. Each defect
-below made a verdict that read clean.
+children, and the zero was the finding rather than the background.
 
 1. **The workload could not hold a daemon child open.** The stress derivation
    wrote a file and exited inside the settle window, so the tick oracle never
    had a subject and only build-completion was doing any work. The builder now
    burns CPU for `--spin` iterations, about twenty seconds by default.
 
-2. **It burns rather than sleeps, deliberately.** A sleeping child reads zero
-   ticks, which is the wedge signature itself. A sleep-based workload would
-   have reported every healthy round as a wedge - the same wrong answer as
-   defect 1, in the opposite direction.
+2. **Not a defect: it burns rather than sleeps, deliberately.** The obvious
+   repair for item 1 is a sleeping builder, and a sleeping child reads zero
+   ticks, which is the wedge signature itself - so that repair would have
+   reported every healthy round as a wedge. Recorded because the wrong version
+   is the one a reader would reach for.
 
-3. **The tick oracle read the wrong process.** With children finally visible,
-   N=2 reported both as zero-tick while both builds completed. A daemon child
+3. **The tick oracle read the wrong process, and this one produced a false
+   WEDGE rather than a false healthy.** With children finally visible, N=2
+   reported both as zero-tick while both builds completed. A daemon child
    does not run the build: it forks the sandboxed builder and blocks in
    `wait()`, so its own utime and stime stay flat for the entire build, and a
    healthy child is indistinguishable from a wedged one at that level.
@@ -96,9 +111,13 @@ It says **concurrency alone is not the trigger**, and therefore that
 upstream. Something present in the campaign and absent from the reproducer is
 load-bearing. The candidates, none yet tested:
 
-- **Memory pressure.** The strongest one. The campaign's daemon workers were
-  measured stuffed to 14 GiB apiece before `a2c003e` bounded the blanket
-  build-dir injection, and the wedge coincided with the machine in swap. The
+- **Memory pressure.** The strongest one. `a2c003e` measured seven daemon
+  workers at roughly 2 GiB RSS each, squeezing the machine to 2.5 GiB
+  available, before it bounded the blanket build-dir injection, and the wedge
+  coincided with the machine in swap. (That commit's SUBJECT says "14 GiB",
+  which is the seven-worker TOTAL; its in-code comment carries the per-worker
+  reading, and the drafts staged from the subject alone said "apiece" until an
+  audit caught it. Cite the comment, not the subject.) The
   reproducer's builders hold a shell loop counter. A wedge driven by RSS
   pressure or reclaim would reproduce at *any* N once memory is tight, and at
   *no* N while it is not - which is exactly the pattern of these two datasets.

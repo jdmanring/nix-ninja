@@ -9,10 +9,11 @@ the thread, rather than as an advertisement for this fork. Where the answer is
 
 ---
 
-## Into #7, "nix-ninja takes ~6m, same as ninja"
+## Into #7, "Add benchmarks for end-to-end compilation of NixOS/Nix for perf work"
 
-And #4 (derivation-generation benchmarks) is the same reply; post to one and
-link from the other.
+The body asks why nix-ninja comes out about the same as ninja. #4
+(derivation-generation benchmarks) gets the same reply; post to one and link
+from the other.
 
 > We have profiler numbers from a much larger graph than the examples here, in
 > case they are useful: qtwebengine 6.11.1, about 15,800 tasks.
@@ -20,8 +21,13 @@ link from the other.
 > Two hotspots dominated the driver, both found with `perf` against the live
 > driver rather than by reading, and both in the same place - the include scan.
 >
-> **1. The virtual-path lookup was a pairwise scan.** Sampling at task 10,500
-> put 25% of driver CPU in `Components::next_back`. `canonicalize_cached` in
+> Method, since it decides how much these are worth: both are `perf` samples
+> against the driver while it was running, not a controlled A/B. The first was
+> taken at task 10,500 of one run, the second after fixing the first, in the
+> same run.
+>
+> **1. The virtual-path lookup was a pairwise scan.** That sample put 25% of
+> driver CPU in `Components::next_back`. `canonicalize_cached` in
 > `deps-infer` compares its virtual-paths map PAIRWISE with a full `Path`
 > comparison per entry, and that map grows with every materialized output, so
 > each include lookup is O(V) in outputs so far. The map's own keyed `get` is
@@ -30,15 +36,18 @@ link from the other.
 > spelled probe (`a/./b`) still find an entry keyed `a/b`; we pin that with a
 > test rather than relying on it.
 >
-> **2. The residual was SipHash over long path keys.** A second sample after
-> fixing 1 put about a third of driver CPU in hashing. The include-scan maps
-> now use `FxHash`, matching what the driver's other hot maps already use.
-> Path keys here are long and adversarial input is not a concern, so the
-> default hasher is paying for a property this code does not need.
+> **2. The residual was SipHash over long path keys.** The second sample put
+> about a third of driver CPU in hashing. We switched these maps to `FxHash`
+> (`rustc-hash`): the keys are long paths, and adversarial input is not a
+> concern here, so the default hasher is paying for a property this code does
+> not need. That does add one dependency, which we would understand you
+> wanting to weigh against the gain.
 >
-> Net effect, measured between two rounds of the same build: the worklist
-> bucket went from decelerating by 44 s per 500-task window to holding flat at
-> 5 s.
+> We are deliberately not quoting an end-to-end number for these two. We have
+> one from our own tree, but our tree carries other performance work in the
+> same area, so we cannot honestly attribute a whole-run delta to just these
+> two commits without re-running them in isolation. If a before/after on a
+> clean base would help you evaluate it, say so and we will do that run.
 >
 > The reason this does not show up on the examples in this repo is that both
 > costs are superlinear in graph size - at a few hundred tasks the scan is free
@@ -138,35 +147,57 @@ by a different route.
 >
 > On the phony mechanism we went a different way, for reasons that only show up
 > under sandboxing; written up in #5 rather than here, since it is a design
-> question about the feature rather than about this PR.
+> question about the feature rather than about this PR. No comment from us on
+> the CMake example half, which is the part of this PR that closes #20 - we
+> have not exercised it.
 
 ---
 
-## Into #52, `-fuse-ld=mold`
+## Into #52, alternate linkers (`CC_LD` / `CXX_LD`, mold as the example)
 
-An honest negative. Worth posting because the adjacency is real.
+The reporter already has the diagnosis and the fix in the issue body. The only
+thing we can add is the collision, so that is all this says.
 
-> No fix from us, but a pointer that may save whoever takes this some time.
->
-> We patch the same code path for a different reason: GN quotes paths in
-> generated commands and `which(1)` does not accept quotes, so the resolved
-> interpreter token needs its quotes stripped before resolution. That is in the
-> `shell_words::split` plus `which` path, which is where a `-fuse-ld=` argument
-> would also have to be recognized and its linker resolved to a store path.
->
-> So the two fixes land in the same function. Whoever takes one will be
-> editing the lines the other needs.
+> Heads up on a collision, since we patch the same code path for a different
+> reason: GN quotes paths in generated commands and `which(1)` does not accept
+> quotes, so the resolved interpreter token needs its quotes stripped before
+> resolution. That is the same `shell_words::split` plus `which` path where the
+> `-fuse-ld=` handling you describe would go, so whoever takes this will be
+> editing the lines that fix needs.
 
 ---
 
 ## Audit
 
-Status: NOT YET AUDITED. Exposed claims a maintainer could falsify:
+Round 1: 2026-08-20, adversarial review against the tree. NOT a sign-off.
+Findings applied to this file:
 
-- the 25% and one-third figures, and the 44 s / 5 s pair. State the sampling
-  method inline (it is `perf` on the live driver at task 10,500) and do not let
-  "measured between two rounds" stand in for a controlled A/B - it was not one.
-- "PR #43 already changes that line to `?`" - verify against their current
-  diff before posting, since a force-push would make it false.
-- the #5 claim that output-mapping "does not reach" the two cases. That is our
-  reading of their diff, not something we ran. Soften to what we verified.
+- **the 44 s / 5 s net-effect figure does not exist anywhere in the tree** and
+  was deleted. `git log --all` has no such reading. Worse, the large measured
+  wins in this area come from commits that are NOT in the proposed perf PR, so
+  a maintainer who merged it and benchmarked would have failed to reproduce our
+  headline number - falsified by the reviewer's own measurement, which is the
+  worst way to lose a PR;
+- **"matching what the driver's other hot maps already use" was false against
+  UPSTREAM's tree.** There is no FxHash anywhere in their crates; the other hot
+  maps are ours. One grep and the reader stops reading. Reworded, and the added
+  `rustc-hash` dependency is now disclosed rather than left in the diff;
+- the 25% and one-third figures are `perf` samples from a single run, not a
+  controlled A/B, and now say so inline. Both come from bare one-line commits
+  with no recorded method, which is a weakness in our own record, not just in
+  the prose;
+- #7 was quoted under a title it does not have. Real title restored;
+- the #52 reply handed the reporter back his own diagnosis and his own proposed
+  fix, which is the one condescending passage in the set. Cut to the single
+  thing we actually add, the merge collision;
+- PR 43's CMake half now gets an acknowledgment instead of silence, and PR 56
+  is credited to amaanq rather than to obsidiansystems, which is only the head
+  repo.
+
+Verified clean in the same pass: the claim that PR 43 already changes
+`want_file` to `?` is TRUE against their current diff; every design claim in
+the #5 reply exists in `task.rs`; #43's age and comment count are accurate.
+
+Status: NOT SENDABLE until a second round. The perf reply in particular should
+not go out until we decide whether to do the isolated before/after run it now
+offers.

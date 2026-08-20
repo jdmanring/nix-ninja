@@ -1,8 +1,14 @@
 # DRAFT PR split for nix-ninja
 
-Not sent. The fork is 88 files and +13,094 lines against `9a07e67`. That is not
-a pull request, it is a pile, and sending it as one guarantees it is never
-reviewed. This is the split.
+Not sent. The fork is 93 files and about +14,000 lines against `9a07e67`,
+roughly three quarters of that being the vendored n2 tree. That is not a pull
+request, it is a pile, and sending it as one guarantees it is never reviewed.
+This is the split.
+
+Regenerate the figures at send time (`git diff --shortstat 9a07e67..HEAD`)
+rather than trusting the ones above: they moved twice while these drafts were
+being written, and a stale count in a PR description is the first thing a
+reviewer checks and the cheapest thing to get wrong.
 
 Ordering principle: each PR must be reviewable without the next one, and must
 be defensible on its own even if every later PR is rejected.
@@ -15,26 +21,49 @@ reason. Real ninja does not sandbox, so a generator that reads a file nobody
 declared still works, and its build file is never corrected. Under nix-ninja
 each of those is a hard failure thousands of tasks in.
 
-Nine classes so far, each found by a failure and fixed by a rule:
+About forty commits, each one a rule, each found by a failure rather than by
+design. They are NOT nine tidy classes - an earlier draft of this file said
+nine and an audit against the log falsified it. Grouped by the ecosystem whose
+generators needed them:
 
-- python import closures (a generator importing from its own subtree via a
-  `sys.path.insert` assembled two statements earlier);
-- GN script siblings;
-- `.grd` / `.grit` resource trees;
-- `node_modules`;
-- stamp and phony expansion (see PR 3);
-- `@`-file and rspfile arguments;
-- schema directories;
-- jinja template siblings: a declared `.template` input implies its
+- **python import resolution** - the largest group and the one with real depth.
+  A script's siblings, its sibling packages, packages those import, a directory
+  spliced onto `sys.path` by the script itself, ancestor probing by chromium's
+  layout, and the whole thing as a transitive closure rather than a per-script
+  pass. PYTHONPATH has to carry the symlink directories, because python
+  realpaths a script symlink for `sys.path[0]`.
+- **GN and command-line arguments** - undeclared scripts referenced by
+  commands, a directory named as an argument, `@`-files and rspfiles, an
+  argument that names a graph node, relative arguments rebased against the gen
+  dir, and quoted interpreter tokens (GN quotes paths, `which(1)` does not).
+- **web resource pipelines** - `.grd` and `.grit` manifests and their textual
+  includes, scaled images resolving through a context directory, vulcanize
+  project files naming their data roots, tsconfig project references, and
+  `node_modules` traveling with the script that resolves it.
+- **phony and stamp expansion** - see below, and their #5.
+- **jinja template siblings** - a declared `.template` implies its
   same-directory siblings, because `FileSystemLoader` is rooted at the module
-  directory and the generator concatenates templates the build file does not
-  list;
-- C23 `#embed`, which is upstream PR 56, adopted rather than reinvented.
+  directory and the generator concatenates templates the build file never
+  lists.
+- **C23 `#embed`** - upstream PR 56 by amaanq, adopted rather than reinvented.
 
-**Each class should be a separate commit inside one PR**, not separate PRs:
-they share a test harness and a single narrative, and split across nine PRs the
-reviewer loses the pattern. If the maintainer prefers them split, the natural
-seam is per-generator-ecosystem (python, GN, web resources).
+Plus a set of error-reporting fixes that belong in the same PR because they are
+what made the rest findable: the error path printing its cause instead of a
+multi-megabyte derivation dump that swallowed it, distinct messages for the two
+no-result failure modes, and names on the last bare io errors.
+
+**`NIX_NINJA_PASS_ENV` must be called out in the description, not discovered in
+the diff.** It is an allowlist of ambient environment variables forwarded into
+the task derivation, and it is the one thing in this PR a nix-minded reviewer
+will rightly want to argue about, since it lets the invoking environment reach
+into a build. It is an allowlist rather than a blanket pass-through, and
+store-path values become inputs. State that up front with the case that needed
+it. Finding it unannounced inside a large inference PR reads as smuggling, and
+it would be a fair reading.
+
+**One PR, one commit per rule**, rather than a PR per rule: they share a test
+harness and one narrative, and split apart the reviewer loses the pattern. If
+the maintainer wants it smaller, the seam is the grouping above.
 
 The one thing to say plainly in the description: these rules are heuristics
 recovering information the build file failed to declare. They are not a general
@@ -66,9 +95,13 @@ boundary, drop the rest. If 43 stalls (open since 2026-02, no maintainer
 comment as of 2026-08-20): offer the multi-target half on its own, crediting
 that PR, and leave the phony mechanism question to their #5.
 
-Either way this PR should NOT carry our phony design with it. That is a
-separate argument and it belongs in the issue, not smuggled into a
-target-handling change.
+Either way this PR carries ONLY the CLI target boundary: the `Vec` return, the
+refusals, the dedup and sort, and the alias expansion needed to resolve a phony
+NAMED AS A TARGET. The phony input-assembly rule itself belongs to PR 1, where
+it is an input-assembly rule like every other rule there, and the argument
+about which phony mechanism is right belongs in their #5. An earlier draft of
+this file had PR 1 defer phony to PR 3 while PR 3 refused it, which left the
+work owned by neither.
 
 ## PR 4 - daemon resilience
 

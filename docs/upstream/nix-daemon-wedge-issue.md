@@ -64,23 +64,27 @@ does not clean up after itself.
 
 ### What we could NOT establish
 
-We wrote a standalone reproducer and it does not reproduce. Six concurrency
-levels from 2 to 32, in both request shapes (N clients issuing one
-`build_paths` each, and one client issuing N concurrently), against a freshly
-restarted daemon on an idle 24-thread host with swap drained: every round
-healthy, every build completed, no child ever read zero ticks.
+We wrote a standalone reproducer and it does not reproduce. Seven distinct
+concurrency levels between 2 and 32, across two request shapes - N clients
+issuing one `build_paths` each (2 through 24), and one client issuing N
+concurrently (4 through 32) - against a freshly restarted daemon on an idle
+24-thread host with swap drained: every round healthy, every build completed,
+no child ever read zero ticks.
 
 So we are explicitly NOT claiming a concurrency threshold. Concurrency alone
 does not appear to be the trigger. The reproducer and its result table are at
 `scripts/daemon-stress-bisect.py` and `docs/daemon-wedge.md` in our fork, and
 the negative result is written up there as carefully as the positive one,
-including four defects in the instrument itself that each produced a
-convincing "healthy" before it measured anything real.
+including three defects in the instrument itself that we had to fix before any
+round meant anything - one of which produced a convincing "healthy" over zero
+observed children, and one of which produced a convincing WEDGE on a round
+where both builds completed.
 
 Our leading untested hypothesis is memory pressure, because it is the only
 candidate that explains both datasets rather than merely differing between
-them: the real build's workers were measured at 14 GiB apiece before we bounded
-what we were sending them, and the wedge coincided with the machine in swap,
+them: the real build's daemon workers were measured at roughly 2 GiB RSS each,
+seven of them, taking the machine down to 2.5 GiB available, before we bounded
+what we were sending them; and the wedge coincided with the machine in swap,
 while the reproducer's builders hold a shell loop counter. A reclaim-driven
 wedge would fire at any concurrency once memory is tight, and at none while it
 is not, which is the shape of both datasets. We have not tested it yet.
@@ -116,14 +120,31 @@ still needs the real workload to show up.
 
 ## Audit
 
-Status: NOT YET AUDITED. Do not file until an adversarial reader has attacked
-every claim above and signed off. The claims most exposed to a hostile read:
+Round 1: 2026-08-20, adversarial review against the tree. NOT a sign-off - it
+returned ten blocking findings across this directory, four of them in this
+file. Applied here:
 
-- "no kernel flock waiter" - state how that was determined, or drop it;
-- the 20 GiB orphan figure - it is a sum across seventeen processes from one
-  `ps` reading, and should say so;
+- the memory figure said "14 GiB apiece" where the measurement is seven workers
+  at ~2 GiB each, machine down to 2.5 GiB available. A 7x inflation in the
+  number the whole memory hypothesis rests on, taken from a commit SUBJECT
+  where the in-code comment carried the real reading;
+- "six concurrency levels from 2 to 32, in both request shapes" - neither shape
+  spans that range. Now states the coverage of each shape separately;
+- "four defects, each produced a convincing healthy" - there are three, one
+  produced a false healthy, one a false WEDGE, and the fourth item was a design
+  choice rather than a defect. The issue and its linked evidence disagreed
+  about the instrument's own history, which invites exactly the reading a
+  negative result cannot survive;
+- the ordering argument in `README.md` leaned on async `nix store add` raising
+  concurrency into the wedge, which is a different RPC plus a mechanism this
+  report exists to disclaim. Replaced with the orphan behavior.
+
+STILL OPEN before filing, and each needs a measurement rather than an edit:
+
+- "no kernel flock waiter" - say how that was determined, or drop it;
 - "verified per kill" - name how many kills, or soften it;
-- the environment section says the client issues up to 20 concurrent
-  `build_paths`, which is where the retired "~20 concurrent" figure came from.
-  Make sure it reads as the client's configured limit and not as a measured
-  threshold, because that is exactly the conflation this draft exists to avoid.
+- the 20 GiB orphan figure is a sum over seventeen processes from a single `ps`
+  reading and should say so;
+- search their tracker for duplicates. Not done: it is part of filing.
+
+Status: NOT SENDABLE. Needs a second audit round after the open items above.

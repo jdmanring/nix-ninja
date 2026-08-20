@@ -25,20 +25,27 @@ hand before the next one makes sense.
 | 5 | Resolve-memo cache | comment into their #17 as an ALTERNATIVE | drafted, `issue-replies.md` |
 | 6 | `${rspfile}` support | PR on hinshun/n2, not on nix-ninja | not drafted, see below |
 
-**1 goes first because it changes what other work is safe.** Their 0.2.0
-milestone includes an async `nix store add` issue, and anyone implementing it
-naively raises client-side concurrency against a daemon that has been observed
-wedging under concurrent `build_paths`. A maintainer about to raise concurrency
-should know that before, not after.
+**1 goes first because a wedged worker does not stay inside the build that
+made it.** Seventeen of them survived as init-reparented root orphans holding
+gigabytes, through `SIGTERM` and through a supervisor restart. That is
+concurrency-independent and needs no argument to connect it to anything: it is
+worth a maintainer's attention on its own.
+
+The weaker version of this argument, which an earlier draft led with and which
+should NOT be used: that their 0.2.0 async `nix store add` work raises client
+concurrency into the wedge. `nix store add` is a different RPC from
+`build_paths`, and our own conclusion is that concurrency alone is not the
+trigger, so that bridge is two inferences wide and made of something we just
+finished disproving.
 
 **3 goes before 2** even though 2 is the larger body of work, because their #7
-("why is nix-ninja the same speed as ninja") and #4 (derivation-generation
-benchmarks) are open maintainer questions carrying no numbers, and we have
-numbers with a method. Answering an open question earns the read that a large
+("Add benchmarks for end-to-end compilation", whose body asks why nix-ninja
+comes out about the same as ninja) and #4 are open maintainer questions
+carrying no numbers, and we have two profiler samples with a stated method. Answering an open question earns the read that a large
 unsolicited PR does not.
 
 **6 is deliberately NOT a nix-ninja PR.** This fork vendored n2 wholesale to
-get `${rspfile}` bound in commands, which is 76 of its 88 changed files and a
+get `${rspfile}` bound in commands, which is 72 of its 93 changed files and a
 standing merge liability against an upstream that has live n2 movement (their
 issue #41). The correct destination for that one feature is `hinshun/n2`, after
 which this fork returns to a git dependency and the vendored tree is deleted.
@@ -49,18 +56,25 @@ Offering the vendored tree to nix-ninja would be offering them our liability.
 Honesty here is what makes the rest credible.
 
 - **A concurrency threshold for the wedge.** It was bisected on 2026-08-20 and
-  did not reproduce at any concurrency from 2 to 32, in either request shape.
-  `../daemon-wedge.md` has the table and the four instrument defects found on
-  the way. The incident is reported as an incident; the mechanism is reported
+  did not reproduce at seven levels between 2 and 32, across two request
+  shapes. `../daemon-wedge.md` has the table, the exact coverage of each shape,
+  and the three instrument defects found on the way. The incident is reported as an incident; the mechanism is reported
   as open.
-- **`-fuse-ld=mold` (their #52).** Unhandled here. We will hit it the first
+- **Alternate linkers (their #52, `CC_LD`/`CXX_LD`, mold as the example).**
+  Unhandled here. We will hit it the first
   time anyone builds with mold, and the fix belongs in the same
   `shell_words::split` and `which` path this fork already patches for quoted
   interpreter tokens.
 - **PR 43's phony mechanism.** Declined on the merits, with the reasoning in
   `issue-replies.md` so the author gets an argument rather than silence. Their
   multi-target support is taken, credited, and rebased onto this fork's phony
-  model.
+  model. Note when writing that PR: the `want_file` `Result` fix is THEIRS, not
+  ours - our own commit `02cd1aa` describes it as fixed in passing, which is
+  wrong, and a description written from that commit would claim their work.
+- **An end-to-end number for the two performance commits.** We have one from
+  our tree, but our tree carries other work in the same area, so it cannot be
+  attributed to those two commits without an isolated re-run. Offered as a run
+  we will do on request rather than quoted.
 
 ## Ground rules for anything added here
 
