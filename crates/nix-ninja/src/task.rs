@@ -787,6 +787,35 @@ impl Runner {
                         }
                     } else if !arg.starts_with('-')
                         && !arg.starts_with('/')
+                        && arg.starts_with("../")
+                        && Path::new(&arg)
+                            .extension()
+                            .is_some_and(|e| e == "idl" || e == "webidl")
+                        && Path::new(&arg).is_file()
+                    {
+                        // A schema FILE argument implies its schema
+                        // DIRECTORY: json_schema_compiler resolves a
+                        // cross-namespace type (usb.Device from
+                        // mime_handler_private.idl) by loading the
+                        // referenced namespace's schema from the same api
+                        // dir at runtime, files no command line names (63
+                        // failures, round 73, unmasked by the idl_parser
+                        // fix). Extension-gated to .idl/.webidl - schema
+                        // dirs are small and nothing else here uses those
+                        // extensions - so a .json argument, which is
+                        // everywhere, cannot trigger a sweep.
+                        if let Some(dir) = Path::new(&arg).parent() {
+                            for input in upload_referenced_dir(
+                                &self.rpc_client,
+                                &self.config.build_dir,
+                                dir,
+                            )? {
+                                self.add_derived_file(files, input.clone());
+                                input_set.insert(input.build_path.clone(), input);
+                            }
+                        }
+                    } else if !arg.starts_with('-')
+                        && !arg.starts_with('/')
                         && arg.contains('/')
                     {
                         // GN rebases some tool arguments to the TARGET'S
