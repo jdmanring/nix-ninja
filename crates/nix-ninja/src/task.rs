@@ -310,7 +310,16 @@ impl Runner {
         if build
             .cmdline
             .as_deref()
-            .is_some_and(|c| c.contains("touch_file.py") || c.contains("ts_library.py"))
+            .is_some_and(|c| {
+                c.contains("touch_file.py")
+                    || c.contains("ts_library.py")
+                    // generate_grd emits a manifest whose consumer (grit)
+                    // reads the files the producer's PHONY inputs carry
+                    // (preprocess_static_files: the preprocessed css);
+                    // recording its edge inputs lets the worklist's phony
+                    // expansion materialize them for the consumer.
+                    || c.contains("generate_grd.py")
+            })
         {
             let ins: Vec<FileId> = build.dirtying_ins().to_vec();
             for fid in build.outs() {
