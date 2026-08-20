@@ -344,7 +344,36 @@ impl Runner {
         }
 
         let tools = self.tools.clone();
+        // Main-loop heartbeat: resolution runs serially here, so when it
+        // degrades the process shows one pegged thread, a silent log and
+        // an idle daemon - indistinguishable from a hang from outside
+        // (measured, round 58: 22 min without a daemon connection). The
+        // counter names the slow task and prices resolution per task; it
+        // is always on because its cost is two atomics per task.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TASKS: AtomicU64 = AtomicU64::new(0);
+        static RESOLVE_MS: AtomicU64 = AtomicU64::new(0);
+        let t0 = std::time::Instant::now();
         let task = self.new_task(files, build)?;
+        let resolve_ms = t0.elapsed().as_millis() as u64;
+        RESOLVE_MS.fetch_add(resolve_ms, Ordering::Relaxed);
+        let n_tasks = TASKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if resolve_ms > 5_000 {
+            eprintln!(
+                "nix-ninja: SLOW RESOLVE {resolve_ms} ms for {} (task {n_tasks})",
+                build
+                    .outs()
+                    .first()
+                    .map(|f| files.by_id[*f].name.as_str())
+                    .unwrap_or("?")
+            );
+        }
+        if n_tasks % 500 == 0 {
+            eprintln!(
+                "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time",
+                RESOLVE_MS.load(Ordering::Relaxed) / 1000
+            );
+        }
 
         // Stamp-tool edges also record the task's RESOLVED inputs (the
         // fid map above records only edge-declared ones): generate_grd
