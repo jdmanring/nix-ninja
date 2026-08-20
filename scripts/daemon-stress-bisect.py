@@ -1,45 +1,61 @@
 #!/usr/bin/env python3
-"""Reproduce the nix-daemon concurrent-build_paths wedge, and bisect its threshold.
+"""Probe the nix-daemon for the concurrent-build_paths wedge.
 
-Background (measured against nix-daemon 2.35.2 during a 15,800-task
-qtwebengine build driven by nix-ninja): at ~20 concurrent build_paths
-requests from one client, daemon child processes go dead-asleep while
-holding their locks - 0 CPU ticks, 0 context switches, no kernel flock
+RESULT SO FAR, 2026-08-20: this script does NOT reproduce the wedge, at any
+concurrency from 2 to 32, in either shape it can drive. Read
+docs/daemon-wedge.md before using it or quoting it. The incident is real and
+separately evidenced; concurrency alone is not its trigger, so it is not a
+threshold-finder today and the name "bisect" describes its protocol rather
+than a result it has ever produced.
+
+Background (observed during a ~15,800 task qtwebengine build driven by
+nix-ninja against nix-daemon 2.35.2): daemon child processes go dead-asleep
+while holding their locks - 0 CPU ticks, 0 context switches, no kernel flock
 waiters - and never reply. Closing the client connection kills the stuck
 child and frees its locks, which is the recovery nix-ninja's watchdog
-implements. The trigger is load: a mass retry that re-issues all ~20
-requests at once deterministically recreates the wedge, which is why the
-watchdog gates retries through a 2-permit semaphore.
+implements. A mass retry that re-issues every outstanding request at once
+recreates the condition, which is why the watchdog gates retries through a
+2-permit semaphore. The children can outlive their supervisor as
+init-reparented root orphans holding gigabytes of RSS.
 
-This script is the standalone reproducer for an upstream report. One
-invocation runs ONE round at one concurrency level N:
+One invocation runs ONE round at one concurrency level N:
 
   1. refuses to run if a nix-ninja campaign build is live (the round
      would wedge it - this script IS the trigger condition);
-  2. launches N concurrent `nix build` requests, each a unique trivial
-     derivation (a nonce env var defeats caching, so every request is a
-     real build_paths that must build);
-  3. samples every nix-daemon child's utime+stime from /proc/<pid>/stat
-     twice, --interval seconds apart, once the builds have had time to
-     start;
+  2. launches N concurrent build_paths requests. Two shapes: by default N
+     separate `nix build` processes, which is N CONNECTIONS carrying one
+     request each; with --one-client, a single nix process building N
+     derivations, which is one connection carrying N concurrent requests
+     and is the shape the incident describes. Keep both: the pair is what
+     separates a per-connection fault from a per-daemon one;
+  3. samples each daemon child's SUBTREE utime+stime from /proc/<pid>/stat
+     twice, --interval apart. The subtree is the unit because a daemon
+     child forks the sandboxed builder and blocks in wait(), so its own
+     ticks stay flat all build and a healthy child would read as wedged;
   4. reports children whose tick delta is zero while still alive - the
-     wedge signature - and whether the N builds completed in --timeout.
+     wedge signature - and whether the round completed in --timeout.
 
-Exit codes: 0 = all builds completed, no wedged child (healthy);
+The stress builder BURNS CPU rather than sleeping, and for long enough to
+outlive --settle. Both properties are load-bearing and both were absent
+first time round: a builder that exits early leaves the oracle with no
+subject, and a sleeping one reads zero ticks, which is the wedge signature
+itself. See docs/daemon-wedge.md for the three verdicts that cost.
+
+Exit codes: 0 = round completed, no wedged child (healthy);
 3 = wedge observed (the finding); 1 = the round itself failed to run.
 
-Bisect protocol (run by hand - daemon restarts need root, so a person
-drives them):
+Protocol (run by hand - daemon restarts need root, so a person drives them):
   for N in 2 8 12 16 20 24:
-    ! doas s6-svc -r /run/service/nix-daemon   # fresh daemon per round
-    python3 scripts/daemon-stress-bisect.py -n $N
+    ! doas s6-svc -r /run/service/nix-daemon   # see below
+    python3 scripts/daemon-stress-bisect.py -n $N --one-client
   N=2 is the negative control: it must exit 0, or the oracle is reading
-  something other than the wedge. A fresh daemon per round matters
-  because a wedged child from round k is indistinguishable from a fresh
-  wedge in round k+1.
+  something other than the wedge. A fresh daemon is needed after any round
+  that WEDGED, because a stuck child from round k is indistinguishable from
+  a fresh wedge in round k+1; a healthy round leaves nothing to confound its
+  successor.
 
---selftest exercises the /proc parsing and verdict logic on fixtures and
-touches neither the daemon nor the store.
+--selftest exercises the /proc parsing, the subtree walk and the verdict
+logic on fixtures, and touches neither the daemon nor the store.
 """
 
 import argparse
