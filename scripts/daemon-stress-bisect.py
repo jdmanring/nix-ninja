@@ -114,16 +114,48 @@ def wedged_pids(t0: dict[int, int], t1: dict[int, int]) -> list[int]:
     return [pid for pid, v in t1.items() if pid in t0 and v - t0[pid] == 0]
 
 
+BUILDER_ARGS = (
+    '["-c" "i=0; while [ $i -lt $SPIN ]; do i=$((i+1)); done; echo $NONCE > $out"]'
+)
+
+
 def build_argv(nix: str) -> list[str]:
     # A unique impure env var makes every derivation distinct, so each
     # request is a genuine build, not a cache hit answering instantly.
     expr = (
         'derivation { name = "stress"; system = builtins.currentSystem; '
-        'builder = "/bin/sh"; args = ["-c" "i=0; while [ $i -lt $SPIN ]; do i=$((i+1)); done; echo $NONCE > $out"]; '
+        'builder = "/bin/sh"; args = ' + BUILDER_ARGS + '; '
         'SPIN = builtins.getEnv "SPIN"; '
         "NONCE = builtins.getEnv \"NONCE\"; }"
     )
     return [nix, "build", "--impure", "--no-link", "--expr", expr]
+
+
+def one_client_argv(nix: str, n: int) -> list[str]:
+    """ONE nix process building n distinct derivations concurrently.
+
+    This is the shape the wedge was reported in and the default multi-process
+    mode is NOT it. Launching n separate `nix build` processes opens n daemon
+    CONNECTIONS carrying one build_paths each; the report describes ~20
+    concurrent build_paths from ONE client, and prescribes dropping the client
+    connection as the recovery - which only means anything when many requests
+    share a connection. Measured 2026-08-20: the multi-process ladder ran
+    healthy at every rung through N=24, falsifying the instrument rather than
+    the daemon.
+    """
+    expr = (
+        "let mk = i: derivation { "
+        'name = "stress-${toString i}"; system = builtins.currentSystem; '
+        'builder = "/bin/sh"; args = ' + BUILDER_ARGS + '; '
+        'SPIN = builtins.getEnv "SPIN"; '
+        'NONCE = builtins.getEnv "NONCE" + toString i; }; '
+        'in builtins.listToAttrs (map (i: { name = "s" + toString i; value = mk i; }) '
+        "(builtins.genList (x: x) " + str(n) + "))"
+    )
+    attrs = [f"s{i}" for i in range(n)]
+    return [
+        nix, "build", "--impure", "--no-link", "--max-jobs", str(n), "--expr", expr
+    ] + attrs
 
 
 def campaign_live() -> bool:
@@ -152,18 +184,29 @@ def run_round(args: argparse.Namespace) -> int:
         return 1
     daemon_pid = args.daemon_pid or find_daemon_pid()
     nonce_base = str(int(time.time()))
-    procs = []
-    for i in range(args.n):
-        env = dict(os.environ, NONCE=f"{nonce_base}-{i}", SPIN=str(args.spin))
-        procs.append(
+    env = dict(os.environ, NONCE=f"{nonce_base}-", SPIN=str(args.spin))
+    if args.one_client:
+        procs = [
             subprocess.Popen(
-                build_argv(args.nix),
+                one_client_argv(args.nix, args.n),
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        )
-    print(f"launched {args.n} concurrent build requests (nonce {nonce_base})")
+        ]
+        shape = "1 client, %d concurrent build_paths" % args.n
+    else:
+        procs = [
+            subprocess.Popen(
+                build_argv(args.nix),
+                env=dict(env, NONCE=f"{nonce_base}-{i}"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            for i in range(args.n)
+        ]
+        shape = "%d clients, 1 build_paths each" % args.n
+    print(f"launched {shape} (nonce {nonce_base})")
 
     time.sleep(args.settle)  # let the daemon fork its children
     kids = daemon_children(daemon_pid)
@@ -184,8 +227,10 @@ def run_round(args: argparse.Namespace) -> int:
             time.sleep(2)
     for p in pending:
         p.kill()
-    done = args.n - len(pending)
-    print(f"builds completed: {done}/{args.n} within {args.timeout}s")
+    total = len(procs)
+    done = total - len(pending)
+    unit = "client(s)" if args.one_client else "builds"
+    print(f"{unit} completed: {done}/{total} within {args.timeout}s")
 
     if wedged or pending:
         print(f"VERDICT: WEDGE at N={args.n}")
@@ -230,6 +275,11 @@ def main() -> int:
         help="shell-loop iterations each stress builder burns (CPU, not sleep)",
     )
     ap.add_argument("--timeout", type=int, default=120, help="build completion budget (s)")
+    ap.add_argument(
+        "--one-client",
+        action="store_true",
+        help="one nix process issuing n concurrent build_paths (the reported shape)",
+    )
     ap.add_argument("--daemon-pid", type=int, help="override daemon pid autodetect")
     ap.add_argument("--nix", default="nix", help="nix binary to launch builds with")
     ap.add_argument("--selftest", action="store_true")
