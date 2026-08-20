@@ -202,6 +202,9 @@ impl Runner {
         );
         let store_regex = Regex::new(&pattern)?;
 
+        // Load the cross-round resolve cache before any task resolves.
+        crate::resolve_cache::init(config.store_dir.clone(), config.build_dir.clone());
+
         let mut wrapper_vars = HashMap::new();
         for (key, value) in env::vars() {
             if key.starts_with("NIX_CFLAGS_COMPILE")
@@ -369,6 +372,11 @@ impl Runner {
             );
         }
         if n_tasks % 500 == 0 {
+            // Persist resolve-cache entries computed since the last tick;
+            // a killed driver loses at most one tick's worth.
+            if let Err(e) = crate::resolve_cache::flush() {
+                eprintln!("nix-ninja: resolve cache flush failed: {e}");
+            }
             eprintln!(
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
                  (worklist {} s, cmdline {} s, py {} s, grd {} s)",
@@ -1783,8 +1791,18 @@ fn python_closure_cached(
     if let Some(hit) = memo.lock().unwrap().get(start_dir) {
         return Ok(hit.clone());
     }
+    // Cross-round: a validated entry from the persisted cache skips the
+    // walk and every add_to_store_nar round trip; see resolve_cache.rs.
+    if let Some(files) = crate::resolve_cache::lookup("py", start_dir) {
+        let arc = Arc::new(files);
+        memo.lock()
+            .unwrap()
+            .insert(start_dir.to_path_buf(), arc.clone());
+        return Ok(arc);
+    }
     let mut fresh: Vec<DerivedFile> = Vec::new();
     upload_python_closure_uncached(rpc_client, build_dir, start_dir, &mut fresh)?;
+    crate::resolve_cache::record("py", start_dir, &fresh);
     let arc = Arc::new(fresh);
     memo.lock()
         .unwrap()
@@ -2184,7 +2202,13 @@ fn upload_referenced_dir(
     if let Some(hit) = memo.lock().unwrap().get(dir) {
         return Ok(hit.clone());
     }
+    // Cross-round persistence, same shape as python_closure_cached.
+    if let Some(files) = crate::resolve_cache::lookup("dir", dir) {
+        memo.lock().unwrap().insert(dir.to_path_buf(), files.clone());
+        return Ok(files);
+    }
     let fresh = upload_referenced_dir_uncached(rpc_client, build_dir, dir)?;
+    crate::resolve_cache::record("dir", dir, &fresh);
     memo.lock().unwrap().insert(dir.to_path_buf(), fresh.clone());
     Ok(fresh)
 }
