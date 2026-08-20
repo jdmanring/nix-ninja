@@ -55,7 +55,21 @@ describes:
 
 **N clients issuing one `build_paths` each** - kept as the contrast, since the
 pair is what would separate a per-connection fault from a per-daemon one:
-N = 2 (control), 8, 12, 16, 20, 24, all healthy.
+
+| N | daemon children | processes sampled | fully-dead subtrees | verdict |
+|---|---|---|---|---|
+| 2 (control) | 2  | 4  | 0 | healthy |
+| 8  | 8  | 16 | 0 | healthy |
+| 12 | 12 | 24 | 0 | healthy |
+| 16 | 16 | 32 | 0 | healthy |
+| 20 | 20 | 40 | 0 | healthy |
+| 24 | 24 | 48 | 0 | healthy |
+
+Sampled is 2N here, one child and one builder each, against N+1 in one-client
+mode. That difference is the whole reason the two modes exist, and it is also
+why the superseded per-child oracle would still have caught a wedge in THIS
+shape while missing it in the other: with one builder per child, a child's
+subtree total and its builder's are the same reading.
 
 Read the coverage from the rows rather than from a count: this document has
 twice carried a total that contradicted its own table. Neither shape spans the
