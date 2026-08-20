@@ -59,6 +59,10 @@ sampled before, during and after.
     [after]  MemAvailable 25.06 GiB; swap used 4.64 GiB of 39.09 GiB
     daemon children: 1; processes sampled: 33; fully-dead subtrees over 8s: 0
 
+produced by, and the flags matter because neither is the default:
+
+    python3 scripts/daemon-stress-bisect.py -n 32 --one-client --settle 4 --interval 8
+
 Two things follow, and the second is the one that matters. The host had roughly
 25 GiB available throughout, so these rounds are not evidence about a daemon
 under memory pressure. And 32 concurrent builders moved MemAvailable by about a

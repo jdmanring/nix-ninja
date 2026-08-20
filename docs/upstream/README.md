@@ -106,8 +106,48 @@ silently wrong if nobody checks:
 - every cited number resolved with a matching title on 2026-08-20: 4, 5, 7, 17,
   20, 41, 43, 52, 56.
 
+Read off the forge the same day, replacing claims these drafts had been
+carrying on our own say-so:
+
+- **#43** (RCoeurjoly) opened 2026-02-26, one commit, ZERO comments of any
+  kind, and `mergeable_state: dirty` - it has conflicts and will not merge as
+  it stands. That last fact changes PR 3's plan, which was written around "if
+  43 lands first": it cannot land without a rebase, and saying so in the reply
+  is more use to the contributor than anything else we had for them;
+- **its `want_file` change is real**, read from the PR's own diff rather than
+  inferred: `- let _ = scheduler.want_file(fid);` becomes
+  `+ scheduler.want_file(fid)?;`. It touches 8 files, +170/-89 of them in
+  `task.rs`, and adds the CMake example that closes #20;
+- **#56** (amaanq) opened 2026-07-23, still open, no comments. Two of our own
+  commit messages credit "obsidiansystems", which is a fork of upstream with
+  issues disabled and not the author; `git notes` on `6cc3a6f` and `c49177b`
+  carry the correction.
+
 Re-read each thread the hour you post. These are other people's repositories and
 the state moves without telling us.
+
+## Where the incident numbers come from
+
+The ground rule below says every number carries the run that produced it, and
+until round 5 several of the drafts' own figures did not. Sourced now:
+
+- **16,077 tasks** - the highest task index any driver log reaches, from
+  `fullgraph-v82.log`: `nix-ninja: SLOW RESOLVE 5683 ms for
+  gen/content/browser/resources/indexed_db/resources.grd (task 16077)`. It is a
+  FLOOR, not a total: the graph has never been driven to completion. Fifteen
+  logs carry task indices and this is the maximum across all of them. Note the
+  trap that nearly recorded the wrong provenance - `fullgraph-v78.log` also
+  contains the string 16077, as a gdb thread LWP id, so a grep for the number
+  finds two files and only one is about tasks;
+- **20 concurrent requests** - the `-j20` in the launch script of record,
+  `fullgraph-v74.sh`: `nix-ninja -j20 QtWebEngineCore.stamp`.
+
+Still unsourced, and they are the incident's own figures rather than the
+build's: seventeen orphans, ~20 GiB summed RSS, 7.5 GiB largest. Those come
+from readings taken by hand during the incident and never written to a file.
+The issue draft states them with that provenance and says what one `ps` sample
+can and cannot support. They cannot be recovered now; the lesson is recorded in
+that draft's "what we should have measured" section instead.
 
 ## Ground rules for anything added here
 

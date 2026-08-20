@@ -32,8 +32,9 @@ turn; the third audit then caught the corrected figure stale again, because
 the number moves every time anyone commits to this fork. A count of our own
 commits is stale by construction, so the command is the statement:
 
-    git log --oneline 9a07e67..HEAD -- crates/nix-ninja crates/deps-infer | wc -l Grouped by the ecosystem whose
-generators needed them:
+    git log --oneline 9a07e67..HEAD -- crates/nix-ninja crates/deps-infer | wc -l
+
+Grouped by the ecosystem whose generators needed them:
 
 - **python import resolution** - the largest group and the one with real depth.
   A script's siblings, its sibling packages, packages those import, a directory
@@ -147,9 +148,13 @@ measurements. Bundling them means the speedup waits on the argument.
 
 Depends on how their PR 43 resolves, so it is written to compose either way.
 
-If 43 lands first: rebase, keep only our phony-expansion at the target
-boundary, drop the rest. If 43 stalls (open since 2026-02, no maintainer
-comment as of 2026-08-20): offer the multi-target half on its own, crediting
+43 cannot land as it stands: the forge reports it `dirty`, so it carries
+conflicts and needs a rebase before anyone can merge it. Plan for the second
+branch and treat the first as the surprise.
+
+If 43 does land: rebase, keep only our phony-expansion at the target boundary,
+drop the rest. While it stalls (opened 2026-02-26, zero comments of any kind as
+of 2026-08-20): offer the multi-target half on its own, crediting
 that PR, and leave the phony mechanism question to their #5.
 
 Either way this PR carries ONLY the CLI target boundary: the `Vec` return, the
