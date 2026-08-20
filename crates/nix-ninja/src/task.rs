@@ -729,10 +729,112 @@ impl Runner {
         // beforehand, so we can see if there's anything that matches and add
         // it as an explicit input.
         let mut node_args: Vec<FileId> = Vec::new();
+        // An rsp-style `@file` argument the graph never declares, plus the
+        // cmdline rewrite it needs. Filled by the `@` branch below, applied
+        // after the loop (the loop holds cmdline borrowed).
+        let mut extra_rspfile: Option<(PathBuf, String)> = None;
+        let mut arg_rewrites: Vec<(String, String)> = Vec::new();
         if let Some(cmdline) = &cmdline {
             let args = shell_words::split(cmdline)?;
+            // CMake custom commands open with `cd <subdir> &&`; every
+            // relative path the command or an rsp file resolves after that
+            // is relative to the subdir, not to the build root the rewrite
+            // above targeted. Depth of the cd target = the `../` levels a
+            // post-cd reference needs to climb back to the build root.
+            let cd_depth = if args.len() >= 3
+                && args[0] == "cd"
+                && args[2] == "&&"
+                && !args[1].starts_with('/')
+            {
+                Path::new(&args[1])
+                    .components()
+                    .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                    .count()
+            } else {
+                0
+            };
             for arg in args {
                 let Some(fid) = files.lookup(&arg) else {
+                    // A `@file` argument is a response file the tool reads
+                    // itself (qtbase's syncqt), invisible to every branch
+                    // below because of the prefix. Three needs at once:
+                    // the file's CONTENT carries absolute host paths
+                    // (rewrite them, cwd-compensated - syncqt resolves
+                    // them from the post-cd cwd); the source dirs that
+                    // content names must be UPLOADED (syncqt scans them
+                    // for headers the graph never declares); and the @
+                    // path itself must resolve from the post-cd cwd. The
+                    // pinned task binary's rspfile slot ships the
+                    // rewritten content; edges with a real ninja rspfile
+                    // keep it - this fills the slot only when free.
+                    if let Some(rsp_rel) = arg.strip_prefix('@') {
+                        if !rsp_rel.is_empty()
+                            && !rsp_rel.starts_with('/')
+                            && !rsp_rel.starts_with('-')
+                            && build.rspfile.is_none()
+                            && extra_rspfile.is_none()
+                            && self.config.build_dir.join(rsp_rel).is_file()
+                        {
+                            if let Ok(raw) =
+                                fs::read_to_string(self.config.build_dir.join(rsp_rel))
+                            {
+                                // Root-relative view for upload decisions;
+                                // the shipped content gets the cd
+                                // compensation instead.
+                                let root_view =
+                                    rewrite_ancestor_paths(&raw, &self.config.build_dir);
+                                for tok in root_view.split_whitespace() {
+                                    if tok.starts_with('-')
+                                        || tok.starts_with('/')
+                                        || !tok.starts_with("../")
+                                    {
+                                        continue;
+                                    }
+                                    let p = Path::new(tok);
+                                    if !p
+                                        .components()
+                                        .any(|c| matches!(c, std::path::Component::Normal(_)))
+                                    {
+                                        continue;
+                                    }
+                                    if p.is_dir() {
+                                        for input in upload_referenced_dir(
+                                            &self.rpc_client,
+                                            &self.config.build_dir,
+                                            p,
+                                        )? {
+                                            self.add_derived_file(files, input.clone());
+                                            input_set
+                                                .insert(input.build_path.clone(), input);
+                                        }
+                                    } else if p.is_file() {
+                                        for input in upload_referenced_file(
+                                            &self.rpc_client,
+                                            &self.config.build_dir,
+                                            p.to_path_buf(),
+                                        )? {
+                                            self.add_derived_file(files, input.clone());
+                                            input_set
+                                                .insert(input.build_path.clone(), input);
+                                        }
+                                    }
+                                }
+                                let content = rewrite_ancestor_paths_ups(
+                                    &raw,
+                                    &self.config.build_dir,
+                                    cd_depth,
+                                );
+                                extra_rspfile = Some((PathBuf::from(rsp_rel), content));
+                                if cd_depth > 0 {
+                                    arg_rewrites.push((
+                                        arg.clone(),
+                                        format!("@{}{rsp_rel}", "../".repeat(cd_depth)),
+                                    ));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     // Not a graph node - but GN commands reference source
                     // scripts the graph never declares (gcc_link_wrapper.py
                     // in every host link rule), assuming the runner shares
@@ -1067,6 +1169,19 @@ impl Runner {
         // Extract store paths from cmdline and add pre-extracted wrapper store paths
         lap(&NT_GRD_MS);
 
+        // The @-argument itself resolves from the post-cd cwd; swap in the
+        // compensated spelling computed by the branch above.
+        let cmdline = if arg_rewrites.is_empty() {
+            cmdline
+        } else {
+            cmdline.map(|mut c| {
+                for (from, to) in &arg_rewrites {
+                    c = c.replace(from.as_str(), to.as_str());
+                }
+                c
+            })
+        };
+
         let mut input_srcs = self.wrapper_store_paths.clone();
         if let Some(cmdline) = &cmdline {
             let found_store_paths =
@@ -1084,10 +1199,13 @@ impl Runner {
             cmdline,
             desc: build.desc.clone(),
             deps: build.deps.clone(),
+            // A graph-declared rspfile wins; the discovered @-file fills
+            // the slot only when the edge declares none (guarded above).
             rspfile: build
                 .rspfile
                 .as_ref()
-                .map(|r| (r.path.clone(), r.content.clone())),
+                .map(|r| (r.path.clone(), r.content.clone()))
+                .or(extra_rspfile),
             files: build_files,
             inputs,
             outputs,
@@ -1780,8 +1898,17 @@ fn patched_env_shebang(path: &Path) -> Result<Option<PathBuf>> {
 /// rewritten. The cmd_climb scan below the discovery loop keeps the sandbox
 /// deep enough for whatever "../" chains this emits.
 fn rewrite_ancestor_paths(cmdline: &str, build_dir: &Path) -> String {
+    rewrite_ancestor_paths_ups(cmdline, build_dir, 0)
+}
+
+/// Like rewrite_ancestor_paths, but every emitted `../` chain gets
+/// `extra_ups` more levels. For content resolved by a process whose cwd
+/// is `extra_ups` components BELOW the build dir (a `cd <subdir> &&`
+/// command prologue), the compensation is what makes the rewritten
+/// relative paths land where the absolute originals pointed.
+fn rewrite_ancestor_paths_ups(cmdline: &str, build_dir: &Path, extra_ups: usize) -> String {
     let mut cmdline = cmdline.to_string();
-    let mut ups = 0usize;
+    let mut ups = extra_ups;
     let mut ancestor = Some(build_dir);
     while let Some(dir) = ancestor {
         if dir.components().count() < 3 {
@@ -2817,6 +2944,29 @@ mod python_import_names_tests {
         let names = python_import_names(&d).unwrap();
         assert!(names.contains(&"json_comment_eater".to_string()));
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // The syncqt shape (round 74): a command that cd's into a subdir and
+    // reads an @-file whose content carries absolute host paths. The
+    // rewrite must compensate every emitted ../ chain by the cd depth,
+    // and the in-build-dir prefix (ups=0 uncompensated) must gain
+    // exactly the compensation - that arithmetic is the fix.
+    #[test]
+    fn ancestor_rewrite_compensates_for_cd_depth() {
+        use super::{rewrite_ancestor_paths, rewrite_ancestor_paths_ups};
+        use std::path::Path;
+        let bd = Path::new("/work/qt/build");
+        let raw = "/work/qt/build/src/core/api/x\n/work/qt/src/core/api\n";
+        assert_eq!(
+            rewrite_ancestor_paths_ups(raw, bd, 3),
+            "../../../src/core/api/x\n../../../../src/core/api\n"
+        );
+        // ups=0 delegation unchanged: in-build paths lose the prefix
+        // entirely, the source sibling climbs one.
+        assert_eq!(
+            rewrite_ancestor_paths(raw, bd),
+            "src/core/api/x\n../src/core/api\n"
+        );
     }
 
     // The idl_parser shape: sys.path.insert into the importer's OWN
