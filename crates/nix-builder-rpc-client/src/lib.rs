@@ -32,6 +32,17 @@ pub const SOCKET_ENV: &str = "NIX_REMOTE";
 /// Fallback for when `$NIX_REMOTE` is unset — Nix's standard daemon socket path.
 const DEFAULT_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
 
+/// Waits between connect attempts, in seconds. A connect failure means the
+/// daemon is DOWN rather than busy, and the commonest cause is a restart:
+/// s6 stops it, the new one starts, and the socket is refused in between.
+/// A flat 10s x 3 gave up in half a minute and lost a 45-minute round.
+const CONNECT_BACKOFF_S: [u64; 6] = [5, 10, 20, 30, 60, 60];
+
+/// Connect attempts before surrendering. One per entry in the ladder above,
+/// so the two cannot drift: the last entry repeats if this were ever raised
+/// alone, which is a silent behaviour change, hence the assertion in tests.
+const CONNECT_RETRIES: u32 = CONNECT_BACKOFF_S.len() as u32;
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("daemon error: {0}")]
@@ -445,24 +456,38 @@ impl BuilderRpcClient {
                     Ok(g) => g,
                     Err(e) => {
                         connect_failures += 1;
-                        if connect_failures > 3 {
+                        if connect_failures > CONNECT_RETRIES {
                             eprintln!(
                                 "nix-ninja: [{}] WATCHDOG giving-up: connect failed \
-                                 {connect_failures} times ({stall_attempts} stalls before it)",
+                                 {connect_failures} times over {}s ({stall_attempts} stalls \
+                                 before it)",
                                 now_s(),
+                                CONNECT_BACKOFF_S.iter().sum::<u64>(),
                             );
                             break Err(Error::from(e));
                         }
+                        // Backoff rather than a flat 10s: the failure this
+                        // covers is the daemon being DOWN, not busy, and a
+                        // restart is not over in 30 seconds. Measured
+                        // 2026-08-20: a restart to install a config change
+                        // killed a round that was 45 minutes in and had
+                        // 15,000 tasks resolved, at "connect failures 1".
+                        // The whole ladder is ~3 minutes, which rides a
+                        // restart and still surrenders long before a
+                        // genuinely dead daemon wastes a night.
+                        let wait = CONNECT_BACKOFF_S
+                            [(connect_failures as usize - 1).min(CONNECT_BACKOFF_S.len() - 1)];
                         eprintln!(
-                            "nix-ninja: [{}] WATCHDOG connect-fail ({e}); retrying in 10s \
-                             (connect failures {connect_failures}, stalls {stall_attempts})",
+                            "nix-ninja: [{}] WATCHDOG connect-fail ({e}); retrying in {wait}s \
+                             (connect failures {connect_failures}/{CONNECT_RETRIES}, \
+                             stalls {stall_attempts})",
                             now_s(),
                         );
                         // Sleep OUTSIDE the gate permit: holding one of the
                         // two recovery lanes through a 10s nap starves the
                         // other retryers for no reason.
                         _gate = None;
-                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                         continue;
                     }
                 };
@@ -687,4 +712,38 @@ fn encode_nar(path: &Path) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     std::io::copy(&mut encoder, &mut buf)?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod connect_backoff_tests {
+    use super::{CONNECT_BACKOFF_S, CONNECT_RETRIES};
+
+    /// The retry count is DERIVED from the ladder. If someone raises the
+    /// count alone, the index clamp silently repeats the last wait instead
+    /// of erroring, so the coupling is the thing worth asserting.
+    #[test]
+    fn retries_match_the_backoff_ladder() {
+        assert_eq!(CONNECT_RETRIES as usize, CONNECT_BACKOFF_S.len());
+    }
+
+    /// The window has to outlast a daemon restart. Round 84 died at
+    /// "connect failures 1" under a flat 10s x 3, which is 30s; a restart
+    /// takes longer. Anything under two minutes reopens that hole.
+    #[test]
+    fn total_window_rides_a_daemon_restart() {
+        let total: u64 = CONNECT_BACKOFF_S.iter().sum();
+        assert!(total >= 120, "connect window {total}s is too short for a restart");
+        // and bounded, so a genuinely dead daemon does not burn a night
+        assert!(total <= 600, "connect window {total}s waits too long on a dead daemon");
+    }
+
+    /// Monotonic: each wait at least as long as the one before it. A ladder
+    /// that dips would spend its attempts fastest exactly when the outage
+    /// has proven it is not brief.
+    #[test]
+    fn backoff_never_shortens() {
+        for w in CONNECT_BACKOFF_S.windows(2) {
+            assert!(w[1] >= w[0], "backoff dips: {:?}", CONNECT_BACKOFF_S);
+        }
+    }
 }
