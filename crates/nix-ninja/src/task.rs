@@ -555,7 +555,13 @@ impl Runner {
 
         // Iterate over all explict, implicit and order-only dependencies as
         // they must all be linked into the derivation's source directory.
-        let mut input_set: HashMap<PathBuf, DerivedFile> = HashMap::new();
+        // FxHashMap, not the default SipHash map: perf on round 64 put
+        // 30% of all driver cycles in SipHash over PathBuf keys of this
+        // map (each ts_library task re-inserts a multi-thousand-entry
+        // memoized closure), and FxHash is not DoS-hardened, which this
+        // map does not need - its keys are the build graph's own paths.
+        let mut input_set: rustc_hash::FxHashMap<PathBuf, DerivedFile> =
+            rustc_hash::FxHashMap::default();
         // Expand phony aliases (transitively) into the real inputs behind
         // them. `via_phony` marks fids reached through an expansion: a
         // pure-ordering token that is not a file (CMake emits `phony || .`,
@@ -564,7 +570,7 @@ impl Runner {
         let is_gcc_task = build.deps.as_deref() == Some("gcc");
         let mut worklist: Vec<(FileId, bool)> =
             build.ordering_ins().iter().map(|f| (*f, false)).collect();
-        let mut seen: std::collections::HashSet<FileId> = std::collections::HashSet::new();
+        let mut seen: rustc_hash::FxHashSet<FileId> = rustc_hash::FxHashSet::default();
         while let Some((fid, via_phony)) = worklist.pop() {
             if !seen.insert(fid) {
                 continue;
@@ -850,8 +856,7 @@ impl Runner {
         // to the .d.ts files written beside it.
         {
             let mut expand: Vec<FileId> = node_args;
-            let mut seen_na: std::collections::HashSet<FileId> =
-                std::collections::HashSet::new();
+            let mut seen_na: rustc_hash::FxHashSet<FileId> = rustc_hash::FxHashSet::default();
             while let Some(nfid) = expand.pop() {
                 if !seen_na.insert(nfid) {
                     continue;

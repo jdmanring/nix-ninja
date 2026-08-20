@@ -1423,6 +1423,7 @@ dependencies = [
  "nix-builder-rpc-client",
  "nix-ninja-task",
  "regex",
+ "rustc-hash",
  "serde",
  "serde_json",
  "sha2 0.10.9",
