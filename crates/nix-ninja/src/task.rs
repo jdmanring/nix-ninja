@@ -906,18 +906,39 @@ impl Runner {
         // the second link task found gcc_link_wrapper.py already
         // registered and attached it alone. Uploads are content-cached,
         // so re-encountering a directory is cheap.
-        let py_inputs: Vec<PathBuf> = input_set
-            .values()
-            .filter(|i| i.build_path.extension().is_some_and(|e| e == "py"))
-            .map(|i| i.build_path.clone())
-            .collect();
-        for py in py_inputs {
-            if !Path::new(&py).is_file() {
-                continue;
+        // Per DIRECTORY, not per file, and registered once. The per-file
+        // version was the ts_library wall (5 s per task, perf round 65):
+        // a closure-heavy input set holds thousands of .py files, and for
+        // each one this pass re-uploaded the file (already in the set,
+        // so already uploaded) and cloned the entire memoized closure
+        // through add_derived_file's lossy-convert + lookup + hash. The
+        // sibling set depends only on the directory; one fill registers
+        // its files in self.derived_files/files for the whole run, and
+        // every later task pays one contains_key per sibling.
+        let mut py_dirs: rustc_hash::FxHashSet<PathBuf> = rustc_hash::FxHashSet::default();
+        for i in input_set.values() {
+            if i.build_path.extension().is_some_and(|e| e == "py")
+                && Path::new(&i.build_path).is_file()
+            {
+                if let Some(dir) = i.build_path.parent() {
+                    py_dirs.insert(dir.to_path_buf());
+                }
             }
-            for sib in upload_referenced_file(&self.rpc_client, &self.config.build_dir, py)? {
-                self.add_derived_file(files, sib.clone());
-                input_set.entry(sib.build_path.clone()).or_insert(sib);
+        }
+        static PY_SIB_FILLED: std::sync::OnceLock<
+            std::sync::Mutex<rustc_hash::FxHashSet<PathBuf>>,
+        > = std::sync::OnceLock::new();
+        let filled = PY_SIB_FILLED.get_or_init(|| std::sync::Mutex::new(Default::default()));
+        for dir in py_dirs {
+            let sibs = python_closure_cached(&self.rpc_client, &self.config.build_dir, &dir)?;
+            let first_fill = filled.lock().unwrap().insert(dir);
+            for sib in sibs.iter() {
+                if first_fill {
+                    self.add_derived_file(files, sib.clone());
+                }
+                if !input_set.contains_key(&sib.build_path) {
+                    input_set.insert(sib.build_path.clone(), sib.clone());
+                }
             }
         }
 
@@ -1737,19 +1758,38 @@ fn upload_python_closure(
     // more content-cached file and the consumer's input_set dedupes by
     // path), so the result is script-independent and one walk per
     // directory serves every script in it.
+    out.extend(
+        python_closure_cached(rpc_client, build_dir, start_dir)?
+            .iter()
+            .cloned(),
+    );
+    Ok(())
+}
+
+/// The memoized closure behind upload_python_closure, shared by Arc so
+/// a caller that only needs to CHECK membership (the per-task python
+/// sibling pass) iterates the one canonical copy instead of cloning
+/// thousands of DerivedFiles per hit - the clone-on-hit was 15% of
+/// driver cycles (malloc/free) on round 65's profile.
+fn python_closure_cached(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    start_dir: &Path,
+) -> Result<Arc<Vec<DerivedFile>>> {
     static CLOSURE_MEMO: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<PathBuf, Vec<DerivedFile>>>,
+        std::sync::Mutex<HashMap<PathBuf, Arc<Vec<DerivedFile>>>>,
     > = std::sync::OnceLock::new();
     let memo = CLOSURE_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     if let Some(hit) = memo.lock().unwrap().get(start_dir) {
-        out.extend(hit.iter().cloned());
-        return Ok(());
+        return Ok(hit.clone());
     }
     let mut fresh: Vec<DerivedFile> = Vec::new();
     upload_python_closure_uncached(rpc_client, build_dir, start_dir, &mut fresh)?;
-    memo.lock().unwrap().insert(start_dir.to_path_buf(), fresh.clone());
-    out.extend(fresh);
-    Ok(())
+    let arc = Arc::new(fresh);
+    memo.lock()
+        .unwrap()
+        .insert(start_dir.to_path_buf(), arc.clone());
+    Ok(arc)
 }
 
 fn upload_python_closure_uncached(
