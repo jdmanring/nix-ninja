@@ -484,8 +484,10 @@ impl BuilderRpcClient {
                             now_s(),
                         );
                         // Sleep OUTSIDE the gate permit: holding one of the
-                        // two recovery lanes through a 10s nap starves the
-                        // other retryers for no reason.
+                        // two recovery lanes through the backoff starves the
+                        // other retryers for no reason, and the wait is now
+                        // up to 60s rather than the flat 10s this comment
+                        // was written against.
                         _gate = None;
                         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                         continue;
