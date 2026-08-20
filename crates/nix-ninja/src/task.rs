@@ -167,6 +167,12 @@ pub struct Runner {
     // measured in the wild (perfetto's touch_file.py); widen when a second
     // convention shows up.
     stamp_inputs: HashMap<FileId, Vec<FileId>>,
+    /// Stamp-edge outputs -> the producing TASK'S fully-resolved input
+    /// set, cmdline-discovered uploads included. The fid map above only
+    /// carries edge-declared inputs; generate_grd names its static
+    /// files (sadtab.svg) in cmdline manifests that appear on no edge,
+    /// so the consumer needs what the producer actually resolved.
+    stamp_input_files: HashMap<FileId, Vec<DerivedFile>>,
     /// Every output of a multi-output task, keyed by each of its outputs:
     /// a consumer depending on ONE of them gets the co-outputs too, since
     /// tools follow a declared output to files written beside it.
@@ -230,6 +236,7 @@ impl Runner {
             build_dir_inputs: HashMap::new(),
             phony_aliases: HashMap::new(),
             stamp_inputs: HashMap::new(),
+            stamp_input_files: HashMap::new(),
             co_outputs: HashMap::new(),
             permits,
             tx,
@@ -338,6 +345,20 @@ impl Runner {
 
         let tools = self.tools.clone();
         let task = self.new_task(files, build)?;
+
+        // Stamp-tool edges also record the task's RESOLVED inputs (the
+        // fid map above records only edge-declared ones): generate_grd
+        // names its static files in cmdline manifests that appear on no
+        // edge, and the grit consumer needs them.
+        if build.cmdline.as_deref().is_some_and(|c| {
+            c.contains("touch_file.py")
+                || c.contains("ts_library.py")
+                || c.contains("generate_grd.py")
+        }) {
+            for fid in build.outs() {
+                self.stamp_input_files.insert(*fid, task.inputs.clone());
+            }
+        }
 
         // Acquire before spawning: bounds thread count AND daemon load.
         // Phony builds returned above and never consume a slot. The
@@ -498,6 +519,24 @@ impl Runner {
             // stamp fid itself continues below as a normal task-output dep.
             if let Some(extra) = self.stamp_inputs.get(&fid) {
                 worklist.extend(extra.iter().map(|f| (*f, true)));
+            }
+            if let Some(extra) = self.stamp_input_files.get(&fid) {
+                for df in extra {
+                    if is_gcc_task {
+                        let n = df.build_path.to_string_lossy();
+                        let header_like = n.ends_with(".h")
+                            || n.ends_with(".hpp")
+                            || n.ends_with(".hh")
+                            || n.ends_with(".inc")
+                            || n.ends_with(".ipp");
+                        if !header_like {
+                            continue;
+                        }
+                    }
+                    input_set
+                        .entry(df.build_path.clone())
+                        .or_insert_with(|| df.clone());
+                }
             }
             // An input produced by a multi-output task pulls in its
             // CO-OUTPUTS: tools follow one declared output to the files
