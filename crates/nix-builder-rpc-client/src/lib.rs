@@ -77,6 +77,23 @@ fn stall_allowance_s(stall_attempts: u32) -> u64 {
 mod watchdog_policy_tests {
     use super::stall_allowance_s;
 
+    // The shell monitors grep the LOG for these substrings, and the log
+    // only ever sees an error through Display - a pattern verified
+    // against the SOURCE (which names the variant) rather than an
+    // emitted line matched nothing for a whole campaign. So: format the
+    // real error, assert the monitored pattern hits.
+    #[test]
+    fn monitored_patterns_appear_in_display_output() {
+        let e = super::Error::DaemonStalled {
+            attempts: 4,
+            connect_failures: 1,
+            last_allowance_s: 4800,
+        };
+        let line = e.to_string();
+        assert!(line.contains("DaemonStalled"), "monitor grep would miss: {line}");
+        assert!(line.contains("daemon-side wedge"));
+    }
+
     #[test]
     fn allowance_schedule_is_pinned() {
         assert_eq!(stall_allowance_s(0), 300);
