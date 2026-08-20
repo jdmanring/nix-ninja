@@ -332,7 +332,27 @@ impl BuilderRpcClient {
             let mut attempt: u32 = 0;
             loop {
                 let allowance_s: u64 = 300u64 << (2 * attempt.min(2));
-                let mut guard = self.pool.acquire().await.map_err(Error::from)?;
+                // A connect can also fail transiently: right after a mass
+                // wedge recovery the daemon is busy reaping ~20 killed
+                // children and fresh accepts time out (measured round 80:
+                // one "timeout: connecting to daemon" ended the round a
+                // minute after the recovery worked). Same retry budget,
+                // short backoff.
+                let mut guard = match self.pool.acquire().await {
+                    Ok(g) => g,
+                    Err(e) => {
+                        attempt += 1;
+                        if attempt > 3 {
+                            break Err(Error::from(e));
+                        }
+                        eprintln!(
+                            "nix-ninja: daemon connection failed ({e}); \
+                             retrying in 10s, attempt {attempt}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        continue;
+                    }
+                };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(allowance_s),
                     guard.execute(|client| {
