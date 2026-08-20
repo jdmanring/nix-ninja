@@ -765,6 +765,30 @@ impl Runner {
             // directory.
             let schema_tool = cmdline.contains("json_schema_compiler/compiler.py");
             for arg in args {
+                // The schema-dir rule must sit ABOVE the node dispatch: the
+                // schema file is a DECLARED input on these edges, so
+                // files.lookup succeeds and the else-branches below never
+                // see it (round 76: all 63 failures were this rule placed
+                // on the path the arg never takes).
+                if schema_tool
+                    && !arg.starts_with('-')
+                    && !arg.starts_with('/')
+                    && Path::new(&arg)
+                        .extension()
+                        .is_some_and(|e| e == "json" || e == "idl" || e == "webidl")
+                    && Path::new(&arg).is_file()
+                {
+                    if let Some(dir) = Path::new(&arg).parent() {
+                        for input in upload_referenced_dir(
+                            &self.rpc_client,
+                            &self.config.build_dir,
+                            dir,
+                        )? {
+                            self.add_derived_file(files, input.clone());
+                            input_set.insert(input.build_path.clone(), input);
+                        }
+                    }
+                }
                 let Some(fid) = files.lookup(&arg) else {
                     // A `@file` argument is a response file the tool reads
                     // itself (qtbase's syncqt), invisible to every branch
@@ -875,25 +899,6 @@ impl Runner {
                         )? {
                             self.add_derived_file(files, input.clone());
                             input_set.insert(input.build_path.clone(), input);
-                        }
-                        // Schema file to the schema compiler: also upload
-                        // its directory (see schema_tool above). Bounded by
-                        // upload_referenced_dir's own cap.
-                        if schema_tool
-                            && Path::new(&arg).extension().is_some_and(|e| {
-                                e == "json" || e == "idl" || e == "webidl"
-                            })
-                        {
-                            if let Some(dir) = Path::new(&arg).parent() {
-                                for input in upload_referenced_dir(
-                                    &self.rpc_client,
-                                    &self.config.build_dir,
-                                    dir,
-                                )? {
-                                    self.add_derived_file(files, input.clone());
-                                    input_set.insert(input.build_path.clone(), input);
-                                }
-                            }
                         }
                     } else if !arg.starts_with('-')
                         && !arg.starts_with('/')
