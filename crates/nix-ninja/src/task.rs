@@ -539,6 +539,23 @@ impl Runner {
         fid
     }
 
+    /// Every concrete output a requested TARGET resolves to.
+    ///
+    /// A phony target has no derived file of its own: this fork records it in
+    /// `phony_aliases` and expands it at input assembly, so dependents inherit
+    /// its inputs as their own derivation inputs. That is the right model for
+    /// the graph and it leaves one gap at the CLI boundary, where a phony
+    /// named as a target would otherwise resolve to nothing and report a
+    /// missing derived file for a build that in fact succeeded.
+    ///
+    /// Expansion is transitive because a phony may alias another phony, and
+    /// the seen-set is what makes an alias cycle terminate rather than hang -
+    /// ninja permits the file to declare one, so it is reachable input, not a
+    /// defensive flourish.
+    pub fn resolve_target(&self, fid: FileId) -> Vec<DerivedFile> {
+        resolve_target_in(&self.derived_files, &self.phony_aliases, fid)
+    }
+
     fn new_task(&mut self, files: &mut graph::GraphFiles, build: &Build) -> Result<Task> {
         // Section clocks for the serial-resolution bottleneck, read by
         // the heartbeat in start(). Wall time between checkpoints lands
@@ -3325,4 +3342,120 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+/// The body of [`Runner::resolve_target`], taking its two maps directly so it
+/// can be tested without standing up a Runner (which needs a store, an RPC
+/// client and a populated graph).
+fn resolve_target_in(
+    derived_files: &HashMap<FileId, DerivedFile>,
+    phony_aliases: &HashMap<FileId, Vec<FileId>>,
+    fid: FileId,
+) -> Vec<DerivedFile> {
+    let mut out = Vec::new();
+    let mut seen: rustc_hash::FxHashSet<FileId> = rustc_hash::FxHashSet::default();
+    let mut worklist = vec![fid];
+    while let Some(next) = worklist.pop() {
+        if !seen.insert(next) {
+            continue;
+        }
+        // A concrete output ends the walk. Checked FIRST because a fid can be
+        // both an alias target and a real output, and the real output is the
+        // thing a caller asked for.
+        if let Some(df) = derived_files.get(&next) {
+            out.push(df.clone());
+            continue;
+        }
+        if let Some(alias_ins) = phony_aliases.get(&next) {
+            worklist.extend(alias_ins.iter().copied());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod target_resolution_tests {
+    use super::*;
+    use harmonia_store_path::StorePath;
+    use nix_ninja_task::derived_file::DerivedFile;
+
+    fn df(name: &str) -> DerivedFile {
+        DerivedFile {
+            derived_path: SingleDerivedPath::Opaque(
+                // from_bytes takes the BASENAME, not an absolute path. The
+                // hash is 32 characters of nix-base32, whose alphabet omits
+                // e/o/u/t but includes 0, so all-zeroes is a valid fixture.
+                StorePath::from_bytes(
+                    format!("00000000000000000000000000000000-{name}").as_bytes(),
+                )
+                .expect("fixture store path"),
+            ),
+            build_path: PathBuf::from(name),
+            rel_path: None,
+        }
+    }
+
+    #[test]
+    fn concrete_target_resolves_to_itself() {
+        let mut outs = HashMap::new();
+        outs.insert(FileId::from(1), df("a.o"));
+        let got = resolve_target_in(&outs, &HashMap::new(), FileId::from(1));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].build_path, PathBuf::from("a.o"));
+    }
+
+    // The gap this whole change closes. A phony records no derived file of its
+    // own in this fork - it is expanded at input assembly - so before
+    // resolve_target existed, naming one as a CLI target reported a missing
+    // derived file for a build that had in fact succeeded.
+    #[test]
+    fn phony_target_resolves_to_the_files_it_aliases() {
+        let mut outs = HashMap::new();
+        outs.insert(FileId::from(1), df("a.o"));
+        outs.insert(FileId::from(2), df("b.o"));
+        let mut phony = HashMap::new();
+        phony.insert(FileId::from(9), vec![FileId::from(1), FileId::from(2)]);
+
+        let mut got = resolve_target_in(&outs, &phony, FileId::from(9));
+        got.sort();
+        assert_eq!(
+            got.iter().map(|d| d.build_path.clone()).collect::<Vec<_>>(),
+            vec![PathBuf::from("a.o"), PathBuf::from("b.o")]
+        );
+    }
+
+    #[test]
+    fn phony_of_phony_resolves_transitively() {
+        let mut outs = HashMap::new();
+        outs.insert(FileId::from(1), df("a.o"));
+        let mut phony = HashMap::new();
+        phony.insert(FileId::from(8), vec![FileId::from(1)]);
+        phony.insert(FileId::from(9), vec![FileId::from(8)]);
+
+        let got = resolve_target_in(&outs, &phony, FileId::from(9));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].build_path, PathBuf::from("a.o"));
+    }
+
+    // ninja lets a build file declare an alias cycle, so this is reachable
+    // input rather than a defensive flourish. Without the seen-set it hangs,
+    // and a hang is the one failure mode that writes no error to read.
+    #[test]
+    fn alias_cycle_terminates() {
+        let mut phony = HashMap::new();
+        phony.insert(FileId::from(1), vec![FileId::from(2)]);
+        phony.insert(FileId::from(2), vec![FileId::from(1)]);
+        let got = resolve_target_in(&HashMap::new(), &phony, FileId::from(1));
+        assert!(got.is_empty());
+    }
+
+    // An unknown target must resolve EMPTY rather than to something
+    // plausible: build() turns the empty vec into the "missing derived file"
+    // error that names the target, and a silent empty success there would
+    // report a build that never happened.
+    #[test]
+    fn unknown_target_resolves_empty() {
+        let got = resolve_target_in(&HashMap::new(), &HashMap::new(), FileId::from(7));
+        assert!(got.is_empty());
+    }
 }

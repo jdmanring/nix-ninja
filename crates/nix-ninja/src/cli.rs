@@ -83,11 +83,21 @@ pub fn run() -> Result<()> {
     }
 
     let rpc_client = Arc::new(BuilderRpcClient::connect_from_env()?);
-    let derived_file = build(&cli, &build_dir, &rpc_client)?;
+    let derived_files = build(&cli, &build_dir, &rpc_client)?;
     if cli.is_output_derivation {
-        submit_outer_output(&cli.store_dir, &derived_file, &rpc_client)?;
+        // One output derivation, by construction: $out is a single path, so
+        // several targets have nowhere to go. Refuse rather than silently
+        // submitting the first, which is what indexing would have done.
+        let [derived_file] = &derived_files[..] else {
+            return Err(anyhow!(
+                "--is-output-derivation writes a single $out, but {} targets were \
+                 requested; name one target",
+                derived_files.len()
+            ));
+        };
+        submit_outer_output(&cli.store_dir, derived_file, &rpc_client)?;
     } else {
-        local::symlink_derived_files(&rpc_client, &cli.store_dir, &build_dir, &[derived_file])?;
+        local::symlink_derived_files(&rpc_client, &cli.store_dir, &build_dir, &derived_files)?;
     }
     Ok(())
 }
@@ -127,7 +137,7 @@ fn submit_outer_output(
     Ok(())
 }
 
-fn build(cli: &Cli, build_dir: &Path, rpc_client: &Arc<BuilderRpcClient>) -> Result<DerivedFile> {
+fn build(cli: &Cli, build_dir: &Path, rpc_client: &Arc<BuilderRpcClient>) -> Result<Vec<DerivedFile>> {
     let config = BuildConfig {
         build_dir: build_dir.to_path_buf(),
         store_dir: cli.store_dir.clone(),
@@ -178,7 +188,16 @@ fn subtool(
         "drv" => {
             let cli = Cli::parse();
             let rpc_client = Arc::new(BuilderRpcClient::connect_from_env()?);
-            let derived_file = build(&cli, build_dir, &rpc_client)?;
+            let derived_files = build(&cli, build_dir, &rpc_client)?;
+            // `drv` prints ONE derivation. Same reasoning as above: refusing
+            // is the only honest answer to several targets here.
+            let [derived_file] = &derived_files[..] else {
+                return Err(anyhow!(
+                    "subtool drv shows a single derivation, but {} targets were \
+                     requested; name one target",
+                    derived_files.len()
+                ));
+            };
             let drv_path = derived_file.derived_path.root_path();
             let bytes = rpc_client.clone_drv(drv_path).ok_or_else(|| {
                 anyhow!(

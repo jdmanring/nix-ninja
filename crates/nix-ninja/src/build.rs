@@ -23,7 +23,11 @@ pub fn build(
     targets: Vec<String>,
     config: BuildConfig,
     rpc_client: &Arc<BuilderRpcClient>,
-) -> Result<DerivedFile> {
+) -> Result<Vec<DerivedFile>> {
+    if targets.is_empty() {
+        return Err(anyhow!("at least one target is required"));
+    }
+
     let mut loader = load_file(build_filename)?;
 
     let tools = task::Tools::new(&config.store_dir)?;
@@ -43,26 +47,51 @@ pub fn build(
 
     let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner);
 
-    // TODO: Support multiple targets, probably treat it like a dynamically
-    // generated phony target.
-    let Some(name) = targets.first() else {
-        return Err(anyhow!("unimplemented"));
-    };
-    let fid = scheduler
-        .lookup(name)
-        .ok_or_else(|| anyhow!("unknown path requested: {}", name))?;
-    let _ = scheduler.want_file(fid);
+    // Multiple targets, adopted from upstream PR 43 onto this fork's phony
+    // model rather than taking that PR's mechanism with it. The two are
+    // complementary and this is the half worth having: `ninja a b c` is
+    // ordinary usage, and the TODO this replaces had been open since the
+    // first commit.
+    let mut target_fids: Vec<(String, FileId)> = Vec::with_capacity(targets.len());
+    for name in &targets {
+        let fid = scheduler
+            .lookup(name)
+            .ok_or_else(|| anyhow!("unknown path requested: {}", name))?;
+        // Was `let _ = scheduler.want_file(fid)`. want_file is what detects a
+        // dependency CYCLE, so discarding its Result turned the one error it
+        // exists to raise into a build that proceeds and fails later
+        // somewhere else.
+        scheduler.want_file(fid)?;
+        target_fids.push((name.clone(), fid));
+    }
     scheduler.run()?;
 
-    // println!("Successfully generated all derivations");
+    // Deduplicated by build_path, because two targets legitimately share
+    // outputs - ask for a phony and one of the files it aliases and the file
+    // arrives twice - and a duplicate here becomes a duplicate symlink
+    // operation at the CLI. Sorted so the output is a function of the target
+    // SET rather than of the order it was typed in, which is what makes it
+    // comparable between runs.
+    let mut outputs: Vec<DerivedFile> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for (name, fid) in target_fids {
+        let resolved = runner.resolve_target(fid);
+        if resolved.is_empty() {
+            return Err(anyhow!(
+                "Missing derived file {:?} for target {}",
+                fid,
+                name
+            ));
+        }
+        for df in resolved {
+            if seen.insert(df.build_path.clone()) {
+                outputs.push(df);
+            }
+        }
+    }
+    outputs.sort();
 
-    let derived_file = runner.derived_files.get(&fid).ok_or(anyhow!(
-        "Missing derived file {:?} for target {}",
-        fid,
-        name
-    ))?;
-
-    Ok(derived_file.clone())
+    Ok(outputs)
 }
 
 fn load_file(build_filename: &str) -> Result<load::Loader> {

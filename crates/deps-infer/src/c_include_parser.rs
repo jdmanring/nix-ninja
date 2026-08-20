@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use regex::Regex;
 use std::borrow::Borrow;
 use std::collections::HashMap;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fs::canonicalize;
 use std::fs::File;
