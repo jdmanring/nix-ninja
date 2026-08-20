@@ -379,6 +379,20 @@ def campaign_live() -> bool:
     return r.returncode != 1
 
 
+def read_ppid(pid: int) -> int | None:
+    """The parent of `pid`, or None if it is gone or unreadable.
+
+    Read from field 4 of /proc/<pid>/stat, past the comm field, which can
+    itself contain spaces and parentheses; `rsplit(")", 1)` is the only safe
+    split for the same reason it is used in parse_stat_starttime.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def find_daemon_pid() -> int:
     """The one live nix-daemon listener, or a refusal.
 
@@ -389,9 +403,15 @@ def find_daemon_pid() -> int:
     enumerates the orphan's children, finds none, and reports healthy over an
     empty population.
 
-    More than one nix-daemon means a survivor is still around, and that is a
-    reason to stop rather than to choose. Aiming the instrument is not a
-    tiebreak.
+    More than one `nix-daemon` is NOT by itself a survivor. The daemon forks a
+    worker per connection and the workers keep the listener's comm, so during
+    any live build `pgrep -x` returns a whole family and a refusal on count
+    fires on a perfectly healthy system. The listener is the one that is not a
+    child of another nix-daemon: workers are forked by it, so their PPID is in
+    the set and the listener's (s6-supervise here, init after a wedge) is not.
+
+    Two such roots IS ambiguous, and that is the case worth refusing on:
+    aiming the instrument is not a tiebreak.
     """
     r = subprocess.run(["pgrep", "-x", "nix-daemon"], capture_output=True, text=True)
     if r.returncode > 1:
@@ -399,13 +419,18 @@ def find_daemon_pid() -> int:
     pids = [int(p) for p in r.stdout.split()]
     if not pids:
         raise SystemExit("no nix-daemon process found")
-    if len(pids) > 1:
-        raise SystemExit(
-            f"{len(pids)} nix-daemon processes alive ({pids}); a survivor from an "
-            "earlier round makes every reading ambiguous. Clear them "
-            "(pkill -9 -x nix-daemon), restart the daemon, and re-run."
-        )
-    return pids[0]
+    if len(pids) == 1:
+        return pids[0]
+    alive = set(pids)
+    roots = [p for p in pids if read_ppid(p) not in alive]
+    if len(roots) == 1:
+        return roots[0]
+    raise SystemExit(
+        f"{len(roots)} nix-daemon listeners alive ({roots}) out of {len(pids)} "
+        "processes; a survivor from an earlier round makes every reading "
+        "ambiguous. Clear them (pkill -9 -x nix-daemon), restart the daemon, "
+        "and re-run."
+    )
 
 
 def run_round(args: argparse.Namespace) -> int:
@@ -637,6 +662,11 @@ def selftest() -> int:
     zline = "999 (nix-ninja-task) Z 1 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 7 0 0"
     assert parse_stat_state(zline) == "Z", parse_stat_state(zline)
     assert parse_stat_state(line) == "S", parse_stat_state(line)
+
+    # read_ppid is what separates a listener from its own workers, so it is
+    # checked against the two answers the kernel already has for this process.
+    assert read_ppid(os.getpid()) == os.getppid(), read_ppid(os.getpid())
+    assert read_ppid(2**22) is None
 
     # Count the assertions by PARSING this function rather than by carrying a
     # literal. The literal said 19 over 18 assertions and the documentation

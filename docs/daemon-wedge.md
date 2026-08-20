@@ -138,8 +138,11 @@ reading.
     restarts the daemon between rounds, so the fresh listener is always younger
     than any wedged survivor, and `-o` returns the survivor. Every later round
     would enumerate the orphan's children, find none, and report healthy. The
-    script now refuses to run at all when more than one `nix-daemon` is alive:
-    aiming the instrument is not a tiebreak.
+    script now selects the LISTENER: the one `nix-daemon` that is not a child
+    of another, since the workers are forked by it. It refuses only when two
+    such roots are alive, which is the genuinely ambiguous case - aiming the
+    instrument is not a tiebreak. Its first repair refused on COUNT, which is
+    defect 13.
 
 11. **The metric was CPU ticks, and the reported condition is ticks AND context
     switches.** A builder legitimately blocked on I/O accrues no ticks either,
@@ -148,6 +151,28 @@ reading.
     utime, stime and both context-switch counts. Every component is monotonic,
     so a zero delta means all of them were zero, which is the reported
     condition rather than a proxy for it.
+
+12. **A zombie read as a wedge, and it was the instrument's first live
+    detection.** A `State: Z` process accrues nothing on utime, stime or either
+    context-switch counter, because it is dead - byte-identical, under a
+    counter-delta oracle, to a process that is alive and stuck. The first real
+    WEDGE this script ever reported on the live daemon was pid 17695,
+    `nix-ninja-task <defunct>`, RSS 0. It would have gone upstream as a
+    detection. `read_activity` now returns None for `State: Z`, and the same
+    daemon re-measured healthy. Note the direction: defect 11 made the metric
+    stricter and this is what the stricter metric then bought - a false
+    POSITIVE, which is the direction a wedge report cannot afford, and the only
+    reason it was caught is that a detection gets read and a healthy verdict
+    does not.
+
+13. **The repair for defect 10 refused on COUNT, and the count is normally
+    greater than one.** `nix-daemon` forks a worker per connection and the
+    workers keep the listener's comm, so during any live build `pgrep -x`
+    returns a whole family and the guard fires on a perfectly healthy system -
+    a false "could not run" wearing a survivor's name. Found by reading the
+    fix rather than by running it, since it needs a live build to fire and the
+    protocol restarts the daemon into an idle one. Fixed by selecting the
+    listener structurally; see item 10.
 
 Round 5 also closed three quieter ones: a transient `/proc` read failure pruned
 the whole subtree beneath it, in the healthy direction; `pgrep`'s exit status
