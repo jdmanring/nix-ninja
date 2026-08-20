@@ -2065,6 +2065,21 @@ fn upload_python_closure_uncached(
                         }
                     }
                 }
+                // Descendants: a sys.path.insert into the importer's OWN
+                // subtree, carried through a variable the one-line splice
+                // reader cannot chase (json_schema_compiler inserts
+                // ppapi/generators and imports idl_parser from it; the
+                // ppapi dir has no __init__.py, so package recursion never
+                // descends there). Bounded walk for <name>.py or
+                // <name>/__init__.py; the CONTAINING dir uploads and
+                // queues so its own imports (idl_lexer -> ply) get chased.
+                for name in &unsatisfied {
+                    if let Some(holder) = find_module_below(&dir, name, 3) {
+                        if upload_dir(&holder, 512, out)? {
+                            queue.push(holder);
+                        }
+                    }
+                }
             }
             // sys.path splices readable on one line still help for the
             // shapes the structural probes miss.
@@ -2231,6 +2246,35 @@ fn python_join_segments(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(found)
+}
+
+/// The directory below `root` holding `<name>.py`, or the package dir
+/// `<name>/` holding an `__init__.py` - whichever a runtime
+/// sys.path.insert into the importer's own subtree would reach. BFS to
+/// `depth`, skipping hidden dirs and node_modules; first hit wins.
+fn find_module_below(root: &Path, name: &str, depth: usize) -> Option<PathBuf> {
+    let mut frontier = vec![root.to_path_buf()];
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for d in frontier {
+            let entries = fs::read_dir(&d).ok()?;
+            for sub in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+                let fname = sub.file_name().unwrap_or_default().to_string_lossy();
+                if fname.starts_with('.') || fname == "node_modules" {
+                    continue;
+                }
+                if sub.join(format!("{name}.py")).is_file() {
+                    return Some(sub);
+                }
+                if fname == name && sub.join("__init__.py").is_file() {
+                    return Some(sub);
+                }
+                next.push(sub);
+            }
+        }
+        frontier = next;
+    }
+    None
 }
 
 /// Directories the .py files in `dir` splice onto sys.path, read
@@ -2743,6 +2787,22 @@ mod python_import_names_tests {
         .unwrap();
         let names = python_import_names(&d).unwrap();
         assert!(names.contains(&"json_comment_eater".to_string()));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // The idl_parser shape: sys.path.insert into the importer's OWN
+    // subtree, path carried through a variable (json_schema_compiler ->
+    // ppapi/generators/idl_parser.py, 64 task failures, round 72). The
+    // probe must find a bare module two levels down, and a negative
+    // control must stay empty.
+    #[test]
+    fn finds_module_in_own_subtree() {
+        let d = std::env::temp_dir().join(format!("nn-below-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("ppapi/generators")).unwrap();
+        std::fs::write(d.join("ppapi/generators/idl_parser.py"), "x = 1\n").unwrap();
+        let hit = super::find_module_below(&d, "idl_parser", 3).unwrap();
+        assert_eq!(hit, d.join("ppapi/generators"));
+        assert!(super::find_module_below(&d, "no_such_module", 3).is_none());
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
