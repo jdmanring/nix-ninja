@@ -828,6 +828,31 @@ impl Runner {
                     grd_list.push(r);
                 }
             }
+            // A grd can also reference GENERATED files (a preprocessed
+            // .css another task emits), which exist nowhere on disk at
+            // scan time and so never pass the existence filter above.
+            // A candidate that names a graph node routes as a Built
+            // input with its co-outputs, same as cmdline node args.
+            for cand in grd_reference_candidates(&grd)? {
+                if input_set.contains_key(&cand) {
+                    continue;
+                }
+                let Some(gfid) = files.lookup(&cand.to_string_lossy()) else {
+                    continue;
+                };
+                let mut expand = vec![gfid];
+                while let Some(nfid) = expand.pop() {
+                    if let Some(df) = self.derived_files.get(&nfid) {
+                        if input_set.contains_key(&df.build_path) {
+                            continue;
+                        }
+                        input_set.insert(df.build_path.clone(), df.clone());
+                        if let Some(sibs) = self.co_outputs.get(&nfid) {
+                            expand.extend(sibs.iter().filter(|s| **s != nfid));
+                        }
+                    }
+                }
+            }
         }
 
         let mut inputs: Vec<DerivedFile> = input_set.into_values().collect();
@@ -1806,6 +1831,29 @@ fn upload_python_closure_uncached(
         }
     }
     Ok(())
+}
+
+/// Every file="..."/path="..." value of a grit manifest resolved
+/// lexically against the manifest's directory, EXISTENCE-BLIND: the
+/// caller matches these against graph nodes to catch generated
+/// references, which exist nowhere on disk at scan time.
+fn grd_reference_candidates(grd: &Path) -> Result<Vec<PathBuf>> {
+    let body = fs::read_to_string(grd)
+        .map_err(|e| anyhow!("read({}) for grd candidates: {e}", grd.display()))?;
+    let dir = grd.parent().unwrap_or(Path::new(""));
+    let mut out = Vec::new();
+    for attr in ["file=\"", "path=\""] {
+        for chunk in body.split(attr).skip(1) {
+            let Some(val) = chunk.split('"').next() else {
+                continue;
+            };
+            if val.is_empty() || val.contains("://") {
+                continue;
+            }
+            out.push(lexical_join(dir, Path::new(val)));
+        }
+    }
+    Ok(out)
 }
 
 /// Quoted string segments of every os.path.join line in the *_project.py
