@@ -120,12 +120,21 @@ where
     Ok(results)
 }
 
-static INCLUDE_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r##"^\s*#\s*include\s*(["<])([^">]*)[">]"##).unwrap());
+// Upstream PR 56 (obsidiansystems, open since 2026-07-23, no maintainer
+// comment as of 2026-08-20). Adopted here rather than reinvented: a directive
+// that pulls a file into the translation unit is a build INPUT, and one this
+// driver did not infer is a missing input - the same failure shape as the
+// eight input classes this fork already fixes, arriving through a directive
+// nobody has hit yet. Cheaper to carry the upstream spelling now than to
+// rediscover it as a ninth class from a resolved-derivation error.
+static INCLUDE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r##"^\s*#\s*(?:include|embed)\s*(["<])([^">]*)[">]"##).unwrap()
+});
 
 /// Given a C-like source, try to resolve includes.
 ///
-/// Includes are generally of the form `#include <name>` or `#include "name"`
+/// Includes are generally of the form `#include <name>` or `#include "name"`.
+/// Also, C23 `#embed` resolves quoted names the same way.
 pub fn extract_includes(
     path: &PathBuf,
     include_dirs: &[PathBuf],
@@ -244,5 +253,46 @@ mod tests {
         assert_eq!(hit, Some(PathBuf::from("/store/x-b.h")));
         let miss = canonicalize_cached(PathBuf::from("gen/a/c.h"), Some(&vp)).unwrap();
         assert_eq!(miss, None);
+    }
+
+    // Upstream PR 56 ships the regex widening with no test. An inference rule
+    // with no test is how the eight input classes this fork carries were each
+    // found the expensive way - as a resolved-derivation failure thousands of
+    // tasks into a build - so the rule gets pinned on arrival.
+    //
+    // The negative cases are the point. `embed` must match only as a
+    // PREPROCESSOR DIRECTIVE: widening `include` to `(?:include|embed)` puts a
+    // very common English word in a pattern that scans every line of every
+    // source file, and a false positive here does not fail loudly - it invents
+    // an input, which resolves to a missing store path much later.
+    #[test]
+    fn include_regex_covers_embed_without_over_matching() {
+        let captured = |line: &str| {
+            INCLUDE_REGEX
+                .captures(line)
+                .map(|c| (c[1].to_string(), c[2].to_string()))
+        };
+
+        // C23 #embed, both spellings, and the whitespace forms the regex allows
+        assert_eq!(
+            captured(r##"#embed "logo.png""##),
+            Some(("\"".into(), "logo.png".into()))
+        );
+        assert_eq!(
+            captured("  #  embed <data.bin>"),
+            Some(("<".into(), "data.bin".into()))
+        );
+        // the directive it was widened from still works
+        assert_eq!(
+            captured(r##"#include "foo.h""##),
+            Some(("\"".into(), "foo.h".into()))
+        );
+
+        // NOT directives: a word in prose, an identifier, a member call, and a
+        // string mentioning the directive. Each would fabricate an input.
+        assert_eq!(captured("// we embed \"logo.png\" here"), None);
+        assert_eq!(captured("embed \"logo.png\""), None);
+        assert_eq!(captured("x.embed(\"logo.png\");"), None);
+        assert_eq!(captured(r##"const char *s = "#embed \"a\"";"##), None);
     }
 }
