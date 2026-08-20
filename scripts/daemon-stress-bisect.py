@@ -69,14 +69,43 @@ def daemon_children(daemon_pid: int) -> list[int]:
     return [int(p) for p in out.split()]
 
 
+def descendants(pid: int) -> list[int]:
+    """pid plus every process beneath it, breadth-first."""
+    seen, frontier = [pid], [pid]
+    while frontier:
+        nxt = []
+        for p in frontier:
+            for kid in daemon_children(p):
+                if kid not in seen:
+                    seen.append(kid)
+                    nxt.append(kid)
+        frontier = nxt
+    return seen
+
+
 def read_ticks(pids: list[int]) -> dict[int, int]:
+    """Ticks per daemon child, summed over its whole SUBTREE.
+
+    A daemon child does not run the build: it forks the sandboxed builder and
+    blocks in wait(), so its OWN utime+stime stays flat for the entire build.
+    Reading the child alone therefore reports a perfectly healthy round as a
+    wedge - measured 2026-08-20, N=2 with a CPU-burning builder returned
+    "zero-tick: 2" while both builds completed. The load lives in the
+    descendants, so the subtree is the unit that distinguishes working from
+    dead-asleep.
+    """
     ticks = {}
     for pid in pids:
-        try:
-            with open(f"/proc/{pid}/stat") as f:
-                ticks[pid] = parse_stat_ticks(f.read())
-        except OSError:
-            pass  # exited between listing and reading: not wedged
+        total, alive = 0, False
+        for member in descendants(pid):
+            try:
+                with open(f"/proc/{member}/stat") as f:
+                    total += parse_stat_ticks(f.read())
+                alive = True
+            except OSError:
+                pass  # exited between listing and reading
+        if alive:
+            ticks[pid] = total
     return ticks
 
 
@@ -90,7 +119,8 @@ def build_argv(nix: str) -> list[str]:
     # request is a genuine build, not a cache hit answering instantly.
     expr = (
         'derivation { name = "stress"; system = builtins.currentSystem; '
-        'builder = "/bin/sh"; args = ["-c" "echo $NONCE > $out"]; '
+        'builder = "/bin/sh"; args = ["-c" "i=0; while [ $i -lt $SPIN ]; do i=$((i+1)); done; echo $NONCE > $out"]; '
+        'SPIN = builtins.getEnv "SPIN"; '
         "NONCE = builtins.getEnv \"NONCE\"; }"
     )
     return [nix, "build", "--impure", "--no-link", "--expr", expr]
@@ -124,7 +154,7 @@ def run_round(args: argparse.Namespace) -> int:
     nonce_base = str(int(time.time()))
     procs = []
     for i in range(args.n):
-        env = dict(os.environ, NONCE=f"{nonce_base}-{i}")
+        env = dict(os.environ, NONCE=f"{nonce_base}-{i}", SPIN=str(args.spin))
         procs.append(
             subprocess.Popen(
                 build_argv(args.nix),
@@ -175,7 +205,11 @@ def selftest() -> int:
     # the build expr is impure-unique: nonce reaches it via env, not argv
     argv = build_argv("nix")
     assert "--impure" in argv and "--no-link" in argv
-    print("selftest: 5 assertions passed")
+    # the subtree walk must at minimum contain its own root, and self-nesting
+    # (a pid reachable from itself) must not loop forever
+    me = os.getpid()
+    assert descendants(me)[0] == me
+    print("selftest: 6 assertions passed")
     return 0
 
 
@@ -183,7 +217,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     ap.add_argument("-n", type=int, default=20, help="concurrent build requests")
     ap.add_argument("--interval", type=int, default=10, help="tick-sample gap (s)")
-    ap.add_argument("--settle", type=int, default=5, help="wait before sampling (s)")
+    ap.add_argument("--settle", type=int, default=2, help="wait before sampling (s)")
+    # The stress builder must BURN CPU, not sleep: a sleeping child reads zero
+    # ticks, which is the wedge signature itself, so a sleep-based workload would
+    # report every healthy round as a wedge. It must also outlive --settle - a
+    # trivial builder exits first and the oracle observes 0 children, which is how
+    # the first three rounds of the 2026-08-20 ladder returned vacuous verdicts.
+    ap.add_argument(
+        "--spin",
+        type=int,
+        default=15_000_000,
+        help="shell-loop iterations each stress builder burns (CPU, not sleep)",
+    )
     ap.add_argument("--timeout", type=int, default=120, help="build completion budget (s)")
     ap.add_argument("--daemon-pid", type=int, help="override daemon pid autodetect")
     ap.add_argument("--nix", default="nix", help="nix binary to launch builds with")
