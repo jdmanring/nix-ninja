@@ -162,14 +162,20 @@ fn main() -> Result<()> {
     {
         let mut py_dirs: Vec<String> = Vec::new();
         for parent in &py_parents {
-            let mut root = parent.as_path();
-            while root.join("__init__.py").is_file() {
-                match root.parent() {
-                    Some(p) => root = p,
-                    None => break,
-                }
+            // A PACKAGE INTERNAL contributes nothing here. Adding it
+            // directly shadowed stdlib ast (mojom/parse/ carries an
+            // ast.py); climbing to its package root instead exposed the
+            // root's child as an importable name and shadowed a
+            // NAMESPACE package elsewhere (flatbuffers' src/python, a
+            // regular package, beat perfetto's python/ namespace
+            // package, measured). Scripts are COPIED into the tree, so
+            // sys.path[0] and each script's own sys.path inserts cover
+            // package imports; only plain script directories belong on
+            // the path.
+            if parent.join("__init__.py").is_file() {
+                continue;
             }
-            let d = root.to_string_lossy().into_owned();
+            let d = parent.to_string_lossy().into_owned();
             if !d.is_empty() && !py_dirs.contains(&d) {
                 py_dirs.push(d);
             }
