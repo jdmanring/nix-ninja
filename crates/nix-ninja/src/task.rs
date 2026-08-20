@@ -1576,6 +1576,37 @@ fn upload_python_closure(
     main: &Path,
     out: &mut Vec<DerivedFile>,
 ) -> Result<()> {
+    // Memoized on (script dir, script): the walk memo alone was not
+    // enough, because the UNCLE and third_party deep scans issue
+    // hundreds of read_dirs per unresolved name per task - an optional
+    // or python-2 import that never resolves re-paid the full scan on
+    // every task referencing the same script (measured: one driver
+    // thread at two-thirds KERNEL time while the build sat idle). The
+    // closure's result for a directory is deterministic within a run,
+    // so the whole outcome caches.
+    static CLOSURE_MEMO: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(PathBuf, PathBuf), Vec<DerivedFile>>>,
+    > = std::sync::OnceLock::new();
+    let memo = CLOSURE_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let key = (start_dir.to_path_buf(), main.to_path_buf());
+    if let Some(hit) = memo.lock().unwrap().get(&key) {
+        out.extend(hit.iter().cloned());
+        return Ok(());
+    }
+    let mut fresh: Vec<DerivedFile> = Vec::new();
+    upload_python_closure_uncached(rpc_client, build_dir, start_dir, main, &mut fresh)?;
+    memo.lock().unwrap().insert(key, fresh.clone());
+    out.extend(fresh);
+    Ok(())
+}
+
+fn upload_python_closure_uncached(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    start_dir: &Path,
+    main: &Path,
+    out: &mut Vec<DerivedFile>,
+) -> Result<()> {
     const CLOSURE_DIR_CAP: usize = 64;
     let mut visited: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
