@@ -173,6 +173,7 @@ def classify(
     ticks0: dict[int, int],
     ticks1: dict[int, int],
     parent1: dict[int, int],
+    parent0: dict[int, int],
 ) -> tuple[list[int], list[int]]:
     """(fully dead subtrees, indeterminate subtrees), outermost nodes only.
 
@@ -206,12 +207,33 @@ def classify(
             members.setdefault(node, []).append(pid)
             node = parent1.get(node, -1)
 
+    # Which subtrees LOST a member, per subtree. Membership for a process that
+    # is gone at t1 has to come from the FIRST sample's parent map, since it no
+    # longer has one. Computing this globally - "did anything anywhere exit" -
+    # marks every zero-delta subtree indeterminate the moment any unrelated
+    # process finishes, which would mask a real wedge behind a bystander. That
+    # is the same aggregate-for-member error the oracle has now made twice, so
+    # it is spelled out rather than left to be re-derived.
+    # parent0 is REQUIRED rather than defaulted. A process gone at t1 has no
+    # entry in parent1, so with an empty first-sample map its ancestry walk
+    # stops at itself and its parent is never marked - which silently restores
+    # the false healthy this function exists to close.
+    lost_under: set[int] = set()
+    p0 = parent0
+    for pid in ticks0:
+        if pid in ticks1:
+            continue
+        node = pid
+        while node != -1:
+            lost_under.add(node)
+            node = p0.get(node, parent1.get(node, -1))
+
     for root, kin in members.items():
         if sum(delta[k] for k in kin) != 0:
             continue
-        # nothing accrued anywhere beneath it: dead, unless a member vanished
-        lost = [p for p in ticks0 if p not in ticks1]
-        (unknown if lost else dead).append(root)
+        # nothing accrued anywhere beneath it: dead, unless one of ITS OWN
+        # members vanished
+        (unknown if root in lost_under else dead).append(root)
 
     dead_set = set(dead)
     outer_dead = sorted(p for p in dead if parent1.get(p, -1) not in dead_set)
@@ -333,10 +355,10 @@ def run_round(args: argparse.Namespace) -> int:
 
     time.sleep(args.settle)  # let the daemon fork its children
     kids = daemon_children(daemon_pid)
-    ticks0, _parent0 = proc_tree(kids)
+    ticks0, parent0 = proc_tree(kids)
     time.sleep(args.interval)
     ticks1, parent1 = proc_tree(kids)
-    wedged, unknown = classify(ticks0, ticks1, parent1)
+    wedged, unknown = classify(ticks0, ticks1, parent1, parent0)
     # Print the POPULATION, not only the verdict. Three of this script's four
     # instrument defects were visible only because the sampled counts sit
     # beside the result: a bare "healthy" over zero observed processes reads
@@ -430,24 +452,38 @@ def selftest() -> int:
     assert wedged_nodes(
         subtree_totals(t0_x, parent_x), subtree_totals(t1_x, {10: -1}), {10: -1}
     ) == [], "the superseded reading must be shown missing it"
-    dead_x, unknown_x = classify(t0_x, t1_x, {10: -1})
+    dead_x, unknown_x = classify(t0_x, t1_x, {10: -1}, parent_x)
     assert dead_x == [] and unknown_x == [10], (dead_x, unknown_x)
 
     # A parent that accrued nothing with NO member lost is dead, not unknown.
-    dead_y, unknown_y = classify({10: 5}, {10: 5}, {10: -1})
+    dead_y, unknown_y = classify({10: 5}, {10: 5}, {10: -1}, {10: -1})
     assert dead_y == [10] and unknown_y == []
 
     # A burning builder keeps its parked parent off both lists.
     parent_z = {20: -1, 21: 20}
-    dead_z, unknown_z = classify({20: 7, 21: 50}, {20: 7, 21: 90}, parent_z)
+    dead_z, unknown_z = classify(
+        {20: 7, 21: 50}, {20: 7, 21: 90}, parent_z, parent_z
+    )
     assert dead_z == [] and unknown_z == []
 
     # A process that APPEARED inside the window counts its whole reading as
     # work: it cannot have accrued those ticks before it existed.
-    dead_w, unknown_w = classify({20: 7}, {20: 7, 21: 40}, parent_z)
+    dead_w, unknown_w = classify({20: 7}, {20: 7, 21: 40}, parent_z, {20: -1})
     assert dead_w == [] and unknown_w == []
 
-    print("selftest: 17 assertions passed")
+    # A BYSTANDER EXIT MUST NOT MASK A WEDGE. Two independent children: 10 is
+    # dead with no children of its own, 30's builder 31 exits normally. Asking
+    # "did anything anywhere exit" would call 10 indeterminate because of 31,
+    # which is a different subtree entirely.
+    parent_b0 = {10: -1, 30: -1, 31: 30}
+    parent_b1 = {10: -1, 30: -1}
+    dead_b, unknown_b = classify(
+        {10: 5, 30: 9, 31: 70}, {10: 5, 30: 9}, parent_b1, parent_b0
+    )
+    assert dead_b == [10], (dead_b, unknown_b)
+    assert unknown_b == [30], (dead_b, unknown_b)
+
+    print("selftest: 19 assertions passed")
     return 0
 
 
