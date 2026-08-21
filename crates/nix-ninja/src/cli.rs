@@ -89,12 +89,18 @@ pub struct Cli {
 /// An accepted-and-ignored flag is indistinguishable from a working one from
 /// the caller's side, which is how -l survived unnoticed. The warning is the
 /// whole fix.
+/// `-l` used to be accepted and ignored, which is worse than refusing it: a
+/// user who passes a load limit gets no limit and no error. It is honoured
+/// now, so the warning says what it actually does instead - load average
+/// counts D-state, and a nix-daemon-backed build parks many processes there,
+/// so on this workload it reads high while nothing is CPU-starved (measured:
+/// load 20.6 at PSI cpu full 0.00). Memory is the control that matters.
 fn warn_ignored_flags(cli: &Cli) {
     if cli.load_average != 0.0 {
         eprintln!(
-            "nix-ninja: warning: -l {} is accepted for ninja compatibility and IGNORED. \
-             Concurrency here is bounded by -j and by the nix daemon's max-jobs; load \
-             average is not consulted.",
+            "nix-ninja: -l {} honoured, but load average counts D-state and this \
+             driver parks processes there waiting on the daemon; it reads high while \
+             nothing is CPU-starved. Admission is bounded by memory first.",
             cli.load_average,
         );
     }
@@ -217,6 +223,7 @@ fn build(cli: &Cli, build_dir: &Path, rpc_client: &Arc<BuilderRpcClient>) -> Res
         // hundreds of concurrent tasks; unbounded is no longer
         // expressible.
         jobs: resolved_jobs(cli),
+        load_limit: cli.load_average,
     };
 
     build::build(

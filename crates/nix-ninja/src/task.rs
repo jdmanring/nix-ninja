@@ -122,6 +122,8 @@ pub struct RunnerConfig {
     /// cannot derive, and being wrong the same way ninja would be wrong is a
     /// better failure than being wrong in a way nobody can reproduce.
     pub pools: HashMap<String, usize>,
+    /// Ninja's `-l`. 0.0 disables, matching ninja.
+    pub load_limit: f64,
 }
 
 /// Counting semaphore bounding concurrent tasks. Permits release on
@@ -180,6 +182,35 @@ fn memory_bounds_gib() -> (u64, u64) {
     (total / 5, total / 2)
 }
 
+/// One-minute load average, or 0.0 where /proc cannot be read.
+fn load_average() -> f64 {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
+        .unwrap_or(0.0)
+}
+
+/// Admission budget under ninja's `-l`: stop starting work while the load
+/// average exceeds the limit.
+///
+/// This is ninja's own contract and nix-ninja previously warned that it
+/// accepted the flag and ignored it, which is worse than not taking it.
+///
+/// It is deliberately the WEAKER of the two controls here, and the reason is
+/// measured rather than assumed: load average counts D-state, and a build
+/// driven through the nix daemon parks many processes there waiting on the
+/// store. This machine has read a load of 20.6 with PSI cpu full at 0.00 -
+/// nothing was CPU-starved and the number said otherwise. So `-l` is honoured
+/// because a user who passes it means it, while the memory taper above is
+/// what actually protects the machine. Never reach for load when the question
+/// is memory.
+fn budget_for_load(cap: usize, load: f64, limit: f64) -> usize {
+    if limit <= 0.0 || load < limit {
+        return cap.max(1);
+    }
+    1
+}
+
 /// Admission budget for the memory currently available.
 ///
 /// Pure so the curve is testable: the failures that matter are a 0 (admits
@@ -229,6 +260,8 @@ fn available_gib() -> u64 {
 struct JobPermits {
     inner: Arc<(Mutex<usize>, Condvar)>,
     cap: usize,
+    /// Ninja's `-l`: 0.0 disables, matching ninja.
+    load_limit: f64,
     /// Whether admission tracks live memory. A field rather than a constant
     /// read inline so tests can disable it: with it live, a concurrency test
     /// asserts on the machine's memory at that instant and fails on a busy
@@ -247,14 +280,22 @@ impl JobPermits {
         JobPermits {
             inner: Arc::new((Mutex::new(0), Condvar::new())),
             cap,
+            load_limit: 0.0,
             memory_aware: true,
         }
+    }
+
+    /// Ninja's `-l`. 0.0 leaves it disabled.
+    fn with_load_limit(mut self, limit: f64) -> Self {
+        self.load_limit = limit;
+        self
     }
 
     /// Same, with the memory gate disabled. Tests only.
     #[cfg(test)]
     fn new_without_memory_gate(cap: usize) -> Self {
         JobPermits {
+            load_limit: 0.0,
             memory_aware: false,
             ..JobPermits::new(cap)
         }
@@ -277,7 +318,11 @@ impl JobPermits {
         loop {
             let budget = if self.memory_aware {
                 let (reserve, full) = memory_bounds_gib();
+                // The tighter of the two controls wins. Memory is the one
+                // that matters here; load is honoured because -l was asked
+                // for, and its weakness is documented at budget_for_load.
                 budget_for_memory(self.cap, available_gib(), reserve, full)
+                    .min(budget_for_load(self.cap, load_average(), self.load_limit))
             } else {
                 self.cap
             };
@@ -391,7 +436,7 @@ impl Runner {
         }
 
         let (tx, rx) = mpsc::channel();
-        let permits = JobPermits::new(config.jobs.max(1));
+        let permits = JobPermits::new(config.jobs.max(1)).with_load_limit(config.load_limit);
         let pool_permits = pool_permits_from_depths(&config.pools);
         Ok(Runner {
             derived_files: HashMap::new(),
@@ -3229,7 +3274,7 @@ fn normalize_output(output: &str) -> String {
 
 #[cfg(test)]
 mod job_permits_tests {
-    use super::{admission_weight, budget_for_memory, JobPermits};
+    use super::{admission_weight, budget_for_load, budget_for_memory, JobPermits};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -3315,6 +3360,20 @@ mod job_permits_tests {
         // otherwise the taper is a cliff wearing a linear formula.
         let mid = budget_for_memory(cap, 10, reserve, full);
         assert!((2..cap).contains(&mid), "mid-range budget {mid} is an endpoint");
+    }
+
+    /// `-l` is ninja's contract: stop starting work above the limit. 0.0
+    /// disables it, which is the default and must never throttle.
+    #[test]
+    fn load_limit_matches_ninja_and_zero_disables() {
+        assert_eq!(budget_for_load(24, 99.0, 0.0), 24, "0.0 must disable -l");
+        assert_eq!(budget_for_load(24, 3.0, 8.0), 24, "under the limit runs wide");
+        assert_eq!(budget_for_load(24, 8.0, 8.0), 1, "at the limit throttles");
+        assert_eq!(budget_for_load(24, 40.0, 8.0), 1, "over the limit throttles");
+        // Never zero: a throttled round must crawl, never stop.
+        for load in [0.0, 1.0, 7.9, 8.0, 100.0] {
+            assert!(budget_for_load(24, load, 8.0) >= 1);
+        }
     }
 
     /// A machine that reports nothing must not serialize the round: unknown
