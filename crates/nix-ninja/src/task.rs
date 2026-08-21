@@ -599,10 +599,24 @@ impl Runner {
             // parsed / reached: misses are files actually read, the sum is
             // every time a TU needed one. The gap is the sharing.
             let (scan_hit, scan_miss) = deps_infer::c_include_parser::scan_stats();
+            // Same tear as the three families above, and it bites HARDER here
+            // because the pair is read as a RATIO: a ms total from one instant
+            // over a call count from another prints a per-call cost that was
+            // never true. Written separately once in this same session, an hour
+            // after fixing the identical defect - the class does not announce
+            // itself on the way back in.
+            let (upd_ms, upd_n) = (
+                DYN_UPDATE_MS.load(Ordering::Relaxed),
+                DYN_UPDATE_N.load(Ordering::Relaxed),
+            );
+            let (add_ms, add_n) = (
+                DYN_ADDDRV_MS.load(Ordering::Relaxed),
+                DYN_ADDDRV_N.load(Ordering::Relaxed),
+            );
             eprintln!(
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
                  (worklist {} s, cmdline {} s, py {} s, grd {} s), \
-                 dyn {} s (realise {} s, discover {} s, update {} s, adddrv {} s), \
+                 dyn {} s (realise {} s, discover {} s, update {} s/{} calls, adddrv {} s/{} calls), \
                  realise {}/{} sent, nar {}/{} sent, scan {}/{} parsed, \
                  rss {} MiB",
                 RESOLVE_MS.load(Ordering::Relaxed) / 1000,
@@ -613,8 +627,10 @@ impl Runner {
                 DYN_MS.load(Ordering::Relaxed) / 1000,
                 DYN_REALISE_MS.load(Ordering::Relaxed) / 1000,
                 DYN_DISCOVER_MS.load(Ordering::Relaxed) / 1000,
-                DYN_UPDATE_MS.load(Ordering::Relaxed) / 1000,
-                DYN_ADDDRV_MS.load(Ordering::Relaxed) / 1000,
+                upd_ms / 1000,
+                upd_n,
+                add_ms / 1000,
+                add_n,
                 rl_sent,
                 rl_asked,
                 nar_sent,
@@ -2121,6 +2137,7 @@ fn handle_derivation_result(
                 t_update.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            DYN_UPDATE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             let t_addrv = std::time::Instant::now();
             let drv_path = rpc_client.add_drv_to_store(&config.store_dir, &drv)?;
@@ -2128,6 +2145,7 @@ fn handle_derivation_result(
                 t_addrv.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            DYN_ADDDRV_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(SingleDerivedPath::Opaque(drv_path))
         }
     } else {
@@ -2810,6 +2828,16 @@ fn self_rss_mib() -> u64 {
 /// that function for what the omission cost.
 /// dyn's two expensive halves, separated because they have different fixes.
 static DYN_UPDATE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// CALL COUNTS, not just totals, and the reason is a question the totals
+// cannot answer. Both calls fire once per DYNAMIC task rather than once per
+// task, so dividing either total by n_tasks understates it by whatever
+// fraction of the graph is dynamic. With the count, adddrv per call is the
+// discriminator: flat per call means a fixed round-trip cost and a batch
+// fixes it, while growth with task count means it is carrying the same
+// superlinear input set that realise-asked shows, and a memo alone will not
+// bound it. Raised by the specification session, addendum 733.
+static DYN_UPDATE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYN_ADDDRV_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_ADDDRV_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_REALISE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_DISCOVER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
