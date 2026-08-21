@@ -626,23 +626,14 @@ impl Runner {
             // Appended rather than given a fixed `{}` in the format string,
             // so a platform without mallinfo2 prints a shorter line instead
             // of two zeros that read as a measurement.
-            let (prunable, kept) = (
-                PRUNABLE_HEADERS.load(Ordering::Relaxed),
-                KEPT_HEADERS.load(Ordering::Relaxed),
+            let (declared, kept) = (
+                DECLARED_HEADERS.load(Ordering::Relaxed),
+                USED_HEADERS.load(Ordering::Relaxed),
             );
             // Printed as a pair with its denominator: "N prunable" alone is
             // unreadable without knowing how many were considered, and this
             // number exists to be compared against the cost of acting on it.
-            let prune = if prunable + kept > 0 {
-                format!(
-                    ", hdrs {} used / {} declared ({} prunable)",
-                    kept,
-                    kept + prunable,
-                    prunable
-                )
-            } else {
-                String::new()
-            };
+            let prune = prune_line(declared, kept);
             let heap = match self_heap_mib() {
                 Some((live, retained)) => {
                     format!(", heap {live} MiB live / {retained} MiB retained")
@@ -2164,37 +2155,21 @@ fn handle_derivation_result(
             //
             // Naming them separately is what stops the next round tuning the
             // wrong one, which this campaign has already done twice.
-            // USED AGAINST DECLARED, counted here because here is where both
-            // numbers exist at once and are about the SAME compile. `task`
-            // carries the closure the graph said this TU might read;
-            // `discovered_deps` is what the preprocessor just proved it does.
-            // Their difference is plan item 1's entire case, and it has never
-            // been measured on this build.
+            // USED AGAINST DECLARED. The DENOMINATOR is counted here and
+            // the numerator inside discover_c_includes, because the two sets
+            // have to be drawn from one population or the ratio restates a
+            // filter instead of measuring anything. `built_inputs` is what
+            // discovery is actually offered - the whole of it, before any
+            // filtering - so it is the honest denominator; `task.inputs` is
+            // wider and would inflate the prunable share with inputs that
+            // were never candidates.
             //
-            // Restricted to header-shaped declared inputs: pruning object
-            // files or generated sources is a different change with a
-            // different risk, and folding them into one ratio would price
-            // neither.
-            {
-                let used: rustc_hash::FxHashSet<&Path> = discovered_deps
-                    .iter()
-                    .map(|d| d.build_path.as_path())
-                    .collect();
-                for input in &task.inputs {
-                    let n = input.build_path.to_string_lossy();
-                    let header_like = n.ends_with(".h")
-                        || n.ends_with(".hpp")
-                        || n.ends_with(".hh")
-                        || n.ends_with(".inc")
-                        || n.ends_with(".ipp");
-                    if !header_like {
-                        continue;
-                    }
-                    if used.contains(input.build_path.as_path()) {
-                        KEPT_HEADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    } else {
-                        PRUNABLE_HEADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+            // Restricted to header-shaped inputs: pruning object files or
+            // generated sources is a different change with a different risk,
+            // and folding them into one ratio would price neither.
+            for input in &built_inputs {
+                if header_like(&input.build_path) {
+                    DECLARED_HEADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
@@ -2955,15 +2930,50 @@ fn self_heap_mib() -> Option<(u64, u64)> {
 /// Wall time inside `handle_derivation_result`, the dynamic-dependency
 /// discovery that the resolve tick never counted. See the note at the top of
 /// that function for what the omission cost.
-/// Phony-reached headers this edge's last compile did NOT open, and the ones
-/// it did. Their ratio is used-input pruning's whole case, and it has never
-/// been measured on this build: the driver declares graph closures and the
-/// record of what was actually read has sat unopened in .n2_db.
+/// Declared header-shaped inputs offered to discovery, and the subset the
+/// preprocessor was observed to open. Their ratio is used-input pruning's
+/// whole case, and it had never been measured on this build.
+///
+/// THE TWO SITES ARE NOT INTERCHANGEABLE and the first version of this got it
+/// wrong. `discovered_deps` is what the compile read AND was not already
+/// declared - discover_c_includes drops the overlap - so comparing it against
+/// the declared set compares two sets that cannot intersect, and would have
+/// printed 100% prunable on any build. The numerator is therefore counted
+/// inside that filter's TAKEN branch, where membership in both sets is the
+/// branch condition and disjointness is impossible by construction.
 ///
 /// Counted whether or not pruning is enabled, so the next round anybody runs
 /// prices the change with no behavior change and no risk.
-static PRUNABLE_HEADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static KEPT_HEADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DECLARED_HEADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static USED_HEADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A zero numerator against a nonzero denominator is the SIGNATURE of the
+/// disjointness defect this counter shipped with once - two sets that cannot
+/// intersect - and not a finding of 100% dead weight. It fails loud rather
+/// than quiet, which is worse: a spectacular number is the one that gets
+/// quoted. Refuse to print a ratio on it and say why.
+fn prune_line(declared: u64, kept: u64) -> String {
+    if declared == 0 {
+        String::new()
+    } else if kept == 0 {
+        ", hdrs SUPPRESSED (0 used / nonzero declared - disjoint sets?)".to_string()
+    } else {
+        format!(
+            ", hdrs {kept} used / {declared} declared ({} prunable)",
+            declared.saturating_sub(kept)
+        )
+    }
+}
+
+/// One definition, because the numerator and the denominator are counted in
+/// different functions and a header-shape test that disagreed between them
+/// would move the ratio with nothing to show for it.
+fn header_like(p: &Path) -> bool {
+    matches!(
+        p.extension().and_then(|e| e.to_str()),
+        Some("h" | "hpp" | "hh" | "inc" | "ipp")
+    )
+}
 
 /// dyn's two expensive halves, separated because they have different fixes.
 static DYN_UPDATE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3939,9 +3949,19 @@ pub fn discover_c_includes(
     // Convert input files to a set for filtering
     let input_files: HashSet<PathBuf> = files.into_iter().collect();
 
+    // Declared-and-opened, deduped: a header reached twice in one preprocess
+    // is one input kept, and counting occurrences could push the numerator
+    // past its denominator.
+    let mut used_declared: HashSet<PathBuf> = HashSet::new();
+
     for include in c_includes {
         // Skip input files - we only want to discover new dependencies
         if input_files.contains(&include) {
+            // THIS BRANCH IS THE MEASUREMENT: reaching it means the include
+            // was declared and the preprocessor opened it. See DECLARED_HEADERS.
+            if header_like(&include) {
+                used_declared.insert(include.clone());
+            }
             continue;
         }
 
@@ -3960,6 +3980,11 @@ pub fn discover_c_includes(
         let derived_file = new_opaque_file(rpc_client, build_dir, include)?;
         discovered_deps.push(derived_file);
     }
+
+    USED_HEADERS.fetch_add(
+        used_declared.len() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     Ok((discovered_deps, discovered_store_paths))
 }
@@ -4099,40 +4124,124 @@ mod target_resolution_tests {
 
 #[cfg(test)]
 mod prune_gate_tests {
+    use super::{header_like, prune_line};
+    use std::path::Path;
 
-    /// The ratio the tick reports must count a declared header that was NOT
-    /// used as prunable, and one that WAS as kept. Asserted on the predicate
-    /// rather than through a build graph, which needs a daemon.
-    ///
-    /// The case that matters is the third: a declared header absent from the
-    /// used set is the whole finding, and a version that counted every
-    /// declared header as kept would print a zero prunable count - which
-    /// reads as "nothing to prune" and is indistinguishable from "no data".
     #[test]
-    fn declared_headers_split_by_whether_discovery_saw_them() {
-        let used = ["a.h", "b.h"];
-        let declared = ["a.h", "b.h", "stale.h", "obj.o", "gen.cc"];
-
-        let (mut kept, mut prunable, mut skipped) = (0, 0, 0);
-        for d in declared {
-            let header_like = d.ends_with(".h")
-                || d.ends_with(".hpp")
-                || d.ends_with(".hh")
-                || d.ends_with(".inc")
-                || d.ends_with(".ipp");
-            if !header_like {
-                skipped += 1;
-                continue;
-            }
-            if used.contains(&d) {
-                kept += 1;
-            } else {
-                prunable += 1;
-            }
+    fn header_shape_covers_the_c_family_and_nothing_else() {
+        for h in ["a.h", "b.hpp", "c.hh", "d.inc", "e.ipp"] {
+            assert!(header_like(Path::new(h)), "{h} should be header-shaped");
         }
-        assert_eq!(kept, 2, "both used headers are kept");
-        assert_eq!(prunable, 1, "the declared-but-unused header is the finding");
-        assert_eq!(skipped, 2, "an object and a source are not this ratio's business");
+        for n in ["obj.o", "gen.cc", "main.cpp", "noext"] {
+            assert!(
+                !header_like(Path::new(n)),
+                "{n} is not this ratio's business"
+            );
+        }
+    }
+
+    /// The arithmetic, and the refusal. A zero numerator is the disjointness
+    /// signature the first version of this shipped, so the tick must NOT
+    /// render it as a ratio - "0 used / N declared" reads as N dead headers.
+    #[test]
+    fn a_zero_numerator_suppresses_the_ratio_instead_of_reporting_it() {
+        assert_eq!(prune_line(0, 0), "", "nothing measured yet prints nothing");
+        assert!(
+            prune_line(900, 0).contains("SUPPRESSED"),
+            "0 used against a nonzero denominator must not print a ratio"
+        );
+        assert_eq!(
+            prune_line(900, 300),
+            ", hdrs 300 used / 900 declared (600 prunable)"
+        );
+        // kept can never exceed declared, but the arithmetic must not panic
+        // if a future edit breaks that invariant.
+        assert!(prune_line(10, 40).contains("(0 prunable)"));
+    }
+
+    /// THE STRUCTURAL GATE, and the reason it reads source rather than
+    /// calling anything: the defect this replaces had a passing unit test.
+    /// That test reimplemented the predicate over data it supplied itself,
+    /// including an overlap between the used and declared sets that the real
+    /// system guarantees cannot happen. No assertion over supplied data can
+    /// catch a numerator drawn from the wrong population - only the SITE can.
+    ///
+    /// So: the used counter must be fed from inside the taken branch of the
+    /// `input_files.contains` filter, where membership in both sets IS the
+    /// branch condition, and must never be fed from `discovered_deps`, which
+    /// that filter defines as the complement of the declared set.
+    #[test]
+    fn the_numerator_is_counted_inside_the_filters_taken_branch() {
+        let src = include_str!("task.rs");
+        // Built at runtime so this test cannot match its own text.
+        let filter = concat!("input_files.", "contains(&include)");
+        let counter = concat!("used_", "declared.insert");
+        let feed = concat!("USED_", "HEADERS.fetch_add");
+
+        let lines: Vec<&str> = src.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains(filter))
+            .expect("the discovery filter moved - re-read discover_c_includes");
+        let branch = &lines[at..(at + 8).min(lines.len())];
+        let cont = branch
+            .iter()
+            .position(|l| l.trim() == "continue;")
+            .expect("the filter's taken branch no longer continues");
+        assert!(
+            branch[..cont].iter().any(|l| l.contains(counter)),
+            "the used counter is not inside the filter's taken branch: it is \
+             counting a population the declared set cannot intersect"
+        );
+
+        // And the complement must never feed it. Checked on the call's own
+        // ARGUMENT rather than its neighbourhood: the first version of this
+        // scanned six lines either side and failed on the correct code,
+        // because the function returns `discovered_deps` three lines below.
+        let feeds: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(feed))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            feeds.len(),
+            1,
+            "expected exactly one site feeding the used counter"
+        );
+        let args = lines[feeds[0] + 1..(feeds[0] + 4).min(lines.len())].join(" ");
+        assert!(
+            args.contains(concat!("used_", "declared.len()")),
+            "the used counter is not fed from the deduped declared-and-opened set"
+        );
+        assert!(
+            !args.contains("discovered_deps"),
+            "the used counter is fed from discovered_deps, the declared set's complement"
+        );
+    }
+
+    /// The negative control. Without it the test above passes on any file
+    /// containing the two strings in any order, which is how the matcher it
+    /// replaces was wrong.
+    #[test]
+    fn the_gate_rejects_a_count_placed_after_the_continue() {
+        let bad = [
+            "if input_files.contains(&include) {",
+            "continue;",
+            "used_declared.insert(x);",
+        ];
+        let at = bad
+            .iter()
+            .position(|l| l.contains("contains(&include)"))
+            .unwrap();
+        let branch = &bad[at..];
+        let cont = branch.iter().position(|l| l.trim() == "continue;").unwrap();
+        assert!(
+            !branch[..cont]
+                .iter()
+                .any(|l| l.contains("used_declared.insert")),
+            "the gate would accept a counter that can never run"
+        );
     }
 }
 
