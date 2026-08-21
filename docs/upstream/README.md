@@ -25,7 +25,7 @@ hand before the next one makes sense.
 | 3 | Driver performance | comment into their #7 and #4, then a PR | drafted, `issue-replies.md` |
 | 4 | Multiple CLI targets | PR on nix-ninja, coordinated with their PR 43 | code landed here, PR not drafted |
 | 5 | Resolve-memo cache | comment into their #17 as an ALTERNATIVE | drafted, `issue-replies.md` |
-| 6 | `${rspfile}` support | PR on hinshun/n2, not on nix-ninja | not drafted, see below |
+| 6 | `${rspfile}` support, and the n2 dependency | `evmar/n2`, NOT `hinshun/n2` | destination corrected 2026-08-21, see below |
 
 **1 goes first because a wedged worker does not stay inside the build that
 made it.** Seventeen of them survived as init-reparented root orphans holding
@@ -52,9 +52,28 @@ unsolicited PR does not.
 get `${rspfile}` bound in commands, which is roughly three quarters of its
 changed files and a
 standing merge liability against an upstream that has live n2 movement (their
-issue #41). The correct destination for that one feature is `hinshun/n2`, after
-which this fork returns to a git dependency and the vendored tree is deleted.
-Offering the vendored tree to nix-ninja would be offering them our liability.
+issue #41). Offering the vendored tree to nix-ninja would be offering them our
+liability.
+
+**But the destination this file named for it was a dead end, and the check
+that would have caught it is one this same file already ran on three other
+repositories.** Read from the forge 2026-08-21: `hinshun/n2` is a FORK of
+`evmar/n2` with issues DISABLED, ZERO pull requests in any state, and a last
+push of 2025-04-23. A PR aimed there has nowhere to land, which is the exact
+finding recorded above for `hinshun/nix-ninja` and `obsidiansystems/nix-ninja`
+- applied to the two nix-ninja forks and not to the n2 fork, in the same
+paragraph that established the rule. `evmar/n2` is the live one: 462 stars,
+issues enabled, last push 2025-11-10.
+
+That reframes the item. `Cargo.lock` pins n2 to
+`hinshun/n2?branch=feature/minimal-pub`, and that branch is **5 commits ahead
+and 9 behind `evmar/main` across 6 files** - visibility widening, which is
+plausibly something upstream n2 would take. So the question worth putting to
+the maintainer is not "who takes our `${rspfile}` patch". It is that nix-ninja
+depends on a dormant fork branch that is behind its own upstream, and the
+`${rspfile}` work is a reason to look at that rather than a thing to file
+somewhere. Whether `evmar` wants either patch is unknown and is not ours to
+assume; the honest opening is the dependency state, which is checkable.
 
 ## What is NOT being offered, and why
 
@@ -186,5 +205,15 @@ reading of a figure whose fix predates the wedge, when the post-fix reading is
 both later and larger; and the task count appeared in four places, including an
 outward-facing reply, with no source at all.
 
-Status: NOT SENDABLE. Five rounds are recorded; the blocking findings are in
-each draft's own audit block.
+Round 6 (2026-08-21) attacked the destinations rather than the prose, which
+is where round 5 had just proved this file weakest. One blocking finding, and
+it is the same shape as round 2's: **a rule this file states was not applied
+to every member of the set it governs.** Item 6's destination is dead, above.
+Nothing else in the routing moved - the nix-ninja numbers and authors were
+re-read and stand.
+
+Status: NOT SENDABLE. Six rounds are recorded; the blocking findings are in
+each draft's own audit block. What holds the set is not draft coverage: it is
+round 5's pre-PR question, which is James's to send and has not been sent.
+Drafting the remaining items does not change that and must not be reported as
+if it did.

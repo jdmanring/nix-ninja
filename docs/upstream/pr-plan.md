@@ -180,9 +180,15 @@ it recovers, since its own action is a load spike.
 
 ## Not a nix-ninja PR at all
 
-`${rspfile}` support belongs in `hinshun/n2`. Sending our vendored n2 tree here
-would transfer our own merge liability to them; see `README.md` in this
-directory.
+Sending our vendored n2 tree to nix-ninja would transfer our own merge
+liability to them; see `README.md` in this directory.
+
+This file said `${rspfile}` support "belongs in `hinshun/n2`" until
+2026-08-21, and that repository takes no pull requests: issues disabled, zero
+PRs ever, dormant since 2025-04-23. The live upstream is `evmar/n2`, and the
+branch nix-ninja pins (`feature/minimal-pub`) is 9 commits behind it. The
+corrected item and what to ask instead are in `README.md`; do not draft
+against the old destination.
 
 ## Audit
 

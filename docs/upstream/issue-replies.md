@@ -159,15 +159,59 @@ by a different route.
 
 ## Into #52, alternate linkers (`CC_LD` / `CXX_LD`, mold as the example)
 
-The reporter already has the diagnosis and the fix in the issue body. The only
-thing we can add is the collision, so that is all this says.
+The reporter has the diagnosis and a workable fix in the issue body. Three
+things are added here that he does not have, all read from nixpkgs
+`fd14620` on 2026-08-21 rather than from memory, and each falsifiable from a
+nixpkgs checkout in one grep.
 
-> Heads up on a collision, since we patch the same code path for a different
-> reason: GN quotes paths in generated commands and `which(1)` does not accept
-> quotes, so the resolved interpreter token needs its quotes stripped before
-> resolution. That is the same `shell_words::split` plus `which` path where the
-> `-fuse-ld=` handling you describe would go, so whoever takes this will be
-> editing the lines that fix needs.
+> Three notes from a fork driving nix-ninja at qtwebengine scale, since we
+> patch the same `shell_words::split` + `which` path for a different reason.
+>
+> **1. The provenance is wider than `CC_LD`/`CXX_LD`, and the wider route is
+> the one that lands in `build.ninja` directly.** In nixpkgs a package can
+> write the flag itself, with no environment variable anywhere. `fex`
+> (`pkgs/by-name/fe/fex/package.nix`) has `cmake` and `ninja` in
+> `nativeBuildInputs` and writes `set(CMAKE_EXE_LINKER_FLAGS_INIT
+> "-fuse-ld=lld")` into a toolchain file, so every link rule in its generated
+> `build.ninja` carries `-fuse-ld=lld` from the package definition. The
+> `useMoldLinker` and `useGoldLinker` stdenv adapters
+> (`pkgs/stdenv/adapters.nix`) do the same through `NIX_CFLAGS_LINK`. A fix
+> keyed on the two environment variables would be correct for the dev-shell
+> case and silent on these. Scanning the evaluated command, which is what
+> your last paragraph proposes, catches both - worth stating explicitly,
+> because the title says `CC_LD` and an implementer may follow the title.
+>
+> **2. The flag is present in the WORKING case too, so a scan that resolves
+> unconditionally can pull in the wrong linker.** `useMoldLinker` overrides
+> `stdenv.cc.bintools` to symlink `ld.mold` into the bintools wrapper's own
+> `bin`, and separately appends `-fuse-ld=mold`. The flag there is not a
+> problem, because the tool is already inside a store path the toolchain
+> carries; the reported failure is the same flag with the tool reachable only
+> through ambient PATH. Since `which` reads the driver's ambient PATH, a scan
+> that sees `-fuse-ld=mold` and resolves `mold` can bind a DIFFERENT mold
+> store path than the one that stdenv baked in. That links successfully with
+> the wrong tool, where the bug you reported at least fails loudly. Whatever
+> the fix does about the ambient case, it should leave the already-reachable
+> case alone.
+>
+> **3. Scope it to the documented spellings and say where the edge is.**
+> `-fuse-ld=<name>` and `--ld-path=<path>` are documented gcc/clang flags and
+> a small fixed set. `-B<dir>`, `LD=`, and `COMPILER_PATH` reach the same
+> outcome and are not bounded that way. Handling the first two and reporting
+> the rest as an unhandled case is worth more than trying to be complete: an
+> unhandled spelling fails with a build error naming a missing tool, which is
+> the safe direction, and it is the direction this already fails in.
+>
+> One collision to expect: GN quotes interpreter paths in generated commands
+> and `which(1)` does not accept quotes, so we strip quotes off the resolved
+> token before resolution. That is the same few lines a `-fuse-ld=` scan
+> would edit.
+
+Not implemented in our fork, and that is a deliberate no rather than a
+backlog entry. Nothing we build uses an alternate linker - the one
+`-fuse-ld=` our own tree meets is nixpkgs' `useLdGold` on ghc, which we
+strip - so implementing it here would be a rule with no consumer, on a fork
+whose reviewability problem is its size.
 
 ---
 
@@ -227,6 +271,27 @@ they help the person in the thread:
 - **the dependency claim was corrected**, see above. `rustc-hash` is already in
   their lock via n2.
 
+Round 6 (2026-08-21) re-attacked the #52 reply, which round 5 had called
+sendable, and found the reply true but thin: it offered one collision and no
+evidence. Rebuilt on three readings of nixpkgs `fd14620`, each checkable by
+the maintainer in one grep. Two of the three came from attacking our own
+first draft rather than the issue:
+
+- the first version cited ghc's `useLdGold` as the counter-example to the
+  `CC_LD` framing. Ghc builds with hadrian, not ninja, so the instance was two
+  steps off the reported mechanism and rejectable in one sentence. Replaced
+  with `fex`, which has `cmake` and `ninja` in `nativeBuildInputs` and writes
+  `-fuse-ld=lld` into a toolchain file - in-graph, no environment variable;
+- the first version was going to recommend `useMoldLinker` as the correct nix
+  answer. Reading `pkgs/stdenv/adapters.nix` killed that: the adapter appends
+  `-fuse-ld=mold` itself. What makes it work is the bintools symlink, not the
+  absence of the flag - which turns the recommendation into the reply's
+  strongest point, that the flag is present in the working case too and an
+  unconditional scan can bind the wrong mold;
+- the claim that the flag set is "closed" was cut. `-fuse-ld=` and
+  `--ld-path=` are documented and small; `-B`, `LD=` and `COMPILER_PATH` are
+  not, and a reader names that edge if the draft does not.
+
 Status: NOT SENDABLE as a set. The perf reply still owes a decision on the
 isolated before/after run it offers, and the #5 and #17 replies need cutting
-before anyone posts them.
+before anyone posts them. #52 and #7/#4 remain the two that are ready.
