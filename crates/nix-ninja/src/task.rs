@@ -586,7 +586,8 @@ impl Runner {
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
                  (worklist {} s, cmdline {} s, py {} s, grd {} s), \
                  dyn {} s (realise {} s, discover {} s), \
-                 realise {}/{} sent, nar {}/{} sent, rss {} MiB",
+                 realise {}/{} sent, nar {}/{} sent, scan {}/{} parsed, \
+                 rss {} MiB",
                 RESOLVE_MS.load(Ordering::Relaxed) / 1000,
                 NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
                 NT_CMDLINE_MS.load(Ordering::Relaxed) / 1000,
@@ -600,6 +601,11 @@ impl Runner {
                 nix_builder_rpc_client::nar_upload_stats().1,
                 nix_builder_rpc_client::nar_upload_stats().0
                     + nix_builder_rpc_client::nar_upload_stats().1,
+                // parsed / reached: misses are files actually read, the sum
+                // is every time a TU needed one. The gap is the sharing.
+                deps_infer::c_include_parser::scan_stats().1,
+                deps_infer::c_include_parser::scan_stats().0
+                    + deps_infer::c_include_parser::scan_stats().1,
                 self_rss_mib(),
             );
         }
