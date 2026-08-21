@@ -1206,7 +1206,46 @@ mod realise_timer_tests {
 
 #[cfg(test)]
 mod realise_memo_tests {
-    use super::merge_hits_and_misses;
+    use super::{merge_hits_and_misses, reorder_misses};
+
+    /// The function was extracted because THIS is where a bug would hide, and
+    /// then nothing tested it. A demotion pushes a slot AFTER the original
+    /// misses, so the input is not ascending; the caller rebuilds the request
+    /// vector from the result and `merge_hits_and_misses` pairs
+    /// `miss_slots[k]` with `built[k]`, so a non-ascending return hands a real
+    /// store path to the WRONG input and fails three layers away in a compile.
+    #[test]
+    fn a_demoted_slot_is_sorted_back_into_place() {
+        // Slots 1 and 4 missed outright; slot 0 was a hit demoted by the stat,
+        // so it arrives last. Ascending order is what the merge requires.
+        assert_eq!(reorder_misses(&[1, 4, 0], 5), vec![0, 1, 4]);
+    }
+
+    /// A slot outside the caller's path count is a bug here, not upstream, and
+    /// must be dropped rather than panic the driver by indexing out of bounds
+    /// when the caller maps the result back over `paths`.
+    #[test]
+    fn an_out_of_range_slot_is_dropped_not_indexed() {
+        assert_eq!(reorder_misses(&[2, 9, 0], 3), vec![0, 2]);
+        assert!(reorder_misses(&[7], 3).is_empty());
+    }
+
+    /// Duplicates cannot arise today - a demoted slot was a hit, so it was
+    /// never in `miss_slots` - but the dedup is load-bearing if that ever
+    /// changes: one duplicate slot asks the daemon twice and shifts every
+    /// later pairing by one.
+    #[test]
+    fn a_duplicate_slot_would_shift_every_later_pairing() {
+        assert_eq!(reorder_misses(&[3, 1, 3], 5), vec![1, 3]);
+    }
+
+    /// The no-demotion path: already ascending, returned unchanged. If this
+    /// ever reorders, every ordinary call is wrong, not just the rare one.
+    #[test]
+    fn the_ordinary_case_is_left_alone() {
+        assert_eq!(reorder_misses(&[0, 2, 3], 4), vec![0, 2, 3]);
+        assert!(reorder_misses(&[], 4).is_empty());
+    }
 
     /// Hits and misses interleaved is the case that orders wrongly if the
     /// merge indexes by position in `built` rather than by recorded slot.
