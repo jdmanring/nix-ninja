@@ -1394,6 +1394,7 @@ dependencies = [
  "nix-nar",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

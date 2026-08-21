@@ -18,3 +18,7 @@ harmonia-utils-hash = { workspace = true }
 nix-nar = "0.3"
 thiserror = "1"
 tokio = { version = "1", features = ["rt", "io-util", "net", "sync", "macros"] }
+# SyncIoBridge only: the NAR encoder is a sync Read and the daemon wants an
+# AsyncBufRead. Already in the lock as a transitive dependency, so this adds
+# no download and no new supply-chain surface.
+tokio-util = { version = "0.7", features = ["io"] }

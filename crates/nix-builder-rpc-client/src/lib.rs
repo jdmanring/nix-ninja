@@ -387,12 +387,47 @@ impl BuilderRpcClient {
 
     /// NAR a filesystem path then upload it as a recursive-CA (NAR-hashed)
     /// store object.
+    /// NAR `path` and upload it, STREAMING rather than buffering.
+    ///
+    /// This built the whole NAR into a `Vec<u8>` first, so every concurrent
+    /// caller held an entire encoded tree in memory - and the caller is
+    /// dependency discovery, which uploads a file per discovered include and
+    /// sometimes a whole directory. The driver runs outside the build
+    /// cgroup's ceiling, so nothing bounded the total; raising admission from
+    /// 2 to 24 multiplied it and the workstation froze hard enough to need a
+    /// power cycle.
+    ///
+    /// Admission control could not have saved it, and that is the part worth
+    /// keeping: a memory taper refuses NEW work, while the memory here is
+    /// committed by work already admitted and grows after admission. Rate
+    /// limits do not bound a peak whose cost arrives later - the buffer had
+    /// to stop existing.
+    ///
+    /// Peak is now the duplex capacity per upload instead of the tree size.
+    /// The encoder runs on the blocking pool and the daemon drains the pipe,
+    /// so a NAR larger than the buffer streams through rather than sitting in
+    /// it. Safe against retries because there are none: `execute` is FnOnce
+    /// and poisons its connection on error, and no caller retries this.
     pub fn add_to_store_nar(&self, name: &str, path: &Path) -> Result<StorePath> {
-        let nar_bytes = encode_nar(path)?;
         let info = self.runtime.block_on(async {
+            // Bounded pipe: the producer blocks when it is full rather than
+            // growing, which is the whole point.
+            let (writer, reader) = tokio::io::duplex(NAR_STREAM_BUF);
+            let owned = path.to_path_buf();
+            let producer = tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut encoder =
+                    nix_nar::Encoder::new(&owned).map_err(|e| Error::Nar(e.to_string()))?;
+                let mut bridge = tokio_util::io::SyncIoBridge::new(writer);
+                std::io::copy(&mut encoder, &mut bridge)?;
+                // Without the shutdown the reader never sees EOF and the
+                // daemon waits forever on a NAR that has already been sent.
+                std::io::Write::flush(&mut bridge)?;
+                bridge.shutdown()?;
+                Ok(())
+            });
             let mut guard = self.pool.acquire().await?;
-            let source = BufReader::new(Cursor::new(nar_bytes));
-            if self.in_drv {
+            let source = BufReader::new(reader);
+            let out = if self.in_drv {
                 guard
                     .execute(|client| {
                         client.add_to_store_scanning(
@@ -420,7 +455,20 @@ impl BuilderRpcClient {
                         )
                     })
                     .await
+            };
+            // Join AFTER the RPC: the daemon drains the pipe, so joining
+            // first deadlocks on any NAR larger than the buffer. A producer
+            // error must not be swallowed - an encoder that failed mid-tree
+            // otherwise looks like a short but valid NAR.
+            match producer.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(join) => return Err(Error::Nar(format!("nar encoder panicked: {join}"))),
             }
+            // The early returns above fix this block's error type, so the
+            // RPC's own error needs converting rather than being handed back
+            // raw the way it was before the join existed.
+            out.map_err(Error::from)
         })?;
         Ok(info.path)
     }
@@ -902,12 +950,13 @@ fn parse_unix_remote(remote: &str) -> Result<PathBuf> {
     Err(Error::UnsupportedRemote(remote.to_string()))
 }
 
-fn encode_nar(path: &Path) -> Result<Vec<u8>> {
-    let mut encoder = nix_nar::Encoder::new(path).map_err(|e| Error::Nar(e.to_string()))?;
-    let mut buf = Vec::new();
-    std::io::copy(&mut encoder, &mut buf)?;
-    Ok(buf)
-}
+/// Bytes in flight per NAR upload.
+///
+/// Replaced an unbounded `Vec<u8>` holding the whole encoded tree. This is a
+/// pipe size rather than a tuning knob: big enough that a small header moves
+/// in one go, small enough that a directory upload cannot be a memory event.
+/// Peak per upload is this, not the tree.
+const NAR_STREAM_BUF: usize = 256 * 1024;
 
 #[cfg(test)]
 mod connect_backoff_tests {
@@ -1038,5 +1087,58 @@ mod uploaded_drv_retention_tests {
             between.lines().count() < 4,
             "the in_drv guard drifted away from the insert it protects"
         );
+    }
+}
+
+#[cfg(test)]
+mod nar_streaming_tests {
+    use super::NAR_STREAM_BUF;
+    use tokio::io::AsyncReadExt;
+
+    /// A NAR larger than the pipe must stream through.
+    ///
+    /// This is the shape that used to be a `Vec<u8>`, and the two ways to get
+    /// it wrong both hang rather than fail: forget the shutdown and the
+    /// reader never sees EOF, or join the producer before draining and the
+    /// producer blocks on a full pipe forever. Both would have looked like
+    /// the daemon wedge this driver already has a watchdog for, which is
+    /// exactly the wrong place to go looking.
+    #[test]
+    fn a_payload_larger_than_the_buffer_streams_without_deadlock() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Three buffers' worth: forces the producer to block and be drained
+        // more than once, which one buffer would not.
+        let payload = vec![0xABu8; NAR_STREAM_BUF * 3 + 7];
+        let expected = payload.len();
+
+        let got = rt.block_on(async move {
+            let (writer, mut reader) = tokio::io::duplex(NAR_STREAM_BUF);
+            let producer = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                let mut src = std::io::Cursor::new(payload);
+                let mut bridge = tokio_util::io::SyncIoBridge::new(writer);
+                std::io::copy(&mut src, &mut bridge)?;
+                std::io::Write::flush(&mut bridge)?;
+                bridge.shutdown()?;
+                Ok(())
+            });
+            let mut sink = Vec::new();
+            // Drain FIRST, join second - the order the real call site uses.
+            reader.read_to_end(&mut sink).await.unwrap();
+            producer.await.unwrap().unwrap();
+            sink.len()
+        });
+
+        assert_eq!(got, expected, "streamed byte count must match the source");
+    }
+
+    /// The buffer is a pipe size, not a tuning knob, but a zero or absurd
+    /// value silently changes it into one - duplex(0) blocks forever.
+    #[test]
+    fn the_stream_buffer_is_sane() {
+        assert!(NAR_STREAM_BUF >= 64 * 1024, "too small to move a header in one go");
+        assert!(NAR_STREAM_BUF <= 4 * 1024 * 1024, "large enough to be a memory event again");
     }
 }
