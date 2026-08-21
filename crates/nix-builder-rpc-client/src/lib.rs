@@ -1291,21 +1291,78 @@ mod uploaded_drv_retention_tests {
     ///
     /// Asserted on the source because the branch needs a live daemon to
     /// exercise and the INVARIANT is what must not drift.
+    ///
+    /// MATCHED LINE-WISE, NOT ON EXACT INDENTATION. The first version searched
+    /// for the map name followed by a newline and exactly sixteen spaces, so
+    /// any reformat made the search return None and the test panicked with
+    /// "the retaining insert must still exist" - naming a deletion that had
+    /// not happened. Loud rather than silent, but a diagnostic that asserts
+    /// the wrong cause sends the next reader after the wrong thing, which is
+    /// worse than one that asserts nothing. Found by the specification
+    /// session.
     #[test]
     fn retention_is_conditional_on_being_inside_a_derivation() {
-        let src = include_str!("lib.rs");
-        let insert = src
-            .find("self.uploaded_drvs\n                .lock()")
-            .expect("the retaining insert must still exist");
-        let guard = src[..insert]
-            .rfind("if self.in_drv {")
-            .expect("the insert must sit under an in_drv guard");
-        // Nothing but the comment and whitespace between guard and insert.
-        let between = &src[guard..insert];
+        let src: Vec<&str> = include_str!("lib.rs").lines().collect();
+        let insert = find_insert(&src).expect("the retaining insert must still exist");
+        let guard = find_guard(&src, insert).expect("the insert must sit under an in_drv guard");
         assert!(
-            between.lines().count() < 4,
+            insert - guard < 4,
             "the in_drv guard drifted away from the insert it protects"
         );
+    }
+
+    /// The check above must fail when the guard is gone, or it asserts
+    /// nothing - and it must NOT fail merely because the code was reformatted,
+    /// which is how the previous version broke. Both directions, on the two
+    /// matchers the live check uses, so the control cannot drift from it.
+    #[test]
+    fn the_matchers_survive_a_reformat_and_fail_without_the_guard() {
+        let reformatted: Vec<&str> = vec![
+            "        if self.in_drv {",
+            "                        self.uploaded_drvs.lock().unwrap()",
+            "            .insert(info.path.clone(), bytes);",
+            "        }",
+        ];
+        let insert = find_insert(&reformatted).expect("indentation must not matter");
+        assert_eq!(find_guard(&reformatted, insert), Some(0));
+
+        // The map is named and the retention is gone: keying on the name
+        // alone would pass here, which is the whole point of the window.
+        let read_only: Vec<&str> =
+            vec!["        if let Some(b) = self.uploaded_drvs.lock().unwrap().get(p) {"];
+        assert_eq!(find_insert(&read_only), None, "a read is not a retention");
+
+        let unguarded: Vec<&str> = vec![
+            "        self.uploaded_drvs",
+            "            .lock()",
+            "            .unwrap()",
+            "            .insert(info.path.clone(), bytes);",
+        ];
+        let insert = find_insert(&unguarded).expect("the insert is still there");
+        assert_eq!(find_guard(&unguarded, insert), None, "no guard to find");
+    }
+
+    /// The line retaining the uploaded .drv, found by CONTENT rather than by
+    /// indentation. The window is what separates it from the read a few lines
+    /// above: both name the map, only one of them inserts.
+    ///
+    /// Needles are built at runtime so they never appear as literals in the
+    /// file this searches - which is this file. A pattern that matches its own
+    /// source finds itself and reports a pass.
+    fn find_insert(lines: &[&str]) -> Option<usize> {
+        let map = concat!("self.", "uploaded_drvs");
+        (0..lines.len()).find(|&i| {
+            lines[i].contains(map)
+                && lines[i..(i + 4).min(lines.len())]
+                    .iter()
+                    .any(|l| l.contains(".insert("))
+        })
+    }
+
+    /// The nearest `in_drv` guard above a given insert.
+    fn find_guard(lines: &[&str], insert: usize) -> Option<usize> {
+        let needle = concat!("if self.", "in_drv {");
+        lines[..insert].iter().rposition(|l| l.contains(needle))
     }
 }
 
