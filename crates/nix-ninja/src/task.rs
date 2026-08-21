@@ -109,13 +109,65 @@ pub struct RunnerConfig {
 
 /// Counting semaphore bounding concurrent tasks. Permits release on
 /// Drop, so a panicking task thread cannot leak a slot.
+/// Inputs per unit of admission weight.
+///
+/// A task's memory cost tracks the input set it materializes, and that set
+/// spans three orders of magnitude in one graph: a leaf TU declares tens of
+/// inputs, a deep one realised 6,134 in a single call at 47 s. Counting both
+/// as "one job" is what makes a single -j wrong everywhere - high enough for
+/// the leaves thrashes on the deep tasks, low enough for the deep ones idles
+/// 22 cores on the leaves. Measured 2026-08-20: -j3 put the machine at PSI
+/// full avg10 52.78 with 29.5 GiB swapped, and -j2 left cores idle through
+/// the shallow strata.
+const INPUTS_PER_WEIGHT: usize = 512;
+
+/// Below this much available memory, admission collapses toward serial
+/// regardless of weight. The budget is a STANDING guess about cost; this is
+/// the measured state of the machine right now, and it has to win - a
+/// weighting that was right when the round started is wrong the moment
+/// something else on the box takes memory.
+const LOW_MEMORY_GIB: u64 = 6;
+
+/// Weight for a task declaring `inputs` inputs, clamped to `budget`.
+///
+/// Pure so the curve can be tested without a scheduler: the failure that
+/// matters is a weight of 0 (admits unboundedly) or a weight above the budget
+/// (never admits, hanging the round), and neither shows up as anything but a
+/// stall.
+fn admission_weight(inputs: usize, budget: usize) -> usize {
+    (1 + inputs / INPUTS_PER_WEIGHT).clamp(1, budget.max(1))
+}
+
+/// Available memory in GiB, or `u64::MAX` where /proc cannot be read - an
+/// unreadable meminfo must not silently serialize the whole round.
+fn available_gib() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb / (1024 * 1024))
+        .unwrap_or(u64::MAX)
+}
+
 struct JobPermits {
     inner: Arc<(Mutex<usize>, Condvar)>,
     cap: usize,
+    /// Free-memory floor below which admission collapses toward serial.
+    /// A field rather than a constant read directly so tests can disable the
+    /// gate: with it live, a concurrency test asserts on the machine's memory
+    /// at that instant and fails on a busy box for a reason that has nothing
+    /// to do with the semaphore. A flaky test about backpressure is worse
+    /// than none, because it gets muted.
+    min_free_gib: u64,
 }
 
 struct JobPermit {
     inner: Arc<(Mutex<usize>, Condvar)>,
+    weight: usize,
 }
 
 impl JobPermits {
@@ -123,21 +175,51 @@ impl JobPermits {
         JobPermits {
             inner: Arc::new((Mutex::new(0), Condvar::new())),
             cap,
+            min_free_gib: LOW_MEMORY_GIB,
         }
     }
 
-    /// Blocks until a slot frees. Blocking in the scheduler's start()
+    /// Same, with the memory gate disabled. Tests only.
+    #[cfg(test)]
+    fn new_without_memory_gate(cap: usize) -> Self {
+        JobPermits {
+            min_free_gib: 0,
+            ..JobPermits::new(cap)
+        }
+    }
+
+    /// Blocks until `weight` units free. Blocking in the scheduler's start()
     /// is deliberate backpressure: running task threads complete and
     /// release without needing the main loop, so this cannot deadlock.
-    fn acquire(&self) -> JobPermit {
+    ///
+    /// The effective budget shrinks under memory pressure, which is what lets
+    /// one round run the shallow strata wide and the deep ones nearly serial
+    /// without anybody choosing a number in advance. A weight already clamped
+    /// to the FULL budget can still exceed the shrunken one, so the wait
+    /// admits it once nothing else holds a unit - otherwise low memory would
+    /// hang the round rather than slow it.
+    fn acquire_weighted(&self, weight: usize) -> JobPermit {
+        let weight = weight.clamp(1, self.cap.max(1));
         let (lock, cvar) = &*self.inner;
         let mut count = lock.lock().unwrap();
-        while *count >= self.cap {
-            count = cvar.wait(count).unwrap();
+        loop {
+            let budget = if self.min_free_gib > 0 && available_gib() < self.min_free_gib {
+                1
+            } else {
+                self.cap
+            };
+            if *count == 0 || *count + weight <= budget {
+                break;
+            }
+            let (c, _) = cvar
+                .wait_timeout(count, std::time::Duration::from_secs(2))
+                .unwrap();
+            count = c;
         }
-        *count += 1;
+        *count += weight;
         JobPermit {
             inner: self.inner.clone(),
+            weight,
         }
     }
 }
@@ -146,8 +228,8 @@ impl Drop for JobPermit {
     fn drop(&mut self) {
         let (lock, cvar) = &*self.inner;
         let mut count = lock.lock().unwrap();
-        *count -= 1;
-        cvar.notify_one();
+        *count = count.saturating_sub(self.weight);
+        cvar.notify_all();
     }
 }
 
@@ -432,7 +514,14 @@ impl Runner {
         // Acquire before spawning: bounds thread count AND daemon load.
         // Phony builds returned above and never consume a slot. The
         // permit moves into the thread and releases on drop, panic-safe.
-        let permit = self.permits.acquire();
+        //
+        // Weighted by the task's declared input count, which is the best
+        // predictor of its memory cost available at admission time and was
+        // previously thrown away by counting every task as one. Small tasks
+        // run wide, deep ones approach serial, and the same round does both.
+        let permit = self
+            .permits
+            .acquire_weighted(admission_weight(task.inputs.len(), self.permits.cap));
 
         let config = self.config.clone();
         let rpc_client = self.rpc_client.clone();
@@ -3050,13 +3139,13 @@ fn normalize_output(output: &str) -> String {
 
 #[cfg(test)]
 mod job_permits_tests {
-    use super::JobPermits;
+    use super::{admission_weight, JobPermits};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     #[test]
     fn concurrency_never_exceeds_cap() {
-        let permits = Arc::new(JobPermits::new(3));
+        let permits = Arc::new(JobPermits::new_without_memory_gate(3));
         let running = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
@@ -3065,7 +3154,7 @@ mod job_permits_tests {
             let running = running.clone();
             let peak = peak.clone();
             handles.push(std::thread::spawn(move || {
-                let _permit = permits.acquire();
+                let _permit = permits.acquire_weighted(1);
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3088,18 +3177,52 @@ mod job_permits_tests {
         );
     }
 
+    /// The weight curve is the whole point of the change: one round must run
+    /// the shallow strata wide and the deep ones nearly serial. A weight of 0
+    /// admits unboundedly and a weight above the budget never admits at all,
+    /// and both present only as a stall, so the boundaries are pinned.
+    #[test]
+    fn weight_tracks_input_count_and_stays_inside_the_budget() {
+        assert_eq!(admission_weight(0, 24), 1, "a leaf task must be weight 1");
+        assert_eq!(admission_weight(20, 24), 1, "tens of inputs is still 1");
+        // The 6,134-input realise measured in round 87: heavy enough that only
+        // a few run together, not so heavy that it serializes the machine.
+        let deep = admission_weight(6134, 24);
+        assert!(
+            (8..=16).contains(&deep),
+            "a 6,134-input task weighed {deep}, outside the intended band"
+        );
+        // Never zero, never past the budget - the two stalling failures.
+        for inputs in [0, 1, 511, 512, 513, 100_000] {
+            for budget in [1, 2, 24] {
+                let w = admission_weight(inputs, budget);
+                assert!(w >= 1, "weight 0 for {inputs}/{budget} admits unboundedly");
+                assert!(w <= budget, "weight {w} exceeds budget {budget}");
+            }
+        }
+    }
+
+    /// A heavy task must still be admitted when it alone exceeds the budget,
+    /// or a low-memory moment turns into a hang instead of a slowdown.
+    #[test]
+    fn an_oversized_task_still_runs_alone() {
+        let permits = std::sync::Arc::new(JobPermits::new_without_memory_gate(2));
+        let _p = permits.acquire_weighted(usize::MAX);
+        // Acquiring it at all proves the empty-pool escape hatch works.
+    }
+
     #[test]
     fn permit_released_on_panic() {
-        let permits = Arc::new(JobPermits::new(1));
+        let permits = Arc::new(JobPermits::new_without_memory_gate(1));
         let p2 = permits.clone();
         let _ = std::thread::spawn(move || {
-            let _permit = p2.acquire();
+            let _permit = p2.acquire_weighted(1);
             panic!("task died");
         })
         .join();
         // If the panicking thread leaked its permit, this blocks forever
         // and the test times out; acquiring proves the Drop ran.
-        let _permit = permits.acquire();
+        let _permit = permits.acquire_weighted(1);
     }
 }
 
