@@ -282,8 +282,20 @@ impl BuilderRpcClient {
         })
     }
 
-    pub fn clone_drv(&self, store_path: &StorePath) -> Option<Vec<u8>> {
-        self.uploaded_drvs.lock().unwrap().get(store_path).cloned()
+    /// The ATerm bytes of an uploaded derivation.
+    ///
+    /// Inside a derivation the uploaded .drv is not materialized, so the only
+    /// copy is the one `add_drv_to_store` kept. OUTSIDE one the store path is
+    /// a readable file, so the bytes are read back on demand and nothing is
+    /// retained - see `add_drv_to_store` for why that matters.
+    pub fn clone_drv(&self, store_dir: &StoreDir, store_path: &StorePath) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.uploaded_drvs.lock().unwrap().get(store_path) {
+            return Some(bytes.clone());
+        }
+        if self.in_drv {
+            return None;
+        }
+        std::fs::read(store_path.to_absolute_path(store_dir)).ok()
     }
 
     // Serialise a derivation and add it to the store.
@@ -308,10 +320,26 @@ impl BuilderRpcClient {
                 .await
         })?;
 
-        self.uploaded_drvs
-            .lock()
-            .unwrap()
-            .insert(info.path.clone(), bytes);
+        // Retained ONLY inside a derivation, where builder-rpc-v0 does not
+        // materialize the uploaded .drv and this is the sole copy. Outside
+        // one the file is on disk and clone_drv reads it back, so retaining
+        // is cost with no reader: both call sites are sandbox-only and
+        // neither runs on the full-graph path this campaign uses.
+        //
+        // NO SIZE FIGURE HERE ON PURPOSE. The first version of this comment
+        // claimed ~6 GiB, extrapolated from a 384 KiB mean over every
+        // ninja-build.drv in the store, and the next progress tick falsified
+        // it: driver RSS fell from 13,335 to 4,568 MiB between two 500-task
+        // windows, and a monotonic map cannot exceed a resident size that
+        // drops below it. The saving is real and unmeasured; measure it by
+        // comparing RSS at equal task counts across a round with and without
+        // this branch, which is the only reading that isolates it.
+        if self.in_drv {
+            self.uploaded_drvs
+                .lock()
+                .unwrap()
+                .insert(info.path.clone(), bytes);
+        }
         Ok(info.path)
     }
 
@@ -981,5 +1009,34 @@ mod realise_memo_tests {
     #[should_panic(expected = "realise returned")]
     fn a_short_reply_is_refused_not_absorbed() {
         merge_hits_and_misses(vec![None, None], vec![0, 1], vec!["only-one"]);
+    }
+}
+
+#[cfg(test)]
+mod uploaded_drv_retention_tests {
+    /// Retention is gated on `in_drv`, and the reason is asymmetric: inside a
+    /// derivation the uploaded .drv is not materialized and the retained copy
+    /// is the only one, so dropping it there loses data. Outside, the file is
+    /// on disk. A future edit that flips this to an unconditional skip would
+    /// break the sandbox path silently - the failure is a missing drv late in
+    /// a build, nowhere near the cache.
+    ///
+    /// Asserted on the source because the branch needs a live daemon to
+    /// exercise and the INVARIANT is what must not drift.
+    #[test]
+    fn retention_is_conditional_on_being_inside_a_derivation() {
+        let src = include_str!("lib.rs");
+        let insert = src
+            .find("self.uploaded_drvs\n                .lock()")
+            .expect("the retaining insert must still exist");
+        let guard = src[..insert]
+            .rfind("if self.in_drv {")
+            .expect("the insert must sit under an in_drv guard");
+        // Nothing but the comment and whitespace between guard and insert.
+        let between = &src[guard..insert];
+        assert!(
+            between.lines().count() < 4,
+            "the in_drv guard drifted away from the insert it protects"
+        );
     }
 }

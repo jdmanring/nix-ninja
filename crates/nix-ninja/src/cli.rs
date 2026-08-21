@@ -172,7 +172,7 @@ fn submit_outer_output(
         output_name: &output_name,
     }
     .to_string();
-    let bytes = rpc_client.clone_drv(final_drv).ok_or_else(|| {
+    let bytes = rpc_client.clone_drv(store_dir, final_drv).ok_or_else(|| {
         anyhow!(
             "final drv {} not in uploaded_drvs cache",
             final_drv_path.display()
@@ -243,7 +243,7 @@ fn subtool(
                 ));
             };
             let drv_path = derived_file.derived_path.root_path();
-            let bytes = rpc_client.clone_drv(drv_path).ok_or_else(|| {
+            let bytes = rpc_client.clone_drv(store_dir, drv_path).ok_or_else(|| {
                 anyhow!(
                     "drv {} not in uploaded_drvs cache",
                     drv_path.to_absolute_path(store_dir).display()
