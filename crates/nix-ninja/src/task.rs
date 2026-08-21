@@ -71,6 +71,11 @@ struct Task {
     // command runs. GN emits one per action rule; a task without it gets
     // an empty argument where the command expects the file.
     rspfile: Option<(PathBuf, String)>,
+    // Ninja `depfile`: the build-dir-relative path the command writes its
+    // Makefile-syntax dependency list to. Upstream #17 asks for this to
+    // become an additional content-addressed output so the driver can read
+    // real dependencies instead of inferring them.
+    depfile: Option<String>,
 
     files: HashMap<FileId, File>,
     inputs: Vec<DerivedFile>,
@@ -316,16 +321,17 @@ impl JobPermits {
         let (lock, cvar) = &*self.inner;
         let mut count = lock.lock().unwrap();
         loop {
-            let budget = if self.memory_aware {
-                let (reserve, full) = memory_bounds_gib();
-                // The tighter of the two controls wins. Memory is the one
-                // that matters here; load is honoured because -l was asked
-                // for, and its weakness is documented at budget_for_load.
-                budget_for_memory(self.cap, available_gib(), reserve, full)
-                    .min(budget_for_load(self.cap, load_average(), self.load_limit))
-            } else {
-                self.cap
-            };
+            let budget =
+                if self.memory_aware {
+                    let (reserve, full) = memory_bounds_gib();
+                    // The tighter of the two controls wins. Memory is the one
+                    // that matters here; load is honoured because -l was asked
+                    // for, and its weakness is documented at budget_for_load.
+                    budget_for_memory(self.cap, available_gib(), reserve, full)
+                        .min(budget_for_load(self.cap, load_average(), self.load_limit))
+                } else {
+                    self.cap
+                };
             if *count == 0 || *count + weight <= budget {
                 break;
             }
@@ -522,11 +528,8 @@ impl Runner {
         // tsconfig. Same recording, same expansion; the via_phony
         // not-a-file drop discards entries that are another task's
         // unmaterialized outputs.
-        if build
-            .cmdline
-            .as_deref()
-            .is_some_and(|c| {
-                c.contains("touch_file.py")
+        if build.cmdline.as_deref().is_some_and(|c| {
+            c.contains("touch_file.py")
                     || c.contains("ts_library.py")
                     // generate_grd emits a manifest whose consumer (grit)
                     // reads the files the producer's PHONY inputs carry
@@ -534,8 +537,7 @@ impl Runner {
                     // recording its edge inputs lets the worklist's phony
                     // expansion materialize them for the consumer.
                     || c.contains("generate_grd.py")
-            })
-        {
+        }) {
             let ins: Vec<FileId> = build.dirtying_ins().to_vec();
             for fid in build.outs() {
                 self.stamp_inputs.insert(*fid, ins.clone());
@@ -693,8 +695,7 @@ impl Runner {
                 .is_some_and(|c| c.contains("generate_grd.py"))
             {
                 for p in generate_grd_input_files(build.cmdline.as_deref().unwrap()) {
-                    let up =
-                        new_opaque_file(&self.rpc_client, &self.config.build_dir, p)?;
+                    let up = new_opaque_file(&self.rpc_client, &self.config.build_dir, p)?;
                     record.push(up);
                 }
             }
@@ -731,29 +732,35 @@ impl Runner {
         std::thread::spawn(move || {
             let _permit = permit;
             let _pool_permit = pool_permit;
-            let (derived_path, err) =
-                match build_task_derivation(tools.clone(), &rpc_client, task.clone()) {
-                    Ok(drv) => match handle_derivation_result(
-                        tools.clone(),
-                        &rpc_client,
-                        task.clone(),
-                        drv.clone(),
-                        &config,
-                    ) {
-                        Ok(final_derived_path) => (Some(final_derived_path), None),
-                        Err(err) => {
-                            // Cause FIRST and no multi-megabyte JSON dump:
-                            // at Chromium scale the dump swallowed the cause
-                            // chain and cost blind debugging rounds.
-                            (None, Some(err.context(format!(
+            let (derived_path, err) = match build_task_derivation(
+                tools.clone(),
+                &rpc_client,
+                task.clone(),
+            ) {
+                Ok(drv) => match handle_derivation_result(
+                    tools.clone(),
+                    &rpc_client,
+                    task.clone(),
+                    drv.clone(),
+                    &config,
+                ) {
+                    Ok(final_derived_path) => (Some(final_derived_path), None),
+                    Err(err) => {
+                        // Cause FIRST and no multi-megabyte JSON dump:
+                        // at Chromium scale the dump swallowed the cause
+                        // chain and cost blind debugging rounds.
+                        (None, Some(err.context(format!(
                                 "Failed to handle derivation result for task (derivation: {}, {} inputs)",
                                 drv.name,
                                 task.inputs.len()
                             ))))
-                        }
-                    },
-                    Err(err) => (None, Some(err.context("Failed to build task derivation for task".to_string()))),
-                };
+                    }
+                },
+                Err(err) => (
+                    None,
+                    Some(err.context("Failed to build task derivation for task".to_string())),
+                ),
+            };
 
             // Create DerivedFiles for all outputs if successful
             let derived_files = if let Some(ref final_derived_path) = derived_path {
@@ -764,9 +771,7 @@ impl Runner {
                     // task.outputs; apply the same here so the recorded
                     // DerivedFile agrees with what the task wrote.
                     match normalize_build_path(&config.build_dir, file.name.clone().into()) {
-                        Ok(p) => {
-                            drv_outputs.push(new_built_file(final_derived_path.clone(), p))
-                        }
+                        Ok(p) => drv_outputs.push(new_built_file(final_derived_path.clone(), p)),
                         Err(e) => {
                             eprintln!("Error: {e}");
                         }
@@ -945,9 +950,7 @@ impl Runner {
             // header filter keeps TU closures lean and a co-output that
             // is not yet a file drops silently rather than erroring.
             if let Some(sibs) = self.co_outputs.get(&fid) {
-                worklist.extend(
-                    sibs.iter().filter(|s| **s != fid).map(|s| (*s, true)),
-                );
+                worklist.extend(sibs.iter().filter(|s| **s != fid).map(|s| (*s, true)));
             }
             // For a compile (deps=gcc), a phony-EXPANDED order-only dep is
             // only a real input if it is header-shaped: expansion of GN's
@@ -1037,8 +1040,10 @@ impl Runner {
 
         // The rebase root for arguments GN wrote relative to the target's
         // own gen dir: the first output's directory.
-        let outputs_hint: Option<PathBuf> =
-            outputs.first().and_then(|o| o.parent()).map(Path::to_path_buf);
+        let outputs_hint: Option<PathBuf> = outputs
+            .first()
+            .and_then(|o| o.parent())
+            .map(Path::to_path_buf);
 
         // TODO: Can we avoid this? Technically the build rule isn't complete.
         //
@@ -1097,11 +1102,9 @@ impl Runner {
                     && Path::new(&arg).is_file()
                 {
                     if let Some(dir) = Path::new(&arg).parent() {
-                        for input in upload_referenced_dir(
-                            &self.rpc_client,
-                            &self.config.build_dir,
-                            dir,
-                        )? {
+                        for input in
+                            upload_referenced_dir(&self.rpc_client, &self.config.build_dir, dir)?
+                        {
                             self.add_derived_file(files, input.clone());
                             input_set.insert(input.build_path.clone(), input);
                         }
@@ -1135,8 +1138,7 @@ impl Runner {
                             && extra_rspfile.is_none()
                             && self.config.build_dir.join(rsp_rel).is_file()
                         {
-                            if let Ok(raw) =
-                                fs::read_to_string(self.config.build_dir.join(rsp_rel))
+                            if let Ok(raw) = fs::read_to_string(self.config.build_dir.join(rsp_rel))
                             {
                                 // Root-relative view for upload decisions;
                                 // the shipped content gets the cd
@@ -1164,8 +1166,7 @@ impl Runner {
                                             p,
                                         )? {
                                             self.add_derived_file(files, input.clone());
-                                            input_set
-                                                .insert(input.build_path.clone(), input);
+                                            input_set.insert(input.build_path.clone(), input);
                                         }
                                     } else if p.is_file() {
                                         for input in upload_referenced_file(
@@ -1174,8 +1175,7 @@ impl Runner {
                                             p.to_path_buf(),
                                         )? {
                                             self.add_derived_file(files, input.clone());
-                                            input_set
-                                                .insert(input.build_path.clone(), input);
+                                            input_set.insert(input.build_path.clone(), input);
                                         }
                                     }
                                 }
@@ -1279,10 +1279,7 @@ impl Runner {
                                 input_set.insert(input.build_path.clone(), input);
                             }
                         }
-                    } else if !arg.starts_with('-')
-                        && !arg.starts_with('/')
-                        && arg.contains('/')
-                    {
+                    } else if !arg.starts_with('-') && !arg.starts_with('/') && arg.contains('/') {
                         // GN rebases some tool arguments to the TARGET'S
                         // OWN GEN DIR rather than the build dir:
                         // ts_library's --definitions names source .d.ts
@@ -1301,9 +1298,7 @@ impl Runner {
                             // so the generated file comes from its
                             // producing derivation rather than whatever
                             // stale copy the host build dir holds.
-                            if let Some(rfid) =
-                                files.lookup(&rebased.to_string_lossy())
-                            {
+                            if let Some(rfid) = files.lookup(&rebased.to_string_lossy()) {
                                 node_args.push(rfid);
                             } else if rebased.is_file() {
                                 for input in upload_referenced_file(
@@ -1486,10 +1481,7 @@ impl Runner {
 
         let mut grd_list: Vec<PathBuf> = input_set
             .keys()
-            .filter(|p| {
-                p.extension()
-                    .is_some_and(|e| e == "grd" || e == "grdp")
-            })
+            .filter(|p| p.extension().is_some_and(|e| e == "grd" || e == "grdp"))
             .cloned()
             .collect();
         while let Some(grd) = grd_list.pop() {
@@ -1601,6 +1593,7 @@ impl Runner {
                 .as_ref()
                 .map(|r| (r.path.clone(), r.content.clone()))
                 .or(extra_rspfile),
+            depfile: build.depfile.clone(),
             files: build_files,
             inputs,
             outputs,
@@ -1844,9 +1837,44 @@ fn build_task_derivation(
         inputs.join(" ").into_bytes().into(),
     );
 
+    // UPSTREAM #17, STEP ONE: the depfile becomes a declared output.
+    //
+    // Nothing new is needed to carry it. `nix-ninja-task` already copies
+    // every declared output out of the build dir into its placeholder, and
+    // a depfile IS a build-dir-relative file the command writes - so
+    // appending it to this list is the whole mechanism. What the driver then
+    // gains is a real dependency list per task, which is what #17 wants to
+    // read back in place of inference.
+    //
+    // GATED ON `deps = gcc`, NOT ON `depfile` ALONE, and the difference is
+    // load-bearing. A declared output that the command does not produce
+    // fails the task. `depfile` on its own is a path ninja would read IF the
+    // command wrote one; `deps = gcc` is ninja's own statement that this
+    // command writes a gcc-style depfile there, which is the only form that
+    // guarantees the file exists when the command exits. Anything else stays
+    // on the inference path it is on today, so this cannot turn a building
+    // task into a failing one.
+    let mut task_outputs: Vec<PathBuf> = task.outputs.clone();
+    let depfile_out: Option<PathBuf> = match (&task.depfile, task.deps.as_deref()) {
+        (Some(d), Some("gcc")) if !d.is_empty() => {
+            let p = PathBuf::from(d);
+            // An absolute or escaping depfile path is not ours to copy: the
+            // task's outputs are build-dir-relative by construction, and a
+            // path outside that tree would be silently rebased. Skip it and
+            // leave the task exactly as it was.
+            if p.is_absolute() || p.starts_with("..") {
+                None
+            } else {
+                task_outputs.push(p.clone());
+                Some(p)
+            }
+        }
+        _ => None,
+    };
+
     // Add all ninja build outputs.
     let mut outputs: Vec<String> = Vec::new();
-    for output_path in &task.outputs {
+    for output_path in &task_outputs {
         // Declare a content addressed output.
         let normalized_name = normalize_output(&output_path.to_string_lossy());
         drv.outputs.insert(
@@ -1873,6 +1901,16 @@ fn build_task_derivation(
         outputs.join(" ").into_bytes().into(),
     );
 
+    // Name the depfile output so a consumer does not have to re-derive which
+    // of the outputs it is by matching the path. #17's later steps (collect,
+    // parse, cache, skip inference) read this.
+    if let Some(d) = &depfile_out {
+        drv.env.insert(
+            b"NIX_NINJA_DEPFILE"[..].into(),
+            normalize_output(&d.to_string_lossy()).into_bytes().into(),
+        );
+    }
+
     // Ninja rspfile support: the task writes this file (relative to its
     // build dir) before spawning the command. Content rides passAsFile
     // beside the input map - rsp files exist precisely because their
@@ -1897,10 +1935,8 @@ fn build_task_derivation(
     // to a file AFTER placeholder substitution (so derived-path
     // placeholders still resolve) and hands the builder
     // NIX_NINJA_INPUTSPath / NIX_NINJA_OUTPUTSPath instead.
-    drv.env.insert(
-        b"passAsFile"[..].into(),
-        pass_as_file.into_bytes().into(),
-    );
+    drv.env
+        .insert(b"passAsFile"[..].into(), pass_as_file.into_bytes().into());
 
     {
         // Prepare $PATH to have coreutils.
@@ -1987,10 +2023,8 @@ fn build_dynamic_task_derivation(
     );
     // Same E2BIG hazard as the task derivation: see the passAsFile
     // comment in build_task_derivation.
-    drv.env.insert(
-        b"passAsFile"[..].into(),
-        b"NIX_NINJA_INPUTS"[..].into(),
-    );
+    drv.env
+        .insert(b"passAsFile"[..].into(), b"NIX_NINJA_INPUTS"[..].into());
 
     drv.outputs.insert(
         "out".parse()?,
@@ -2299,12 +2333,11 @@ fn new_opaque_file(
     // affected store objects re-key. Scripts INVOKED as `python3 x.py`
     // never read their shebang, so the rewrite is inert for them.
     let upload_src = patched_env_shebang(&canonical_path)?;
-    let store_path =
-        rpc_client.add_to_store_nar_cached(
-            &name,
-            upload_src.as_deref().unwrap_or(&canonical_path),
-            &canonical_path,
-        )?;
+    let store_path = rpc_client.add_to_store_nar_cached(
+        &name,
+        upload_src.as_deref().unwrap_or(&canonical_path),
+        &canonical_path,
+    )?;
 
     Ok(DerivedFile {
         derived_path: SingleDerivedPath::Opaque(store_path),
@@ -2355,9 +2388,8 @@ fn patched_env_shebang(path: &Path) -> Result<Option<PathBuf>> {
     // Memoized per source path: the same script is uploaded once per
     // walk memo miss, but several scripts share interpreters and the
     // tmp copies are tiny; keyed by source so repeat calls are free.
-    static SHEBANG_MEMO: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<PathBuf, PathBuf>>,
-    > = std::sync::OnceLock::new();
+    static SHEBANG_MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, PathBuf>>> =
+        std::sync::OnceLock::new();
     let memo = SHEBANG_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     if let Some(hit) = memo.lock().unwrap().get(path) {
         return Ok(Some(hit.clone()));
@@ -2367,7 +2399,9 @@ fn patched_env_shebang(path: &Path) -> Result<Option<PathBuf>> {
     let out = dir.join(format!(
         "{}-{}",
         memo.lock().unwrap().len(),
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("script")
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("script")
     ));
     let mut patched = format!("#!{}\n", resolved.display()).into_bytes();
     patched.extend_from_slice(&body[first_nl + 1..]);
@@ -2508,17 +2542,77 @@ fn upload_referenced_file(
 /// and vendored-tree probes below. Incomplete by design - a missed name
 /// costs a few stats and a failed directory probe, never a wrong file.
 const PY_STDLIB: &[&str] = &[
-    "abc", "argparse", "ast", "base64", "binascii", "bisect", "codecs",
-    "collections", "contextlib", "copy", "csv", "ctypes", "dataclasses",
-    "datetime", "difflib", "enum", "errno", "fnmatch", "functools",
-    "getopt", "glob", "gzip", "hashlib", "heapq", "html", "http", "io",
-    "importlib", "inspect", "itertools", "json", "keyword", "locale",
-    "logging", "math", "multiprocessing", "operator", "optparse", "os",
-    "pathlib", "pickle", "platform", "posixpath", "pprint", "queue",
-    "random", "re", "shlex", "shutil", "signal", "site", "socket",
-    "stat", "string", "struct", "subprocess", "sys", "tempfile",
-    "textwrap", "threading", "time", "traceback", "types", "typing",
-    "unittest", "urllib", "uuid", "warnings", "xml", "zipfile", "zlib",
+    "abc",
+    "argparse",
+    "ast",
+    "base64",
+    "binascii",
+    "bisect",
+    "codecs",
+    "collections",
+    "contextlib",
+    "copy",
+    "csv",
+    "ctypes",
+    "dataclasses",
+    "datetime",
+    "difflib",
+    "enum",
+    "errno",
+    "fnmatch",
+    "functools",
+    "getopt",
+    "glob",
+    "gzip",
+    "hashlib",
+    "heapq",
+    "html",
+    "http",
+    "io",
+    "importlib",
+    "inspect",
+    "itertools",
+    "json",
+    "keyword",
+    "locale",
+    "logging",
+    "math",
+    "multiprocessing",
+    "operator",
+    "optparse",
+    "os",
+    "pathlib",
+    "pickle",
+    "platform",
+    "posixpath",
+    "pprint",
+    "queue",
+    "random",
+    "re",
+    "shlex",
+    "shutil",
+    "signal",
+    "site",
+    "socket",
+    "stat",
+    "string",
+    "struct",
+    "subprocess",
+    "sys",
+    "tempfile",
+    "textwrap",
+    "threading",
+    "time",
+    "traceback",
+    "types",
+    "typing",
+    "unittest",
+    "urllib",
+    "uuid",
+    "warnings",
+    "xml",
+    "zipfile",
+    "zlib",
 ];
 
 /// Upload the TRANSITIVE python dependency closure rooted at a script's
@@ -2599,26 +2693,24 @@ fn upload_python_closure_uncached(
     out: &mut Vec<DerivedFile>,
 ) -> Result<()> {
     const CLOSURE_DIR_CAP: usize = 64;
-    let mut visited: std::collections::HashSet<PathBuf> =
-        std::collections::HashSet::new();
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut queue: Vec<PathBuf> = vec![start_dir.to_path_buf()];
-    let upload_dir =
-        |dir: &Path, cap: usize, out: &mut Vec<DerivedFile>| -> Result<bool> {
-            match walk_dir_capped(rpc_client, build_dir, dir, cap)? {
-                Some(files) => {
-                    out.extend(files);
-                    Ok(true)
-                }
-                None => {
-                    println!(
-                        "nix-ninja: python dep dir {} exceeds {} files; skipped",
-                        dir.display(),
-                        cap
-                    );
-                    Ok(false)
-                }
+    let upload_dir = |dir: &Path, cap: usize, out: &mut Vec<DerivedFile>| -> Result<bool> {
+        match walk_dir_capped(rpc_client, build_dir, dir, cap)? {
+            Some(files) => {
+                out.extend(files);
+                Ok(true)
             }
-        };
+            None => {
+                println!(
+                    "nix-ninja: python dep dir {} exceeds {} files; skipped",
+                    dir.display(),
+                    cap
+                );
+                Ok(false)
+            }
+        }
+    };
     while let Some(dir) = queue.pop() {
         if !visited.insert(dir.clone()) || visited.len() > CLOSURE_DIR_CAP {
             continue;
@@ -2626,16 +2718,13 @@ fn upload_python_closure_uncached(
         // Siblings: every .py module, node_modules for node.py, and
         // package directories - which recurse, because their own files
         // import too.
-        let entries = fs::read_dir(&dir).map_err(|e| {
-            anyhow!("read_dir({}) for python closure: {e}", dir.display())
-        })?;
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| anyhow!("read_dir({}) for python closure: {e}", dir.display()))?;
         for entry in entries.flatten() {
             let p = entry.path();
             if p.extension().is_some_and(|e| e == "py") && p.is_file() {
                 out.push(new_opaque_file(rpc_client, build_dir, p)?);
-            } else if p.is_dir()
-                && p.file_name().is_some_and(|n| n == "node_modules")
-            {
+            } else if p.is_dir() && p.file_name().is_some_and(|n| n == "node_modules") {
                 upload_dir(&p, 8192, out)?;
             } else if p.is_dir() && p.join("__init__.py").is_file() {
                 if upload_dir(&p, 512, out)? {
@@ -2658,9 +2747,7 @@ fn upload_python_closure_uncached(
                 // (common/ holds models.py) or BEING the named package
                 // (tracing/tracing_build/ answers import tracing_build).
                 for uncle in fs::read_dir(parent)
-                    .map_err(|e| {
-                        anyhow!("read_dir({}) for uncle modules: {e}", parent.display())
-                    })?
+                    .map_err(|e| anyhow!("read_dir({}) for uncle modules: {e}", parent.display()))?
                     .flatten()
                     .map(|e| e.path())
                     .filter(|p| p.is_dir() && *p != dir)
@@ -2685,9 +2772,7 @@ fn upload_python_closure_uncached(
                     'levels: for _ in 0..4 {
                         let Some(up) = anc.parent() else { break };
                         anc = up.to_path_buf();
-                        for cand in
-                            [anc.join(name), anc.join("third_party").join(name)]
-                        {
+                        for cand in [anc.join(name), anc.join("third_party").join(name)] {
                             let module = cand.join(format!("{name}.py")).is_file();
                             let package = cand.join("__init__.py").is_file();
                             if module || package {
@@ -2734,8 +2819,7 @@ fn upload_python_closure_uncached(
                         let score = |p: &Path| -> u32 {
                             let s = p.to_string_lossy().into_owned();
                             let versioned = s.split('/').any(|c| {
-                                c.contains('-')
-                                    && c.chars().any(|ch| ch.is_ascii_digit())
+                                c.contains('-') && c.chars().any(|ch| ch.is_ascii_digit())
                             });
                             u32::from(versioned) * 2 + u32::from(s.contains("py3"))
                         };
@@ -2783,11 +2867,7 @@ fn upload_python_closure_uncached(
                 .into_iter()
                 .flatten()
                 .flatten()
-                .any(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .ends_with("_project.py")
-                });
+                .any(|e| e.file_name().to_string_lossy().ends_with("_project.py"));
             if has_project_file {
                 let mut bases = vec![dir.clone()];
                 if let Some(par) = dir.parent() {
@@ -2869,7 +2949,6 @@ fn self_rss_mib() -> u64 {
         .unwrap_or(0)
 }
 
-
 /// Live heap against allocator-retained heap, the pair RSS cannot separate.
 ///
 /// Returns `(in_use, retained)` in MiB. RSS is `retained` plus everything that
@@ -2925,7 +3004,6 @@ fn self_heap_mib() -> Option<(u64, u64)> {
 fn self_heap_mib() -> Option<(u64, u64)> {
     None
 }
-
 
 /// Wall time inside `handle_derivation_result`, the dynamic-dependency
 /// discovery that the resolve tick never counted. See the note at the top of
@@ -3074,7 +3152,9 @@ fn python_join_segments(dir: &Path) -> Result<Vec<PathBuf>> {
         {
             continue;
         }
-        let Ok(body) = fs::read_to_string(&p) else { continue };
+        let Ok(body) = fs::read_to_string(&p) else {
+            continue;
+        };
         for line in body.lines() {
             if !line.contains("os.path.join") {
                 continue;
@@ -3145,7 +3225,9 @@ fn python_syspath_dirs(dir: &Path) -> Result<Vec<PathBuf>> {
         if !p.extension().is_some_and(|e| e == "py") {
             continue;
         }
-        let Ok(body) = fs::read_to_string(&p) else { continue };
+        let Ok(body) = fs::read_to_string(&p) else {
+            continue;
+        };
         for line in body.lines() {
             if !line.contains("sys.path") {
                 continue;
@@ -3193,21 +3275,24 @@ fn upload_referenced_dir(
     // round, 327 files per walk, dominating the py resolve bucket after
     // the closure memo landed (round 63: 100s cumulative at task 8,000,
     // 397s at 9,000 - the marginal cost was this walk).
-    static DIR_MEMO: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<PathBuf, Vec<DerivedFile>>>,
-    > = std::sync::OnceLock::new();
+    static DIR_MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Vec<DerivedFile>>>> =
+        std::sync::OnceLock::new();
     let memo = DIR_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     if let Some(hit) = memo.lock().unwrap().get(dir) {
         return Ok(hit.clone());
     }
     // Cross-round persistence, same shape as python_closure_cached.
     if let Some(files) = crate::resolve_cache::lookup("dir", dir) {
-        memo.lock().unwrap().insert(dir.to_path_buf(), files.clone());
+        memo.lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), files.clone());
         return Ok(files);
     }
     let fresh = upload_referenced_dir_uncached(rpc_client, build_dir, dir)?;
     crate::resolve_cache::record("dir", dir, &fresh);
-    memo.lock().unwrap().insert(dir.to_path_buf(), fresh.clone());
+    memo.lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), fresh.clone());
     Ok(fresh)
 }
 
@@ -3309,10 +3394,14 @@ fn grd_references(grd: &Path) -> Result<Vec<PathBuf>> {
     let body = fs::read_to_string(grd)
         .map_err(|e| anyhow!("read({}) for grd scan: {e}", grd.display()))?;
     let dir = grd.parent().unwrap_or(Path::new(""));
-    let mut contexts: Vec<String> = ["default_100_percent", "default_200_percent", "default_300_percent"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut contexts: Vec<String> = [
+        "default_100_percent",
+        "default_200_percent",
+        "default_300_percent",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     for chunk in body.split("context=\"").skip(1) {
         if let Some(val) = chunk.split('"').next() {
             if !val.is_empty() && !contexts.iter().any(|c| c == val) {
@@ -3358,9 +3447,8 @@ fn python_import_names(pkg: &Path) -> Result<Vec<String>> {
     // Memoized like walk_dir_capped and for the same reason: the
     // closure runs per task and re-reads the same directories' file
     // bodies thousands of times otherwise.
-    static NAMES_MEMO: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<PathBuf, Vec<String>>>,
-    > = std::sync::OnceLock::new();
+    static NAMES_MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Vec<String>>>> =
+        std::sync::OnceLock::new();
     let memo = NAMES_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     if let Some(hit) = memo.lock().unwrap().get(pkg) {
         return Ok(hit.clone());
@@ -3396,11 +3484,7 @@ fn python_import_names_uncached(pkg: &Path) -> Result<Vec<String>> {
                 .split(|c: char| c == ' ' || c == '.' || c == ',')
                 .next()
                 .unwrap_or("");
-            if !first.is_empty()
-                && first
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
+            if !first.is_empty() && first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 names.insert(first.to_string());
             }
         }
@@ -3445,8 +3529,8 @@ fn walk_dir_capped_uncached(
     let mut paths = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let entries = fs::read_dir(&d)
-            .map_err(|e| anyhow!("read_dir({}) for dir arg: {e}", d.display()))?;
+        let entries =
+            fs::read_dir(&d).map_err(|e| anyhow!("read_dir({}) for dir arg: {e}", d.display()))?;
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_dir() {
@@ -3592,8 +3676,16 @@ mod job_permits_tests {
     fn budget_tapers_with_memory_instead_of_cliffing() {
         let (cap, reserve, full) = (24usize, 6u64, 15u64);
         assert_eq!(budget_for_memory(cap, 30, reserve, full), 24, "plenty free");
-        assert_eq!(budget_for_memory(cap, 15, reserve, full), 24, "at full mark");
-        assert_eq!(budget_for_memory(cap, 6, reserve, full), 1, "at the reserve");
+        assert_eq!(
+            budget_for_memory(cap, 15, reserve, full),
+            24,
+            "at full mark"
+        );
+        assert_eq!(
+            budget_for_memory(cap, 6, reserve, full),
+            1,
+            "at the reserve"
+        );
         assert_eq!(budget_for_memory(cap, 2, reserve, full), 1, "below reserve");
         // Strictly non-decreasing in available memory, and never outside
         // [1, cap] - a 0 hangs the round, a value over cap thrashes it.
@@ -3607,7 +3699,10 @@ mod job_permits_tests {
         // Mid-range must actually be in the middle, not pinned to an end -
         // otherwise the taper is a cliff wearing a linear formula.
         let mid = budget_for_memory(cap, 10, reserve, full);
-        assert!((2..cap).contains(&mid), "mid-range budget {mid} is an endpoint");
+        assert!(
+            (2..cap).contains(&mid),
+            "mid-range budget {mid} is an endpoint"
+        );
     }
 
     /// `-l` is ninja's contract: stop starting work above the limit. 0.0
@@ -3615,9 +3710,17 @@ mod job_permits_tests {
     #[test]
     fn load_limit_matches_ninja_and_zero_disables() {
         assert_eq!(budget_for_load(24, 99.0, 0.0), 24, "0.0 must disable -l");
-        assert_eq!(budget_for_load(24, 3.0, 8.0), 24, "under the limit runs wide");
+        assert_eq!(
+            budget_for_load(24, 3.0, 8.0),
+            24,
+            "under the limit runs wide"
+        );
         assert_eq!(budget_for_load(24, 8.0, 8.0), 1, "at the limit throttles");
-        assert_eq!(budget_for_load(24, 40.0, 8.0), 1, "over the limit throttles");
+        assert_eq!(
+            budget_for_load(24, 40.0, 8.0),
+            1,
+            "over the limit throttles"
+        );
         // Never zero: a throttled round must crawl, never stop.
         for load in [0.0, 1.0, 7.9, 8.0, 100.0] {
             assert!(budget_for_load(24, load, 8.0) >= 1);
