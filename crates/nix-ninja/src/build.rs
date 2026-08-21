@@ -8,7 +8,7 @@ use n2::{canon, load, scanner};
 use nix_builder_rpc_client::BuilderRpcClient;
 use nix_ninja_task::derived_file::DerivedFile;
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct BuildConfig {
@@ -30,6 +30,7 @@ pub fn build(
     }
 
     let mut loader = load_file(build_filename)?;
+    load_discovered_deps(&mut loader);
 
     let tools = task::Tools::new(&config.store_dir)?;
 
@@ -97,6 +98,63 @@ pub fn build(
     outputs.sort();
 
     Ok(outputs)
+}
+
+/// Load `.n2_db` into the graph, so each edge carries the inputs its last
+/// compile ACTUALLY read.
+///
+/// The driver has never consulted this file. Every gcc task declares the
+/// graph closure - what the build file SAYS a compile might read - while the
+/// record of what it did read has been on disk the whole time, written by the
+/// same vendored n2 this driver parses with. That record is what used-input
+/// pruning needs, and reading it costs one file open.
+///
+/// Read-only in effect: `db::open` takes the file append-mode and returns a
+/// writer this drops without writing. It CREATES the file when absent, which
+/// is why the existence check is here rather than left to it - a driver that
+/// silently creates state in the build directory is a driver whose reruns
+/// differ from its first run.
+///
+/// Failure is not fatal and not silent. A missing or unreadable db means no
+/// pruning data, which is exactly the first-run state the whole feature has
+/// to handle anyway; saying so is what stops "pruning saved nothing" being
+/// read as a fact about the build rather than about a file that would not
+/// open.
+fn load_discovered_deps(loader: &mut load::Loader) {
+    let mut db_path = PathBuf::from(".n2_db");
+    if let Some(builddir) = &loader.builddir {
+        db_path = Path::new(builddir).join(db_path);
+    }
+    if !db_path.exists() {
+        eprintln!(
+            "nix-ninja: no {} - no used-input record, declaring graph closures",
+            db_path.display()
+        );
+        return;
+    }
+    let mut hashes = n2::graph::Hashes::default();
+    match n2::db::open(&db_path, &mut loader.graph, &mut hashes) {
+        Ok(_writer) => {
+            let (mut with_deps, mut total_deps) = (0usize, 0usize);
+            for id in loader.graph.builds.all_ids() {
+                let k = loader.graph.builds[id].discovered_ins().len();
+                if k > 0 {
+                    with_deps += 1;
+                    total_deps += k;
+                }
+            }
+            eprintln!(
+                "nix-ninja: {} carries used-input records for {} edge(s),                  {} discovered input(s) total",
+                db_path.display(),
+                with_deps,
+                total_deps
+            );
+        }
+        Err(e) => eprintln!(
+            "nix-ninja: {} did not open ({e}) - declaring graph closures",
+            db_path.display()
+        ),
+    }
 }
 
 fn load_file(build_filename: &str) -> Result<load::Loader> {

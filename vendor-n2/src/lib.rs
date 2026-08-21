@@ -1,5 +1,8 @@
 pub mod canon;
-mod db;
+// Public for nix-ninja, which drives the Loader directly and so never gets
+// the `.n2_db` that `load::read()` opens for it. The used-input record lives
+// here and nowhere else.
+pub mod db;
 pub mod densemap;
 pub mod depfile;
 mod eval;

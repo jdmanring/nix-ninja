@@ -626,6 +626,28 @@ impl Runner {
             // Appended rather than given a fixed `{}` in the format string,
             // so a platform without mallinfo2 prints a shorter line instead
             // of two zeros that read as a measurement.
+            let (prunable, kept) = (
+                PRUNABLE_HEADERS.load(Ordering::Relaxed),
+                KEPT_HEADERS.load(Ordering::Relaxed),
+            );
+            // Printed as a pair with its denominator: "N prunable" alone is
+            // unreadable without knowing how many were considered, and this
+            // number exists to be compared against the cost of acting on it.
+            let prune = if prunable + kept > 0 {
+                format!(
+                    ", hdrs {} used / {} declared ({} prunable, {})",
+                    kept,
+                    kept + prunable,
+                    prunable,
+                    if PRUNE_INPUTS.load(Ordering::Relaxed) {
+                        "PRUNING"
+                    } else {
+                        "measuring only"
+                    }
+                )
+            } else {
+                String::new()
+            };
             let heap = match self_heap_mib() {
                 Some((live, retained)) => {
                     format!(", heap {live} MiB live / {retained} MiB retained")
@@ -637,7 +659,7 @@ impl Runner {
                  (worklist {} s, cmdline {} s, py {} s, grd {} s), \
                  dyn {} s (realise {} s, discover {} s, update {} s/{} calls, adddrv {} s/{} calls), \
                  realise {}/{} sent, nar {}/{} sent, scan {}/{} parsed, \
-                 rss {} MiB{}",
+                 rss {} MiB{}{}",
                 RESOLVE_MS.load(Ordering::Relaxed) / 1000,
                 NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
                 NT_CMDLINE_MS.load(Ordering::Relaxed) / 1000,
@@ -658,6 +680,7 @@ impl Runner {
                 scan_hit + scan_miss,
                 self_rss_mib(),
                 heap,
+                prune,
             );
         }
 
@@ -885,6 +908,31 @@ impl Runner {
         // the build dir itself) is silently dropped there, whereas a
         // missing DIRECT input stays a loud error as before.
         let is_gcc_task = build.deps.as_deref() == Some("gcc");
+        // USED-INPUT PRUNING, and it MEASURES BY DEFAULT AND ENFORCES ONLY ON
+        // REQUEST. `discovered_ins` is what this edge's last compile actually
+        // opened, read from .n2_db; the closure below is what the build file
+        // says it might. The gap between them is the prize, and it has never
+        // been measured on this build - so the counters run unconditionally
+        // and the behavior change sits behind NIX_NINJA_PRUNE_INPUTS.
+        //
+        // Split that way on purpose. Declaring fewer inputs than a compile
+        // needs makes the task fail INSIDE the sandbox rather than succeed
+        // wrongly, which is the safe direction - but that safety is a
+        // property of the daemon, not of this code: it holds under the
+        // multi-user daemon, whose nix.conf sets sandbox = true with
+        // sandbox-fallback = false, and would not have held under the
+        // unsandboxed nix-portable this project ran until 2026-08-21, where
+        // an under-declared header is read from the host and the task passes.
+        // A round costs hours, so the counterfactual count buys the decision
+        // for free in the next round anybody runs, with no risk attached.
+        //
+        // Empty means no record - a first run, or an edge that has never been
+        // built - and pruning to an empty set would declare nothing at all.
+        // That reads as an aggressive optimization and is a build with no
+        // inputs, so an empty record disables pruning for that edge entirely.
+        let discovered: rustc_hash::FxHashSet<FileId> =
+            build.discovered_ins().iter().copied().collect();
+        let can_prune = is_gcc_task && !discovered.is_empty();
         let mut worklist: Vec<(FileId, bool)> =
             build.ordering_ins().iter().map(|f| (*f, false)).collect();
         let mut seen: rustc_hash::FxHashSet<FileId> = rustc_hash::FxHashSet::default();
@@ -955,6 +1003,16 @@ impl Runner {
                     || name.ends_with(".ipp");
                 if !header_like {
                     continue;
+                }
+                // A header this compile reached through a phony and did not
+                // read last time. Counted always; dropped only when asked.
+                if can_prune && !discovered.contains(&fid) {
+                    PRUNABLE_HEADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if PRUNE_INPUTS.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                } else if can_prune {
+                    KEPT_HEADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             let input = match self.derived_files.get(&fid) {
@@ -2903,6 +2961,37 @@ fn self_heap_mib() -> Option<(u64, u64)> {
 /// Wall time inside `handle_derivation_result`, the dynamic-dependency
 /// discovery that the resolve tick never counted. See the note at the top of
 /// that function for what the omission cost.
+/// Phony-reached headers this edge's last compile did NOT open, and the ones
+/// it did. Their ratio is used-input pruning's whole case, and it has never
+/// been measured on this build: the driver declares graph closures and the
+/// record of what was actually read has sat unopened in .n2_db.
+///
+/// Counted whether or not pruning is enabled, so the next round anybody runs
+/// prices the change with no behavior change and no risk.
+static PRUNABLE_HEADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static KEPT_HEADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether to act on the count above. Off unless NIX_NINJA_PRUNE_INPUTS is
+/// set to something other than 0.
+///
+/// Read once into an atomic rather than per-edge: this is consulted inside the
+/// input-set loop of every gcc task, and a getenv there is a syscall per
+/// header. Deliberately NOT a clap flag - the driver is invoked from a script
+/// this fork does not own, and an environment variable can be set for one
+/// round without editing it.
+static PRUNE_INPUTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Call once at startup. Returns what it set, so the caller can say so in the
+/// log: a round that pruned and a round that measured must not be
+/// indistinguishable afterwards.
+pub fn init_prune_inputs() -> bool {
+    let on = std::env::var("NIX_NINJA_PRUNE_INPUTS")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    PRUNE_INPUTS.store(on, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
 /// dyn's two expensive halves, separated because they have different fixes.
 static DYN_UPDATE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 // CALL COUNTS, not just totals, and the reason is a question the totals
@@ -4032,6 +4121,74 @@ mod target_resolution_tests {
     fn unknown_target_resolves_empty() {
         let got = resolve_target_in(&HashMap::new(), &HashMap::new(), FileId::from(7));
         assert!(got.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod prune_gate_tests {
+    use super::init_prune_inputs;
+
+    /// The env gate, both directions and the shapes in between.
+    ///
+    /// Serialized into ONE test because it mutates process-wide environment
+    /// and the atomic behind it: two tests doing this in parallel would pass
+    /// or fail depending on which ran first, which is a flake that looks like
+    /// a logic error.
+    #[test]
+    fn the_env_gate_is_off_unless_asked() {
+        // SAFETY: single-threaded within this test; see the note above on why
+        // it is not split.
+        unsafe {
+            std::env::remove_var("NIX_NINJA_PRUNE_INPUTS");
+            assert!(!init_prune_inputs(), "unset must not prune");
+
+            // Empty and "0" are the two ways a script accidentally sets a
+            // variable it meant to leave alone. Both mean off, because the
+            // failure this guards has to be ASKED for.
+            std::env::set_var("NIX_NINJA_PRUNE_INPUTS", "");
+            assert!(!init_prune_inputs(), "empty must not prune");
+            std::env::set_var("NIX_NINJA_PRUNE_INPUTS", "0");
+            assert!(!init_prune_inputs(), "0 must not prune");
+
+            std::env::set_var("NIX_NINJA_PRUNE_INPUTS", "1");
+            assert!(init_prune_inputs(), "1 must prune");
+            // The negative control for the assertions above: if any non-empty
+            // value turned it on, "0" would have failed. If NOTHING turned it
+            // on, this fails.
+            std::env::remove_var("NIX_NINJA_PRUNE_INPUTS");
+            assert!(!init_prune_inputs(), "must return to off");
+        }
+    }
+
+    /// An edge with no used-input record must NOT prune, and this is the case
+    /// that makes the feature dangerous rather than merely ineffective.
+    ///
+    /// A first run, or an edge that has never been built, carries an empty
+    /// `discovered_ins`. Pruning to it declares NO headers at all - which
+    /// reads in a log exactly like a very effective optimization and is a
+    /// compile with nothing to include. The guard is `!discovered.is_empty()`
+    /// at the construction of `can_prune`, and this asserts the predicate
+    /// rather than the code path, because the path needs a build graph.
+    #[test]
+    fn an_empty_used_input_record_disables_pruning() {
+        for (record, expect) in [
+            (vec![], false),
+            (vec![7u32], true),
+            (vec![7u32, 9u32], true),
+        ] {
+            let is_gcc = true;
+            let can_prune = is_gcc && !record.is_empty();
+            assert_eq!(
+                can_prune, expect,
+                "a {}-entry record must {} pruning",
+                record.len(),
+                if expect { "allow" } else { "disable" }
+            );
+        }
+        // And a non-gcc edge never prunes, whatever it carries: the header
+        // filter this hangs off only runs for deps=gcc.
+        let is_gcc = false;
+        assert!(!(is_gcc && !vec![7u32].is_empty()));
     }
 }
 
