@@ -379,12 +379,14 @@ impl Runner {
             }
             eprintln!(
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
-                 (worklist {} s, cmdline {} s, py {} s, grd {} s), rss {} MiB",
+                 (worklist {} s, cmdline {} s, py {} s, grd {} s), dyn {} s, \
+                 rss {} MiB",
                 RESOLVE_MS.load(Ordering::Relaxed) / 1000,
                 NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
                 NT_CMDLINE_MS.load(Ordering::Relaxed) / 1000,
                 NT_PY_MS.load(Ordering::Relaxed) / 1000,
                 NT_GRD_MS.load(Ordering::Relaxed) / 1000,
+                DYN_MS.load(Ordering::Relaxed) / 1000,
                 self_rss_mib(),
             );
         }
@@ -1769,6 +1771,14 @@ fn handle_derivation_result(
     mut drv: Derivation,
     config: &RunnerConfig,
 ) -> Result<SingleDerivedPath> {
+    // This function sits OUTSIDE new_task and therefore outside RESOLVE_MS,
+    // and it blocks the serial resolve loop on a daemon realise per dynamic
+    // task. Round 86 reported 142 s of "total resolve time" against ~43
+    // minutes of wall clock at the same task count, and the whole gap was
+    // here - unmeasured, so three rounds were tuned against memory instead.
+    // Timed with a Drop guard for the same reason build_paths is: several
+    // early returns, and an untimed one hides the case worth catching.
+    let _dyn_timer = DynDiscoveryTimer(std::time::Instant::now());
     // Collect built inputs when deps == "gcc" for dynamic dependency discovery
     let built_inputs: Vec<DerivedFile> = if task.deps.as_ref() == Some(&"gcc".to_string()) {
         task.inputs
@@ -2490,6 +2500,23 @@ fn self_rss_mib() -> u64 {
         })
         .map(|pages| pages * 4096 / (1024 * 1024))
         .unwrap_or(0)
+}
+
+
+/// Wall time inside `handle_derivation_result`, the dynamic-dependency
+/// discovery that the resolve tick never counted. See the note at the top of
+/// that function for what the omission cost.
+static DYN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct DynDiscoveryTimer(std::time::Instant);
+
+impl Drop for DynDiscoveryTimer {
+    fn drop(&mut self) {
+        DYN_MS.fetch_add(
+            self.0.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 static NT_WORKLIST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
