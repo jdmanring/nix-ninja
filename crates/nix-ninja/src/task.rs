@@ -121,12 +121,53 @@ pub struct RunnerConfig {
 /// the shallow strata.
 const INPUTS_PER_WEIGHT: usize = 512;
 
-/// Below this much available memory, admission collapses toward serial
-/// regardless of weight. The budget is a STANDING guess about cost; this is
-/// the measured state of the machine right now, and it has to win - a
-/// weighting that was right when the round started is wrong the moment
-/// something else on the box takes memory.
-const LOW_MEMORY_GIB: u64 = 6;
+/// Memory headroom is CONTINUOUS, so the response to it is too.
+///
+/// The first version was a floor with a hardcoded 6 GiB: above it the full
+/// budget, below it serial. That is a step function over a smooth resource,
+/// and it makes the machine oscillate - admit wide, overshoot, collapse to 1,
+/// recover, admit wide again. It also invented a constant, which is the same
+/// defect as inventing a `-j`, one level down.
+///
+/// Both bounds are now derived from the machine. The reserve is MemTotal/5,
+/// which on this 30.45 GiB box is 6.1 GiB and is the desktop's working set
+/// plus slack; the point at which the full budget is allowed is MemTotal/2.
+/// Between them the budget scales linearly, so pressure produces a taper
+/// rather than a cliff.
+fn memory_bounds_gib() -> (u64, u64) {
+    let total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb / (1024 * 1024))
+        .unwrap_or(0);
+    (total / 5, total / 2)
+}
+
+/// Admission budget for the memory currently available.
+///
+/// Pure so the curve is testable: the failures that matter are a 0 (admits
+/// nothing, hangs the round) and a value above `cap` (admits more than asked
+/// for), and both present only as a stall or a thrash.
+fn budget_for_memory(cap: usize, avail_gib: u64, reserve_gib: u64, full_gib: u64) -> usize {
+    if cap <= 1 || full_gib <= reserve_gib {
+        return cap.max(1);
+    }
+    if avail_gib >= full_gib {
+        return cap;
+    }
+    if avail_gib <= reserve_gib {
+        return 1;
+    }
+    let span = full_gib - reserve_gib;
+    let over = avail_gib - reserve_gib;
+    let scaled = 1 + ((cap - 1) as u64 * over / span) as usize;
+    scaled.clamp(1, cap)
+}
 
 /// Weight for a task declaring `inputs` inputs, clamped to `budget`.
 ///
@@ -156,13 +197,12 @@ fn available_gib() -> u64 {
 struct JobPermits {
     inner: Arc<(Mutex<usize>, Condvar)>,
     cap: usize,
-    /// Free-memory floor below which admission collapses toward serial.
-    /// A field rather than a constant read directly so tests can disable the
-    /// gate: with it live, a concurrency test asserts on the machine's memory
-    /// at that instant and fails on a busy box for a reason that has nothing
-    /// to do with the semaphore. A flaky test about backpressure is worse
-    /// than none, because it gets muted.
-    min_free_gib: u64,
+    /// Whether admission tracks live memory. A field rather than a constant
+    /// read inline so tests can disable it: with it live, a concurrency test
+    /// asserts on the machine's memory at that instant and fails on a busy
+    /// box for a reason unrelated to the semaphore. A flaky test about
+    /// backpressure is worse than none, because it gets muted.
+    memory_aware: bool,
 }
 
 struct JobPermit {
@@ -175,7 +215,7 @@ impl JobPermits {
         JobPermits {
             inner: Arc::new((Mutex::new(0), Condvar::new())),
             cap,
-            min_free_gib: LOW_MEMORY_GIB,
+            memory_aware: true,
         }
     }
 
@@ -183,7 +223,7 @@ impl JobPermits {
     #[cfg(test)]
     fn new_without_memory_gate(cap: usize) -> Self {
         JobPermits {
-            min_free_gib: 0,
+            memory_aware: false,
             ..JobPermits::new(cap)
         }
     }
@@ -203,8 +243,9 @@ impl JobPermits {
         let (lock, cvar) = &*self.inner;
         let mut count = lock.lock().unwrap();
         loop {
-            let budget = if self.min_free_gib > 0 && available_gib() < self.min_free_gib {
-                1
+            let budget = if self.memory_aware {
+                let (reserve, full) = memory_bounds_gib();
+                budget_for_memory(self.cap, available_gib(), reserve, full)
             } else {
                 self.cap
             };
@@ -3139,7 +3180,7 @@ fn normalize_output(output: &str) -> String {
 
 #[cfg(test)]
 mod job_permits_tests {
-    use super::{admission_weight, JobPermits};
+    use super::{admission_weight, budget_for_memory, JobPermits};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -3200,6 +3241,39 @@ mod job_permits_tests {
                 assert!(w <= budget, "weight {w} exceeds budget {budget}");
             }
         }
+    }
+
+    /// The taper is the point: a step function over a smooth resource makes
+    /// the machine oscillate - admit wide, overshoot, collapse to serial,
+    /// recover, repeat. The two ends and monotonicity are what must hold.
+    #[test]
+    fn budget_tapers_with_memory_instead_of_cliffing() {
+        let (cap, reserve, full) = (24usize, 6u64, 15u64);
+        assert_eq!(budget_for_memory(cap, 30, reserve, full), 24, "plenty free");
+        assert_eq!(budget_for_memory(cap, 15, reserve, full), 24, "at full mark");
+        assert_eq!(budget_for_memory(cap, 6, reserve, full), 1, "at the reserve");
+        assert_eq!(budget_for_memory(cap, 2, reserve, full), 1, "below reserve");
+        // Strictly non-decreasing in available memory, and never outside
+        // [1, cap] - a 0 hangs the round, a value over cap thrashes it.
+        let mut prev = 0;
+        for avail in 0..=40 {
+            let b = budget_for_memory(cap, avail, reserve, full);
+            assert!((1..=cap).contains(&b), "budget {b} outside [1,{cap}]");
+            assert!(b >= prev, "budget fell from {prev} to {b} as memory ROSE");
+            prev = b;
+        }
+        // Mid-range must actually be in the middle, not pinned to an end -
+        // otherwise the taper is a cliff wearing a linear formula.
+        let mid = budget_for_memory(cap, 10, reserve, full);
+        assert!((2..cap).contains(&mid), "mid-range budget {mid} is an endpoint");
+    }
+
+    /// A machine that reports nothing must not serialize the round: unknown
+    /// memory means fall back to the asked-for cap, never to 1.
+    #[test]
+    fn degenerate_bounds_fall_back_to_the_full_cap() {
+        assert_eq!(budget_for_memory(24, 0, 0, 0), 24, "unreadable meminfo");
+        assert_eq!(budget_for_memory(1, 0, 6, 15), 1, "cap of 1 stays 1");
     }
 
     /// A heavy task must still be admitted when it alone exceeds the budget,
