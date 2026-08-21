@@ -26,9 +26,16 @@ hand before the next one makes sense.
 | 4 | Multiple CLI targets | PR on nix-ninja, coordinated with their PR 43 | drafted, `pr3-multiple-targets.md` |
 | 5 | Resolve-memo cache | comment into their #17 as an ALTERNATIVE | drafted, `issue-replies.md` |
 | 6 | `${rspfile}` support, and the n2 dependency | `evmar/n2`, NOT `hinshun/n2` | destination corrected 2026-08-21, see below |
+| 7 | `contrib/devstore.sh` | PR on nix-ninja | drafted, `devstore-pr.md`; **send first** |
 
-**1 goes first because a wedged worker does not stay inside the build that
-made it.** Seventeen of them survived as init-reparented root orphans holding
+**7 goes before all of them, which is why it is last in the table and first in
+practice.** It is the only item answering a request the maintainer wrote down
+himself, it touches no crate, and it cannot conflict with anything. Numbered 7
+because it was written last; ordered first because everything else asks him to
+take code he did not ask for.
+
+**1 goes first among the rest because a wedged worker does not stay inside the
+build that made it.** Seventeen of them survived as init-reparented root orphans holding
 gigabytes, through `SIGTERM` and through a supervisor restart. That is
 concurrency-independent and needs no argument to connect it to anything: it is
 worth a maintainer's attention on its own.

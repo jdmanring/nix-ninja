@@ -13,8 +13,17 @@
 #   contrib/devstore.sh stop
 #
 # The daemon comes from this repository's own `nix` flake input, so it is the
-# version the project already pins and nothing new is fetched. Override with
-# NIX_NINJA_DEVSTORE_DAEMON=/path/to/nix-daemon.
+# version this project already pins rather than one this script chose. It is
+# built or substituted like any other input the first time, which on a cold
+# machine can mean building nix; after that it is a store lookup. Override
+# with NIX_NINJA_DEVSTORE_DAEMON=/path/to/nix-daemon.
+#
+# `sandbox = false` below is deliberate and is the one setting worth arguing
+# about. The store lives under a user-owned directory with no build users
+# group, so builds run as the invoking user and the host filesystem is
+# visible to them. That is fine for iterating on nix-ninja and is NOT fine
+# for producing anything anyone will consume: an unsandboxed build can link
+# whatever the host happens to have. Do not push results from this store.
 #
 # TWO INGREDIENTS ARE REQUIRED AND BOTH FAIL BY BLAMING THE CLIENT. This is
 # the part worth reading; each cost an afternoon.
