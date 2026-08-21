@@ -64,11 +64,7 @@ pub struct Loader {
     /// and without this the parsed `pool` statements are unreachable, so
     /// every declared per-edge concurrency limit is silently dropped.
     pub pools: SmallMap<String, usize>,
-    /// Public for the same reason `pools` above it is, and for the same
-    /// consumer. The `.n2_db` holding each edge's DISCOVERED inputs lives
-    /// under this directory, so a driver bypassing `read()` cannot find the
-    /// record of which headers a compile actually opened without it.
-    pub builddir: Option<String>,
+    builddir: Option<String>,
 }
 
 impl Loader {

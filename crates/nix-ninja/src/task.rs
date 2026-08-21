@@ -635,15 +635,10 @@ impl Runner {
             // number exists to be compared against the cost of acting on it.
             let prune = if prunable + kept > 0 {
                 format!(
-                    ", hdrs {} used / {} declared ({} prunable, {})",
+                    ", hdrs {} used / {} declared ({} prunable)",
                     kept,
                     kept + prunable,
-                    prunable,
-                    if PRUNE_INPUTS.load(Ordering::Relaxed) {
-                        "PRUNING"
-                    } else {
-                        "measuring only"
-                    }
+                    prunable
                 )
             } else {
                 String::new()
@@ -908,31 +903,6 @@ impl Runner {
         // the build dir itself) is silently dropped there, whereas a
         // missing DIRECT input stays a loud error as before.
         let is_gcc_task = build.deps.as_deref() == Some("gcc");
-        // USED-INPUT PRUNING, and it MEASURES BY DEFAULT AND ENFORCES ONLY ON
-        // REQUEST. `discovered_ins` is what this edge's last compile actually
-        // opened, read from .n2_db; the closure below is what the build file
-        // says it might. The gap between them is the prize, and it has never
-        // been measured on this build - so the counters run unconditionally
-        // and the behavior change sits behind NIX_NINJA_PRUNE_INPUTS.
-        //
-        // Split that way on purpose. Declaring fewer inputs than a compile
-        // needs makes the task fail INSIDE the sandbox rather than succeed
-        // wrongly, which is the safe direction - but that safety is a
-        // property of the daemon, not of this code: it holds under the
-        // multi-user daemon, whose nix.conf sets sandbox = true with
-        // sandbox-fallback = false, and would not have held under the
-        // unsandboxed nix-portable this project ran until 2026-08-21, where
-        // an under-declared header is read from the host and the task passes.
-        // A round costs hours, so the counterfactual count buys the decision
-        // for free in the next round anybody runs, with no risk attached.
-        //
-        // Empty means no record - a first run, or an edge that has never been
-        // built - and pruning to an empty set would declare nothing at all.
-        // That reads as an aggressive optimization and is a build with no
-        // inputs, so an empty record disables pruning for that edge entirely.
-        let discovered: rustc_hash::FxHashSet<FileId> =
-            build.discovered_ins().iter().copied().collect();
-        let can_prune = is_gcc_task && !discovered.is_empty();
         let mut worklist: Vec<(FileId, bool)> =
             build.ordering_ins().iter().map(|f| (*f, false)).collect();
         let mut seen: rustc_hash::FxHashSet<FileId> = rustc_hash::FxHashSet::default();
@@ -1003,16 +973,6 @@ impl Runner {
                     || name.ends_with(".ipp");
                 if !header_like {
                     continue;
-                }
-                // A header this compile reached through a phony and did not
-                // read last time. Counted always; dropped only when asked.
-                if can_prune && !discovered.contains(&fid) {
-                    PRUNABLE_HEADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if PRUNE_INPUTS.load(std::sync::atomic::Ordering::Relaxed) {
-                        continue;
-                    }
-                } else if can_prune {
-                    KEPT_HEADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             let input = match self.derived_files.get(&fid) {
@@ -2204,6 +2164,40 @@ fn handle_derivation_result(
             //
             // Naming them separately is what stops the next round tuning the
             // wrong one, which this campaign has already done twice.
+            // USED AGAINST DECLARED, counted here because here is where both
+            // numbers exist at once and are about the SAME compile. `task`
+            // carries the closure the graph said this TU might read;
+            // `discovered_deps` is what the preprocessor just proved it does.
+            // Their difference is plan item 1's entire case, and it has never
+            // been measured on this build.
+            //
+            // Restricted to header-shaped declared inputs: pruning object
+            // files or generated sources is a different change with a
+            // different risk, and folding them into one ratio would price
+            // neither.
+            {
+                let used: rustc_hash::FxHashSet<&Path> = discovered_deps
+                    .iter()
+                    .map(|d| d.build_path.as_path())
+                    .collect();
+                for input in &task.inputs {
+                    let n = input.build_path.to_string_lossy();
+                    let header_like = n.ends_with(".h")
+                        || n.ends_with(".hpp")
+                        || n.ends_with(".hh")
+                        || n.ends_with(".inc")
+                        || n.ends_with(".ipp");
+                    if !header_like {
+                        continue;
+                    }
+                    if used.contains(input.build_path.as_path()) {
+                        KEPT_HEADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        PRUNABLE_HEADERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+
             let t_update = std::time::Instant::now();
             dynamic_task::update_derivation_with_discoveries(
                 &mut drv,
@@ -2970,27 +2964,6 @@ fn self_heap_mib() -> Option<(u64, u64)> {
 /// prices the change with no behavior change and no risk.
 static PRUNABLE_HEADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static KEPT_HEADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Whether to act on the count above. Off unless NIX_NINJA_PRUNE_INPUTS is
-/// set to something other than 0.
-///
-/// Read once into an atomic rather than per-edge: this is consulted inside the
-/// input-set loop of every gcc task, and a getenv there is a syscall per
-/// header. Deliberately NOT a clap flag - the driver is invoked from a script
-/// this fork does not own, and an environment variable can be set for one
-/// round without editing it.
-static PRUNE_INPUTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Call once at startup. Returns what it set, so the caller can say so in the
-/// log: a round that pruned and a round that measured must not be
-/// indistinguishable afterwards.
-pub fn init_prune_inputs() -> bool {
-    let on = std::env::var("NIX_NINJA_PRUNE_INPUTS")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
-    PRUNE_INPUTS.store(on, std::sync::atomic::Ordering::Relaxed);
-    on
-}
 
 /// dyn's two expensive halves, separated because they have different fixes.
 static DYN_UPDATE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4126,69 +4099,40 @@ mod target_resolution_tests {
 
 #[cfg(test)]
 mod prune_gate_tests {
-    use super::init_prune_inputs;
 
-    /// The env gate, both directions and the shapes in between.
+    /// The ratio the tick reports must count a declared header that was NOT
+    /// used as prunable, and one that WAS as kept. Asserted on the predicate
+    /// rather than through a build graph, which needs a daemon.
     ///
-    /// Serialized into ONE test because it mutates process-wide environment
-    /// and the atomic behind it: two tests doing this in parallel would pass
-    /// or fail depending on which ran first, which is a flake that looks like
-    /// a logic error.
+    /// The case that matters is the third: a declared header absent from the
+    /// used set is the whole finding, and a version that counted every
+    /// declared header as kept would print a zero prunable count - which
+    /// reads as "nothing to prune" and is indistinguishable from "no data".
     #[test]
-    fn the_env_gate_is_off_unless_asked() {
-        // SAFETY: single-threaded within this test; see the note above on why
-        // it is not split.
-        unsafe {
-            std::env::remove_var("NIX_NINJA_PRUNE_INPUTS");
-            assert!(!init_prune_inputs(), "unset must not prune");
+    fn declared_headers_split_by_whether_discovery_saw_them() {
+        let used = ["a.h", "b.h"];
+        let declared = ["a.h", "b.h", "stale.h", "obj.o", "gen.cc"];
 
-            // Empty and "0" are the two ways a script accidentally sets a
-            // variable it meant to leave alone. Both mean off, because the
-            // failure this guards has to be ASKED for.
-            std::env::set_var("NIX_NINJA_PRUNE_INPUTS", "");
-            assert!(!init_prune_inputs(), "empty must not prune");
-            std::env::set_var("NIX_NINJA_PRUNE_INPUTS", "0");
-            assert!(!init_prune_inputs(), "0 must not prune");
-
-            std::env::set_var("NIX_NINJA_PRUNE_INPUTS", "1");
-            assert!(init_prune_inputs(), "1 must prune");
-            // The negative control for the assertions above: if any non-empty
-            // value turned it on, "0" would have failed. If NOTHING turned it
-            // on, this fails.
-            std::env::remove_var("NIX_NINJA_PRUNE_INPUTS");
-            assert!(!init_prune_inputs(), "must return to off");
+        let (mut kept, mut prunable, mut skipped) = (0, 0, 0);
+        for d in declared {
+            let header_like = d.ends_with(".h")
+                || d.ends_with(".hpp")
+                || d.ends_with(".hh")
+                || d.ends_with(".inc")
+                || d.ends_with(".ipp");
+            if !header_like {
+                skipped += 1;
+                continue;
+            }
+            if used.contains(&d) {
+                kept += 1;
+            } else {
+                prunable += 1;
+            }
         }
-    }
-
-    /// An edge with no used-input record must NOT prune, and this is the case
-    /// that makes the feature dangerous rather than merely ineffective.
-    ///
-    /// A first run, or an edge that has never been built, carries an empty
-    /// `discovered_ins`. Pruning to it declares NO headers at all - which
-    /// reads in a log exactly like a very effective optimization and is a
-    /// compile with nothing to include. The guard is `!discovered.is_empty()`
-    /// at the construction of `can_prune`, and this asserts the predicate
-    /// rather than the code path, because the path needs a build graph.
-    #[test]
-    fn an_empty_used_input_record_disables_pruning() {
-        for (record, expect) in [
-            (vec![], false),
-            (vec![7u32], true),
-            (vec![7u32, 9u32], true),
-        ] {
-            let is_gcc = true;
-            let can_prune = is_gcc && !record.is_empty();
-            assert_eq!(
-                can_prune, expect,
-                "a {}-entry record must {} pruning",
-                record.len(),
-                if expect { "allow" } else { "disable" }
-            );
-        }
-        // And a non-gcc edge never prunes, whatever it carries: the header
-        // filter this hangs off only runs for deps=gcc.
-        let is_gcc = false;
-        assert!(!(is_gcc && !vec![7u32].is_empty()));
+        assert_eq!(kept, 2, "both used headers are kept");
+        assert_eq!(prunable, 1, "the declared-but-unused header is the finding");
+        assert_eq!(skipped, 2, "an object and a source are not this ratio's business");
     }
 }
 

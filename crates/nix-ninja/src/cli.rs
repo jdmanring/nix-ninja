@@ -191,19 +191,6 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Said out loud at startup rather than left to be inferred from the
-    // counters: a round that PRUNED inputs and a round that only measured
-    // them produce different artifacts, and telling them apart afterwards
-    // from a log that never named the mode is guesswork.
-    if crate::task::init_prune_inputs() {
-        eprintln!(
-            "nix-ninja: NIX_NINJA_PRUNE_INPUTS is set - declaring only headers \
-             the last compile of each edge actually read. Under-declaration \
-             fails inside the sandbox; this is safe only under a daemon that \
-             sandboxes."
-        );
-    }
-
     // Change directory if specified
     if let Some(dir) = &cli.dir {
         std::env::set_current_dir(dir)
