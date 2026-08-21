@@ -131,6 +131,95 @@ static INCLUDE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r##"^\s*#\s*(?:include|embed)\s*(["<])([^">]*)[">]"##).unwrap()
 });
 
+/// One `#include`/`#embed` directive as written, before resolution.
+/// `quoted` is true for `"name"`, false for `<name>`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Directive {
+    pub quoted: bool,
+    pub name: PathBuf,
+}
+
+// The DIRECTIVES of a file depend on its CONTENT alone; resolving them to
+// paths depends on the include-dir set, which differs per translation unit.
+// Splitting the two is clang-scan-deps' "minimized source" idea: the scan is
+// cached content-keyed and shared across every TU, and only the cheap
+// resolution re-runs per TU.
+//
+// Why it is worth having here: the BFS `visited` set is PER CALL, so a header
+// included by N translation units was opened, read line by line and regex
+// matched N times. On this graph N reaches the thousands for the common Qt
+// and Chromium headers, and `discover` measured 3612 s of a 5199 s dyn phase.
+//
+// Validated by (mtime, size) so an edited header is re-scanned. Generated
+// headers are written once by a task and then read, so they validate
+// correctly rather than being pinned to a pre-generation read.
+type DirectiveCache =
+    Arc<RwLock<rustc_hash::FxHashMap<PathBuf, (u64, u128, Arc<Vec<Directive>>)>>>;
+static DIRECTIVE_CACHE: LazyLock<DirectiveCache> = LazyLock::new(Default::default);
+
+pub static SCAN_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SCAN_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (hits, misses) for the shared directive scan cache.
+pub fn scan_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (SCAN_HITS.load(Relaxed), SCAN_MISSES.load(Relaxed))
+}
+
+fn file_key(path: &Path) -> Option<(u64, u128)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((md.len(), mtime))
+}
+
+/// Parse a file's include directives, memoized across translation units.
+pub fn scan_directives(path: &Path) -> Result<Arc<Vec<Directive>>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let key = file_key(path);
+
+    if let Some((len, mtime)) = key {
+        if let Ok(cache) = DIRECTIVE_CACHE.read() {
+            if let Some((l, m, dirs)) = cache.get(path) {
+                if *l == len && *m == mtime {
+                    SCAN_HITS.fetch_add(1, Relaxed);
+                    return Ok(dirs.clone());
+                }
+            }
+        }
+    }
+
+    let f =
+        File::open(path).map_err(|e| anyhow!("Failed to open file {}: {}", path.display(), e))?;
+    let mut directives = Vec::new();
+    for line in BufReader::new(f).lines() {
+        let line = match line {
+            Ok(l) => l,
+            // Usually this means the file isn't UTF-8 and we can skip.
+            Err(_) => break,
+        };
+        if let Some(captures) = INCLUDE_REGEX.captures(&line) {
+            directives.push(Directive {
+                quoted: captures.get(1).unwrap().as_str() == "\"",
+                name: PathBuf::from(captures.get(2).unwrap().as_str()),
+            });
+        }
+    }
+
+    let directives = Arc::new(directives);
+    SCAN_MISSES.fetch_add(1, Relaxed);
+    if let Some((len, mtime)) = key {
+        if let Ok(mut cache) = DIRECTIVE_CACHE.write() {
+            cache.insert(path.to_path_buf(), (len, mtime, directives.clone()));
+        }
+    }
+    Ok(directives)
+}
+
 /// Given a C-like source, try to resolve includes.
 ///
 /// Includes are generally of the form `#include <name>` or `#include "name"`.
@@ -140,40 +229,22 @@ pub fn extract_includes(
     include_dirs: &[PathBuf],
     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
-    let f =
-        File::open(path).map_err(|e| anyhow!("Failed to open file {}: {}", path.display(), e))?;
-    let reader = BufReader::new(f);
-    let mut result = Vec::new();
+    let directives = scan_directives(path)?;
     let parent_dir = PathBuf::from(path.parent().unwrap());
+    let mut result = Vec::new();
 
-    let lines = reader.lines();
-
-    for line in lines {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => {
-                // Usually this means the file isn't UTF-8 and we can skip.
-                return Ok(result);
-            }
-        };
-
-        if let Some(captures) = INCLUDE_REGEX.captures(&line) {
-            let inc_type = captures.get(1).unwrap().as_str();
-            let relative_path = PathBuf::from(captures.get(2).unwrap().as_str());
-
-            if inc_type == "\"" {
-                if let Some(p) = try_resolve(&parent_dir, &relative_path, virtual_paths) {
-                    result.push(p);
-                    continue;
-                }
-            }
-
-            if let Some(p) = include_dirs
-                .iter()
-                .find_map(|i| try_resolve(i, &relative_path, virtual_paths))
-            {
+    for d in directives.iter() {
+        if d.quoted {
+            if let Some(p) = try_resolve(&parent_dir, &d.name, virtual_paths) {
                 result.push(p);
+                continue;
             }
+        }
+        if let Some(p) = include_dirs
+            .iter()
+            .find_map(|i| try_resolve(i, &d.name, virtual_paths))
+        {
+            result.push(p);
         }
     }
 
@@ -294,5 +365,49 @@ mod tests {
         assert_eq!(captured("embed \"logo.png\""), None);
         assert_eq!(captured("x.embed(\"logo.png\");"), None);
         assert_eq!(captured(r##"const char *s = "#embed \"a\"";"##), None);
+    }
+
+    /// The scan cache must (a) actually hit across translation units, which
+    /// is the whole point, and (b) NOTICE an edit, because a cache that never
+    /// invalidates is worse than no cache: it pins a stale dependency set and
+    /// the build silently stops tracking a header.
+    #[test]
+    fn directive_cache_hits_across_tus_and_invalidates_on_edit() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("nnscan{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let h = dir.join("shared.h");
+        std::fs::File::create(&h)
+            .unwrap()
+            .write_all(b"#include \"a.h\"\n")
+            .unwrap();
+
+        let before = scan_stats();
+        let first = scan_directives(&h).unwrap();
+        assert_eq!(first.len(), 1, "one directive parsed");
+        assert_eq!(first[0].name, PathBuf::from("a.h"));
+
+        // Every later translation unit that reaches this header must hit.
+        for _ in 0..5 {
+            let again = scan_directives(&h).unwrap();
+            assert_eq!(again.len(), 1);
+        }
+        let after = scan_stats();
+        assert_eq!(after.1 - before.1, 1, "parsed exactly once");
+        assert_eq!(after.0 - before.0, 5, "five cross-TU hits");
+
+        // An edit must be seen. Size differs here, and the guard also carries
+        // mtime for a same-size edit.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::File::create(&h)
+            .unwrap()
+            .write_all(b"#include \"a.h\"\n#include <b.h>\n")
+            .unwrap();
+        let edited = scan_directives(&h).unwrap();
+        assert_eq!(edited.len(), 2, "edit was NOT seen - cache is pinning stale deps");
+        assert!(!edited[1].quoted, "angle-bracket form preserved");
+        assert_eq!(scan_stats().1 - after.1, 1, "the edit cost one re-parse");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
