@@ -379,12 +379,13 @@ impl Runner {
             }
             eprintln!(
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
-                 (worklist {} s, cmdline {} s, py {} s, grd {} s)",
+                 (worklist {} s, cmdline {} s, py {} s, grd {} s), rss {} MiB",
                 RESOLVE_MS.load(Ordering::Relaxed) / 1000,
                 NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
                 NT_CMDLINE_MS.load(Ordering::Relaxed) / 1000,
                 NT_PY_MS.load(Ordering::Relaxed) / 1000,
                 NT_GRD_MS.load(Ordering::Relaxed) / 1000,
+                self_rss_mib(),
             );
         }
 
@@ -2466,6 +2467,31 @@ fn grd_reference_candidates(grd: &Path) -> Result<Vec<PathBuf>> {
 // Section buckets for new_task's serial-resolution cost, printed by the
 // heartbeat in start(): worklist expansion, cmdline scan (incl. the
 // implicit-inputs blanket), the py sibling post-pass, and the grd pass.
+
+/// The driver's own resident size, in MiB, or 0 where /proc is unavailable.
+///
+/// The 500-task tick reported counts and four timers and nothing about the
+/// driver's own footprint, so a climb from 0 to 13.19 GiB across one round's
+/// resolution - and the drop back to 2.10 GiB the instant resolution ended -
+/// was found by reading /proc by hand, after the round that needed it. The
+/// footprint is resolve-phase state rather than a leak, which is a fact worth
+/// having in the log rather than in somebody's shell history.
+///
+/// statm field 2 is resident pages. A failed read reports 0: this is a
+/// progress line, and a driver that cannot read its own /proc must not die
+/// mid-round over a diagnostic.
+fn self_rss_mib() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(1)
+                .and_then(|p| p.parse::<u64>().ok())
+        })
+        .map(|pages| pages * 4096 / (1024 * 1024))
+        .unwrap_or(0)
+}
+
 static NT_WORKLIST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static NT_CMDLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static NT_PY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3485,5 +3511,22 @@ mod target_resolution_tests {
     fn unknown_target_resolves_empty() {
         let got = resolve_target_in(&HashMap::new(), &HashMap::new(), FileId::from(7));
         assert!(got.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod self_rss_tests {
+    use super::self_rss_mib;
+
+    /// A running process has a nonzero resident size, so a zero here means
+    /// the read or the parse failed - which is the failure this returns 0
+    /// for deliberately, and the reason a test has to distinguish them.
+    #[test]
+    fn reports_a_plausible_resident_size() {
+        let mib = self_rss_mib();
+        assert!(mib > 0, "self_rss_mib returned 0 for a live process");
+        // A test binary under 8 GiB: loose enough never to flake, tight
+        // enough to catch a unit error (pages read as bytes would be ~4000x).
+        assert!(mib < 8192, "implausible rss {mib} MiB - check the unit");
     }
 }
