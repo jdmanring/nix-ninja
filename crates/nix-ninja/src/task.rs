@@ -105,10 +105,42 @@ pub struct RunnerConfig {
     /// order-only deps expand to hundreds of generated-header tasks)
     /// that produced a load average of 553 on a 24-thread machine.
     pub jobs: usize,
+    /// Ninja's own per-edge concurrency classes, `name -> depth`, straight
+    /// from the `pool` statements in the build files. Depth 0 is unbounded.
+    ///
+    /// This is the mechanism ninja provides for exactly the problem the
+    /// weighting above approximates, and the graph declares it: qtwebengine's
+    /// build files assign 11,114 edges to `link_pool` (depth 10) and
+    /// `action_pool` (depth 24). The parser already produced both and the
+    /// runner discarded them, so the driver was guessing at a limit its input
+    /// stated outright.
+    ///
+    /// The depths are NOT independent wisdom - GN computes them on the
+    /// generating machine from its CPU count and its cgroup `memory.max`, so
+    /// on this host they are partly a reflection of our own ceiling. They are
+    /// still the right thing to honour: they are per-EDGE, which the driver
+    /// cannot derive, and being wrong the same way ninja would be wrong is a
+    /// better failure than being wrong in a way nobody can reproduce.
+    pub pools: HashMap<String, usize>,
 }
 
 /// Counting semaphore bounding concurrent tasks. Permits release on
 /// Drop, so a panicking task thread cannot leak a slot.
+
+/// Build one semaphore per bounded ninja pool.
+///
+/// Depth 0 is ninja's UNBOUNDED, not "admit nothing", and the two are one
+/// character apart in every implementation of this: a pool built at depth 0
+/// would block its edges forever, which presents as a hung build rather than
+/// as a wrong limit. Pools at depth 0 get no semaphore at all.
+fn pool_permits_from_depths(depths: &HashMap<String, usize>) -> HashMap<String, JobPermits> {
+    depths
+        .iter()
+        .filter(|(_, d)| **d > 0)
+        .map(|(name, depth)| (name.clone(), JobPermits::new(*depth)))
+        .collect()
+}
+
 /// Inputs per unit of admission weight.
 ///
 /// A task's memory cost tracks the input set it materializes, and that set
@@ -310,6 +342,9 @@ pub struct Runner {
     wrapper_store_paths: Vec<StorePath>,
     store_regex: Regex,
     permits: JobPermits,
+    /// One semaphore per declared ninja pool, by name. Absent name or depth 0
+    /// means unbounded, matching ninja.
+    pool_permits: HashMap<String, JobPermits>,
 }
 
 impl Runner {
@@ -357,6 +392,7 @@ impl Runner {
 
         let (tx, rx) = mpsc::channel();
         let permits = JobPermits::new(config.jobs.max(1));
+        let pool_permits = pool_permits_from_depths(&config.pools);
         Ok(Runner {
             derived_files: HashMap::new(),
             build_dir_inputs: HashMap::new(),
@@ -365,6 +401,7 @@ impl Runner {
             stamp_input_files: HashMap::new(),
             co_outputs: HashMap::new(),
             permits,
+            pool_permits,
             tx,
             rx,
             tools,
@@ -564,10 +601,22 @@ impl Runner {
             .permits
             .acquire_weighted(admission_weight(task.inputs.len(), self.permits.cap));
 
+        // THEN the edge's declared ninja pool, if it has one. Order matters
+        // and is always global-then-pool: a thread waiting on a pool already
+        // holds its global units, so the threads that will free the pool are
+        // never blocked behind it and the pair cannot deadlock. Reversing it
+        // would let pool holders queue for global slots held by pool waiters.
+        let pool_permit = build
+            .pool
+            .as_ref()
+            .and_then(|name| self.pool_permits.get(name))
+            .map(|p| p.acquire_weighted(1));
+
         let config = self.config.clone();
         let rpc_client = self.rpc_client.clone();
         std::thread::spawn(move || {
             let _permit = permit;
+            let _pool_permit = pool_permit;
             let (derived_path, err) =
                 match build_task_derivation(tools.clone(), &rpc_client, task.clone()) {
                     Ok(drv) => match handle_derivation_result(
@@ -3777,5 +3826,39 @@ mod self_rss_tests {
         // A test binary under 8 GiB: loose enough never to flake, tight
         // enough to catch a unit error (pages read as bytes would be ~4000x).
         assert!(mib < 8192, "implausible rss {mib} MiB - check the unit");
+    }
+}
+
+#[cfg(test)]
+mod ninja_pool_tests {
+    use super::pool_permits_from_depths;
+    use std::collections::HashMap;
+
+    /// Depth 0 is ninja's unbounded. A semaphore built at 0 admits nothing
+    /// and hangs every edge in that pool - a wrong limit shows up as a slow
+    /// build, this one as no build, and the difference is one comparison.
+    #[test]
+    fn depth_zero_is_unbounded_and_gets_no_semaphore() {
+        let depths: HashMap<String, usize> = [
+            ("unbounded".to_string(), 0usize),
+            ("link_pool".to_string(), 10),
+            ("action_pool".to_string(), 24),
+        ]
+        .into_iter()
+        .collect();
+        let permits = pool_permits_from_depths(&depths);
+        assert!(
+            !permits.contains_key("unbounded"),
+            "a depth-0 pool must have no semaphore, or its edges never run"
+        );
+        assert_eq!(permits.get("link_pool").map(|p| p.cap), Some(10));
+        assert_eq!(permits.get("action_pool").map(|p| p.cap), Some(24));
+    }
+
+    /// No declared pools is the common case for hand-written build files and
+    /// must not error or fabricate one.
+    #[test]
+    fn no_pools_is_an_empty_map() {
+        assert!(pool_permits_from_depths(&HashMap::new()).is_empty());
     }
 }

@@ -41,6 +41,9 @@ pub fn build(
             store_dir: config.store_dir,
             is_output_derivation: config.is_output_derivation,
             jobs: config.jobs,
+            // Ninja's own per-edge concurrency classes. The parser has always
+            // produced these and the runner never received them.
+            pools: loader.pools.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         },
     )?;
     runner.read_build_dir(&mut loader.graph.files)?;

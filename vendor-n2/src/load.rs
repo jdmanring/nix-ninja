@@ -58,7 +58,12 @@ pub struct Loader {
     default: Vec<FileId>,
     /// rule name -> list of (key, val)
     rules: HashMap<String, SmallMap<String, eval::EvalString<String>>>,
-    pools: SmallMap<String, usize>,
+    /// Public like `graph` above it: a consumer driving the Loader directly,
+    /// rather than through `read()`, still needs the pool depths. nix-ninja
+    /// does exactly that - `read()` also opens a .n2_db it has no use for -
+    /// and without this the parsed `pool` statements are unreachable, so
+    /// every declared per-edge concurrency limit is silently dropped.
+    pub pools: SmallMap<String, usize>,
     builddir: Option<String>,
 }
 
