@@ -586,7 +586,7 @@ impl Runner {
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
                  (worklist {} s, cmdline {} s, py {} s, grd {} s), \
                  dyn {} s (realise {} s, discover {} s), \
-                 realise {}/{} sent, rss {} MiB",
+                 realise {}/{} sent, nar {}/{} sent, rss {} MiB",
                 RESOLVE_MS.load(Ordering::Relaxed) / 1000,
                 NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
                 NT_CMDLINE_MS.load(Ordering::Relaxed) / 1000,
@@ -597,6 +597,9 @@ impl Runner {
                 DYN_DISCOVER_MS.load(Ordering::Relaxed) / 1000,
                 nix_builder_rpc_client::realise_stats().1,
                 nix_builder_rpc_client::realise_stats().0,
+                nix_builder_rpc_client::nar_upload_stats().1,
+                nix_builder_rpc_client::nar_upload_stats().0
+                    + nix_builder_rpc_client::nar_upload_stats().1,
                 self_rss_mib(),
             );
         }
@@ -2182,7 +2185,11 @@ fn new_opaque_file(
     // never read their shebang, so the rewrite is inert for them.
     let upload_src = patched_env_shebang(&canonical_path)?;
     let store_path =
-        rpc_client.add_to_store_nar(&name, upload_src.as_deref().unwrap_or(&canonical_path))?;
+        rpc_client.add_to_store_nar_cached(
+            &name,
+            upload_src.as_deref().unwrap_or(&canonical_path),
+            &canonical_path,
+        )?;
 
     Ok(DerivedFile {
         derived_path: SingleDerivedPath::Opaque(store_path),

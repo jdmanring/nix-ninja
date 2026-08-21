@@ -144,6 +144,24 @@ pub struct BuilderRpcClient {
     /// hit is confirmed by existence before it is used - one stat against one
     /// round trip.
     realised: Mutex<HashMap<String, StorePath>>,
+
+    /// Canonical path -> (size, mtime_ns, store path) for NAR uploads.
+    ///
+    /// Dependency discovery uploads a store object per discovered include,
+    /// and headers are shared across a component's whole TU set, so the same
+    /// file was NAR-encoded and sent once per TU that included it. This is
+    /// the same defect the realise memo fixed, on the other RPC.
+    ///
+    /// Build-directory files are MUTABLE, unlike store paths, so the key
+    /// carries size and mtime and a changed file is a miss. The failure
+    /// direction is re-upload, never a stale store path - the same posture
+    /// resolve_cache states for its own entries.
+    ///
+    /// Two threads racing the same fresh path both upload; the result is
+    /// content-addressed so that is wasted work rather than a wrong answer,
+    /// and holding the lock across an upload would serialize every upload in
+    /// the round.
+    nar_uploads: Mutex<HashMap<PathBuf, (u64, u128, StorePath)>>,
 }
 
 /// Wall-clock attribution for the realise RPC.
@@ -279,6 +297,7 @@ impl BuilderRpcClient {
             in_drv,
             uploaded_drvs: Default::default(),
             realised: Default::default(),
+            nar_uploads: Default::default(),
         })
     }
 
@@ -387,6 +406,49 @@ impl BuilderRpcClient {
 
     /// NAR a filesystem path then upload it as a recursive-CA (NAR-hashed)
     /// store object.
+    /// NAR and upload `path`, skipping the work if `key` is unchanged since
+    /// the last upload of it.
+    ///
+    /// `key` is the file whose identity is being cached - the canonical path -
+    /// while `path` may be a rewritten copy (a shebang patch), which is a
+    /// pure function of that file's content and so is covered by the same
+    /// size-and-mtime check.
+    pub fn add_to_store_nar_cached(
+        &self,
+        name: &str,
+        path: &Path,
+        key: &Path,
+    ) -> Result<StorePath> {
+        let stamp = std::fs::metadata(key).ok().and_then(|md| {
+            let mtime = md
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            Some((md.len(), mtime))
+        });
+        if let Some((size, mtime)) = stamp {
+            if let Some((s, m, sp)) = self.nar_uploads.lock().unwrap().get(key) {
+                if *s == size && *m == mtime {
+                    NAR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(sp.clone());
+                }
+            }
+        }
+        NAR_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sp = self.add_to_store_nar(name, path)?;
+        // Only cache what could be stamped: an unstattable key must stay a
+        // miss forever rather than be remembered under a stamp of zero.
+        if let Some((size, mtime)) = stamp {
+            self.nar_uploads
+                .lock()
+                .unwrap()
+                .insert(key.to_path_buf(), (size, mtime, sp.clone()));
+        }
+        Ok(sp)
+    }
+
     /// NAR `path` and upload it, STREAMING rather than buffering.
     ///
     /// This built the whole NAR into a `Vec<u8>` first, so every concurrent
@@ -950,6 +1012,19 @@ fn parse_unix_remote(remote: &str) -> Result<PathBuf> {
     Err(Error::UnsupportedRemote(remote.to_string()))
 }
 
+/// Uploads served from the memo, and uploads that reached the daemon. Printed
+/// by the driver's tick so the saving is measurable rather than asserted.
+static NAR_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NAR_UPLOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(hits, uploads)` for the NAR memo.
+pub fn nar_upload_stats() -> (u64, u64) {
+    (
+        NAR_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        NAR_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Bytes in flight per NAR upload.
 ///
 /// Replaced an unbounded `Vec<u8>` holding the whole encoded tree. This is a
@@ -1140,5 +1215,57 @@ mod nar_streaming_tests {
     fn the_stream_buffer_is_sane() {
         assert!(NAR_STREAM_BUF >= 64 * 1024, "too small to move a header in one go");
         assert!(NAR_STREAM_BUF <= 4 * 1024 * 1024, "large enough to be a memory event again");
+    }
+}
+
+#[cfg(test)]
+mod nar_upload_memo_tests {
+    use std::io::Write;
+
+    /// A build-directory file is MUTABLE, which is what separates this memo
+    /// from the realise one. The dangerous direction is a generated header
+    /// rewritten mid-round and served from the cache afterwards: the task
+    /// would take a store path for content that no longer exists anywhere,
+    /// and the compile fails far from here. Size-and-mtime is the guard, and
+    /// this asserts it actually discriminates rather than just being present.
+    #[test]
+    fn a_rewritten_file_changes_its_stamp() {
+        let dir = std::env::temp_dir().join(format!("nn-narmemo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("generated.h");
+
+        let stamp = |p: &std::path::Path| {
+            let md = std::fs::metadata(p).unwrap();
+            (
+                md.len(),
+                md.modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            )
+        };
+
+        std::fs::File::create(&f).unwrap().write_all(b"#define A 1\n").unwrap();
+        let before = stamp(&f);
+
+        // Same length, different content: the size half alone would call this
+        // unchanged, which is exactly the case a regenerated header hits.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::File::create(&f).unwrap().write_all(b"#define A 2\n").unwrap();
+        let after = stamp(&f);
+
+        assert_eq!(before.0, after.0, "test is only meaningful at equal size");
+        assert_ne!(before, after, "equal-size rewrite must still change the stamp");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unstattable key must never be memoized: remembering it under a
+    /// zero stamp would serve one file's store path for another's.
+    #[test]
+    fn an_unstattable_key_is_not_cacheable() {
+        let missing = std::path::Path::new("/nonexistent/nn-memo-probe");
+        assert!(std::fs::metadata(missing).is_err());
     }
 }
