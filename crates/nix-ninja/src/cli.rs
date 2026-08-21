@@ -147,12 +147,35 @@ fn resolved_jobs(cli: &Cli) -> usize {
 ///
 /// So this ceiling is now calibrated against a defect that has been fixed, and
 /// it is very likely the reason the machine is idle while the round crawls.
-/// DEFER(James decides the connection budget): raise it, with a re-measurement
-/// per connection at the new value before the round after. NOT changed by a
-/// session: rounds 85, 87 and 89 all died on memory, the driver runs outside
-/// `/nixbuild`'s ceiling so nothing bounds a wrong guess, and the standing
-/// rule here is that a session proposes resource numbers and James sets them.
-const MAX_DAEMON_CONNECTIONS: usize = 3;
+/// RAISED 3 -> 6 ON 2026-08-21, and the arithmetic is written out because a
+/// limit that does not show its terms is exactly what this comment already
+/// complains about. Every term re-measured rather than carried forward:
+///
+///   MemTotal                      30.45 GiB
+///   driver peak, round 90          7.70 GiB  (from its own 35 ticks; the
+///                                             13.19 GiB this campaign kept
+///                                             quoting is an earlier round
+///                                             and is stale)
+///   daemon worker, per connection  0.80 GiB  (0.44/0.76/0.44 measured,
+///                                             worst rounded up)
+///   at 6 connections               4.80 GiB
+///   driver + workers              12.50 GiB  outside `/nixbuild` entirely
+///
+/// That leaves about 14 GiB for builds and the desktop against a `/nixbuild`
+/// ceiling of 24 GiB, so the machine is over-committed by roughly 10 GiB and
+/// WAS BEFORE THIS CHANGE - three more connections cost 2.4 GiB and do not
+/// create that gap. It survives because builds rarely reach the ceiling. The
+/// missing measurement is peak per-build-cgroup RSS during a round, which is
+/// what would say whether 24 GiB can come down without failing a large LTO
+/// link; round 91 should record it.
+///
+/// Six rather than something larger because the machine was 88% idle at three
+/// with all 26 driver threads blocked in state S, so doubling is enough to
+/// learn whether connections are the bottleneck, and a wrong guess at 6 costs
+/// 2.4 GiB rather than 10. Re-measure per connection at this value before
+/// raising it again: skipping that requirement is how the old figure went
+/// stale in the first place.
+const MAX_DAEMON_CONNECTIONS: usize = 6;
 
 fn resolved_connections(cli: &Cli) -> usize {
     resolved_jobs(cli).min(MAX_DAEMON_CONNECTIONS).max(1)
@@ -356,12 +379,33 @@ mod tests {
     /// invariant is now the bug.
     #[test]
     fn connections_are_capped_independently_of_admission() {
-        assert_eq!(resolved_connections(&cli_with(&["-j", "24"])), 3);
-        assert_eq!(resolved_connections(&cli_with(&["-j", "64"])), 3);
+        // Asserted against the CONSTANT, not against a literal 3. The literal
+        // pinned the value in two places, so raising the cap failed a test
+        // whose subject is the capping BEHAVIOUR rather than the number - and a
+        // test that fails on a deliberate retune teaches people to edit tests.
+        // The number itself is defended by the arithmetic at its definition,
+        // which a literal here cannot restate and would only duplicate.
+        assert_eq!(
+            resolved_connections(&cli_with(&["-j", "24"])),
+            MAX_DAEMON_CONNECTIONS
+        );
+        assert_eq!(
+            resolved_connections(&cli_with(&["-j", "64"])),
+            MAX_DAEMON_CONNECTIONS
+        );
         // Below the cap the request still wins: a deliberate -j1 must not be
-        // silently widened to three connections.
+        // silently widened to the full connection pool.
         assert_eq!(resolved_connections(&cli_with(&["-j", "1"])), 1);
         assert_eq!(resolved_connections(&cli_with(&["-j", "2"])), 2);
+        // AND THE CAP MUST ACTUALLY BIND, which the two assertions above stop
+        // proving once they read the constant: with a bug that ignored the cap
+        // entirely, `resolved_connections(-j 64)` would return 64 and the
+        // comparison would still be against MAX_DAEMON_CONNECTIONS only if the
+        // constant were 64. This pins the relationship instead.
+        assert!(
+            resolved_connections(&cli_with(&["-j", "64"])) < 64,
+            "a -j far above the cap must be capped, not passed through"
+        );
         // And never zero, which would be a pool that can never serve.
         assert!(resolved_connections(&cli_with(&["-j", "0"])) >= 1);
     }
