@@ -2942,6 +2942,18 @@ fn self_heap_mib() -> Option<(u64, u64)> {
 /// inside that filter's TAKEN branch, where membership in both sets is the
 /// branch condition and disjointness is impossible by construction.
 ///
+/// THE SEAM THAT WOULD REOPEN THIS, named because it is not a defect today
+/// and so has nothing else to mark it. The numerator tests `header_like` on
+/// `include`; the denominator tests it on `input.build_path`. Those are one
+/// population only while `built_paths` is keyed by BUILD path. Key it by
+/// store path in some later refactor and the numerator silently returns to
+/// zero while the denominator stays nonzero - the original defect, arriving
+/// through a change that has nothing to do with this counter.
+///
+/// Which is why `prune_line`'s refusal is a standing detector rather than
+/// scaffolding for a fixed bug: do not retire it once the ratio starts
+/// looking believable. Raised by the specification session, e8d6b02.
+///
 /// Counted whether or not pruning is enabled, so the next round anybody runs
 /// prices the change with no behavior change and no risk.
 static DECLARED_HEADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
