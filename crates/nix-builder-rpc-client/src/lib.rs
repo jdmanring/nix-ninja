@@ -143,7 +143,10 @@ pub struct BuilderRpcClient {
     /// The only way a hit goes stale is the store path being collected, so a
     /// hit is confirmed by existence before it is used - one stat against one
     /// round trip.
-    realised: Mutex<HashMap<String, StorePath>>,
+    /// The bool is EXISTENCE ALREADY CONFIRMED. See `build_paths`: the
+    /// check that guards against a collected path used to run on every
+    /// hit, which made it O(paths asked) rather than O(paths).
+    realised: Mutex<HashMap<String, (StorePath, bool)>>,
 
     /// Canonical path -> (size, mtime_ns, store path) for NAR uploads.
     ///
@@ -182,6 +185,29 @@ pub fn realise_stats() -> (u64, u64) {
         REALISE_ASKED.load(std::sync::atomic::Ordering::Relaxed),
         REALISE_SENT.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+/// Sort miss slots and return them alongside the same order, so the request
+/// vector rebuilt from them lines up with the daemon's reply.
+///
+/// A demoted hit is appended after the original misses, so `miss_slots` is no
+/// longer ascending; `merge_hits_and_misses` pairs `miss_slots[k]` with
+/// `built[k]` and a disagreement returns a real store path for the WRONG
+/// input, which fails three layers away in a compile.
+///
+/// `len` is the caller's path count: a slot outside it is a bug here, not
+/// upstream, and is dropped rather than allowed to index out of bounds.
+///
+/// Returns ONE vector, not two. It returned `(v.clone(), v)` - the same order
+/// twice - which made the caller's destructuring read as though the slot order
+/// and the request order could differ, which is exactly the divergence this
+/// function exists to prevent. A signature that suggests two orders invites
+/// somebody to make them two. Reported by the specification session.
+fn reorder_misses(miss_slots: &[usize], len: usize) -> Vec<usize> {
+    let mut v: Vec<usize> = miss_slots.iter().copied().filter(|&i| i < len).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// Put freshly realised paths back into the slots their requests came from.
@@ -551,27 +577,95 @@ impl BuilderRpcClient {
         store_dir: &StoreDir,
         paths: &[SingleDerivedPath],
     ) -> Result<Vec<StorePath>> {
+        // THE HIT PATH WAS O(PATHS ASKED) IN SYSCALLS, UNDER A GLOBAL LOCK.
+        //
+        // It computed a key string, then called `.exists()` on the cached
+        // store path, for EVERY path of EVERY call, with `self.realised`
+        // held across the whole loop. Round 90 measured 6,082,577 paths asked
+        // against 38,378 sent - so the memo had removed 99.4% of the daemon
+        // round trips and kept a stat and an allocation per ask, serialised.
+        // At task 17,500 `realise` was 6905 s of a 13,050 s dyn phase while
+        // the machine sat 88% idle with all 26 driver threads in state S:
+        // blocked on this mutex, not computing.
+        //
+        // Two changes, and the existence check is KEPT rather than dropped -
+        // its reason is still true, a collected path symlinked here fails
+        // later and further from the cause.
+        //
+        //   Keys are built BEFORE the lock. An allocation is cheap; six
+        //   million of them inside a contended mutex are not.
+        //
+        //   Existence is confirmed ONCE PER PATH instead of once per ask,
+        //   and the stat runs with the lock RELEASED. What the check defends
+        //   against is a collection during this run; a path re-asked for the
+        //   thousandth time has already been confirmed, and re-confirming it
+        //   is what made the cost scale with the input set rather than with
+        //   the store. First confirmation still happens before any caller
+        //   receives the path.
+        let keys: Vec<String> = paths.iter().map(|p| store_dir.display(p).to_string()).collect();
+
         let mut out: Vec<Option<StorePath>> = Vec::with_capacity(paths.len());
         let mut misses: Vec<SingleDerivedPath> = Vec::new();
         let mut miss_slots: Vec<usize> = Vec::new();
+        // (slot, key, path) for hits whose existence has not been confirmed yet.
+        let mut to_confirm: Vec<(usize, String, StorePath)> = Vec::new();
         {
             let cache = self.realised.lock().unwrap();
             for (i, p) in paths.iter().enumerate() {
-                let key = store_dir.display(p).to_string();
-                match cache.get(&key) {
-                    // A collected store path is a miss, not a hit: the caller
-                    // symlinks what it gets back, so a path that no longer
-                    // exists would fail later and further from the cause.
-                    Some(sp) if sp.to_absolute_path(store_dir).exists() => {
-                        out.push(Some(sp.clone()))
+                match cache.get(&keys[i]) {
+                    Some((sp, true)) => out.push(Some(sp.clone())),
+                    Some((sp, false)) => {
+                        out.push(Some(sp.clone()));
+                        to_confirm.push((i, keys[i].clone(), sp.clone()));
                     }
-                    _ => {
+                    None => {
                         out.push(None);
                         miss_slots.push(i);
                         misses.push(p.clone());
                     }
                 }
             }
+        }
+
+        // Lock released: the syscalls happen here.
+        if !to_confirm.is_empty() {
+            let mut confirmed: Vec<(String, StorePath)> = Vec::new();
+            for (slot, key, sp) in to_confirm {
+                if sp.to_absolute_path(store_dir).exists() {
+                    confirmed.push((key, sp));
+                } else {
+                    // Collected under us. Demote to a miss exactly as before.
+                    out[slot] = None;
+                    miss_slots.push(slot);
+                    misses.push(paths[slot].clone());
+                    self.realised.lock().unwrap().remove(&key);
+                }
+            }
+            if !confirmed.is_empty() {
+                // MARK THE PATH THAT WAS STAT'D, NOT WHATEVER IS UNDER THE KEY
+                // NOW. The lock is released across the stat, so between the
+                // check and this write another thread can demote, remove and
+                // re-realise the same key; a bare `get_mut(&key).1 = true`
+                // would then stamp "existence confirmed" on a StorePath nobody
+                // ever stat'd. Narrow, but the comment above promises first
+                // confirmation precedes any caller receiving the path, and in
+                // that interleaving it would not. Comparing the value keeps
+                // the promise true. Reported by the specification session.
+                let mut cache = self.realised.lock().unwrap();
+                for (key, stated) in confirmed {
+                    if let Some(e) = cache.get_mut(&key) {
+                        if e.0 == stated {
+                            e.1 = true;
+                        }
+                    }
+                }
+            }
+            // A demotion appends out of order; the merge below pairs
+            // `miss_slots[k]` with `built[k]`, so the two must agree.
+            // Extracted rather than inlined because THIS is where a bug would
+            // hide and `build_paths` cannot be unit-tested without a daemon.
+            miss_slots = reorder_misses(&miss_slots, paths.len());
+            misses = miss_slots.iter().map(|&i| paths[i].clone()).collect();
         }
 
         REALISE_ASKED.fetch_add(paths.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -586,8 +680,10 @@ impl BuilderRpcClient {
         let built = self.build_paths_uncached(store_dir, &misses)?;
         {
             let mut cache = self.realised.lock().unwrap();
-            for (p, sp) in misses.iter().zip(built.iter()) {
-                cache.insert(store_dir.display(p).to_string(), sp.clone());
+            for (&slot, sp) in miss_slots.iter().zip(built.iter()) {
+                // true: freshly realised by the daemon, so it exists now and
+                // needs no confirming stat on its first hit.
+                cache.insert(keys[slot].clone(), (sp.clone(), true));
             }
         }
         Ok(merge_hits_and_misses(out, miss_slots, built))
@@ -736,6 +832,15 @@ impl BuilderRpcClient {
         use std::sync::atomic::Ordering::Relaxed;
         let results = self.runtime.block_on(async {
             // Two counters, deliberately not one: with a shared budget,
+            // COUNTS THIS CALL, NOT THIS RUN, and the message now says so.
+            // `stall_attempts` is a local of the per-call retry loop, so round
+            // 90's three watchdog timeouts each printed "stalls 1" and the run
+            // total of 3 was recoverable only by counting log lines - a number
+            // that reads as a total while being a per-call figure. Fixed in the
+            // wording rather than with a second counter: the per-call number is
+            // the one the retry logic acts on, and a run total that nothing
+            // reads is a counter to keep correct for no consumer. Reported by
+            // the specification session.
             // three stalls plus one connect failure would surface as a
             // plain connect error (the wedge evidence discarded), and
             // three connect failures would consume the allowance
@@ -783,7 +888,7 @@ impl BuilderRpcClient {
                         eprintln!(
                             "nix-ninja: [{}] WATCHDOG connect-fail ({e}); retrying in {wait}s \
                              (connect failures {connect_failures}/{CONNECT_RETRIES}, \
-                             stalls {stall_attempts})",
+                             stalls this call {stall_attempts})",
                             now_s(),
                         );
                         // Sleep OUTSIDE the gate permit: holding one of the
@@ -856,7 +961,7 @@ impl BuilderRpcClient {
                         }
                         eprintln!(
                             "nix-ninja: [{}] WATCHDOG conn-error ({e}) after {}s; dropped \
-                             the connection and retrying (stalls {stall_attempts})",
+                             the connection and retrying (stalls this call {stall_attempts})",
                             now_s(),
                             now_s().saturating_sub(started_wall),
                         );
@@ -876,7 +981,7 @@ impl BuilderRpcClient {
                              {allowance_s}s, waited since [{started_wall}] ({others} \
                              others in flight); dropped the wedged connection (frees \
                              the stuck daemon child's locks) and retrying \
-                             (stalls {stall_attempts})",
+                             (stalls this call {stall_attempts})",
                             now_s(),
                         );
                     }
