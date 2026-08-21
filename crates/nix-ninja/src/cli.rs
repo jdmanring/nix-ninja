@@ -110,6 +110,26 @@ fn resolved_jobs(cli: &Cli) -> usize {
     }
 }
 
+/// Daemon connections are a DIFFERENT resource from admission slots and must
+/// not share a number.
+///
+/// A connection measured 9.6 GiB of daemon-side memory during round 87 - two
+/// of them plus the builds put the machine at PSI full avg10 52.78 with
+/// 29.5 GiB swapped. Admission slots are nearly free by comparison, and the
+/// whole point of weighting them is to run the shallow strata wide, which
+/// wants a budget near the core count. Tying the pool to `-j` means asking
+/// for that width opens twenty-four connections and kills the box.
+///
+/// So `-j` sizes admission and this caps the pool. The ceiling is small on
+/// purpose: past a handful of connections the daemon's own per-connection
+/// state, not the driver, is what exhausts the machine, and the wedge the
+/// watchdog exists for was measured at about twenty concurrent requests.
+const MAX_DAEMON_CONNECTIONS: usize = 3;
+
+fn resolved_connections(cli: &Cli) -> usize {
+    resolved_jobs(cli).min(MAX_DAEMON_CONNECTIONS).max(1)
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     warn_ignored_flags(&cli);
@@ -132,7 +152,7 @@ pub fn run() -> Result<()> {
         return subtool(&build_dir, &cli.store_dir, &tool, cli.targets.clone());
     }
 
-    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(resolved_jobs(&cli)))?);
+    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(resolved_connections(&cli)))?);
     let derived_files = build(&cli, &build_dir, &rpc_client)?;
     if cli.is_output_derivation {
         // One output derivation, by construction: $out is a single path, so
@@ -231,7 +251,7 @@ fn subtool(
         }
         "drv" => {
             let cli = Cli::parse();
-            let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(resolved_jobs(&cli)))?);
+            let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(resolved_connections(&cli)))?);
             let derived_files = build(&cli, build_dir, &rpc_client)?;
             // `drv` prints ONE derivation. Same reasoning as above: refusing
             // is the only honest answer to several targets here.
@@ -291,13 +311,30 @@ mod tests {
         Cli::parse_from(v)
     }
 
-    /// The pool and the semaphore must resolve to the SAME number. They were
-    /// two independent bounds and the smaller one won silently, so the check
-    /// that matters is the agreement, not either value alone.
+    /// `-j` sizes ADMISSION, and admission is meant to go wide.
     #[test]
     fn resolved_jobs_follows_dash_j() {
         assert_eq!(resolved_jobs(&cli_with(&["-j", "6"])), 6);
         assert_eq!(resolved_jobs(&cli_with(&["-j", "64"])), 64);
+    }
+
+    /// Connections are capped INDEPENDENTLY of admission, and this test
+    /// replaces one asserting the two agree. They did agree, deliberately,
+    /// until a connection was measured at 9.6 GiB of daemon memory: after
+    /// that, asking for the wide admission the weighting exists to provide
+    /// would have opened one connection per slot and taken the machine down.
+    /// Two resources, two numbers - the equality that used to be the
+    /// invariant is now the bug.
+    #[test]
+    fn connections_are_capped_independently_of_admission() {
+        assert_eq!(resolved_connections(&cli_with(&["-j", "24"])), 3);
+        assert_eq!(resolved_connections(&cli_with(&["-j", "64"])), 3);
+        // Below the cap the request still wins: a deliberate -j1 must not be
+        // silently widened to three connections.
+        assert_eq!(resolved_connections(&cli_with(&["-j", "1"])), 1);
+        assert_eq!(resolved_connections(&cli_with(&["-j", "2"])), 2);
+        // And never zero, which would be a pool that can never serve.
+        assert!(resolved_connections(&cli_with(&["-j", "0"])) >= 1);
     }
 
     #[test]
