@@ -75,6 +75,13 @@ depends on a dormant fork branch that is behind its own upstream, and the
 somewhere. Whether `evmar` wants either patch is unknown and is not ours to
 assume; the honest opening is the dependency state, which is checkable.
 
+## Their roadmap, separately indexed
+
+The table above is indexed by our pull requests, which cannot answer "what of
+the maintainer's own list is already covered here". `roadmap-coverage.md` is
+that index, against their `docs/todo.md`. Two items turned out to be
+substantially built and invisible as such. Read it before proposing new work.
+
 ## What is NOT being offered, and why
 
 Honesty here is what makes the rest credible.
