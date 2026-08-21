@@ -582,6 +582,23 @@ impl Runner {
             if let Err(e) = crate::resolve_cache::flush() {
                 eprintln!("nix-ninja: resolve cache flush failed: {e}");
             }
+            // Each stats() call is a fresh pair of atomic loads, so calling
+            // one twice in an argument list samples two different instants
+            // while other threads advance the counters - which can print a
+            // sent count above its own total, or parsed above reached. Read
+            // each family ONCE into a tuple. Reported by the specification
+            // session against scan_stats; realise and nar had it too, and
+            // that is why all three are read here rather than the one that
+            // was noticed.
+            // realise_stats is (ASKED, SENT) - the first element is ALREADY
+            // the total, unlike the other two, which are (hits, count) and
+            // need summing. The original argument list encoded that
+            // difference positionally and it is easy to lose in a rename.
+            let (rl_asked, rl_sent) = nix_builder_rpc_client::realise_stats();
+            let (nar_hits, nar_sent) = nix_builder_rpc_client::nar_upload_stats();
+            // parsed / reached: misses are files actually read, the sum is
+            // every time a TU needed one. The gap is the sharing.
+            let (scan_hit, scan_miss) = deps_infer::c_include_parser::scan_stats();
             eprintln!(
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
                  (worklist {} s, cmdline {} s, py {} s, grd {} s), \
@@ -596,16 +613,12 @@ impl Runner {
                 DYN_MS.load(Ordering::Relaxed) / 1000,
                 DYN_REALISE_MS.load(Ordering::Relaxed) / 1000,
                 DYN_DISCOVER_MS.load(Ordering::Relaxed) / 1000,
-                nix_builder_rpc_client::realise_stats().1,
-                nix_builder_rpc_client::realise_stats().0,
-                nix_builder_rpc_client::nar_upload_stats().1,
-                nix_builder_rpc_client::nar_upload_stats().0
-                    + nix_builder_rpc_client::nar_upload_stats().1,
-                // parsed / reached: misses are files actually read, the sum
-                // is every time a TU needed one. The gap is the sharing.
-                deps_infer::c_include_parser::scan_stats().1,
-                deps_infer::c_include_parser::scan_stats().0
-                    + deps_infer::c_include_parser::scan_stats().1,
+                rl_sent,
+                rl_asked,
+                nar_sent,
+                nar_hits + nar_sent,
+                scan_miss,
+                scan_hit + scan_miss,
                 self_rss_mib(),
             );
         }

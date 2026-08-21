@@ -153,6 +153,17 @@ pub struct Directive {
 // Validated by (mtime, size) so an edited header is re-scanned. Generated
 // headers are written once by a task and then read, so they validate
 // correctly rather than being pinned to a pre-generation read.
+//
+// DEFER(a person edits sources under a running driver): key on a content
+// hash instead. A same-SIZE edit landing inside the filesystem's mtime
+// granularity is invisible to this key, and the stale entry then pins a
+// dependency set the file no longer has - silent, and in the direction that
+// stops tracking a header rather than over-tracking one. It costs nothing
+// for the build-from-a-store-checkout case this runs in, where sources do
+// not change under the driver; it is exactly the case a developer editing
+// in place would hit. The hash is one read per unique header, which a miss
+// already pays, so the upgrade is cheap whenever that consumer appears.
+// Raised by the specification session, addendum 730.
 type DirectiveCache =
     Arc<RwLock<rustc_hash::FxHashMap<PathBuf, (u64, u128, Arc<Vec<Directive>>)>>>;
 static DIRECTIVE_CACHE: LazyLock<DirectiveCache> = LazyLock::new(Default::default);
