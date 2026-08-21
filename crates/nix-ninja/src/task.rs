@@ -623,12 +623,21 @@ impl Runner {
                 DYN_ADDDRV_MS.load(Ordering::Relaxed),
                 DYN_ADDDRV_N.load(Ordering::Relaxed),
             );
+            // Appended rather than given a fixed `{}` in the format string,
+            // so a platform without mallinfo2 prints a shorter line instead
+            // of two zeros that read as a measurement.
+            let heap = match self_heap_mib() {
+                Some((live, retained)) => {
+                    format!(", heap {live} MiB live / {retained} MiB retained")
+                }
+                None => String::new(),
+            };
             eprintln!(
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
                  (worklist {} s, cmdline {} s, py {} s, grd {} s), \
                  dyn {} s (realise {} s, discover {} s, update {} s/{} calls, adddrv {} s/{} calls), \
                  realise {}/{} sent, nar {}/{} sent, scan {}/{} parsed, \
-                 rss {} MiB",
+                 rss {} MiB{}",
                 RESOLVE_MS.load(Ordering::Relaxed) / 1000,
                 NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
                 NT_CMDLINE_MS.load(Ordering::Relaxed) / 1000,
@@ -648,6 +657,7 @@ impl Runner {
                 scan_miss,
                 scan_hit + scan_miss,
                 self_rss_mib(),
+                heap,
             );
         }
 
@@ -2833,6 +2843,63 @@ fn self_rss_mib() -> u64 {
 }
 
 
+/// Live heap against allocator-retained heap, the pair RSS cannot separate.
+///
+/// Returns `(in_use, retained)` in MiB. RSS is `retained` plus everything that
+/// is not heap, so RSS alone cannot tell a growing working set from an
+/// allocator sitting on its high-water mark - and three rounds of RSS-only
+/// ticks did not tell them apart. The driver runs 26 threads against glibc's
+/// default of up to `8 * nproc` arenas (192 here), which is exactly the
+/// arrangement where the two readings diverge.
+///
+/// The discriminator: `retained` climbing with `in_use` flat is retention, and
+/// `MALLOC_ARENA_MAX` is the fix. Both climbing together is live state, and
+/// the fix is in the resolve-phase data structures. Their difference is
+/// `fordblks`, the free-but-held bytes, which is the bloat itself.
+///
+/// WHICH FIELDS, measured rather than assumed, because the obvious reading of
+/// the man page is wrong in the direction that reads as a measurement:
+///
+/// - `in_use` is `uordblks + hblkhd`, NOT `uordblks`. Anything past the mmap
+///   threshold bypasses the arena, so a 128 MiB allocation lands entirely in
+///   `hblkhd` and leaves `uordblks` unmoved. A tick reporting `uordblks` alone
+///   printed `0 -> 0 MiB` across a live 128 MiB vector; the first version of
+///   this function did exactly that and its own test caught it.
+/// - `arena` sums the NON-MAIN arenas too, verified with an 8-thread probe
+///   (268 MiB held, 1.2 MiB after the frees). Had it been main-arena-only,
+///   this tick would have been blind to precisely the per-thread retention it
+///   exists to measure, while still printing a plausible number.
+/// - mmapped bytes are returned to the kernel on free, so they are never
+///   retention; they appear in both terms and cancel out of the difference.
+///
+/// mallinfo2 rather than mallinfo: mallinfo's fields are `int`, and this
+/// driver has been measured at 13.19 GiB, so every field of the older call
+/// would have overflowed and reported a plausible small number - a wrong
+/// reading that announces nothing, which is the class this project keeps
+/// paying for.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn self_heap_mib() -> Option<(u64, u64)> {
+    // SAFETY: mallinfo2 takes no arguments, reads the allocator's own
+    // counters, and returns a plain struct of integers. It walks every arena
+    // holding the malloc lock, so it is not free: called once per resolve
+    // tick, never per task.
+    let mi = unsafe { libc::mallinfo2() };
+    const MIB: u64 = 1024 * 1024;
+    Some((
+        (mi.uordblks as u64 + mi.hblkhd as u64) / MIB,
+        (mi.arena as u64 + mi.hblkhd as u64) / MIB,
+    ))
+}
+
+/// mallinfo2 is glibc's. Everywhere else the tick omits the pair rather than
+/// printing zeros: a zero here is indistinguishable from an allocator holding
+/// nothing, and this line exists to be read as a measurement.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn self_heap_mib() -> Option<(u64, u64)> {
+    None
+}
+
+
 /// Wall time inside `handle_derivation_result`, the dynamic-dependency
 /// discovery that the resolve tick never counted. See the note at the top of
 /// that function for what the omission cost.
@@ -3982,6 +4049,42 @@ mod self_rss_tests {
         // A test binary under 8 GiB: loose enough never to flake, tight
         // enough to catch a unit error (pages read as bytes would be ~4000x).
         assert!(mib < 8192, "implausible rss {mib} MiB - check the unit");
+    }
+
+    /// The point of the pair is that it MOVES with the live set while RSS
+    /// does not have to, so the check allocates and watches it. Asserting
+    /// only that the call returns something would pass against a stub
+    /// returning constants, which is the reading this tick exists to replace.
+    ///
+    /// This assertion has already earned its place: against the first version
+    /// of `self_heap_mib`, which reported `uordblks` alone, it failed with
+    /// `0 -> 0 MiB` because a 128 MiB allocation is served by mmap and never
+    /// touches the arena. That is the whole class of defect here - a field
+    /// that is plausible, documented, and answers a different question.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn in_use_tracks_a_real_allocation() {
+        use super::self_heap_mib;
+
+        let (before, _) = self_heap_mib().expect("glibc reports mallinfo2");
+        // 128 MiB, well past any allocation the test harness does on its own
+        // threads while this runs, so the comparison does not need a lock.
+        let big: Vec<u8> = vec![7u8; 128 * 1024 * 1024];
+        let (during, retained) = self_heap_mib().expect("glibc reports mallinfo2");
+        assert!(
+            during >= before + 64,
+            "in-use heap did not move across a 128 MiB allocation: \
+             {before} -> {during} MiB"
+        );
+        // In-use blocks are drawn from the arena or from mmap, so this
+        // ordering holds by construction; it fails if the two fields are
+        // ever swapped, which is the one error the numbers alone would hide.
+        assert!(
+            during <= retained,
+            "in-use {during} MiB exceeds retained {retained} MiB - fields swapped?"
+        );
+        // Keep the allocation live past the second reading.
+        assert_eq!(std::hint::black_box(&big).len(), 128 * 1024 * 1024);
     }
 }
 
