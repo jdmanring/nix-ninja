@@ -602,7 +602,7 @@ impl Runner {
             eprintln!(
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
                  (worklist {} s, cmdline {} s, py {} s, grd {} s), \
-                 dyn {} s (realise {} s, discover {} s), \
+                 dyn {} s (realise {} s, discover {} s, update {} s, adddrv {} s), \
                  realise {}/{} sent, nar {}/{} sent, scan {}/{} parsed, \
                  rss {} MiB",
                 RESOLVE_MS.load(Ordering::Relaxed) / 1000,
@@ -613,6 +613,8 @@ impl Runner {
                 DYN_MS.load(Ordering::Relaxed) / 1000,
                 DYN_REALISE_MS.load(Ordering::Relaxed) / 1000,
                 DYN_DISCOVER_MS.load(Ordering::Relaxed) / 1000,
+                DYN_UPDATE_MS.load(Ordering::Relaxed) / 1000,
+                DYN_ADDDRV_MS.load(Ordering::Relaxed) / 1000,
                 rl_sent,
                 rl_asked,
                 nar_sent,
@@ -2089,14 +2091,43 @@ fn handle_derivation_result(
                 std::sync::atomic::Ordering::Relaxed,
             );
 
+            // THE REMAINDER OF dyn WAS UNNAMED, AND AT TASK 15,500 OF ROUND 90
+            // IT WAS 33% OF IT: realise 3172 s + discover 750 s against dyn
+            // 5869 s. That is addendum 721's shape arriving one level down -
+            // there, handle_derivation_result sat outside RESOLVE_MS and the
+            // driver printed its smallest phase as the total. Two candidates
+            // sit here and they have DIFFERENT fixes, which is the whole
+            // reason for measuring rather than picking:
+            //
+            //   update_derivation_with_discoveries rewrites the input set,
+            //   and the input set is growing superlinearly - measured within
+            //   round 90 alone, tasks x1.6 from 9,500 to 15,500 while realise
+            //   asked x92. Its fix is depsets (plan item 2).
+            //
+            //   add_drv_to_store is a DAEMON ROUND TRIP per dynamic task,
+            //   the same class as the call 721 found. Its fix is a memo or a
+            //   batch, not depsets.
+            //
+            // Naming them separately is what stops the next round tuning the
+            // wrong one, which this campaign has already done twice.
+            let t_update = std::time::Instant::now();
             dynamic_task::update_derivation_with_discoveries(
                 &mut drv,
                 discovered_deps,
                 discovered_store_paths,
                 &config.store_dir,
             )?;
+            DYN_UPDATE_MS.fetch_add(
+                t_update.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
+            let t_addrv = std::time::Instant::now();
             let drv_path = rpc_client.add_drv_to_store(&config.store_dir, &drv)?;
+            DYN_ADDDRV_MS.fetch_add(
+                t_addrv.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             Ok(SingleDerivedPath::Opaque(drv_path))
         }
     } else {
@@ -2778,6 +2809,8 @@ fn self_rss_mib() -> u64 {
 /// discovery that the resolve tick never counted. See the note at the top of
 /// that function for what the omission cost.
 /// dyn's two expensive halves, separated because they have different fixes.
+static DYN_UPDATE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYN_ADDDRV_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_REALISE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_DISCOVER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
