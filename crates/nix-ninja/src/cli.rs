@@ -130,6 +130,28 @@ fn resolved_jobs(cli: &Cli) -> usize {
 /// purpose: past a handful of connections the daemon's own per-connection
 /// state, not the driver, is what exhausts the machine, and the wedge the
 /// watchdog exists for was measured at about twenty concurrent requests.
+/// RE-MEASURED 2026-08-21, ROUND 90, TASK 17,500, AND THE 9.6 GiB ABOVE NO
+/// LONGER DESCRIBES THIS SYSTEM. Three live daemon workers read 0.44, 0.76
+/// and 0.44 GiB RSS; `/nixbuild` held 7.94 GiB of a 24 GiB ceiling, of which
+/// `anon` was 1.59 GiB and the rest reclaimable page cache. The machine was
+/// 88% idle across 24 cores, load 3.63, with all 26 driver threads in state
+/// S - blocked on the daemon, not computing.
+///
+/// The old figure is kept rather than replaced because it was true when taken.
+/// What changed is mechanism, not conditions: round 87 predates NAR streaming,
+/// the NAR upload memo and the realise memo, and a connection that buffers
+/// whole NARs is a different object from one that streams them. That is what
+/// makes 13-21x plausible as a real shift rather than a measurement artifact,
+/// though the honest caveat is that 87's number was taken mid-thrash and this
+/// one in a steady state, so they are not like-for-like.
+///
+/// So this ceiling is now calibrated against a defect that has been fixed, and
+/// it is very likely the reason the machine is idle while the round crawls.
+/// DEFER(James decides the connection budget): raise it, with a re-measurement
+/// per connection at the new value before the round after. NOT changed by a
+/// session: rounds 85, 87 and 89 all died on memory, the driver runs outside
+/// `/nixbuild`'s ceiling so nothing bounds a wrong guess, and the standing
+/// rule here is that a session proposes resource numbers and James sets them.
 const MAX_DAEMON_CONNECTIONS: usize = 3;
 
 fn resolved_connections(cli: &Cli) -> usize {
