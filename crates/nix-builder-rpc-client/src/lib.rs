@@ -129,6 +129,45 @@ pub struct BuilderRpcClient {
     uploaded_drvs: Mutex<HashMap<StorePath, Vec<u8>>>,
 }
 
+/// Wall-clock attribution for the realise RPC.
+///
+/// The driver timed four sub-phases of task RESOLUTION and nothing at all
+/// around the daemon round trip, so a round that spent 85% of its wall clock
+/// inside one `build_paths` reported 129 s of "total resolve time" and looked
+/// idle. Three rounds were then tuned against memory, which was never the
+/// bound. A Drop guard rather than a timed block because this function has
+/// several early returns and an untimed one would understate the very case
+/// worth catching.
+static BUILD_PATHS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BUILD_PATHS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A single realise slower than this names itself immediately, with the path
+/// count, rather than waiting for a total nobody reads mid-round.
+const SLOW_REALISE_MS: u64 = 30_000;
+
+struct RealiseTimer {
+    started: std::time::Instant,
+    paths: usize,
+}
+
+impl Drop for RealiseTimer {
+    fn drop(&mut self) {
+        let ms = self.started.elapsed().as_millis() as u64;
+        let total = BUILD_PATHS_MS.fetch_add(ms, std::sync::atomic::Ordering::Relaxed) + ms;
+        let calls = BUILD_PATHS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if ms >= SLOW_REALISE_MS {
+            eprintln!(
+                "nix-ninja: SLOW REALISE {} s for {} derived path(s) \
+                 (realise total {} s over {} call(s))",
+                ms / 1000,
+                self.paths,
+                total / 1000,
+                calls,
+            );
+        }
+    }
+}
+
 impl BuilderRpcClient {
     /// Connect to `$NIX_REMOTE` if set, otherwise the standard daemon
     pub fn connect_from_env(pool_max: Option<usize>) -> Result<Self> {
@@ -299,6 +338,10 @@ impl BuilderRpcClient {
         store_dir: &StoreDir,
         paths: &[SingleDerivedPath],
     ) -> Result<Vec<StorePath>> {
+        let _realise_timer = RealiseTimer {
+            started: std::time::Instant::now(),
+            paths: paths.len(),
+        };
         // Dedupe per derivation with MERGED output specs: requesting the
         // same drv once per output (a codegen drv producing dozens of
         // headers appears dozens of times among a task's inputs) makes
@@ -747,5 +790,37 @@ mod connect_backoff_tests {
         for w in CONNECT_BACKOFF_S.windows(2) {
             assert!(w[1] >= w[0], "backoff dips: {:?}", CONNECT_BACKOFF_S);
         }
+    }
+}
+
+#[cfg(test)]
+mod realise_timer_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// The guard must record on EVERY exit, which is the whole reason it is a
+    /// Drop impl and not a timed block. An early return that skips the
+    /// accounting would understate exactly the slow call worth catching.
+    #[test]
+    fn dropping_the_guard_records_a_call() {
+        let before = BUILD_PATHS_CALLS.load(Ordering::Relaxed);
+        {
+            let _t = RealiseTimer {
+                started: std::time::Instant::now(),
+                paths: 7,
+            };
+        }
+        assert_eq!(BUILD_PATHS_CALLS.load(Ordering::Relaxed), before + 1);
+    }
+
+    /// The threshold is quoted in the comment above it and in docs/errata.md;
+    /// pin it so a silent edit cannot make the loud case quiet again.
+    #[test]
+    fn slow_threshold_stays_loud_enough_to_catch_a_stalled_round() {
+        assert_eq!(SLOW_REALISE_MS, 30_000);
+        // A round that spends minutes in one realise must trip it; a healthy
+        // sub-second realise must not.
+        assert!(735_000 >= SLOW_REALISE_MS);
+        assert!(800 < SLOW_REALISE_MS);
     }
 }
