@@ -605,6 +605,16 @@ impl Runner {
             // never true. Written separately once in this same session, an hour
             // after fixing the identical defect - the class does not announce
             // itself on the way back in.
+            //
+            // AND THIS IS A TUPLE SYNTACTICALLY, NOT AN ATOMIC READ. The two
+            // loads are still two instants; what the binding buys is a window
+            // of nanoseconds instead of one spanning a whole format call, which
+            // is enough for a figure a person reads and is NOT enough for one
+            // code consumes. If a per-call number ever feeds a threshold or a
+            // regression gate, pack ms and n into a single AtomicU64 (32/32
+            // covers these magnitudes) or take a Mutex on the slow path. Said
+            // here because "read as a pair" reads like atomicity and is not.
+            // Raised by the specification session, addendum 734.
             let (upd_ms, upd_n) = (
                 DYN_UPDATE_MS.load(Ordering::Relaxed),
                 DYN_UPDATE_N.load(Ordering::Relaxed),
