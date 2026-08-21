@@ -380,13 +380,15 @@ impl Runner {
             eprintln!(
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
                  (worklist {} s, cmdline {} s, py {} s, grd {} s), dyn {} s, \
-                 rss {} MiB",
+                 realise {}/{} sent, rss {} MiB",
                 RESOLVE_MS.load(Ordering::Relaxed) / 1000,
                 NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
                 NT_CMDLINE_MS.load(Ordering::Relaxed) / 1000,
                 NT_PY_MS.load(Ordering::Relaxed) / 1000,
                 NT_GRD_MS.load(Ordering::Relaxed) / 1000,
                 DYN_MS.load(Ordering::Relaxed) / 1000,
+                nix_builder_rpc_client::realise_stats().1,
+                nix_builder_rpc_client::realise_stats().0,
                 self_rss_mib(),
             );
         }

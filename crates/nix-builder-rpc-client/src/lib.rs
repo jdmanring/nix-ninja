@@ -127,6 +127,23 @@ pub struct BuilderRpcClient {
 
     /// ATerm bytes kept because builder-rpc-v0 does not materialize uploaded .drv files in the sandbox.
     uploaded_drvs: Mutex<HashMap<StorePath, Vec<u8>>>,
+
+    /// Derived path (as displayed) -> the store path it realised to.
+    ///
+    /// Outside a sandbox every gcc task realises its own built inputs before
+    /// the local header scan, and neighbouring tasks share nearly all of
+    /// them - the generated-header set of one component is an input to every
+    /// TU in it. Without this the driver pays a daemon round trip per task
+    /// for paths it realised seconds earlier, on the SERIAL resolve loop, and
+    /// that repetition was the whole gap between round 86's 142 s of counted
+    /// resolve time and its ~43 minutes of wall clock.
+    ///
+    /// Sound because a realisation is immutable: a derived path resolves to
+    /// one store path, and CA derivations make that a function of content.
+    /// The only way a hit goes stale is the store path being collected, so a
+    /// hit is confirmed by existence before it is used - one stat against one
+    /// round trip.
+    realised: Mutex<HashMap<String, StorePath>>,
 }
 
 /// Wall-clock attribution for the realise RPC.
@@ -138,6 +155,55 @@ pub struct BuilderRpcClient {
 /// bound. A Drop guard rather than a timed block because this function has
 /// several early returns and an untimed one would understate the very case
 /// worth catching.
+
+/// `(asked, sent)` realise paths so far: what callers requested, and what
+/// actually reached the daemon. Reported by the driver's progress tick,
+/// because a memo whose saving is never printed is a claim nobody can check.
+pub fn realise_stats() -> (u64, u64) {
+    (
+        REALISE_ASKED.load(std::sync::atomic::Ordering::Relaxed),
+        REALISE_SENT.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Put freshly realised paths back into the slots their requests came from.
+///
+/// Extracted and generic so it can be tested: the daemon-facing half of the
+/// memo needs a live daemon, but the half that can silently corrupt an answer
+/// does not. A misaligned slot returns the WRONG store path for a real input
+/// and every later failure points somewhere else - the caller symlinks it and
+/// a compile fails on a missing header three layers away.
+///
+/// Panics if a slot is unfilled or the miss count disagrees with the built
+/// count. Both are impossible from the one caller and both are silent
+/// corruption if they ever stop being.
+fn merge_hits_and_misses<T>(
+    mut slots: Vec<Option<T>>,
+    miss_slots: Vec<usize>,
+    built: Vec<T>,
+) -> Vec<T> {
+    assert_eq!(
+        miss_slots.len(),
+        built.len(),
+        "realise returned {} paths for {} requests",
+        built.len(),
+        miss_slots.len(),
+    );
+    for (slot, value) in miss_slots.into_iter().zip(built.into_iter()) {
+        slots[slot] = Some(value);
+    }
+    slots
+        .into_iter()
+        .map(|o| o.expect("every slot is filled by a hit or by a miss"))
+        .collect()
+}
+
+/// Paths the driver asked to realise, and the subset that reached the daemon.
+/// The ratio is the memo's validation number and the only honest way to state
+/// its benefit; a hit count alone says nothing about what was avoided.
+static REALISE_ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REALISE_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static BUILD_PATHS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BUILD_PATHS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -212,6 +278,7 @@ impl BuilderRpcClient {
             pool,
             in_drv,
             uploaded_drvs: Default::default(),
+            realised: Default::default(),
         })
     }
 
@@ -333,7 +400,62 @@ impl BuilderRpcClient {
     /// Build the given derived paths and return the store path each one
     /// resolves to, in input order. Only usable outside a `builder-rpc-v0`
     /// sandbox — the restricted allowlist does not include `BuildPaths`.
+    /// Realise `paths`, skipping any this client has already realised.
+    ///
+    /// The cache is checked here rather than inside the request builder
+    /// because everything below - the merged output specs, the printed-length
+    /// split, the watchdog, the output pooling that maps a CA reply back to a
+    /// request - is interdependent and correct. Wrapping it leaves all of that
+    /// untouched and makes the saving a property of what is ASKED rather than
+    /// of how the asking works.
     pub fn build_paths(
+        &self,
+        store_dir: &StoreDir,
+        paths: &[SingleDerivedPath],
+    ) -> Result<Vec<StorePath>> {
+        let mut out: Vec<Option<StorePath>> = Vec::with_capacity(paths.len());
+        let mut misses: Vec<SingleDerivedPath> = Vec::new();
+        let mut miss_slots: Vec<usize> = Vec::new();
+        {
+            let cache = self.realised.lock().unwrap();
+            for (i, p) in paths.iter().enumerate() {
+                let key = store_dir.display(p).to_string();
+                match cache.get(&key) {
+                    // A collected store path is a miss, not a hit: the caller
+                    // symlinks what it gets back, so a path that no longer
+                    // exists would fail later and further from the cause.
+                    Some(sp) if sp.to_absolute_path(store_dir).exists() => {
+                        out.push(Some(sp.clone()))
+                    }
+                    _ => {
+                        out.push(None);
+                        miss_slots.push(i);
+                        misses.push(p.clone());
+                    }
+                }
+            }
+        }
+
+        REALISE_ASKED.fetch_add(paths.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        REALISE_SENT.fetch_add(misses.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+        // Every path already realised: no daemon round trip at all. This is
+        // the common case on a resolve loop walking one component's TUs.
+        if misses.is_empty() {
+            return Ok(out.into_iter().map(|o| o.expect("all hits")).collect());
+        }
+
+        let built = self.build_paths_uncached(store_dir, &misses)?;
+        {
+            let mut cache = self.realised.lock().unwrap();
+            for (p, sp) in misses.iter().zip(built.iter()) {
+                cache.insert(store_dir.display(p).to_string(), sp.clone());
+            }
+        }
+        Ok(merge_hits_and_misses(out, miss_slots, built))
+    }
+
+    fn build_paths_uncached(
         &self,
         store_dir: &StoreDir,
         paths: &[SingleDerivedPath],
@@ -822,5 +944,42 @@ mod realise_timer_tests {
         // sub-second realise must not.
         assert!(735_000 >= SLOW_REALISE_MS);
         assert!(800 < SLOW_REALISE_MS);
+    }
+}
+
+#[cfg(test)]
+mod realise_memo_tests {
+    use super::merge_hits_and_misses;
+
+    /// Hits and misses interleaved is the case that orders wrongly if the
+    /// merge indexes by position in `built` rather than by recorded slot.
+    #[test]
+    fn interleaved_hits_and_misses_keep_request_order() {
+        let slots = vec![Some("hit0"), None, Some("hit2"), None, None];
+        let merged = merge_hits_and_misses(slots, vec![1, 3, 4], vec!["m1", "m3", "m4"]);
+        assert_eq!(merged, vec!["hit0", "m1", "hit2", "m3", "m4"]);
+    }
+
+    /// An all-hit request never reaches the daemon; an all-miss one is the
+    /// pre-memo behaviour and must be unchanged.
+    #[test]
+    fn the_two_extremes_are_both_identity() {
+        assert_eq!(
+            merge_hits_and_misses(vec![Some("a"), Some("b")], vec![], vec![]),
+            vec!["a", "b"]
+        );
+        assert_eq!(
+            merge_hits_and_misses(vec![None, None], vec![0, 1], vec!["x", "y"]),
+            vec!["x", "y"]
+        );
+    }
+
+    /// A short reply must abort rather than leave a slot holding a
+    /// neighbour's path, which is the corruption this function exists to
+    /// make impossible.
+    #[test]
+    #[should_panic(expected = "realise returned")]
+    fn a_short_reply_is_refused_not_absorbed() {
+        merge_hits_and_misses(vec![None, None], vec![0, 1], vec!["only-one"]);
     }
 }
