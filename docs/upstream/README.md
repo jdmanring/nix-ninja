@@ -22,6 +22,7 @@ hand before the next one makes sense.
 |---|---|---|---|
 | 1 | The daemon wedge | a NEW issue on NixOS/nix, plus a note here | drafted, `nix-daemon-wedge-issue.md` |
 | 2 | Dependency-inference input classes | PR(s) on nix-ninja | not drafted |
+| 8 | Depfile support (their #17) | PR on nix-ninja | step one built, `roadmap-coverage.md`; not drafted |
 | 3 | Driver performance | comment into their #7 and #4, then a PR | drafted, `issue-replies.md` |
 | 4 | Multiple CLI targets | PR on nix-ninja, coordinated with their PR 43 | drafted, `pr3-multiple-targets.md` |
 | 5 | Resolve-memo cache | comment into their #17 as an ALTERNATIVE | drafted, `issue-replies.md` |

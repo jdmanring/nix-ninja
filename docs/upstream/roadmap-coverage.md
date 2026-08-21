@@ -11,7 +11,7 @@ code already written, and neither was visible as covered.
 | their todo item | issue | state here |
 |---|---|---|
 | Phony target support | #5 | **substantially built**, on a different mechanism from PR 43's |
-| Depfile support | #17 | not built. The general solution, and the one that would retire most of PR 1 |
+| Depfile support | #17 | **step one built** 2026-08-21: the depfile is a declared CA output. Steps two and three open |
 | `mkMesonPackage` configure caching | #16 | not built; we have a measured argument FOR it |
 | Writing derivation caching for local mode | - | **partly built**: `resolve_cache.rs` |
 | `nix store add` async | #18 | not built |
@@ -52,11 +52,27 @@ consumer, which is worth more than agreement.
 
 ## The three genuinely open, in the order they are worth taking
 
-1. **#17 depfiles.** The general solution. `pr-plan.md` already argues that PR
-   1's inference rules are heuristics recovering what the build file failed to
-   declare, and that depfiles are the real answer - so this is the item that
-   makes most of our own largest PR unnecessary. Taking it is worth more to
-   both trees than defending the heuristics.
+1. **#17 depfiles - STARTED, step one done.** The issue asks for three
+   things: emit the depfile as an extra content-addressed output, collect and
+   parse the results into a build-dir cache, then skip inference on a second
+   run for tasks with `deps = gcc`. Step one is built and measured (`dd73947`).
+   It needed no new machinery: `nix-ninja-task` already copies every declared
+   output into its placeholder, so appending the depfile to the output list is
+   the whole mechanism. Gated on `deps = gcc` rather than on `depfile` alone,
+   because a declared output the command does not produce fails the task, and
+   only `deps = gcc` is ninja's own statement that one gets written.
+   Verified on a two-rule fixture carrying its own negative control: the
+   `deps = gcc` edge emits outputs `[hello.o, hello.o.d]` with
+   `NIX_NINJA_DEPFILE=hello.o.d`, the edge without emits `[plain.o]` and no
+   variable, and the realized output holds gcc's real list including glibc's
+   `stdc-predef.h`.
+   **Steps two and three are the ones with design questions left**, and they
+   are where the value is: the cache format (n2's db, ninja's deps log, or the
+   append-and-replay shape `resolve_cache.rs` already uses here), and where
+   the skip decision goes in the runner. Neither is blocked on the maintainer.
+   This is still the item that makes most of our own largest PR unnecessary,
+   which is the argument for finishing it rather than defending the
+   heuristics.
 2. **#18 async `nix store add`.** The maintainer's own note calls it "probably
    biggest perf bottleneck". Our driver timers now attribute the realise RPC
    separately, so we can measure whether that holds at our scale, which is a
