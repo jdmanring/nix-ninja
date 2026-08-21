@@ -379,7 +379,8 @@ impl Runner {
             }
             eprintln!(
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
-                 (worklist {} s, cmdline {} s, py {} s, grd {} s), dyn {} s, \
+                 (worklist {} s, cmdline {} s, py {} s, grd {} s), \
+                 dyn {} s (realise {} s, discover {} s), \
                  realise {}/{} sent, rss {} MiB",
                 RESOLVE_MS.load(Ordering::Relaxed) / 1000,
                 NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
@@ -387,6 +388,8 @@ impl Runner {
                 NT_PY_MS.load(Ordering::Relaxed) / 1000,
                 NT_GRD_MS.load(Ordering::Relaxed) / 1000,
                 DYN_MS.load(Ordering::Relaxed) / 1000,
+                DYN_REALISE_MS.load(Ordering::Relaxed) / 1000,
+                DYN_DISCOVER_MS.load(Ordering::Relaxed) / 1000,
                 nix_builder_rpc_client::realise_stats().1,
                 nix_builder_rpc_client::realise_stats().0,
                 self_rss_mib(),
@@ -1812,9 +1815,21 @@ fn handle_derivation_result(
             // Otherwise, symlink these built_inputs into build_dir and do
             // dependency discovery locally.
 
+            // dyn is ~82% of this campaign's wall clock and had no breakdown
+            // until now - the same omission one level down that made the
+            // whole phase invisible. Its parts have different fixes: realise
+            // is a daemon round trip (memoized), discovery runs the compiler
+            // locally (real work). Naming which dominates decides whether
+            // anything is left to optimize here or whether it is the build.
+            let t_realise = std::time::Instant::now();
             let built_paths =
                 local::build_derived_files(rpc_client, &config.store_dir, &built_inputs)?;
+            DYN_REALISE_MS.fetch_add(
+                t_realise.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
+            let t_discover = std::time::Instant::now();
             let (discovered_deps, discovered_store_paths) =
                 dynamic_task::discover_dynamic_dependencies(
                     rpc_client,
@@ -1823,6 +1838,10 @@ fn handle_derivation_result(
                     &drv,
                     built_paths,
                 )?;
+            DYN_DISCOVER_MS.fetch_add(
+                t_discover.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             dynamic_task::update_derivation_with_discoveries(
                 &mut drv,
@@ -2508,6 +2527,10 @@ fn self_rss_mib() -> u64 {
 /// Wall time inside `handle_derivation_result`, the dynamic-dependency
 /// discovery that the resolve tick never counted. See the note at the top of
 /// that function for what the omission cost.
+/// dyn's two expensive halves, separated because they have different fixes.
+static DYN_REALISE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYN_DISCOVER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static DYN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct DynDiscoveryTimer(std::time::Instant);
