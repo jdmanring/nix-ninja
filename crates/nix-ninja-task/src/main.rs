@@ -5,7 +5,7 @@ use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
 use nix_ninja_task::patchelf;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[derive(Parser)]
@@ -286,7 +286,48 @@ fn create_output_dirs(outputs: &Vec<DerivedFile>) -> Result<()> {
     Ok(())
 }
 
+/// The directory a `cd <dir> && ...` prologue names, when it is relative.
+/// Returns None for a command with no prologue and for an absolute target,
+/// which is not ours to create.
+fn cd_prologue_dir(cmdline: &str) -> Option<&str> {
+    let after = cmdline.strip_prefix("cd ")?;
+    let (dir, _) = after.split_once(" && ")?;
+    if dir.is_empty() || dir.starts_with('/') {
+        return None;
+    }
+    Some(dir)
+}
+
+/// A `cd` TARGET IS NOT AN INPUT, SO NOTHING MATERIALIZES IT. The task
+/// creates directories for its declared outputs and materializes the files
+/// it declares as inputs; a directory that merely has to EXIST for the shell
+/// to enter it is in neither set. CMake's out-of-source layout produces
+/// exactly that: a custom command cds into a source subdirectory while every
+/// file it touches lives under the build tree, so the target holds no input
+/// and is never created.
+///
+/// The failure is `/bin/sh: cd: can't cd to ../src/svg: No such file or
+/// directory`, which reads as a missing SOURCE tree - a packaging problem -
+/// rather than as a directory nobody was asked to make.
+///
+/// Creating it is safe because the command's own paths are already rewritten
+/// to resolve from it: the cwd's CONTENT is not what the command reads, only
+/// its position. An absolute target is left alone - that is a path outside
+/// the task's tree and creating it would be the sandbox escape the path
+/// rewriting exists to prevent.
+fn ensure_cd_target(cmdline: &str) -> Result<()> {
+    if let Some(dir) = cd_prologue_dir(cmdline) {
+        if !Path::new(dir).is_dir() {
+            fs::create_dir_all(dir).map_err(|e| {
+                anyhow::anyhow!("create_dir_all({dir}) for a cd prologue: {e}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn spawn_process(cmdline: &str) -> Result<i32> {
+    ensure_cd_target(cmdline)?;
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", cmdline])
         .stdout(Stdio::inherit())
@@ -295,4 +336,26 @@ fn spawn_process(cmdline: &str) -> Result<i32> {
 
     let output = cmd.status()?;
     Ok(output.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+mod cd_prologue_tests {
+    use super::cd_prologue_dir;
+
+    #[test]
+    fn reads_a_relative_target_and_refuses_the_rest() {
+        assert_eq!(
+            cd_prologue_dir("cd ../src/svg && cmake -P x.cmake"),
+            Some("../src/svg")
+        );
+        assert_eq!(cd_prologue_dir("cd src/core && tool a"), Some("src/core"));
+        // NEGATIVE CONTROLS, and the absolute one is the important half: a
+        // path outside the task's tree is not ours to create, and doing so
+        // would be the sandbox escape the path rewriting exists to prevent.
+        assert_eq!(cd_prologue_dir("/nix/store/x/bin/cc -c a.cpp"), None);
+        assert_eq!(cd_prologue_dir("cd /work/qt/src && tool a"), None);
+        // A `cd` with no `&&` is not a prologue - it is the whole command,
+        // and it changes nothing for the process that follows it.
+        assert_eq!(cd_prologue_dir("cd src/svg"), None);
+    }
 }
