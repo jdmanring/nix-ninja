@@ -104,6 +104,45 @@ depends on a dormant fork branch that is behind its own upstream, and the
 somewhere. Whether `evmar` wants either patch is unknown and is not ours to
 assume; the honest opening is the dependency state, which is checkable.
 
+**And the divergence is TWO FILES, measured 2026-08-22, which is what makes
+that opening filable at all.** Everything above describes the vendored tree by
+its size, and its size is a fact about the COPY rather than about our changes:
+72 of 94 files, and all but two of them byte-identical to the branch they came
+from. Diffed against a fresh clone of `hinshun/n2` at `feature/minimal-pub`
+(tip `341b511`, 2025-03-31), our whole delta is `src/load.rs` and `Cargo.toml`,
+40 changed lines together. That is small enough to paste into an issue, and an
+issue is the only destination available.
+
+The `load.rs` half is TWO independent changes and they should never be offered
+as one. Binding `${rspfile}` inside `command` is the chromium fix, about thirty
+lines, and it restores documented ninja behavior that this branch lacks - GN
+emits `--definitions ${rspfile}` for every action and the argument was silently
+lost. Making `Loader::pools` public is one word, unrelated, and needed only by
+a consumer driving the Loader directly rather than through `read()`; nix-ninja
+does exactly that, so every declared per-edge concurrency limit was being
+dropped. A reviewer can take either without the other.
+
+**The `Cargo.toml` change must NOT travel, and it never did anything here.**
+It sets `default = []` where the branch has `default = ["jemalloc"]`, commented
+as jemalloc-sys failing to build in this environment. Both consumers already
+declare `default-features = false` - upstream's own manifests do, on
+`origin/main`, and so do ours - and `vendor-n2` is not a workspace member, so
+n2's default feature set is never enabled by this build either way. The comment
+asserts a cause the manifest forecloses. Two readings agree and neither needs a
+compile; if it is ever worth settling exactly, the reading is a build, not
+another look at the file.
+
+`vendor-n2/.cargo-ok` is in the tree as well. That file is written by cargo
+into its own registry checkouts, so the copy was taken from cargo's cache
+rather than from a clone - worth removing whatever else happens to the vendored
+tree, since it is not part of n2.
+
+Method, because the size figure is what misled every earlier reading of this
+item: clone the pinned branch, `diff -rq` the two trees, and read the files
+that differ. The count of files in a vendored copy says nothing about the
+divergence, and quoting it as though it did is what turned a forty-line patch
+into an unsendable pile.
+
 ## Their roadmap, separately indexed
 
 The table above is indexed by our pull requests, which cannot answer "what of

@@ -190,6 +190,13 @@ branch nix-ninja pins (`feature/minimal-pub`) is 9 commits behind it. The
 corrected item and what to ask instead are in `README.md`; do not draft
 against the old destination.
 
+The size figures above describe the vendored COPY and not our changes, and the
+two are not close. Measured 2026-08-22 against a fresh clone of the pinned
+branch, the divergence is `src/load.rs` and `Cargo.toml`, 40 lines - of which
+the `Cargo.toml` change is inert here and must not travel. `README.md` carries
+the breakdown and the method. Quote that when describing this item, never the
+file proportion, which is what made a forty-line patch read as unsendable.
+
 ## Audit
 
 Round 1 (2026-08-20) falsified this file's class list: it said nine classes
