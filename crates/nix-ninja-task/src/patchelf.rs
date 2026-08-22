@@ -24,6 +24,17 @@ pub fn fix_rpaths(store_dir: &Path, outputs: &[DerivedFile]) -> Result<()> {
 // Check if this is an executable or shared library that can have RPATH.
 // Skip object files (.o) or non-ELF files.
 fn is_elf_dynamic(path: &Path) -> Result<bool> {
+    // A DIRECTORY OUTPUT IS NOT AN ELF AND READING ONE IS AN ERROR, not a
+    // false. Since the driver can declare a whole tree as an output - the
+    // syncqt include directory, whose contents ninja never names - this is
+    // reached with a directory, and `fs::read` returns EISDIR:
+    //     Error: read(.../include/QtSvg): Is a directory
+    // which fails the task rather than skipping the entry. Nothing inside an
+    // include tree carries an RPATH; a directory output that does would need
+    // a walk here, and there is no such output today.
+    if path.is_dir() {
+        return Ok(false);
+    }
     let data = fs::read(path).map_err(|e| anyhow::anyhow!("read({}): {e}", path.display()))?;
 
     let elf = match ElfBytes::<AnyEndian>::minimal_parse(&data) {

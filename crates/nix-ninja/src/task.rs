@@ -777,6 +777,17 @@ impl Runner {
                         }
                     }
                 }
+                // THE TREE, BY THE SAME RULE new_task USED. Its FileId is
+                // synthetic - ninja has no node for a directory - so it can
+                // only reach a consumer by being attached to the outputs the
+                // graph DOES know, which is what the caller does below.
+                let paths: Vec<PathBuf> =
+                    drv_outputs.iter().map(|d| d.build_path.clone()).collect();
+                if let Some(dir) = common_include_root(&paths) {
+                    if !paths.contains(&dir) {
+                        drv_outputs.push(new_built_file(final_derived_path.clone(), dir));
+                    }
+                }
                 drv_outputs
             } else {
                 Vec::new()
@@ -822,8 +833,32 @@ impl Runner {
             return Ok((result.bid, false));
         }
 
+        // A DIRECTORY OUTPUT REACHES CONSUMERS ONLY BY RIDING A REAL ONE.
+        // co_outputs is keyed by ninja FileIds and lists a rule's declared
+        // outs; a directory is not a graph node, so nothing would ever
+        // expand to it. Attaching its synthetic id to the co-output list of
+        // each real output of the same rule puts it exactly where the public
+        // forwarding headers already travel - which is how they reach a
+        // translation unit's input list today.
+        let mut fids: Vec<FileId> = Vec::new();
+        let mut tree_fid: Option<FileId> = None;
         for derived_file in result.derived_files {
-            self.add_derived_file(files, derived_file.clone());
+            let is_tree = derived_file.build_path.components().count() == 2
+                && derived_file.build_path.starts_with("include");
+            let fid = self.add_derived_file(files, derived_file.clone());
+            if is_tree {
+                tree_fid = Some(fid);
+            } else {
+                fids.push(fid);
+            }
+        }
+        if let Some(tf) = tree_fid {
+            for fid in &fids {
+                let entry = self.co_outputs.entry(*fid).or_insert_with(|| vec![*fid]);
+                if !entry.contains(&tf) {
+                    entry.push(tf);
+                }
+            }
         }
 
         Ok((result.bid, true))
@@ -1923,15 +1958,16 @@ fn build_task_derivation(
     // whoever depends on one of them - which is exactly how the PUBLIC
     // headers reach a TU's input list today. The directory rides the same
     // edge.
-    if task
-        .cmdline
-        .as_deref()
-        .is_some_and(|c| c.contains("syncqt"))
-    {
-        if let Some(dir) = common_include_root(&task_outputs) {
-            if !task_outputs.contains(&dir) {
-                task_outputs.push(dir);
-            }
+    // GATED ON THE OUTPUT SHAPE, NOT ON THE COMMAND, because the consumer
+    // side has to reach the same conclusion from the same evidence. A
+    // cmdline test here and a structural test there can disagree, and the
+    // disagreement produces a DerivedFile naming a derivation output that
+    // does not exist - a dangling reference rather than a missing header.
+    // For a task that is not syncqt the rule declares a directory holding
+    // exactly its own declared outputs, which is redundant and correct.
+    if let Some(dir) = common_include_root(&task_outputs) {
+        if !task_outputs.contains(&dir) {
+            task_outputs.push(dir);
         }
     }
     let depfile_out: Option<PathBuf> = match (&task.depfile, task.deps.as_deref()) {
