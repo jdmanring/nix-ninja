@@ -136,6 +136,42 @@ pub fn create_symlinks(
             fs::remove_file(&dest_path).map_err(|e| anyhow::anyhow!("remove_file({}): {e}", dest_path.display()))?;
         }
 
+        // TWO INPUTS CAN NAME ONE DESTINATION, and when they name the same
+        // SOURCE that is a duplicate rather than a conflict. The driver keys
+        // its input set by the build path as SPELLED, so one file discovered
+        // by two routes arrives twice - once relative to the build dir and
+        // once as a `../` climb that resolves back to it. Measured on qtsvg
+        // 6.11.1, 2026-08-22: `src/svg/.../Qt6SvgPrivateTargets.cmake` and
+        // `../../../build/src/build/src/svg/.../Qt6SvgPrivateTargets.cmake`,
+        // same store path, same destination.
+        // The second symlink then fails EEXIST, and the message names a real
+        // store path and a real destination, so it reads as a collision
+        // between two different files.
+        // Skip when the link already points where this one would; refuse
+        // when it points somewhere else, because that IS a conflict and
+        // silently keeping the first would be a wrong build with no symptom.
+        if dest_path.is_symlink() {
+            match fs::read_link(&dest_path) {
+                Ok(existing) if existing == source_path => continue,
+                Ok(existing) => {
+                    return Err(anyhow!(
+                        "nix-ninja-task: {} is already a symlink to {}, and a \
+                         second input wants it to point at {}. Two different \
+                         files claim one build path.",
+                        dest_path.display(),
+                        existing.display(),
+                        source_path.display()
+                    ))
+                }
+                Err(e) => {
+                    return Err(anyhow!(
+                        "nix-ninja-task: read_link({}): {e}",
+                        dest_path.display()
+                    ))
+                }
+            }
+        }
+
         // Python scripts are COPIED, not symlinked: a script that takes
         // realpath(__file__) - Chromium's version.py does, to find its
         // sibling LASTCHANGE.dummy - resolves a symlink into the store,
