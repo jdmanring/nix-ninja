@@ -1387,7 +1387,34 @@ impl Runner {
         // and depfile discovery carry the real dependencies. 512 covers
         // the meson projects this hack was written for (dbus: dozens).
         const IMPLICIT_INPUTS_LIMIT: usize = 512;
-        if self.build_dir_inputs.len() <= IMPLICIT_INPUTS_LIMIT {
+        // OVERRIDABLE, so the blanket's correctness consequences can be
+        // MEASURED rather than argued. Setting the limit to 0 turns it off
+        // for a whole run; unset, the constant above is the value and every
+        // emitted derivation is byte-identical to what upstream emits.
+        // Read once per process: this runs per task, and env::var on a hot
+        // path for a value that cannot change mid-run is waste.
+        static IMPLICIT_LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let implicit_limit = *IMPLICIT_LIMIT.get_or_init(|| {
+            std::env::var("NIX_NINJA_IMPLICIT_INPUTS_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(IMPLICIT_INPUTS_LIMIT)
+        });
+        // THE BRANCH IS THE FACT, NOT THE CONSTANT. Whether the blanket
+        // fires depends on build_dir_inputs.len(), which nothing prints, so
+        // a hypothesis about the blanket cannot be tested without this line.
+        // Once per process, naming BOTH sides of the comparison, because a
+        // limit without the length it is compared against says nothing.
+        static BLANKET_REPORTED: std::sync::Once = std::sync::Once::new();
+        BLANKET_REPORTED.call_once(|| {
+            eprintln!(
+                "nix-ninja: implicit-input blanket {}: build_dir_inputs={} limit={}",
+                if self.build_dir_inputs.len() <= implicit_limit { "ON" } else { "OFF" },
+                self.build_dir_inputs.len(),
+                implicit_limit,
+            );
+        });
+        if self.build_dir_inputs.len() <= implicit_limit {
             for input in self.build_dir_inputs.values() {
                 input_set.insert(input.build_path.clone(), input.clone());
             }
@@ -2477,6 +2504,33 @@ fn rewrite_cmdline(cmdline: &str, build_dir: &Path) -> String {
                     "cd {rel} && {}",
                     rewrite_ancestor_paths_ups(tail, build_dir, depth)
                 );
+            }
+            // THE CD TARGET CAN SIT ABOVE THE BUILD DIR, and until this
+            // branch existed that command fell through to the plain
+            // rewrite: the tail's paths came out relative to the BUILD
+            // DIR while the shell's cwd was somewhere else entirely.
+            // Measured 2026-08-22 on qtsvg, a CMake project configured
+            // out-of-source at <src>/build, whose version-script rule is
+            //     cd ../src/svg && cmake -DIN_FILE=src/svg/Svg.version.in ...
+            // `Svg.version.in` is GENERATED into the build dir, so from
+            // ../src/svg it is ../../build/src/svg/Svg.version.in and the
+            // emitted command looked for it one tree over. CMake reports
+            // that as "Input file ... doesn't exists", which reads as a
+            // missing input rather than as a wrong cwd.
+            // `rewrite_ancestor_paths` already emits the climb from its
+            // BASE to each ancestor, so passing the cd target as the base
+            // is the whole fix - no depth arithmetic, and it is correct
+            // for any k levels up and d levels down. The branch above is
+            // left alone deliberately: it produces a longer but equally
+            // valid spelling that other passes match against, and this
+            // change is not licensed to move it.
+            if !rel.starts_with('/') {
+                let cd_abs = if Path::new(dir).is_absolute() {
+                    PathBuf::from(dir)
+                } else {
+                    lexical_join(build_dir, Path::new(dir))
+                };
+                return format!("cd {rel} && {}", rewrite_ancestor_paths(tail, &cd_abs));
             }
         }
     }
@@ -3884,6 +3938,25 @@ mod python_import_names_tests {
         );
         // No cd prologue: plain rewrite.
         assert_eq!(rewrite_cmdline("tool /work/qt/build/x", bd), "tool x");
+        // A CD TARGET ABOVE THE BUILD DIR - qtsvg's version-script rule.
+        // The tail names a file GENERATED into the build dir, so from the
+        // source subdir it has to climb out and back down. Before this
+        // case existed the command fell through to the plain rewrite and
+        // the tail came out build-dir-relative under a different cwd.
+        assert_eq!(
+            rewrite_cmdline(
+                "cd /work/qt/src/svg && cmake -DIN_FILE=/work/qt/build/src/svg/Svg.version.in -P /nix/store/x/G.cmake",
+                bd
+            ),
+            "cd ../src/svg && cmake -DIN_FILE=../../build/src/svg/Svg.version.in -P /nix/store/x/G.cmake"
+        );
+        // NEGATIVE CONTROL for the same branch: a store path must survive
+        // untouched, because the rewrite stops above three components and
+        // a task's tools are all under /nix/store.
+        assert_eq!(
+            rewrite_cmdline("cd /work/qt/src/svg && /nix/store/t/bin/tool", bd),
+            "cd ../src/svg && /nix/store/t/bin/tool"
+        );
     }
 
     // The idl_parser shape: sys.path.insert into the importer's OWN
