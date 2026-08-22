@@ -295,3 +295,78 @@ first draft rather than the issue:
 Status: NOT SENDABLE as a set. The perf reply still owes a decision on the
 isolated before/after run it offers, and the #5 and #17 replies need cutting
 before anyone posts them. #52 and #7/#4 remain the two that are ready.
+
+
+---
+
+## Into #31, "example-hello fails to build in x86_64 Linux container"
+
+Added 2026-08-21. **This issue had no presence anywhere in this directory
+before today**, and neither did #6 or #14 - see the audit note at the foot of
+`roadmap-coverage.md` for why: the coverage index was built against
+`docs/todo.md`, and the todo file is not the issue list.
+
+It is worth a reply because the thread STOPPED on an unanswered failure rather
+than on a resolution. The title names an error the reporter got past. The last
+comment, smpdt on 2025-06-23 and unanswered for fourteen months, is a different
+one:
+
+```
+error: Cannot build '/nix/store/...-ninja-build-hello.p-main.cpp.o.drv'.
+       Reason: builder failed with exit code 1.
+       > NIX_BUILD_TOP /tmp/nix-build-...
+       > Error: Permission denied (os error 13)
+```
+
+with the reporter's own guess: "I wonder if Docker's sandboxing doesn't play
+nice with recursive nix".
+
+### The reply
+
+> Worth retesting rather than diagnosing from here, because the mechanism this
+> failure is about has been replaced since the thread stopped.
+>
+> When you hit this, a task reached the daemon through recursive-nix from
+> inside its own build. #49, "nix-ninja: route inside-derivation calls through
+> builder-rpc-v0", merged 2026-07-23 - thirteen months after this comment - and
+> changed that path. Your guess that Docker's sandboxing and recursive-nix were
+> the pair in conflict is pointing at the mechanism that is no longer the one
+> in use, which is a reason to re-run rather than a reason to close.
+>
+> One thing worth checking BEFORE the rerun, because it fails much later and
+> with a message that does not name the cause: whether the daemon you end up
+> with advertises `builder-rpc-v0`. Every dynamic task requires it by name, a
+> daemon without it refuses the derivation, and the refusal does not say
+> "your daemon is too old". The whole check is a derivation that requires the
+> feature - if it is denied, the refusal prints the daemon's entire available
+> feature set, which is the list you want to read.
+>
+> Note this is a property of the DAEMON binary rather than of your client or
+> your `experimental-features` line: the name is not grantable through
+> `system-features`, so the only lever is which nix the daemon is. In a
+> container that is whichever nix the image starts, which is the same class of
+> problem the original report in this thread turned out to be.
+
+### What this reply does NOT claim
+
+It does not say #31 is fixed. Nobody here has run nix-ninja in a Docker
+container, and the reporter's environment is not reproduced. The claim is
+narrower and is checkable by them: the mechanism their hypothesis names was
+replaced by a merged PR, so the evidence in the thread no longer describes the
+code. Saying "this is probably fixed" would be a guess about somebody else's
+environment presented as a finding, which is the thing this directory keeps
+catching in itself.
+
+## The two remaining uncovered issues, and neither is ours
+
+**#6, "Investigate if it's possible to use snix as an alternative backend"**
+(`help wanted`). Not ours. `CONTRIBUTING.md` already states the blocker -
+snix's `nix-compat` supports Nix 2.3, which has neither content-addressed nor
+dynamic derivations - and nothing this fork did bears on it. Recorded as
+deliberately unaddressed rather than left invisible.
+
+**#14, "aarch64 support"**. Not ours, for a reason that is a fact about the
+hardware rather than a judgement: everything this fork has measured ran on one
+x86_64 workstation. Offering anything into an architecture issue from a tree
+that has never been built on that architecture would be exactly the
+untested-claim shape the rest of this directory exists to avoid.

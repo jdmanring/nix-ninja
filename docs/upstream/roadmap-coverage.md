@@ -17,6 +17,7 @@ code already written, and neither was visible as covered.
 | `nix store add` async | #18 | not built |
 | Benchmarks for generating derivations | #4 | profiler samples, no benchmark |
 | Benchmarks for end-to-end compilation | #7 | profiler samples, no benchmark |
+| CMake example (`help wanted`) | #20 | **the recipe is now known and RUN**, 2026-08-21 |
 
 ## The two that are covered and did not look it
 
@@ -45,10 +46,37 @@ into its own derivation. We have a cost of NOT doing it that the issue does
 not state: because the configure phase goes to whichever nixpkgs setup hook
 claims the slot first, and `mkMesonPackage` always sets `buildPhase` with
 meson listed first in `nativeBuildInputs`, a CMake project driven through the
-builder needs `dontUseMesonConfigure = true` plus explicit `cmakeFlags`. That
-is a three-argument workaround every non-meson consumer rediscovers, and
-splitting the phase is what removes it. Evidence for their design, from a
+builder needs `dontUseMesonConfigure = true` plus explicit `cmakeFlags`.
+Splitting the phase is what removes that. Evidence for their design, from a
 consumer, which is worth more than agreement.
+
+**THAT WAS WRITTEN AS A THREE-ARGUMENT WORKAROUND AND IT IS FIVE, corrected
+2026-08-21 by RUNNING it rather than by re-reading the hooks.** The three were
+derived from `ninja/setup-hook.sh`, `cmake/setup-hook.sh` and
+`mkMesonPackage/default.nix`, and they are each necessary and not sufficient.
+Driving qtsvg through the builder needs two more, and neither is reachable by
+reading those files:
+
+    dontWrapQtApps = true;              # qtbase in buildInputs makes the Qt
+                                        # hook refuse without a wrapping
+                                        # decision; fails in qtPreHook, before
+                                        # configure runs at all
+    nativeBuildInputs = [ cmake ninja ] # CMake validates CMAKE_MAKE_PROGRAM at
+                                        # CONFIGURE time and refuses -GNinja
+                                        # with no ninja binary to name
+
+The second looks like it contradicts the point of the tool and does not: ninja
+is there to WRITE `build.ninja`, never to execute it. The build phase is still
+`nix-ninja <target>`, and that is confirmed by the provenance of the failure
+rather than deduced from hook precedence - the run failed with
+`Failed to build task derivation`, which only `crates/nix-ninja/src/task.rs`
+emits.
+
+The correction is worth more to #16 than the original claim was. A workaround
+that grew from three arguments to five the first time somebody drove a
+non-meson project is a better argument for splitting the phase than a
+three-argument one, and the two additions are exactly the kind a maintainer
+cannot enumerate from the source.
 
 ## The three genuinely open, in the order they are worth taking
 
@@ -84,6 +112,49 @@ ranked list rather than a backlog is the point: this file exists so the next
 session does not re-derive the ranking or, worse, start item 1 by writing more
 inference rules.
 
+## The one that became answerable on 2026-08-21, and it is not in the todo file
+
+**#20, "Add example for CMake project", `help wanted`, open since
+2025-04-01.** It is absent from `docs/todo.md`, which is why this index did not
+carry it until now: the index was built against the todo file, and the todo
+file is not the issue list. An item can be labelled `help wanted` for sixteen
+months and never appear in the roadmap this file was checking.
+
+It is now the most actionable item here, because the thing #20 asks for is a
+worked CMake recipe and the recipe is known and RUN rather than reasoned:
+
+    dontUseMesonConfigure = true;
+    nativeBuildInputs = [ cmake ninja ];
+    cmakeFlags = [ "-GNinja" ];
+    dontWrapQtApps = true;          # only for a Qt module
+    buildInputs = [ qt6.qtbase ];   # only for a Qt module
+
+Driven against qtsvg 6.11.1 on 2026-08-21. Configure completed, `build.ninja`
+was written, the graph was parsed, and the run reached task-derivation
+generation before stopping on a defect in `task.rs` (a leading `cd` from a
+CMake custom command resolved as a binary; `cd` is a shell builtin). So the
+packaging half is established end to end and the tool half has a named,
+located blocker.
+
+**PR #43 must be dealt with before anything is offered into #20.**
+RCoeurjoly's "feat: add CMake example and support ninja phony targets" is OPEN,
+CONFLICTING, and untouched since 2026-02-27, and it is an attempt at this same
+issue. Whatever goes into #20 either builds on that PR or says clearly why it
+does not - the same defect this directory just made with #26 and item 7, and
+the second instance is the one that would be inexcusable.
+
+**What is NOT established, and it bounds the offer.** The run did not measure
+TU granularity for a Qt module, which is the property the exercise exists to
+demonstrate; it stopped at the first build task. A CMake example offered into
+#20 today would be an example that CONFIGURES, not one that builds through. The
+honest sequence is: fix the `cd` resolution, drive qtsvg to completion, measure
+granularity, and only then offer an example. Offering it before that is
+offering a recipe whose last step nobody has seen work.
+
+An example smaller than a Qt module is the likelier fit for #20 anyway - the
+maintainer asked for an example, not a Qt port - and the three non-Qt arguments
+are the whole of what a plain CMake project needs.
+
 ## Audit
 
 Round 1 (2026-08-21). Findings applied while drafting:
@@ -97,6 +168,14 @@ Round 1 (2026-08-21). Findings applied while drafting:
 - the table originally carried a count of covered items. Cut - the honest
   statement is per-row, and a count over a list that moves on their schedule
   is stale by construction.
+
+Round 2 (2026-08-21): the index was built against `docs/todo.md` and the todo
+file is not the issue list, so #20 - `help wanted`, open sixteen months - was
+absent from a document whose stated purpose is "read it before proposing new
+work". A coverage index keyed on the wrong source answers cleanly and
+incompletely. Fixed by adding #20; NOT fixed generally, because nothing here
+reconciles the todo file against the issue list and a session could make the
+same omission tomorrow for #14, #31, #41 or #52.
 
 Not attacked by an independent reader. Status: internal working document, not
 for sending. If any row is quoted outward it must be re-read against their

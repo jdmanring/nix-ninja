@@ -27,13 +27,34 @@ hand before the next one makes sense.
 | 4 | Multiple CLI targets | PR on nix-ninja, coordinated with their PR 43 | drafted, `pr3-multiple-targets.md` |
 | 5 | Resolve-memo cache | comment into their #17 as an ALTERNATIVE | drafted, `issue-replies.md` |
 | 6 | `${rspfile}` support, and the n2 dependency | `evmar/n2`, NOT `hinshun/n2` | destination corrected 2026-08-21, see below |
-| 7 | `contrib/devstore.sh` | PR on nix-ninja | drafted, `devstore-pr.md`; **send first** |
+| 7 | `contrib/devstore.sh` | PR on nix-ninja | drafted, `devstore-pr.md`; **behind 0 as of 2026-08-21** |
+| 0 | Reply into their PR #26 | comment on nix-ninja PR #26 | drafted, `pr26-reply.md`; **send first** |
 
-**7 goes before all of them, which is why it is last in the table and first in
-practice.** It is the only item answering a request the maintainer wrote down
-himself, it touches no crate, and it cannot conflict with anything. Numbered 7
-because it was written last; ordered first because everything else asks him to
-take code he did not ask for.
+**0 GOES FIRST, AND IT DISPLACED 7 ON 2026-08-21.** Until then this file said 7
+went first, on the grounds that it is the only item answering a request the
+maintainer wrote down himself. That grounds now points at 0 instead, by this
+file's own other rule - "answering an open question earns the read that a large
+unsolicited PR does not."
+
+There is an open maintainer question on the exact subject of item 7, addressed
+to a named person, unanswered for a month, and it is the thing keeping a draft
+PR from resolving either way. Ericson2314 into PR #26, 2026-07-23: `nix flake
+check` no longer requires experimental features on the main store, the VM tests
+are in it now, "does that mean we don't need this anymore, I think?"
+
+**And item 7 was drafted without knowing #26 existed.** PR #26 is jaen's
+`nix-portable` attempt at the same problem, open as a draft since 2025-04-18;
+the maintainer named `obsidiansystems/sandstone` in that thread as the
+`--store` prior art, which is structurally what `contrib/devstore.sh` does.
+Nothing in this directory mentioned any of the three before 2026-08-21, so the
+first question a maintainer would ask about item 7 had no answer in it. That is
+a defect in the audit rather than in the script: round 1 attacked the prose and
+never opened the destination repository's own PR list. Recorded in
+`devstore-pr.md` under Round 2.
+
+7 still goes before the rest for the original reason - it touches no crate and
+cannot conflict - but it goes after 0, and it does not go at all until it says
+how it relates to #26.
 
 **1 goes first among the rest because a wedged worker does not stay inside the
 build that made it.** Seventeen of them survived as init-reparented root orphans holding

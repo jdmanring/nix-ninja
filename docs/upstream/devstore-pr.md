@@ -101,8 +101,41 @@ Round 1 (2026-08-21), drafted and attacked in the same pass:
   one. A `CONTRIBUTING.md` edit arriving inside an unrelated PR is the
   found-in-the-diff shape `pr-plan.md` already calls smuggling.
 
+Round 2 (2026-08-21), and it is a BLOCKING finding this draft could not have
+survived contact with:
+
+- **THIS IS THE THIRD ATTEMPT AT THE PROBLEM AND THE DRAFT NAMED NEITHER OF
+  THE OTHER TWO.** PR #26 (jaen, open DRAFT since 2025-04-18, active as
+  recently as 2026-07-23) is "Use `nix-portable` to allow using the devshell
+  without installing DD-enabled nix globally" - the same problem in the same
+  words. In that thread the maintainer named
+  `obsidiansystems/sandstone` and its `--store /tmp/store` approach against a
+  pinned nix, which is structurally what this script does; jaen then tried it,
+  reported it working, and wrote `jaen/nix-dev-wrapper` to handle syncing
+  paths back to the global store.
+  The first question a maintainer would ask is "how is this different from
+  #26?" and round 1 had no answer, because round 1 did not know #26 existed.
+  Round 1 says it was "drafted and attacked in the same pass"; the pass never
+  looked at the destination repository's own open PRs. That is evidence about
+  the audit rather than about the draft.
+- **There is an open maintainer question on that thread and it is about this.**
+  Ericson2314, 2026-07-23: `nix flake check` no longer requires experimental
+  features on the main store, the VM tests are in it now, "does that mean we
+  don't need this anymore, I think?" Unanswered for a month. Sending a PR into
+  a repository where an unanswered maintainer question asks whether the PR's
+  whole category is still needed is the shape that gets closed in one line.
+
+Consequence for the ORDER, and it follows from `README.md`'s own rule rather
+than a new one: answering an open question earns a read that an unsolicited PR
+does not. `pr26-reply.md` answers Ericson2314 from the repository's own flake -
+the examples sit behind `lib.optionalAttrs (builtins ? outputOf)`, so without
+`dynamic-derivations` they are absent from the attribute set, measured both
+ways - and it credits jaen with the sync-back half this script does not
+attempt. That reply ships FIRST. This PR follows it, or follows from it if the
+answer is that the maintainer wants the script.
+
 Not attacked by an independent reader; rule 10 requires that before sending.
 
-Status: NOT SENDABLE pending the independent audit. It is the closest to
-sendable of anything here, and it is not blocked on the pre-PR question that
-holds the rest.
+Status: NOT SENDABLE. Round 2 moved it behind `pr26-reply.md`, and the body
+above still needs a section relating it to #26 and to sandstone before it goes
+out on its own. It is no longer the first thing to send.
