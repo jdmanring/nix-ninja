@@ -259,6 +259,15 @@ fn copy_outputs_to_placeholders(store_dir: &StoreDir, outputs: &[DerivedFile]) -
                 anyhow::anyhow!("create_dir_all({}) for output: {e}", parent.display())
             })?;
         }
+        // A DIRECTORY OUTPUT IS THE ONLY WAY TO CARRY WHAT A RULE DOES NOT
+        // DECLARE. syncqt writes hundreds of forwarding headers whose names
+        // ninja never knows, so the driver declares the TREE and this copies
+        // whatever is in it. fs::copy is file-to-file and would fail with
+        // EISDIR here, which reads as a permissions problem.
+        if output.build_path.is_dir() {
+            copy_tree(&output.build_path, &target_path)?;
+            continue;
+        }
         fs::copy(&output.build_path, &target_path).map_err(|e| {
             anyhow::anyhow!(
                 "copy({} -> {}): {e}",
@@ -285,6 +294,47 @@ fn create_output_dirs(outputs: &Vec<DerivedFile>) -> Result<()> {
                 )
             })?;
             dirs.push(parent);
+        }
+    }
+    Ok(())
+}
+
+/// Copy a directory recursively, following nothing. Symlinks inside a build
+/// tree point at materialized inputs, so copying the LINK would carry a path
+/// that does not exist on the far side; copying what it resolves to is what
+/// the consumer needs.
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)
+        .map_err(|e| anyhow::anyhow!("create_dir_all({}): {e}", dst.display()))?;
+    for entry in fs::read_dir(src)
+        .map_err(|e| anyhow::anyhow!("read_dir({}): {e}", src.display()))?
+    {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        // metadata() follows the link; file_type() would not.
+        let md = match fs::metadata(&from) {
+            Ok(m) => m,
+            // A DANGLING LINK IS NOT AN ERROR HERE. A build tree carries
+            // links to inputs that were materialized for a different task;
+            // failing on one would turn a complete output into no output.
+            Err(_) => continue,
+        };
+        if md.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)
+                .map_err(|e| anyhow::anyhow!("copy({} -> {}): {e}",
+                    from.display(), to.display()))?;
+            // fs::copy carries the source mode, and a generated header is
+            // often 0444. A later task that has to overwrite it dies EACCES,
+            // which is the same defect the duplicate-output fix already met.
+            let mut perms = fs::metadata(&to)
+                .map_err(|e| anyhow::anyhow!("metadata({}): {e}", to.display()))?
+                .permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(&to, perms);
         }
     }
     Ok(())

@@ -104,6 +104,33 @@ impl fmt::Display for DerivedFile {
 ///
 /// For each derived file, creates a symlink at `prefix/${derived_file.build_path}`
 /// pointing to the actual file at `derived_file.rel_path`.
+/// Link every file under `src` into `dst`, creating real directories on the
+/// way. Existing entries are left alone rather than replaced: a declared
+/// output already materialised at that path is the same file this would link.
+fn link_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(dst)
+        .map_err(|e| anyhow!("create_dir_all({}) for a directory input: {e}", dst.display()))?;
+    for entry in fs::read_dir(src)
+        .map_err(|e| anyhow!("read_dir({}) for a directory input: {e}", src.display()))?
+    {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let md = match fs::metadata(&from) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if md.is_dir() {
+            link_tree(&from, &to)?;
+        } else if !to.exists() && !to.is_symlink() {
+            std::os::unix::fs::symlink(&from, &to).map_err(|e| {
+                anyhow!("symlink({} -> {}): {e}", from.display(), to.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
 pub fn create_symlinks(
     prefix: &std::path::Path,
     store_dir: &StoreDir,
@@ -150,6 +177,21 @@ pub fn create_symlinks(
         // Skip when the link already points where this one would; refuse
         // when it points somewhere else, because that IS a conflict and
         // silently keeping the first would be a wrong build with no symptom.
+        // A DIRECTORY INPUT IS LINKED FILE BY FILE, NOT AS A DIRECTORY.
+        // The syncqt include tree arrives as one store path, and symlinking
+        // the directory itself makes it read-only: the rule's individually
+        // declared public headers then have nowhere to land, and any task
+        // that writes into the tree dies EACCES inside the store. Linking the
+        // CONTENTS leaves the directory a real, writable one and lets the
+        // per-file links for the declared outputs sit beside the undeclared
+        // ones. First writer wins, and a file already present is left alone -
+        // it is the same content by construction, since both spellings came
+        // from the same task.
+        if source_path.is_dir() {
+            link_tree(&source_path, &dest_path)?;
+            continue;
+        }
+
         if dest_path.is_symlink() {
             match fs::read_link(&dest_path) {
                 Ok(existing) if existing == source_path => continue,

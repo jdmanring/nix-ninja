@@ -1895,6 +1895,45 @@ fn build_task_derivation(
     // Order-preserving, because the encoded list is positional for the reader
     // on the other side.
     let mut task_outputs: Vec<PathBuf> = dedup_paths(&task.outputs);
+
+    // SYNCQT WRITES HUNDREDS OF OUTPUTS NINJA NEVER DECLARES, and until this
+    // existed no Qt module could build.
+    //
+    // A Qt module resolves its private includes through forwarding headers
+    // syncqt generates into `include/<Module>/private/`. ninja declares the
+    // TIMESTAMP file the rule touches and a handful of public headers; it
+    // does not declare the rest, because syncqt decides them at runtime by
+    // scanning the source tree. nix-ninja copies DECLARED outputs into store
+    // paths and cannot see the others, so every translation unit that
+    // includes a private header fails with
+    //     fatal error: QtSvg/private/qsvghelper_p.h: No such file or directory
+    // while the header sits in the build tree of the task that made it.
+    // Measured on qtsvg 6.11.1, 2026-08-22, over nine harness runs.
+    //
+    // The DIRECTORY is the declarable unit, because its NAME is knowable at
+    // graph time and its contents are not. Take it from the outputs the rule
+    // already declares rather than from the command line: the public
+    // forwarding headers are declared, they sit under the same
+    // `include/<Module>/` root, and their common prefix is the tree syncqt
+    // fills. Parsing the command's own @-file would read an argument list
+    // this pass has no other reason to interpret.
+    //
+    // Consumers need no change: a translation unit depends on the syncqt
+    // timestamp, and co-output expansion already carries a rule's siblings to
+    // whoever depends on one of them - which is exactly how the PUBLIC
+    // headers reach a TU's input list today. The directory rides the same
+    // edge.
+    if task
+        .cmdline
+        .as_deref()
+        .is_some_and(|c| c.contains("syncqt"))
+    {
+        if let Some(dir) = common_include_root(&task_outputs) {
+            if !task_outputs.contains(&dir) {
+                task_outputs.push(dir);
+            }
+        }
+    }
     let depfile_out: Option<PathBuf> = match (&task.depfile, task.deps.as_deref()) {
         (Some(d), Some("gcc")) if !d.is_empty() => {
             let p = PathBuf::from(d);
@@ -2586,6 +2625,34 @@ fn dedup_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// The `include/<Module>` root shared by a rule's declared outputs, when at
+/// least two of them agree on it. Returns None when the rule declares no
+/// include-tree outputs or when they disagree - a single output would make
+/// its own parent the "common" root, which for `include/QtSvg/QtSvgDepends`
+/// is right and for anything else is a guess, so two is the floor.
+fn common_include_root(outputs: &[PathBuf]) -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for o in outputs {
+        let mut comps = o.components();
+        if comps.next()?.as_os_str() != "include" {
+            continue;
+        }
+        if let Some(module) = comps.next() {
+            let r = Path::new("include").join(module.as_os_str());
+            if !roots.contains(&r) {
+                roots.push(r);
+            }
+        }
+    }
+    // Exactly one module tree, named by at least two declared outputs.
+    if roots.len() != 1 {
+        return None;
+    }
+    let root = roots.remove(0);
+    let named = outputs.iter().filter(|o| o.starts_with(&root)).count();
+    if named >= 2 { Some(root) } else { None }
 }
 
 fn leading_parent_components(p: &Path) -> usize {
@@ -3964,6 +4031,37 @@ mod python_import_names_tests {
                 bd
             ),
             "cd src/core/api && tool @../../../src/core/api/a && touch ../../../src/core/api/ts"
+        );
+        // THE syncqt INCLUDE ROOT, taken from the outputs the rule already
+        // declares. Two agreeing outputs name it; one does not, because a
+        // single output would make its own parent the "common" root.
+        use super::common_include_root;
+        use std::path::PathBuf as PB;
+        assert_eq!(
+            common_include_root(&[
+                PB::from("include/QtSvg/QtSvgDepends"),
+                PB::from("include/QtSvg/qtsvgversion.h"),
+                PB::from("src/svg/Svg_syncqt_timestamp"),
+            ]),
+            Some(PB::from("include/QtSvg"))
+        );
+        // NEGATIVE CONTROLS. A rule with no include outputs declares no tree;
+        // two different module trees are not one root and guessing between
+        // them would declare a directory the rule does not own.
+        assert_eq!(
+            common_include_root(&[PB::from("src/svg/Svg_syncqt_timestamp")]),
+            None
+        );
+        assert_eq!(
+            common_include_root(&[
+                PB::from("include/QtSvg/a.h"),
+                PB::from("include/QtGui/b.h"),
+            ]),
+            None
+        );
+        assert_eq!(
+            common_include_root(&[PB::from("include/QtSvg/only.h")]),
+            None
         );
         // A REPEATED OUTPUT IS DROPPED, ORDER PRESERVED. The positional
         // encoding on the other side makes order load-bearing, so a
