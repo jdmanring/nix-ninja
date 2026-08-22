@@ -1881,7 +1881,20 @@ fn build_task_derivation(
     // guarantees the file exists when the command exits. Anything else stays
     // on the inference path it is on today, so this cannot turn a building
     // task into a failing one.
-    let mut task_outputs: Vec<PathBuf> = task.outputs.clone();
+    // DEDUPED, BECAUSE A REPEATED OUTPUT COSTS A TASK FAILURE RATHER THAN A
+    // WASTED COPY. `drv.outputs` is a map, so a path appearing twice collapses
+    // there and the derivation looks correct; this Vec is not, so
+    // NIX_NINJA_OUTPUTS carries the entry twice and nix-ninja-task copies the
+    // same file to the same destination twice. `fs::copy` REPLICATES THE
+    // SOURCE'S MODE, and CMake writes generated version scripts read-only, so
+    // the first copy leaves a 0444 file and the second dies EACCES:
+    //     copy(src/svg/Svg.version -> /nix/store/...): Permission denied
+    // Measured on qtsvg 6.11.1, 2026-08-22. The message names the store as the
+    // unwritable thing, which sends a reader to sandbox permissions; the
+    // duplicate is invisible unless NIX_NINJA_OUTPUTS is read directly.
+    // Order-preserving, because the encoded list is positional for the reader
+    // on the other side.
+    let mut task_outputs: Vec<PathBuf> = dedup_paths(&task.outputs);
     let depfile_out: Option<PathBuf> = match (&task.depfile, task.deps.as_deref()) {
         (Some(d), Some("gcc")) if !d.is_empty() => {
             let p = PathBuf::from(d);
@@ -2557,6 +2570,18 @@ fn rewrite_ancestor_paths_ups(cmdline: &str, build_dir: &Path, extra_ups: usize)
         ancestor = dir.parent();
     }
     cmdline
+}
+
+/// First occurrence of each path, order preserved.
+fn dedup_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        if seen.insert(p.clone()) {
+            out.push(p.clone());
+        }
+    }
+    out
 }
 
 fn leading_parent_components(p: &Path) -> usize {
@@ -3936,6 +3961,26 @@ mod python_import_names_tests {
             ),
             "cd src/core/api && tool @../../../src/core/api/a && touch ../../../src/core/api/ts"
         );
+        // A REPEATED OUTPUT IS DROPPED, ORDER PRESERVED. The positional
+        // encoding on the other side makes order load-bearing, so a
+        // dedupe that reorders would be a different defect.
+        use super::dedup_paths;
+        use std::path::PathBuf;
+        assert_eq!(
+            dedup_paths(&[
+                PathBuf::from("src/svg/Svg.version"),
+                PathBuf::from("include/QtSvg/QtSvg"),
+                PathBuf::from("src/svg/Svg.version"),
+            ]),
+            vec![
+                PathBuf::from("src/svg/Svg.version"),
+                PathBuf::from("include/QtSvg/QtSvg"),
+            ]
+        );
+        // NEGATIVE CONTROL: a list with no repeat must come back untouched,
+        // or the helper is deleting outputs rather than duplicates.
+        let distinct = vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")];
+        assert_eq!(dedup_paths(&distinct), distinct);
         // No cd prologue: plain rewrite.
         assert_eq!(rewrite_cmdline("tool /work/qt/build/x", bd), "tool x");
         // A CD TARGET ABOVE THE BUILD DIR - qtsvg's version-script rule.
