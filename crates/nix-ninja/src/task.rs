@@ -1180,11 +1180,30 @@ impl Runner {
                                 // compensation instead.
                                 let root_view =
                                     rewrite_ancestor_paths(&raw, &self.config.build_dir);
+                                let mut _rsp_dirs = 0usize;
+                                let mut _rsp_files = 0usize;
                                 for tok in root_view.split_whitespace() {
-                                    if tok.starts_with('-')
-                                        || tok.starts_with('/')
-                                        || !tok.starts_with("../")
-                                    {
+                                    // BUILD-DIR-RELATIVE TOKENS COUNT TOO.
+                                    // The `../` requirement admits only paths
+                                    // that climb OUT of the build dir, which
+                                    // is where a GN source root sits and is
+                                    // not where a CMake project's generated
+                                    // headers sit. syncqt's args name both,
+                                    // and a token skipped here is a header
+                                    // the tool then cannot see - it runs,
+                                    // succeeds, and emits an include tree
+                                    // missing every private forwarding
+                                    // header, which fails later in every
+                                    // translation unit and names no cause.
+                                    // Existence still decides: the branches
+                                    // below only take a token that resolves
+                                    // to a real file or directory, so
+                                    // widening the shape cannot admit a
+                                    // non-path.
+                                    if tok.starts_with('-') || tok.starts_with('/') {
+                                        continue;
+                                    }
+                                    if !tok.contains('/') {
                                         continue;
                                     }
                                     let p = Path::new(tok);
@@ -1195,6 +1214,7 @@ impl Runner {
                                         continue;
                                     }
                                     if p.is_dir() {
+                                        _rsp_dirs += 1;
                                         for input in upload_referenced_dir(
                                             &self.rpc_client,
                                             &self.config.build_dir,
@@ -1204,6 +1224,7 @@ impl Runner {
                                             input_set.insert(input.build_path.clone(), input);
                                         }
                                     } else if p.is_file() {
+                                        _rsp_files += 1;
                                         for input in upload_referenced_file(
                                             &self.rpc_client,
                                             &self.config.build_dir,
@@ -1214,6 +1235,24 @@ impl Runner {
                                         }
                                     }
                                 }
+                                // WHAT THE CONTENT SCAN ACTUALLY TOOK, once
+                                // per rspfile. syncqt's args file names the
+                                // module's source headers, and if none of
+                                // them is uploaded the tool runs and emits
+                                // only the forwarding headers ninja already
+                                // declares - a successful task that produces
+                                // an incomplete include tree, which fails
+                                // later in every translation unit and names
+                                // no cause. A count here separates "the scan
+                                // found nothing" from "the scan was never
+                                // reached", which the failure cannot.
+                                eprintln!(
+                                    "nix-ninja: rspfile {rsp_rel}: {} token(s), \
+                                     {} dir(s), {} file(s) uploaded",
+                                    root_view.split_whitespace().count(),
+                                    _rsp_dirs,
+                                    _rsp_files,
+                                );
                                 let content = rewrite_ancestor_paths_ups(
                                     &raw,
                                     &self.config.build_dir,

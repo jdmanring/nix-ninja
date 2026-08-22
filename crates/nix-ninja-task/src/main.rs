@@ -213,6 +213,37 @@ fn main() -> Result<()> {
                 })?;
             }
         }
+        // AN RSPFILE IS A CARRIER OF CONFIGURE-TIME ABSOLUTE PATHS, and
+        // rewriting the command line does not reach inside it. Qt's syncqt
+        // args file is the case that proves it: it names
+        //     -sourceDir  /build/src/src/svg
+        //     -headers    /build/src/src/svg/qsvghelper_p.h  ... x26
+        // as the paths CMake saw when it CONFIGURED, in a different
+        // derivation with a different root. Inside a task those resolve
+        // nowhere, so syncqt runs, exits zero, and generates forwarding
+        // headers for none of them - an include tree missing every private
+        // header. Every translation unit then fails on QtSvg/private/*, with
+        // nothing in the syncqt task's own log to say why.
+        //
+        // The mapping comes from the file itself, the way the autogen plan's
+        // does. `-binaryDir` names the rspfile's OWN directory in
+        // configure-time absolute form, and the rspfile's path tells us that
+        // directory's actual location now. Pairing them, and then their
+        // parents up the chain, converts every prefix the file can carry.
+        let before = content.len();
+        let content = rewrite_rsp_roots(&content, &rsp);
+        // FIRED OR NOT, once per rspfile. A rewrite that returns its input
+        // unchanged and a rewrite that never ran produce the same file, and
+        // the failure they cause is identical and appears three tasks later.
+        println!(
+            "nix-ninja-task: rsp root rewrite: {} -> {} bytes, binaryDir={:?}",
+            before,
+            content.len(),
+            content
+                .split_whitespace()
+                .skip_while(|t| *t != "-binaryDir")
+                .nth(1)
+        );
         fs::write(&rsp, &content)
             .map_err(|e| anyhow::anyhow!("writing rspfile {rsp_path}: {e}"))?;
         println!("nix-ninja-task: wrote rspfile {rsp_path} ({} bytes)", content.len());
@@ -338,6 +369,64 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Rewrite configure-time absolute roots in an rspfile to where the tree
+/// actually sits now.
+///
+/// Keyed on `-binaryDir`, which names the rspfile's own directory as the
+/// configure step saw it; the rspfile's current path gives the same directory
+/// now. Pairing the two and walking both up together converts the build root,
+/// the source root above it, and anything else the file spells with those
+/// prefixes.
+///
+/// Returns the content unchanged when the key is absent or is not absolute -
+/// an rspfile that carries no configure-time root needs no rewrite, and
+/// guessing one would corrupt a file that was already correct.
+fn rewrite_rsp_roots(content: &str, rsp: &Path) -> String {
+    let mut toks = content.split_whitespace();
+    let mut binary_dir: Option<&str> = None;
+    while let Some(t) = toks.next() {
+        if t == "-binaryDir" {
+            binary_dir = toks.next();
+            break;
+        }
+    }
+    let (Some(bd), Some(actual)) = (binary_dir, rsp.parent()) else {
+        return content.to_string();
+    };
+    if !bd.starts_with('/') {
+        return content.to_string();
+    }
+    let actual = match actual.canonicalize() {
+        Ok(a) => a,
+        Err(_) => actual.to_path_buf(),
+    };
+    // Longest first, and through placeholders, because each pair's
+    // replacement CONTAINS the shorter pairs' text - the same nesting that
+    // made two sequential replaces corrupt each other in the autogen plan.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut from = Some(Path::new(bd));
+    let mut to = Some(actual.as_path());
+    while let (Some(f), Some(t)) = (from, to) {
+        if f.components().count() < 3 || t.components().count() < 3 {
+            break;
+        }
+        pairs.push((
+            f.to_string_lossy().into_owned(),
+            t.to_string_lossy().into_owned(),
+        ));
+        from = f.parent();
+        to = t.parent();
+    }
+    let mut out = content.to_string();
+    for (i, (f, _)) in pairs.iter().enumerate() {
+        out = out.replace(f.as_str(), &format!("\0NNR{i}\0"));
+    }
+    for (i, (_, t)) in pairs.iter().enumerate() {
+        out = out.replace(&format!("\0NNR{i}\0"), t.as_str());
+    }
+    out
 }
 
 /// The directory a `cd <dir> && ...` prologue names, when it is relative.
@@ -615,5 +704,40 @@ mod autogen_rewrite_tests {
         let naive = text.replace(jb, actual_b).replace(js, actual_s);
         assert_ne!(naive, out);
         assert!(naive.contains("/build/source/build/source/"));
+    }
+}
+
+#[cfg(test)]
+mod rsp_root_tests {
+    use super::rewrite_rsp_roots;
+    use std::path::Path;
+
+    #[test]
+    fn maps_configure_time_roots_onto_the_current_tree() {
+        let content = "-module QtSvg -sourceDir /build/src/src/svg \
+-binaryDir /build/src/build/src/svg -headers /build/src/src/svg/a_p.h \
+/build/src/build/include/QtSvg/x.h";
+        let rsp = Path::new("/work/t/src/build/src/svg/Svg_syncqt_args");
+        let out = rewrite_rsp_roots(content, rsp);
+        // The build root and the source root above it both move, and neither
+        // replacement is re-rewritten by the other.
+        assert!(out.contains("-sourceDir /work/t/src/src/svg"), "{out}");
+        assert!(out.contains("/work/t/src/src/svg/a_p.h"), "{out}");
+        assert!(out.contains("/work/t/src/build/include/QtSvg/x.h"), "{out}");
+        // A PRECISE NEGATIVE, not a substring hunt. "/build/src" appears
+        // inside the CORRECT answer - /work/t/src/build/src/svg - so
+        // asserting its absence fails on a passing rewrite. What must be
+        // gone is the configure-time SOURCE root as a whole path.
+        assert!(!out.contains("/build/src/src/svg"), "{out}");
+        assert!(!out.contains("/build/src/build"), "{out}");
+
+        // NEGATIVE CONTROLS: no key, and a relative key. An rspfile carrying
+        // no configure-time root needs no rewrite, and inventing one would
+        // corrupt a file that was already correct.
+        assert_eq!(rewrite_rsp_roots("-flag value", rsp), "-flag value");
+        assert_eq!(
+            rewrite_rsp_roots("-binaryDir src/svg -x y", rsp),
+            "-binaryDir src/svg -x y"
+        );
     }
 }
