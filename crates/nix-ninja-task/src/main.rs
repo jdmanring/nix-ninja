@@ -222,6 +222,10 @@ fn main() -> Result<()> {
         println!("nix-ninja-task: {desc}");
     }
 
+    // CMake's AUTOGEN plan carries CONFIGURE-TIME ABSOLUTE PATHS, and no
+    // rewrite reaches them. See rewrite_autogen_info.
+    rewrite_autogen_info(&cli.cmdline, &build_dir)?;
+
     // Spawn cmdline process via sh like ninja upstream does.
     println!("nix-ninja-task: Running: /bin/sh -c \"{}\"", cli.cmdline);
     let exit_code = spawn_process(&cli.cmdline)?;
@@ -326,6 +330,141 @@ fn ensure_cd_target(cmdline: &str) -> Result<()> {
     Ok(())
 }
 
+/// The value of a top-level `"KEY" : "value"` in a JSON text, without a JSON
+/// parser. CMake writes one key per line and never escapes a path, so this is
+/// exact for the file it is used on and deliberately narrow: it returns None
+/// the moment the shape is not what it expects, and the caller then leaves the
+/// file alone rather than half-rewriting it.
+fn json_string_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let after = &text[text.find(&needle)? + needle.len()..];
+    let after = after.trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    let after = after.strip_prefix('"')?;
+    let end = after.find('"')?;
+    Some(&after[..end])
+}
+
+/// CMAKE'S AUTOGEN PLAN IS A THIRD CARRIER OF ABSOLUTE PATHS, and until this
+/// existed nothing rewrote it.
+///
+/// nix-ninja rewrites absolute ancestor prefixes in the COMMAND LINE, and it
+/// rewrites and re-ships RSPFILE CONTENT. A Qt module's automoc step reads
+/// neither: cmake writes `AutogenInfo.json` at CONFIGURE time with the paths
+/// it saw then, and a task materialises the same tree at a different root, so
+/// every path in the file dangles. cmake reports it as
+///
+///     The header file "SRC:/build/include/QtSvg/qtsvgexports.h" does not exist.
+///
+/// which reads as a missing generated header while the header is present in
+/// the task's own tree under a different prefix.
+///
+/// Absolute-to-absolute, not absolute-to-relative: the file's consumer is
+/// cmake's own autogen driver, which resolves these against nothing in
+/// particular, and a relative spelling would depend on a working directory
+/// this code does not own.
+///
+/// The mapping comes from the file itself. `CMAKE_BINARY_DIR` is what the
+/// build dir was called at configure time and `build_dir` is what it is now;
+/// `CMAKE_SOURCE_DIR` keeps its relationship to the binary dir, so the same
+/// relative step from the new binary dir lands on the new source dir. Deepest
+/// prefix first, because a shallower one is a prefix of it.
+///
+/// The rewritten file REPLACES the materialised symlink, so the command line
+/// needs no change and nothing else has to learn a second spelling.
+fn rewrite_autogen_info(cmdline: &str, build_dir: &Path) -> Result<()> {
+    if !cmdline.contains("cmake_autogen") {
+        return Ok(());
+    }
+    // The path is written to resolve from the command's own cwd, which is the
+    // cd prologue's target when there is one.
+    let base = match cd_prologue_dir(cmdline) {
+        Some(d) => build_dir.join(d),
+        None => build_dir.to_path_buf(),
+    };
+    for tok in cmdline.split_whitespace() {
+        let tok = tok.trim_matches('"');
+        if !tok.ends_with("AutogenInfo.json") {
+            continue;
+        }
+        let path = base.join(tok);
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            // Not ours to diagnose: the command is about to run and will
+            // report a missing plan far better than this would.
+            Err(_) => continue,
+        };
+        let (jb, js) = match (
+            json_string_value(&text, "CMAKE_BINARY_DIR"),
+            json_string_value(&text, "CMAKE_SOURCE_DIR"),
+        ) {
+            (Some(b), Some(s)) if b.starts_with('/') && s.starts_with('/') => {
+                (b.to_string(), s.to_string())
+            }
+            _ => {
+                println!(
+                    "nix-ninja-task: {} has no absolute CMAKE_BINARY_DIR/CMAKE_SOURCE_DIR pair, \
+                     leaving it alone",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let actual_b = build_dir.to_string_lossy().into_owned();
+        // The source dir's relationship to the binary dir is preserved.
+        let rel = pathdiff_lexical(&js, &jb);
+        let actual_s = lexical_normalize(&format!("{actual_b}/{rel}"));
+        let mut out = text;
+        // Deepest first: whichever of the two is longer contains the other.
+        let mut pairs = vec![(jb, actual_b), (js, actual_s)];
+        pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        for (from, to) in &pairs {
+            out = out.replace(from.as_str(), to.as_str());
+        }
+        // The materialised input is a read-only store symlink; replace it.
+        let _ = fs::remove_file(&path);
+        fs::write(&path, &out)
+            .map_err(|e| anyhow::anyhow!("rewriting {}: {e}", path.display()))?;
+        println!(
+            "nix-ninja-task: rewrote autogen plan {} ({} bytes)",
+            path.display(),
+            out.len()
+        );
+    }
+    Ok(())
+}
+
+/// The `../` chain and remainder from `base` to `path`, both absolute and
+/// both already normalised by cmake. Falls back to `path` itself when they
+/// share no root, which the caller then normalises to an absolute result.
+fn pathdiff_lexical(path: &str, base: &str) -> String {
+    let pc: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    let bc: Vec<&str> = base.split('/').filter(|c| !c.is_empty()).collect();
+    let common = pc.iter().zip(bc.iter()).take_while(|(a, b)| a == b).count();
+    let mut out: Vec<String> = vec!["..".into(); bc.len() - common];
+    out.extend(pc[common..].iter().map(|s| (*s).to_string()));
+    if out.is_empty() {
+        ".".into()
+    } else {
+        out.join("/")
+    }
+}
+
+/// Resolve `.` and `..` textually in an absolute path.
+fn lexical_normalize(p: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    format!("/{}", out.join("/"))
+}
+
 fn spawn_process(cmdline: &str) -> Result<i32> {
     ensure_cd_target(cmdline)?;
     let mut cmd = Command::new("/bin/sh");
@@ -357,5 +496,34 @@ mod cd_prologue_tests {
         // A `cd` with no `&&` is not a prologue - it is the whole command,
         // and it changes nothing for the process that follows it.
         assert_eq!(cd_prologue_dir("cd src/svg"), None);
+    }
+}
+
+#[cfg(test)]
+mod autogen_rewrite_tests {
+    use super::{json_string_value, lexical_normalize, pathdiff_lexical};
+
+    #[test]
+    fn reads_a_key_and_maps_the_source_dir_across() {
+        let text = r#"{
+  "CMAKE_SOURCE_DIR" : "/build/src",
+  "CMAKE_BINARY_DIR" : "/build/src/build",
+  "HEADERS" : [ [ "/build/src/build/include/QtSvg/x.h", "Mu", null ] ]
+}"#;
+        assert_eq!(json_string_value(text, "CMAKE_BINARY_DIR"), Some("/build/src/build"));
+        assert_eq!(json_string_value(text, "CMAKE_SOURCE_DIR"), Some("/build/src"));
+        // NEGATIVE CONTROL: an absent key must return None, because the
+        // caller leaves the file untouched on None and half-rewriting it
+        // would be worse than not rewriting it at all.
+        assert_eq!(json_string_value(text, "CMAKE_NOT_A_KEY"), None);
+
+        // The source dir keeps its relationship to the binary dir.
+        assert_eq!(pathdiff_lexical("/build/src", "/build/src/build"), "..");
+        assert_eq!(
+            lexical_normalize("/a/b/src/build/.."),
+            "/a/b/src"
+        );
+        // And a sibling layout, which is the other shape cmake produces.
+        assert_eq!(pathdiff_lexical("/w/src", "/w/build"), "../src");
     }
 }
