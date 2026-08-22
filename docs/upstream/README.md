@@ -253,3 +253,30 @@ each draft's own audit block. What holds the set is not draft coverage: it is
 round 5's pre-PR question, which is James's to send and has not been sent.
 Drafting the remaining items does not change that and must not be reported as
 if it did.
+
+## The prose gate, which lives in the other tree and so never ran here
+
+Added 2026-08-22, after running it for the first time and finding 13 things.
+
+These drafts become issue and PR text on a public repository, which makes them
+the most outward-facing artifacts in either tree. The style rules they are
+written against, and the vale configuration that enforces them, live in the
+ArtNix repository. Nothing there walks this one, so every draft in this
+directory was written under a rule set that was never checked against it.
+
+Run before filing anything from this directory:
+
+    vale --config ~/.claude/styles/vale.ini docs/upstream/*.md
+    grep -c "—" docs/upstream/*.md          # the em-dash standard is ZERO
+
+Not automated, deliberately: filing happens rarely and by hand, an audit is
+already required before anything leaves this directory, and a cross-repo gate
+would put an ArtNix path inside this fork, which is divergence to re-resolve
+at every upstream merge for a check that runs a handful of times a year.
+
+TWO FINDINGS ARE EXPECTED AND MUST NOT BE "FIXED". `roadmap-coverage.md:104`
+quotes the maintainer's own note, which is not ours to edit, and
+`issue-replies.md:356` uses a hedge inside a hypothetical the paragraph is
+rejecting, where the hedge is the subject rather than the claim. A clean run
+is therefore 2 warnings, not 0, and a run reporting 0 means somebody edited a
+quotation.
