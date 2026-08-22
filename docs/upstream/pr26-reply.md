@@ -130,5 +130,5 @@ Round 1 (2026-08-21), drafted and attacked in the same pass:
 
 Not attacked by an independent reader; rule 10 requires that before sending.
 Specifically unaudited: whether jaen or the maintainer would read the "smaller
-than #26" framing as accurate, which is a judgement about their work rather
+than #26" framing as accurate, which is a judgment about their work rather
 than ours.

@@ -5,7 +5,7 @@ right index for sending, and it is the wrong one for answering "what of the
 maintainer's own list is already done", which nobody could read off either
 file. This is that index, against `docs/todo.md` as it stands at `9a07e67`.
 
-Read it before proposing new work. Two items below are largely covered by
+Read it before proposing new work. Two items below are already covered by
 code already written, and neither was visible as covered.
 
 | their todo item | issue | state here |
@@ -102,7 +102,7 @@ cannot enumerate from the source.
    which is the argument for finishing it rather than defending the
    heuristics.
 2. **#18 async `nix store add`.** The maintainer's own note calls it "probably
-   biggest perf bottleneck". Our driver timers now attribute the realise RPC
+   biggest perf bottleneck". Our driver timers now attribute the realize RPC
    separately, so we can measure whether that holds at our scale, which is a
    cheaper first contribution than the change itself.
 3. **#16 configure caching.** Above.
@@ -117,7 +117,7 @@ inference rules.
 **#20, "Add example for CMake project", `help wanted`, open since
 2025-04-01.** It is absent from `docs/todo.md`, which is why this index did not
 carry it until now: the index was built against the todo file, and the todo
-file is not the issue list. An item can be labelled `help wanted` for sixteen
+file is not the issue list. An item can be labeled `help wanted` for sixteen
 months and never appear in the roadmap this file was checking.
 
 It is now the most actionable item here, because the thing #20 asks for is a
@@ -139,7 +139,7 @@ located blocker.
 **PR #43 must be dealt with before anything is offered into #20.**
 RCoeurjoly's "feat: add CMake example and support ninja phony targets" is OPEN,
 CONFLICTING, and untouched since 2026-02-27, and it is an attempt at this same
-issue. Whatever goes into #20 either builds on that PR or says clearly why it
+issue. Whatever goes into #20 either builds on that PR or says explicitly why it
 does not - the same defect this directory just made with #26 and item 7, and
 the second instance is the one that would be inexcusable.
 

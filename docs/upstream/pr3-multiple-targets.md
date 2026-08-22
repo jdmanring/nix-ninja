@@ -52,9 +52,9 @@ construction.
 >   than of the order it was typed, which is what makes two runs comparable.
 >
 > One thing the sort buys that is worth stating, since it is the only
-> behavioural claim here a reviewer cannot read off the diff: with the output
+> behavioral claim here a reviewer cannot read off the diff: with the output
 > order fixed by the target set, `nix-ninja a b` and `nix-ninja b a` produce
-> the same output list, so a caller can diff two runs without normalising
+> the same output list, so a caller can diff two runs without normalizing
 > first.
 
 ## What this PR does not claim

@@ -159,7 +159,7 @@ opens `cd <subdir> && <real command>`; the binary pick skipped `:` and `&&` but
 not `cd`, which is a shell builtin, so the task failed with `Failed to find cd:
 cannot find binary path` - reading as a missing tool rather than as a command
 shape the resolver does not handle. `cd_depth` in the same file already
-recognises that prefix for path rewriting; only the binary pick was never
+recognizes that prefix for path rewriting; only the binary pick was never
 taught it. Stepped over as a pair, since skipping `cd` alone resolves its bare
 directory argument next.
 

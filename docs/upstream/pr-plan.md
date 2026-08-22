@@ -101,7 +101,7 @@ Round 5's hostile read of this plan, from the maintainer's chair, landed one
 objection the plan had no answer to, and it is not about size.
 
 We are proposing that a general ninja-to-nix compiler absorb an unbounded,
-adversarially-discovered, largely chromium-shaped rule set - `.grd` scaled
+adversarially-discovered, chromium-shaped rule set - `.grd` scaled
 images through a context directory, vulcanize project files, jinja
 `FileSystemLoader` siblings, ancestor probing by chromium's layout - while the
 plan's own description says the general solution is depfiles, which is their

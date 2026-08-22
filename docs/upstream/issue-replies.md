@@ -366,7 +366,7 @@ dynamic derivations - and nothing this fork did bears on it. Recorded as
 deliberately unaddressed rather than left invisible.
 
 **#14, "aarch64 support"**. Not ours, for a reason that is a fact about the
-hardware rather than a judgement: everything this fork has measured ran on one
+hardware rather than a judgment: everything this fork has measured ran on one
 x86_64 workstation. Offering anything into an architecture issue from a tree
 that has never been built on that architecture would be exactly the
 untested-claim shape the rest of this directory exists to avoid.

@@ -53,7 +53,7 @@ Three independent readings, all pointing the same way:
 3. Closing the client connection immediately kills the stuck child and
    releases its locks. That is the recovery we implemented and it has not yet
    failed for us, though we did not record a per-kill count, so read it as
-   consistent behaviour rather than as a tally.
+   consistent behavior rather than as a tally.
 
 ### The part that outlives the build
 
@@ -216,7 +216,7 @@ which is the honest ratio for a set of sentences nobody had measured:
   capture, no log. It had propagated purely by restatement. It was the most
   specific-sounding line in the symptom list, which is exactly why it would
   have been the first thing a maintainer tried to use;
-- **"verified per kill" is softened** to consistent behaviour, for the same
+- **"verified per kill" is softened** to consistent behavior, for the same
   reason: no count was recorded, so the tally was an invention;
 - **the orphan RSS figures now carry their method** - one `ps` sample, summed,
   RSS double-counting shared pages;
