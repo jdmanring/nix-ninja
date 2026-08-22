@@ -190,6 +190,14 @@ branch nix-ninja pins (`feature/minimal-pub`) is 9 commits behind it. The
 corrected item and what to ask instead are in `README.md`; do not draft
 against the old destination.
 
+That correction is itself superseded, 2026-08-22, and in the direction that
+reopens the item: `feature/minimal-pub` is the head branch of `evmar/n2` PR
+#140, open since 2025-04-23. The destination is a live pull request thread, not
+a dormant fork, and `hinshun/n2` looking dormant is what a PR head branch looks
+like from outside. Two threads take the two changes: #140 for `pub pools`, and
+issue #119 for `${rspfile}`. `README.md` carries both, and the ordering the
+`${rspfile}` argument has to be made in.
+
 The size figures above describe the vendored COPY and not our changes, and the
 two are not close. Measured 2026-08-22 against a fresh clone of the pinned
 branch, the divergence is `src/load.rs` and `Cargo.toml`, 40 lines - of which

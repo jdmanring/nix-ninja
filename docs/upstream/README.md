@@ -137,6 +137,57 @@ into its own registry checkouts, so the copy was taken from cargo's cache
 rather than from a clone - worth removing whatever else happens to the vendored
 tree, since it is not part of n2.
 
+**AND THE DEAD END ABOVE IS NOT ONE, WHICH REVERSES THIS ITEM'S CONCLUSION
+RATHER THAN REFINING IT.** Everything above this paragraph reasons from
+`hinshun/n2` having issues disabled, zero pull requests and a last push of
+2025-04-23, and reads that as no destination. Checked from the forge
+2026-08-22: `feature/minimal-pub` is the HEAD BRANCH of `evmar/n2` PR #140,
+"Minimal non-breaking changes to support nix-ninja", opened by hinshun
+2025-04-23 and still OPEN. A repository holding a PR head branch looks exactly
+like a dormant fork from the outside - the offer lives in the other repo, and
+every signal we read is a property of where we looked. His #138 (Loader graph
+access) and #139 (jemalloc behind a crate feature) are both MERGED, March 2025,
+so the maintainer takes this author's work.
+
+The reading error is one step past the size error and has the same shape: the
+question asked was "does this repository accept contributions", which has a
+clean answer, and the question that decides the route is "is this branch
+already offered somewhere". Both were answered confidently and only the second
+was about the route.
+
+**TWO DESTINATIONS, and they are different threads.** `pub pools` is a comment
+on #140: one word, on a struct that PR exists to open up - its own body says it
+needs several modules public - and the #140 diff carries no pools hunk. It
+belongs there while the thread is open. The `${rspfile}` change belongs on
+issue #119, "`$rspfile` in command is not evaluated properly", OPEN since
+2024-09-02, where PR #120 has been attempting the same fix since 2024-09-09.
+
+**LEAD THE `${rspfile}` ARGUMENT WITH THE EVALUATOR'S PROPERTY, NOT WITH OUR
+PRE-PASS.** #120 stalled on a review comment about ninja's recursive variable
+lookup and cycle detection. The reason our change does not need detection is
+NOT that its pre-pass leaves `${rspfile}` unbound - that is true and it locates
+the safety in our code, which invites a maintainer to ask what happens when
+someone edits the pre-pass and gets no answer. The safety predates the change:
+`src/eval.rs:42` expands a resolved variable against `&envs[i + 1..]`, so the
+scope slice strictly shrinks and evaluation terminates for every variable in
+n2. evmar's own doc comment on `evaluate` says it - lookups "will be
+recursively expanded starting from the env after the one that had the first
+successful lookup". n2 has no cycle detection because its evaluator cannot
+cycle, which is a deliberate departure from ninja. #120's real problem was
+importing ninja's recursive model into a design that had replaced it.
+
+So the accurate description is small: the change adds one arm to the existing
+magic-variable table in `BuildImplicitVars::get_var`, beside `in` and `out`,
+and touches the evaluation model not at all. The pre-pass is an ordering detail
+mentioned after that, never as the argument. Said in the other order it reads
+as a claim that our code is careful, which is a larger thing to ask him to
+accept and is not what is true.
+
+The audience point belongs in the thread rather than left for him to infer:
+`evmar/n2` is the live upstream and `hinshun/n2` is what nix-ninja pins, so a
+patch here has two possible readers and only one of them is reachable by an
+outside contributor.
+
 Method, because the size figure is what misled every earlier reading of this
 item: clone the pinned branch, `diff -rq` the two trees, and read the files
 that differ. The count of files in a vendored copy says nothing about the
