@@ -1076,6 +1076,35 @@ impl Runner {
             } else {
                 0
             };
+            // A CD TARGET THAT ESCAPES THE BUILD DIR CANNOT BE UNDONE BY
+            // STRIPPING `../`, and cd_depth above is exactly that operation.
+            // For `cd ../src/svg` the rewrite emits `../../build/<rel>` for a
+            // build-dir path: two ups AND a re-descent through `build/`.
+            // Stripping two leaves `build/<rel>`, which is one component off
+            // and registers a second input for the SAME store path at a
+            // bogus build path - two symlinks to one destination, and the
+            // task dies "File exists" while every path in the message is
+            // real. Measured on qtsvg 6.11.1, 2026-08-22, by diffing a
+            // resolved derivation's NIX_NINJA_INPUTS against the same
+            // derivation built by the previous driver: one entry each before,
+            // two after.
+            // So where the target escapes, resolve LEXICALLY against it and
+            // re-express against the build dir. Confined to that case on
+            // purpose: `cd_depth` is correct for a pure descent, several
+            // branches below depend on the spelling it produces, and this is
+            // not the hour to move a path that works.
+            let cd_escapes = args.len() >= 3
+                && args[0] == "cd"
+                && args[2] == "&&"
+                && args[1].starts_with("../");
+            let cd_abs: Option<PathBuf> = if cd_escapes {
+                Some(lexical_join(&self.config.build_dir, Path::new(&args[1])))
+            } else {
+                None
+            };
+            // Owned, so the helper below borrows neither `self` nor the
+            // config while the loop holds `self` mutably.
+            let bdir = self.config.build_dir.clone();
             // json_schema_compiler resolves a cross-namespace type
             // (extensionTypes.InjectDetails from web_view_internal.json) by
             // loading the referenced namespace's schema from the same api
@@ -1127,9 +1156,8 @@ impl Runner {
                         // The blanket rewrite already compensated this token
                         // for the cd depth; strip that prefix back off to
                         // get the build-root-relative file the driver reads.
-                        let rsp_rel = rsp_arg
-                            .strip_prefix(&"../".repeat(cd_depth))
-                            .unwrap_or(rsp_arg);
+                        let rsp_rel_owned = unprefix_cd(rsp_arg, &cd_abs, &bdir, cd_depth);
+                        let rsp_rel: &str = &rsp_rel_owned;
                         if !rsp_rel.is_empty()
                             && !rsp_rel.starts_with('/')
                             && !rsp_rel.starts_with('-')
@@ -1179,11 +1207,19 @@ impl Runner {
                                         }
                                     }
                                 }
-                                let content = rewrite_ancestor_paths_ups(
-                                    &raw,
-                                    &self.config.build_dir,
-                                    cd_depth,
-                                );
+                                // The shipped content is read by a process
+                                // whose cwd is the cd target, so it is
+                                // compensated the same way the cmdline was -
+                                // by depth for a descent, against the target
+                                // itself where the target escapes.
+                                let content = match &cd_abs {
+                                    Some(base) => rewrite_ancestor_paths(&raw, base),
+                                    None => rewrite_ancestor_paths_ups(
+                                        &raw,
+                                        &self.config.build_dir,
+                                        cd_depth,
+                                    ),
+                                };
                                 // Write under a FRESH name: the original is
                                 // usually also a declared input, materialized
                                 // as a read-only store symlink the task's
@@ -1198,6 +1234,25 @@ impl Runner {
                         }
                         continue;
                     }
+                    // NORMALIZE ONCE, AT THE BOUNDARY, rather than teaching
+                    // six branches about the cd prologue. Everything below
+                    // this line treats a relative arg as build-dir-relative,
+                    // which is true for a descent and false when the cd
+                    // target escapes the build dir - there the rewrite emits
+                    // `../../build/<rel>` and an unconverted branch registers
+                    // an input at a build path one component off, duplicating
+                    // a store path already in the set. Converting here leaves
+                    // every branch byte-identical for the descent case, which
+                    // is the case that works today.
+                    // The `@` branch above keeps the ORIGINAL spelling
+                    // deliberately: it pushes an arg_rewrites entry that is
+                    // applied to the emitted cmdline by string replacement,
+                    // and a normalized key would match nothing there.
+                    let arg = if cd_escapes {
+                        unprefix_cd(&arg, &cd_abs, &bdir, cd_depth)
+                    } else {
+                        arg
+                    };
                     // Not a graph node - but GN commands reference source
                     // scripts the graph never declares (gcc_link_wrapper.py
                     // in every host link rule), assuming the runner shares
@@ -2584,6 +2639,27 @@ fn dedup_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
+/// A relative argument written to resolve from a `cd <dir> &&` prologue,
+/// re-expressed relative to the build dir. For a pure descent that is
+/// stripping the `../` chain the rewrite added; where the cd target escapes
+/// the build dir no chain-strip can do it, so resolve lexically against the
+/// target and relativize. Falls back to the argument unchanged rather than
+/// inventing a path.
+fn unprefix_cd(arg: &str, cd_abs: &Option<PathBuf>, build_dir: &Path, cd_depth: usize) -> String {
+    match cd_abs {
+        Some(base) => {
+            let joined = lexical_join(base, Path::new(arg));
+            relative_from(&joined, build_dir)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| arg.to_string())
+        }
+        None => arg
+            .strip_prefix(&"../".repeat(cd_depth))
+            .unwrap_or(arg)
+            .to_string(),
+    }
+}
+
 fn leading_parent_components(p: &Path) -> usize {
     p.components()
         .take_while(|c| matches!(c, std::path::Component::ParentDir))
@@ -3960,6 +4036,27 @@ mod python_import_names_tests {
                 bd
             ),
             "cd src/core/api && tool @../../../src/core/api/a && touch ../../../src/core/api/ts"
+        );
+        // UNDOING A cd PROLOGUE, BOTH SHAPES. A pure descent strips the
+        // `../` chain the rewrite added; an escaping target cannot be
+        // undone that way and resolves lexically instead.
+        use super::unprefix_cd;
+        let bd2 = std::path::Path::new("/build/source/build");
+        assert_eq!(
+            unprefix_cd("../../../src/core/api/a", &None, bd2, 3),
+            "src/core/api/a"
+        );
+        let cd_abs = Some(std::path::PathBuf::from("/build/source/src/svg"));
+        assert_eq!(
+            unprefix_cd("../../build/src/svg/CMakeFiles/x.cmake", &cd_abs, bd2, 2),
+            "src/svg/CMakeFiles/x.cmake"
+        );
+        // NEGATIVE CONTROL: the escaping form must NOT be reachable by the
+        // chain-strip the descent case uses. If it were, this whole branch
+        // would be unnecessary and the duplicate input it fixes impossible.
+        assert_ne!(
+            unprefix_cd("../../build/src/svg/CMakeFiles/x.cmake", &None, bd2, 2),
+            "src/svg/CMakeFiles/x.cmake"
         );
         // A REPEATED OUTPUT IS DROPPED, ORDER PRESERVED. The positional
         // encoding on the other side makes order load-bearing, so a
