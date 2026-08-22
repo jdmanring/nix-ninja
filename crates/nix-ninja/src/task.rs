@@ -1076,35 +1076,6 @@ impl Runner {
             } else {
                 0
             };
-            // A CD TARGET THAT ESCAPES THE BUILD DIR CANNOT BE UNDONE BY
-            // STRIPPING `../`, and cd_depth above is exactly that operation.
-            // For `cd ../src/svg` the rewrite emits `../../build/<rel>` for a
-            // build-dir path: two ups AND a re-descent through `build/`.
-            // Stripping two leaves `build/<rel>`, which is one component off
-            // and registers a second input for the SAME store path at a
-            // bogus build path - two symlinks to one destination, and the
-            // task dies "File exists" while every path in the message is
-            // real. Measured on qtsvg 6.11.1, 2026-08-22, by diffing a
-            // resolved derivation's NIX_NINJA_INPUTS against the same
-            // derivation built by the previous driver: one entry each before,
-            // two after.
-            // So where the target escapes, resolve LEXICALLY against it and
-            // re-express against the build dir. Confined to that case on
-            // purpose: `cd_depth` is correct for a pure descent, several
-            // branches below depend on the spelling it produces, and this is
-            // not the hour to move a path that works.
-            let cd_escapes = args.len() >= 3
-                && args[0] == "cd"
-                && args[2] == "&&"
-                && args[1].starts_with("../");
-            let cd_abs: Option<PathBuf> = if cd_escapes {
-                Some(lexical_join(&self.config.build_dir, Path::new(&args[1])))
-            } else {
-                None
-            };
-            // Owned, so the helper below borrows neither `self` nor the
-            // config while the loop holds `self` mutably.
-            let bdir = self.config.build_dir.clone();
             // json_schema_compiler resolves a cross-namespace type
             // (extensionTypes.InjectDetails from web_view_internal.json) by
             // loading the referenced namespace's schema from the same api
@@ -1156,8 +1127,9 @@ impl Runner {
                         // The blanket rewrite already compensated this token
                         // for the cd depth; strip that prefix back off to
                         // get the build-root-relative file the driver reads.
-                        let rsp_rel_owned = unprefix_cd(rsp_arg, &cd_abs, &bdir, cd_depth);
-                        let rsp_rel: &str = &rsp_rel_owned;
+                        let rsp_rel = rsp_arg
+                            .strip_prefix(&"../".repeat(cd_depth))
+                            .unwrap_or(rsp_arg);
                         if !rsp_rel.is_empty()
                             && !rsp_rel.starts_with('/')
                             && !rsp_rel.starts_with('-')
@@ -1207,19 +1179,11 @@ impl Runner {
                                         }
                                     }
                                 }
-                                // The shipped content is read by a process
-                                // whose cwd is the cd target, so it is
-                                // compensated the same way the cmdline was -
-                                // by depth for a descent, against the target
-                                // itself where the target escapes.
-                                let content = match &cd_abs {
-                                    Some(base) => rewrite_ancestor_paths(&raw, base),
-                                    None => rewrite_ancestor_paths_ups(
-                                        &raw,
-                                        &self.config.build_dir,
-                                        cd_depth,
-                                    ),
-                                };
+                                let content = rewrite_ancestor_paths_ups(
+                                    &raw,
+                                    &self.config.build_dir,
+                                    cd_depth,
+                                );
                                 // Write under a FRESH name: the original is
                                 // usually also a declared input, materialized
                                 // as a read-only store symlink the task's
@@ -1234,25 +1198,6 @@ impl Runner {
                         }
                         continue;
                     }
-                    // NORMALIZE ONCE, AT THE BOUNDARY, rather than teaching
-                    // six branches about the cd prologue. Everything below
-                    // this line treats a relative arg as build-dir-relative,
-                    // which is true for a descent and false when the cd
-                    // target escapes the build dir - there the rewrite emits
-                    // `../../build/<rel>` and an unconverted branch registers
-                    // an input at a build path one component off, duplicating
-                    // a store path already in the set. Converting here leaves
-                    // every branch byte-identical for the descent case, which
-                    // is the case that works today.
-                    // The `@` branch above keeps the ORIGINAL spelling
-                    // deliberately: it pushes an arg_rewrites entry that is
-                    // applied to the emitted cmdline by string replacement,
-                    // and a normalized key would match nothing there.
-                    let arg = if cd_escapes {
-                        unprefix_cd(&arg, &cd_abs, &bdir, cd_depth)
-                    } else {
-                        arg
-                    };
                     // Not a graph node - but GN commands reference source
                     // scripts the graph never declares (gcc_link_wrapper.py
                     // in every host link rule), assuming the runner shares
@@ -2573,32 +2518,36 @@ fn rewrite_cmdline(cmdline: &str, build_dir: &Path) -> String {
                     rewrite_ancestor_paths_ups(tail, build_dir, depth)
                 );
             }
-            // THE CD TARGET CAN SIT ABOVE THE BUILD DIR, and until this
-            // branch existed that command fell through to the plain
-            // rewrite: the tail's paths came out relative to the BUILD
-            // DIR while the shell's cwd was somewhere else entirely.
-            // Measured 2026-08-22 on qtsvg, a CMake project configured
-            // out-of-source at <src>/build, whose version-script rule is
+            // A CD TARGET ABOVE THE BUILD DIR: DROP THE PROLOGUE RATHER
+            // THAN COMPENSATE FOR IT.
+            // CMake configured out-of-source at <src>/build emits rules
+            // that cd into the SOURCE tree, and those used to fall through
+            // to the plain rewrite - which rewrites the tail build-dir
+            // relative AND leaves the cd in place, so every path resolved
+            // from the wrong directory:
             //     cd ../src/svg && cmake -DIN_FILE=src/svg/Svg.version.in ...
-            // `Svg.version.in` is GENERATED into the build dir, so from
-            // ../src/svg it is ../../build/src/svg/Svg.version.in and the
-            // emitted command looked for it one tree over. CMake reports
-            // that as "Input file ... doesn't exists", which reads as a
-            // missing input rather than as a wrong cwd.
-            // `rewrite_ancestor_paths` already emits the climb from its
-            // BASE to each ancestor, so passing the cd target as the base
-            // is the whole fix - no depth arithmetic, and it is correct
-            // for any k levels up and d levels down. The branch above is
-            // left alone deliberately: it produces a longer but equally
-            // valid spelling that other passes match against, and this
-            // change is not licensed to move it.
+            // `Svg.version.in` is generated into the build dir, so CMake
+            // reported "Input file ... doesn't exists" - a missing INPUT,
+            // which is not what was wrong.
+            // The tail is ALREADY correct for a process running in the
+            // build dir, because that is what the plain rewrite produces.
+            // So the prologue is not merely uncompensated, it is the
+            // defect: remove it and the command is right.
+            // WHY NOT RE-EXPRESS THE TAIL AGAINST THE CD TARGET, which is
+            // the other obvious repair and was tried first: it changes the
+            // SPELLING of every path in the command, and several passes
+            // below turn command tokens into input build paths by reading
+            // that spelling. Measured 2026-08-22 - every input in a qtsvg
+            // task registered TWICE, once correctly and once at a path one
+            // component off, and the task then died materialising two
+            // symlinks at one destination. Changing the emitted paths is a
+            // wide change; deleting three characters is a narrow one, and
+            // both fix the same command.
+            // Bounded to a target with no absolute prefix, and the tail is
+            // rewritten exactly as the fallback below would rewrite it, so
+            // nothing downstream sees a spelling it has not always seen.
             if !rel.starts_with('/') {
-                let cd_abs = if Path::new(dir).is_absolute() {
-                    PathBuf::from(dir)
-                } else {
-                    lexical_join(build_dir, Path::new(dir))
-                };
-                return format!("cd {rel} && {}", rewrite_ancestor_paths(tail, &cd_abs));
+                return rewrite_ancestor_paths(tail, build_dir);
             }
         }
     }
@@ -2637,27 +2586,6 @@ fn dedup_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
         }
     }
     out
-}
-
-/// A relative argument written to resolve from a `cd <dir> &&` prologue,
-/// re-expressed relative to the build dir. For a pure descent that is
-/// stripping the `../` chain the rewrite added; where the cd target escapes
-/// the build dir no chain-strip can do it, so resolve lexically against the
-/// target and relativize. Falls back to the argument unchanged rather than
-/// inventing a path.
-fn unprefix_cd(arg: &str, cd_abs: &Option<PathBuf>, build_dir: &Path, cd_depth: usize) -> String {
-    match cd_abs {
-        Some(base) => {
-            let joined = lexical_join(base, Path::new(arg));
-            relative_from(&joined, build_dir)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| arg.to_string())
-        }
-        None => arg
-            .strip_prefix(&"../".repeat(cd_depth))
-            .unwrap_or(arg)
-            .to_string(),
-    }
 }
 
 fn leading_parent_components(p: &Path) -> usize {
@@ -4037,27 +3965,6 @@ mod python_import_names_tests {
             ),
             "cd src/core/api && tool @../../../src/core/api/a && touch ../../../src/core/api/ts"
         );
-        // UNDOING A cd PROLOGUE, BOTH SHAPES. A pure descent strips the
-        // `../` chain the rewrite added; an escaping target cannot be
-        // undone that way and resolves lexically instead.
-        use super::unprefix_cd;
-        let bd2 = std::path::Path::new("/build/source/build");
-        assert_eq!(
-            unprefix_cd("../../../src/core/api/a", &None, bd2, 3),
-            "src/core/api/a"
-        );
-        let cd_abs = Some(std::path::PathBuf::from("/build/source/src/svg"));
-        assert_eq!(
-            unprefix_cd("../../build/src/svg/CMakeFiles/x.cmake", &cd_abs, bd2, 2),
-            "src/svg/CMakeFiles/x.cmake"
-        );
-        // NEGATIVE CONTROL: the escaping form must NOT be reachable by the
-        // chain-strip the descent case uses. If it were, this whole branch
-        // would be unnecessary and the duplicate input it fixes impossible.
-        assert_ne!(
-            unprefix_cd("../../build/src/svg/CMakeFiles/x.cmake", &None, bd2, 2),
-            "src/svg/CMakeFiles/x.cmake"
-        );
         // A REPEATED OUTPUT IS DROPPED, ORDER PRESERVED. The positional
         // encoding on the other side makes order load-bearing, so a
         // dedupe that reorders would be a different defect.
@@ -4085,20 +3992,31 @@ mod python_import_names_tests {
         // source subdir it has to climb out and back down. Before this
         // case existed the command fell through to the plain rewrite and
         // the tail came out build-dir-relative under a different cwd.
+        // A CD TARGET ABOVE THE BUILD DIR: the prologue is DROPPED and the
+        // tail is left exactly as the plain rewrite spells it, so the
+        // command runs in the build dir where those paths resolve.
         assert_eq!(
             rewrite_cmdline(
                 "cd /work/qt/src/svg && cmake -DIN_FILE=/work/qt/build/src/svg/Svg.version.in -P /nix/store/x/G.cmake",
                 bd
             ),
-            "cd ../src/svg && cmake -DIN_FILE=../../build/src/svg/Svg.version.in -P /nix/store/x/G.cmake"
+            "cmake -DIN_FILE=src/svg/Svg.version.in -P /nix/store/x/G.cmake"
         );
-        // NEGATIVE CONTROL for the same branch: a store path must survive
-        // untouched, because the rewrite stops above three components and
-        // a task's tools are all under /nix/store.
+        // NEGATIVE CONTROL: a store path must survive untouched, because the
+        // rewrite stops above three components and a task's tools are all
+        // under /nix/store.
         assert_eq!(
             rewrite_cmdline("cd /work/qt/src/svg && /nix/store/t/bin/tool", bd),
-            "cd ../src/svg && /nix/store/t/bin/tool"
+            "/nix/store/t/bin/tool"
         );
+        // AND THE DESCENT CASE IS UNTOUCHED, which is what bounds this
+        // change: its prologue stays and its tail keeps the depth
+        // compensation every downstream pass reads.
+        assert!(rewrite_cmdline(
+            "cd /work/qt/build/src/core/api && tool @/work/qt/build/src/core/api/a",
+            bd
+        )
+        .starts_with("cd src/core/api && "));
     }
 
     // The idl_parser shape: sys.path.insert into the importer's OWN
