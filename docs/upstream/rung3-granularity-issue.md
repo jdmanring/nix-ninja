@@ -1,4 +1,4 @@
-# DRAFT issue: per-TU derivations take the whole source tree on a CMake project
+# DRAFT issue: a one-file edit rebuilds every TU derivation on a CMake project
 
 Not filed. Sessions stage; James files.
 
@@ -50,18 +50,18 @@ The count is unaffected and the cause is withdrawn.
 
 ## What this draft does NOT claim
 
-It does not say why. Whether the whole-tree input is CMake-specific,
-C++-specific, a consequence of the custom-command path, or a regression is
-unmeasured here, and a cause offered without measurement is the thing this
-staging directory keeps catching in itself.
+It does not say why. Whether the result is CMake-specific, C++-specific, a
+consequence of the custom-command path, or a regression is unmeasured, and a
+cause offered without measurement is the thing this staging directory keeps
+catching in itself - twice in this document alone, the precompiled header and
+then the whole-tree input.
 
-It also does not claim pixman's per-TU inputs were verified in the same run -
-that number is from an earlier run of the same harness, and the two were not
-taken side by side.
+The side-by-side gap an earlier version flagged is CLOSED: pixman and qtsvg
+were run in the same session against the same driver, and the resolved/generator
+split came out of that pairing.
 
-Both gaps are worth closing before filing, and both are cheap: dump one pixman
-TU derivation's inputs and check whether it names whole-tree or per-file, in
-the same session as a qtsvg one.
+What remains open before filing: whether 27 of 27 reproduces off this machine,
+and whether a CMake project smaller than a Qt module shows the same shape.
 
 ## The recipe, because it is a second finding and #20 asks for it
 
