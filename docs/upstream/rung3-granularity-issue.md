@@ -12,14 +12,59 @@ object file - not holding on a CMake project.
 qtsvg 6.11.1, built through `mkMesonPackage` with the CMake arguments below,
 on nix 2.36.0pre with `builder-rpc-v0` available.
 
-    translation-unit derivations:                     27
-    TU derivations that changed after a ONE-FILE
-    comment edit to src/svg/qsvganimate.cpp:          27
+    compiler invocations, unedited rebuild:            0
+    compiler invocations, after a one-file comment
+      edit to src/svg/qsvganimate.cpp:               32
 
-For contrast, the same harness against pixman (meson, C) changed 1 of 35.
+Counted as `Building CXX object` lines in the outer build's own streamed log
+(`nix build -L`), same command both arms. The unedited arm is the control: it
+is what makes the edited arm mean anything, since a phase that compiled
+nothing because its outer derivation was already valid also reports 0.
 
-Repeated with `-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON`: still 27 of 27, so the
+For contrast, pixman (meson, C) through the same harness and driver in the
+same session rebuilt 1 of 35 translation-unit derivations.
+
+Repeated with `-DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON`: unchanged, so the
 precompiled header is not the cause.
+
+## The instrument this draft used first, and why it was withdrawn
+
+Earlier versions led with "27 of 27 translation-unit derivations rebuilt after
+a one-file edit". That number cannot answer the question and is withdrawn.
+
+A generator derivation embeds the whole source tree:
+
+    "src": "/nix/store/<hash>-src"
+
+24 of qtsvg's 27 tasks stay generators, so for those the count is pinned at
+100% by construction and reads the tree hash rather than granularity. 27 of
+27, 26 of 27 and 0 of 27 are all consistent with per-TU granularity working
+perfectly.
+
+The count remains VALID for pixman, whose 35 tasks all resolved with no
+generator involved, which is why the defect went unnoticed: the instrument is
+sound exactly where no dynamic derivation is in play.
+
+## What replaces it, and it is a pairing rather than a ratio
+
+Every generator is named `ninja-build.drv.drv`, so a set difference over
+derivation paths can only ever say "all of N" and never which unit or why.
+Pairing by the task spec's object-file output gives a per-unit answer with the
+changed input named. Paired across the unedited and edited runs, 24 of 27
+labeled:
+
+    src-svg-...-qsvganimate.cpp.o   <- drv-ninja-build.json, ninja-build.drv, src
+    src-svg-...-qsvgfont.cpp.o      <- drv-ninja-build.json, ninja-build.drv, src
+
+`qsvganimate.cpp` is the edited file. `qsvgfont.cpp` is not. They rebuild for
+the identical reason: `src`, the whole tree, which every generator takes as an
+input because it has not resolved which files its unit needs.
+
+That is an observation about generators and NOT a cause. Whether the emitted
+inner derivation for an unaffected unit is also different is unmeasured, and
+it decides which half of the codebase any fix belongs in: a different inner
+derivation is a `task.rs` matter, an identical one that still propagates is a
+CA early-cutoff matter.
 
 ## The population differs in a way that is not explained
 
@@ -60,8 +105,9 @@ The side-by-side gap an earlier version flagged is CLOSED: pixman and qtsvg
 were run in the same session against the same driver, and the resolved/generator
 split came out of that pairing.
 
-What remains open before filing: whether 27 of 27 reproduces off this machine,
-and whether a CMake project smaller than a Qt module shows the same shape.
+What remains open before filing: whether the 0/32 invocation pair reproduces
+off this machine, and whether a CMake project smaller than a Qt module shows
+the same shape.
 
 ## The recipe, because it is a second finding and #20 asks for it
 
@@ -125,7 +171,7 @@ any of the above. It is the one piece here that is ready.
 Round 1 (2026-08-21), drafted and attacked in the same pass:
 
 - the first draft asserted the precompiled header as the cause. Killed by
-  running with PCH disabled: still 27 of 27. Rewritten to record the dead
+  running with PCH disabled: unchanged. Rewritten to record the dead
   hypothesis, because a report that names a wrong cause is worse than one that
   names none;
 - the first draft said "pixman gets 1 of 35" without noting the two runs were
@@ -141,6 +187,14 @@ Round 1 (2026-08-21), drafted and attacked in the same pass:
   bears on whether the project's central claim holds.
 
 Not attacked by an independent reader; rule 10 requires that before filing.
-Specifically unaudited: whether 27 of 27 reproduces on a machine that is not
-this one, and whether a smaller CMake project shows the same shape - both
+Round 2 (2026-08-22): the headline INSTRUMENT was withdrawn, not just a
+cause. "27 of 27" was reading the source-tree hash, because a generator embeds
+`src` and is therefore pinned to change on any edit. Three withdrawals now on
+one failure - precompiled header, whole-tree input, and the count itself - and
+the pattern in all three is a reading whose denominator is fixed by
+construction. The surviving verdict rests on compiler invocations taken with a
+control.
+
+Specifically unaudited: whether the 0/32 pair reproduces on a machine that is
+not this one, and whether a smaller CMake project shows the same shape - both
 worth having before this is filed as a defect rather than as a report.
