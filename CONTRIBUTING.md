@@ -72,7 +72,13 @@ examples (e.g. when iterating on `nix build .#example-nix`) all in one build.
 }
 ```
 
+If there's a good UX way of iterating on `nix-ninja` in a tmp store and without
+modifying your main nix, please contribute!
+
 ### Iterating without touching your system nix
+
+One answer to the invitation above, offered rather than closing it:
+
 
 `contrib/devstore.sh` runs a daemon on a throwaway store as your own user, so
 you can iterate without making a patched nix your system daemon. The daemon

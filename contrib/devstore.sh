@@ -8,6 +8,21 @@
 # daemon, which is a large thing to ask of a contributor and impossible on a
 # shared machine.
 #
+# ISSUE 26 IS THE SAME QUESTION AND ALREADY HOLDS A MAINTAINER'S YES, so this
+# belongs in that thread rather than arriving beside it. jaen opened it as
+# "Use `nix-portable` to allow using the devshell without installing
+# DD-enabled nix globally", and Ericson2314 endorsed the approach on
+# 2026-07-23: "one may still want to not enable experimental features in their
+# main store, so I think thinking about the chroot store for demos is still
+# prudent." That comment also records that `nix flake check` no longer
+# requires experimental features on the main store, which dates any
+# justification for this script written without reading the thread.
+#
+# This takes the `--store` approach the maintainer pointed jaen at, rather
+# than nix-portable, and does NOT attempt jaen's sync-back to the global
+# store - the hard part of that PR and the reason it grew into a separate
+# Rust tool.
+#
 #   contrib/devstore.sh selftest        # prove the store works
 #   contrib/devstore.sh run -- <cmd>    # run a command against it
 #   contrib/devstore.sh stop
