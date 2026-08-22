@@ -414,13 +414,23 @@ fn rewrite_autogen_info(cmdline: &str, build_dir: &Path) -> Result<()> {
         // The source dir's relationship to the binary dir is preserved.
         let rel = pathdiff_lexical(&js, &jb);
         let actual_s = lexical_normalize(&format!("{actual_b}/{rel}"));
-        let mut out = text;
-        // Deepest first: whichever of the two is longer contains the other.
-        let mut pairs = vec![(jb, actual_b), (js, actual_s)];
-        pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
-        for (from, to) in &pairs {
-            out = out.replace(from.as_str(), to.as_str());
-        }
+        // ONE PASS, VIA A PLACEHOLDER, because two sequential replaces
+        // corrupt each other here. The source dir is a PREFIX of the binary
+        // dir (`/build/src` and `/build/src/build`), and the replacement for
+        // the binary dir CONTAINS the source dir's text - measured:
+        //     /build/src/build/include/x.h
+        //   -> /build/source/build/src/build/include/x.h   (binary dir done)
+        //   -> /build/source/build/source/build/src/build/include/x.h
+        // once the source-dir replace runs over the result. cmake then
+        // reports the header as missing relative to a mangled binary dir,
+        // which reads as the rewrite not having happened at all.
+        // The placeholder cannot occur in a path, so the second replace
+        // cannot see the first's output.
+        const HOLD: &str = "\u{0}NN_BINDIR\u{0}";
+        let out = text
+            .replace(jb.as_str(), HOLD)
+            .replace(js.as_str(), actual_s.as_str())
+            .replace(HOLD, actual_b.as_str());
         // The materialised input is a read-only store symlink; replace it.
         let _ = fs::remove_file(&path);
         fs::write(&path, &out)
@@ -525,5 +535,35 @@ mod autogen_rewrite_tests {
         );
         // And a sibling layout, which is the other shape cmake produces.
         assert_eq!(pathdiff_lexical("/w/src", "/w/build"), "../src");
+    }
+
+    #[test]
+    fn nested_prefixes_do_not_rewrite_each_other() {
+        // THE SOURCE DIR IS A PREFIX OF THE BINARY DIR in every out-of-source
+        // CMake layout, so two sequential replaces corrupt each other: the
+        // binary dir's replacement CONTAINS the source dir's text. This is
+        // the exact pair measured on qtsvg.
+        let jb = "/build/src/build";
+        let js = "/build/src";
+        let actual_b = "/build/source/build/src/build";
+        let actual_s = "/build/source/build/src";
+        let text = "\"/build/src/build/include/QtSvg/x.h\" \"/build/src/svg/y.cpp\"";
+
+        const HOLD: &str = "\u{0}NN_BINDIR\u{0}";
+        let out = text
+            .replace(jb, HOLD)
+            .replace(js, actual_s)
+            .replace(HOLD, actual_b);
+        assert_eq!(
+            out,
+            "\"/build/source/build/src/build/include/QtSvg/x.h\" \"/build/source/build/src/svg/y.cpp\""
+        );
+
+        // NEGATIVE CONTROL: the naive two-replace order produces the mangled
+        // path this guards against. If this ever stops differing, the
+        // placeholder is unnecessary and the bug it fixes was impossible.
+        let naive = text.replace(jb, actual_b).replace(js, actual_s);
+        assert_ne!(naive, out);
+        assert!(naive.contains("/build/source/build/source/"));
     }
 }
