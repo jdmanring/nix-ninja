@@ -1950,14 +1950,36 @@ fn build_task_derivation(
         // guards: `: && <real command> && :`. The `:` is a shell builtin,
         // fine at execution time, but it is not a binary to resolve - skip
         // leading no-op tokens to find the real tool.
-        let cmdline_binary = cmdline
-            .split_whitespace()
-            .find(|tok| *tok != ":" && *tok != "&&")
-            .ok_or_else(|| anyhow!("No command found in cmdline"))?
-            // GN quotes interpreter paths ("…/python3.14"); the shell
-            // strips the quotes at exec time, so strip them here too or
-            // `which` is asked for a name with literal quote characters.
-            .trim_matches(|c| c == '"' || c == '\'');
+        //
+        // A CMake CUSTOM COMMAND opens `cd <subdir> &&` instead, and `cd` is
+        // also a shell builtin, so a PATH lookup for it cannot succeed: it
+        // fails the whole task with "Failed to find cd: cannot find binary
+        // path", which reads as a missing tool rather than as a command shape
+        // this resolver does not handle. `cd_depth` above already recognises
+        // this exact prefix to compute how far a post-cd relative path has to
+        // climb back to the build root; only the binary pick was never taught
+        // it.
+        //
+        // `cd` has to be stepped over as a PAIR, which is why this is a loop
+        // rather than one more token in the filter: its argument is a bare
+        // directory name, which is a plausible binary name and would be
+        // resolved in its place, so the failure would move rather than go
+        // away.
+        let mut cmdline_toks = cmdline.split_whitespace();
+        let cmdline_binary = loop {
+            match cmdline_toks.next() {
+                None => return Err(anyhow!("No command found in cmdline")),
+                Some(":") | Some("&&") => continue,
+                Some("cd") => {
+                    cmdline_toks.next();
+                    continue;
+                }
+                // GN quotes interpreter paths ("…/python3.14"); the shell
+                // strips the quotes at exec time, so strip them here too or
+                // `which` is asked for a name with literal quote characters.
+                Some(tok) => break tok.trim_matches(|c| c == '"' || c == '\''),
+            }
+        };
 
         // A command resolving outside the store (e.g. a `../gen.sh` script
         // from the source tree) is a task input handled by
