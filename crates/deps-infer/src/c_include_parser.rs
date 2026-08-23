@@ -98,14 +98,23 @@ fn bfs_parse_includes(
                     continue;
                 }
                 let tail = PathBuf::from(val);
-                let hit = try_resolve(dir, &tail, virtual_paths.as_ref()).or_else(|| {
-                    include_dirs
-                        .iter()
-                        .find_map(|i| try_resolve(i, &tail, virtual_paths.as_ref()))
-                });
-                if let Some(p) = hit {
+                // The spelled declaration must join the HEAD THAT RESOLVED,
+                // not the use's includer dir: libpng's mips_init.c names
+                // "contrib/mips-msa/linux.c", which resolves through -I.
+                // (the build root), and joining the includer dir instead
+                // fabricated mips/contrib/... - a path that exists nowhere
+                // and hard-failed the upload (2026-08-23).
+                let hit = try_resolve(dir, &tail, virtual_paths.as_ref())
+                    .map(|p| (dir.clone(), p))
+                    .or_else(|| {
+                        include_dirs.iter().find_map(|i| {
+                            try_resolve(i, &tail, virtual_paths.as_ref())
+                                .map(|p| (i.clone(), p))
+                        })
+                    });
+                if let Some((head, p)) = hit {
                     resolved.insert(key);
-                    let spelled = lexical_normalize(&dir.join(&tail));
+                    let spelled = lexical_normalize(&head.join(&tail));
                     if spelled != p && spelled.is_relative() && visited.insert(spelled.clone()) {
                         result.push(spelled);
                     }
@@ -582,6 +591,27 @@ mod tests {
             "root override missing: {names:?}");
         assert!(names.iter().any(|n| n.ends_with("body_cm.ch")),
             "guarded default missing: {names:?}");
+    }
+
+    #[test]
+    fn computed_include_resolving_through_include_dir_keeps_that_head() {
+        // libpng mips_init.c: the computed include's value resolves via
+        // -I. (build root), not the includer's own dir; joining the
+        // includer dir fabricated mips/contrib/... which exists nowhere.
+        let _g = SCAN_TEST_LOCK.lock().unwrap();
+        let d = std::env::temp_dir().join(format!("nn-head-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("contrib")).unwrap();
+        std::fs::create_dir_all(d.join("mips")).unwrap();
+        std::fs::write(d.join("contrib/x.c"), "\n").unwrap();
+        std::fs::write(d.join("mips/init.c"),
+            "#define F \"contrib/x.c\"\n#include F\n").unwrap();
+        let got = bfs_parse_includes(
+            vec![d.join("mips/init.c")], &[d.clone()], None).unwrap();
+        let names: Vec<String> = got.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert!(names.iter().any(|n| n.ends_with("contrib/x.c")), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("mips/contrib")),
+            "fabricated spelling declared: {names:?}");
     }
 
     #[test]
