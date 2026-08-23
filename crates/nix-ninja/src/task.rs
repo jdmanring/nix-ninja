@@ -1699,6 +1699,32 @@ impl Runner {
             }
         }
 
+        // A file named INSIDE a -Wl group is an input no branch above
+        // sees: the token starts with '-', so every file-arg branch skips
+        // it, and json-c's version script additionally sits in the SOURCE
+        // root, one level above the build dir the non-gcc blanket covers
+        // (server edition 2026-08-23, ld.bfd: "cannot open linker script
+        // file /build/source/json-c.sym"). Existence decides, as in the
+        // rsp scan above; values of output-taking flags are skipped
+        // because the linker WRITES those.
+        if let Some(cmdline) = &cmdline {
+            for tok in cmdline.split_whitespace() {
+                let Some(group) = tok.strip_prefix("-Wl,") else { continue };
+                for cand in wl_file_candidates(group) {
+                    let p = Path::new(cand);
+                    if !p.is_file() {
+                        continue;
+                    }
+                    let up =
+                        new_opaque_file(&self.rpc_client, &self.config.build_dir, p.to_path_buf())?;
+                    self.add_derived_file(files, up.clone());
+                    if !input_set.contains_key(&up.build_path) {
+                        input_set.insert(up.build_path.clone(), up);
+                    }
+                }
+            }
+        }
+
         // A .template input implies its same-directory .template
         // siblings: inspector_protocol's code_generator.py loads
         // templates through a jinja FileSystemLoader rooted at the
@@ -2868,6 +2894,37 @@ fn outer_output_paths() -> Vec<String> {
 /// duplicate DerivedFile entry, and this helper must not change what the
 /// driver emits - an emission change moves every banked hash mid-campaign.
 /// The client's stamp cache makes the duplicate upload a map lookup anyway.
+/// The elements of one `-Wl,` group (already stripped of the prefix)
+/// that could name input FILES: flags and the values of output-taking
+/// flags are excluded, everything else is a candidate for the caller's
+/// existence check. `--flag=value` and `--flag,value` both parse.
+fn wl_file_candidates(group: &str) -> Vec<&str> {
+    const OUTPUT_FLAGS: [&str; 4] = ["--dependency-file", "-Map", "--Map", "--out-implib"];
+    let mut out = Vec::new();
+    let mut skip_next = false;
+    for el in group.split(',') {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let (flag, val) = match el.split_once('=') {
+            Some((f, v)) => (f, Some(v)),
+            None => (el, None),
+        };
+        if OUTPUT_FLAGS.contains(&flag) {
+            if val.is_none() {
+                skip_next = true;
+            }
+            continue;
+        }
+        let cand = val.unwrap_or(el);
+        if !cand.is_empty() && !cand.starts_with('-') {
+            out.push(cand);
+        }
+    }
+    out
+}
+
 fn new_opaque_files(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &std::path::Path,
@@ -4924,6 +4981,30 @@ mod new_built_file_tests {
                 .parse::<StorePath>()
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn wl_groups_yield_files_and_skip_output_flags() {
+        // json-c, 2026-08-23: the version script travels inside a -Wl
+        // group. Both spellings parse; output-taking flags' values are
+        // never candidates in either spelling; -soname's value IS a
+        // candidate (the caller's existence check rejects it).
+        assert_eq!(
+            super::wl_file_candidates("--version-script,/src/json-c.sym"),
+            vec!["/src/json-c.sym"]
+        );
+        assert_eq!(
+            super::wl_file_candidates("--version-script=/src/json-c.sym"),
+            vec!["/src/json-c.sym"]
+        );
+        assert_eq!(
+            super::wl_file_candidates("--dependency-file,x/link.d,-soname,libx.so.5"),
+            vec!["libx.so.5"]
+        );
+        assert_eq!(
+            super::wl_file_candidates("--dependency-file=x/link.d,-Bsymbolic-functions"),
+            Vec::<&str>::new()
+        );
     }
 
     #[test]
