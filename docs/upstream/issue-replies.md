@@ -370,3 +370,24 @@ hardware rather than a judgment: everything this fork has measured ran on one
 x86_64 workstation. Offering anything into an architecture issue from a tree
 that has never been built on that architecture would be exactly the
 untested-claim shape the rest of this directory exists to avoid.
+
+## #31 (example-hello fails in container: "Building dynamic derivations in one shot is not yet implemented")
+
+Draft reply, staged 2026-08-23, not sent:
+
+That error is nix's, not nix-ninja's: the daemon serving the build has to
+implement building a dynamic derivation end to end, and the nixos/nix
+container image ships a nix that does not. The configuration this fork
+has driven ~1,200-package builds through:
+
+- daemon: nix 2.36.0pre (the `builder-rpc-v0` system feature is in 2.36.0pre
+  and not in 2.35.x; it is not grantable via `system-features` - both
+  versions silently drop the name - so the daemon binary is the only lever)
+- `experimental-features = nix-command flakes ca-derivations
+  dynamic-derivations recursive-nix` in the DAEMON's nix.conf (the
+  client's file does not reach the daemon; `--extra-experimental-features`
+  on the invocation covers the client side)
+
+A four-second probe that answers whether a given daemon qualifies, without
+building anything real: require a nonexistent system feature and read the
+`Available features:` list in the refusal.
