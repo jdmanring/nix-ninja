@@ -2726,8 +2726,19 @@ fn common_include_root(outputs: &[PathBuf]) -> Option<PathBuf> {
         return None;
     }
     let root = roots.remove(0);
+    // ONE NAMED OUTPUT IS THE FLOOR, NOT TWO, and the two-output version is
+    // why this shipped inert. The rule it has to cover is syncqt, whose edge
+    // declares a timestamp and a SINGLE include file - so a floor of two
+    // rejected the one task that writes the tree, while firing happily on a
+    // neighbouring rule that declares several. Measured: exactly one tree
+    // output in a whole qtsvg run, and not from the syncqt task, which is
+    // indistinguishable from the tree working until you check WHICH task
+    // produced it.
+    // A task with one include output now declares a directory holding that
+    // file, which is redundant and correct - the same argument that lets
+    // this be structural rather than gated on the command.
     let named = outputs.iter().filter(|o| o.starts_with(&root)).count();
-    if named >= 2 { Some(root) } else { None }
+    if named >= 1 { Some(root) } else { None }
 }
 
 fn leading_parent_components(p: &Path) -> usize {
@@ -4134,9 +4145,14 @@ mod python_import_names_tests {
             ]),
             None
         );
+        // ONE include output IS enough - syncqt's own edge declares exactly
+        // one, and requiring two rejected the only rule that matters.
         assert_eq!(
-            common_include_root(&[PB::from("include/QtSvg/only.h")]),
-            None
+            common_include_root(&[
+                PB::from("include/QtSvg/only.h"),
+                PB::from("src/svg/Svg_syncqt_timestamp"),
+            ]),
+            Some(PB::from("include/QtSvg"))
         );
         // A REPEATED OUTPUT IS DROPPED, ORDER PRESERVED. The positional
         // encoding on the other side makes order load-bearing, so a

@@ -432,6 +432,19 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         let from = entry.path();
         let to = dst.join(entry.file_name());
         // metadata() follows the link; file_type() would not.
+        // A TOOL'S OWN INCREMENTAL-STATE DIRECTORY MUST NOT BE CAPTURED.
+        // syncqt writes `.syncqt_staging` beside the headers it generates
+        // and reads it to decide the sync is already done. Copying it into
+        // the tree output makes it an INPUT on the next run, syncqt then
+        // skips, and the task succeeds while generating nothing - the output
+        // is byte-identical every time, which reads as determinism rather
+        // than as a short circuit. Measured on qtsvg: eight files captured,
+        // three of them staging, and no private forwarding headers ever.
+        // Dot-directories generally, because this is what tools use for the
+        // purpose and none of them belongs in a declared output.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let md = match fs::metadata(&from) {
             Ok(m) => m,
             // A DANGLING LINK IS NOT AN ERROR HERE. A build tree carries
@@ -569,7 +582,49 @@ fn absolutize_rsp(content: &str, cmdline: &str) -> String {
             out.push_str(line);
         }
     }
-    println!("nix-ninja-task: absolutized {n} rspfile path(s) for syncqt");
+    // WHAT THE REWRITTEN LIST ACTUALLY POINTS AT. A count of rewritten
+    // tokens says the rewrite ran; it does not say the result resolves, and
+    // syncqt answers both cases the same way - exit 0, no output, no headers.
+    // Report the two values everything else depends on, and whether the
+    // source directory it names holds anything.
+    let val_after = |flag: &str| -> Option<String> {
+        let mut it = out.split_whitespace();
+        while let Some(t) = it.next() {
+            if t == flag {
+                return it.next().map(|s| s.to_string());
+            }
+        }
+        None
+    };
+    for flag in ["-sourceDir", "-privateIncludeDir"] {
+        match val_after(flag) {
+            Some(v) => {
+                let hdrs = fs::read_dir(&v)
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter(|e| e.path().extension().is_some_and(|x| x == "h"))
+                            .count() as i64
+                    })
+                    .unwrap_or(-1);
+                println!("nix-ninja-task: {flag} = {v} ({hdrs} header(s), -1 means absent)");
+            }
+            None => println!("nix-ninja-task: {flag} ABSENT from the rewritten rspfile"),
+        }
+    }
+    let heads = out
+        .split_whitespace()
+        .skip_while(|t| *t != "-headers")
+        .filter(|t| t.ends_with(".h"))
+        .count();
+    let heads_ok = out
+        .split_whitespace()
+        .skip_while(|t| *t != "-headers")
+        .filter(|t| t.ends_with(".h") && Path::new(t).exists())
+        .count();
+    println!(
+        "nix-ninja-task: absolutized {n} rspfile path(s) for syncqt; \
+         {heads_ok} of {heads} header path(s) resolve"
+    );
     out
 }
 
