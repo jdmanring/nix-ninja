@@ -4353,13 +4353,35 @@ fn normalize_build_path(build_dir: &Path, p: PathBuf) -> Result<PathBuf> {
 
 fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> DerivedFile {
     let output_name = normalize_output(&build_path.to_string_lossy());
+    // rel_path IS A LOCATION INSIDE THE STORE OUTPUT AND MUST NOT CLIMB.
+    // An out-of-build-dir output (openfec's ../bin/Release/libopenfec.so)
+    // keeps its ../ in build_path, which is a SANDBOX location and is
+    // correct there - but carried verbatim into rel_path, the producer's
+    // copy target `$out/../bin/...` lands OUTSIDE the output (an empty
+    // store dir that reads as success) and the consumer's symlink source
+    // `store-path/../bin/...` names a path that cannot exist. Map each
+    // `..` component to a literal `.nn-up` directory: both sides derive
+    // the location from this one construction, so the producer writes and
+    // the consumer reads the same in-output path. (Server edition attempt
+    // 8, 2026-08-23: `symlink source does not exist:
+    // .../4qv7...so.1.4.2/../bin/Release/libopenfec.so.1.4.2`.)
+    let rel_path: PathBuf = build_path
+        .components()
+        .map(|c| {
+            if c == std::path::Component::ParentDir {
+                std::ffi::OsStr::new(".nn-up")
+            } else {
+                c.as_os_str()
+            }
+        })
+        .collect();
     DerivedFile {
         derived_path: SingleDerivedPath::Built {
             drv_path: Arc::new(derived_path),
             output: output_name.parse().expect("invalid output name"),
         },
-        build_path: build_path.clone(),
-        rel_path: Some(build_path),
+        build_path,
+        rel_path: Some(rel_path),
     }
 }
 
@@ -4783,6 +4805,50 @@ mod rewrite_ancestor_paths_tests {
         let bd = Path::new("/work/qtwe/build/out");
         let cmd = "/nix/store/abc-python/bin/python3 /bin/sh /home/x";
         assert_eq!(rewrite_ancestor_paths(cmd, bd), cmd);
+    }
+}
+
+#[cfg(test)]
+mod new_built_file_tests {
+    use super::new_built_file;
+    use harmonia_store_derivation::derived_path::SingleDerivedPath;
+    use harmonia_store_path::StorePath;
+    use std::path::PathBuf;
+
+    fn dummy_drv() -> SingleDerivedPath {
+        SingleDerivedPath::Opaque(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-x.drv"
+                .parse::<StorePath>()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn rel_path_never_climbs() {
+        // An out-of-build-dir output keeps its climb in build_path (a
+        // sandbox location) and must NOT keep it in rel_path (a location
+        // inside the store output): carried verbatim, the producer copies
+        // to $out/../... (outside the output, silently empty result) and
+        // the consumer reads store-path/../... (cannot exist). openfec,
+        // server edition attempt 8, 2026-08-23.
+        let df = new_built_file(
+            dummy_drv(),
+            PathBuf::from("../bin/Release/libopenfec.so.1.4.2"),
+        );
+        assert_eq!(
+            df.build_path,
+            PathBuf::from("../bin/Release/libopenfec.so.1.4.2")
+        );
+        assert_eq!(
+            df.rel_path,
+            Some(PathBuf::from(".nn-up/bin/Release/libopenfec.so.1.4.2"))
+        );
+    }
+
+    #[test]
+    fn in_tree_output_keeps_rel_path_equal() {
+        let df = new_built_file(dummy_drv(), PathBuf::from("src/main.o"));
+        assert_eq!(df.rel_path, Some(PathBuf::from("src/main.o")));
     }
 }
 
