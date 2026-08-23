@@ -8,6 +8,8 @@
 { lib
 , cmake
 , coreutils
+, ninja
+, writeShellScript
 , nix
 , nix-ninja
 , nix-ninja-task
@@ -25,6 +27,15 @@
 let
   normalizedTarget = builtins.replaceStrings ["/"] ["-"] target;
 
+  dispatchNinja = writeShellScript "nn-cmake-dispatch" ''
+    for a in "$@"; do
+      case "$a" in
+        cmTC_*) exec ${ninja}/bin/ninja "$@" ;;
+      esac
+    done
+    exec ${nix-ninja}/bin/nix-ninja "$@"
+  '';
+
   ninjaDrv = stdenv.mkDerivation (args' // {
     name = "${name}.drv";
 
@@ -35,6 +46,7 @@ let
     nativeBuildInputs = [
       cmake
       coreutils
+      ninja
       nix
       nix-ninja
       nix-ninja-task
@@ -43,10 +55,21 @@ let
 
     requiredSystemFeatures = [ "builder-rpc-v0" ];
 
+    # CMake's configure-time try-compiles (cmTC_* targets) must run under
+    # real ninja: nix-ninja in NIX_NINJA_DRV mode submits the outer output,
+    # and a second submission from a probe is refused as a duplicate. Same
+    # dispatch policy as a compiler drop-in shim: probe targets to ninja,
+    # everything else to nix-ninja.
     cmakeFlags = [
       "-GNinja"
-      "-DCMAKE_MAKE_PROGRAM=${nix-ninja}/bin/nix-ninja"
+      "-DCMAKE_MAKE_PROGRAM=${dispatchNinja}"
     ];
+
+    # Real ninja is present only for the try-compile dispatch; keep its
+    # nixpkgs setup hook from taking over the phases.
+    dontUseNinjaBuild = true;
+    dontUseNinjaInstall = true;
+    dontUseNinjaCheck = true;
 
     preConfigure = ''
       export NIX_NINJA_DRV="true"
