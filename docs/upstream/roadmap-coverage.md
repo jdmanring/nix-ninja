@@ -10,14 +10,15 @@ code already written, and neither was visible as covered.
 
 | their todo item | issue | state here |
 |---|---|---|
-| Phony target support | #5 | **substantially built**, on a different mechanism from PR 43's |
-| Depfile support | #17 | **step one built** 2026-08-21: the depfile is a declared CA output. Steps two and three open |
+| Phony target support | #5 | **substantially built**, on a different mechanism from PR 43's; 2026-08-23 adds the empty-phony no-op (header-only cmake `all`, dcd132a) |
+| Depfile support | #17 | **built end to end** 2026-08-23: declared CA output (dd73947), named via NIX_NINJA_DEPFILE, and the read-back - a fresh on-disk depfile replaces the include scan, guarded by mtime against staleness in the fail-toward-the-scan direction (50fad25). The dynamic task keeps scanning by design: its build dir is reconstructed fresh |
 | `mkMesonPackage` configure caching | #16 | not built; we have a measured argument FOR it |
 | Writing derivation caching for local mode | - | **partly built**: `resolve_cache.rs` |
 | `nix store add` async | #18 | not built |
 | Benchmarks for generating derivations | #4 | profiler samples, no benchmark |
 | Benchmarks for end-to-end compilation | #7 | profiler samples, no benchmark |
 | CMake example (`help wanted`) | #20 | **the recipe is now known and RUN**, 2026-08-21 |
+| meson `-fuse-ld` linker missing from task PATH | #52 | **built** 2026-08-23 (50fad25): the requested linker resolves outside the sandbox and rides in as input + PATH; bfd exempt, unresolved keeps the compiler's own error |
 
 ## The two that are covered and did not look it
 
@@ -180,3 +181,30 @@ same omission tomorrow for #14, #31, #41 or #52.
 Not attacked by an independent reader. Status: internal working document, not
 for sending. If any row is quoted outward it must be re-read against their
 `docs/todo.md` first, which moves without telling us.
+
+
+## 2026-08-23: the whole-graph classes, added while driving a distribution build
+
+Seven defect classes surfaced by building an entire NixOS-style system
+(ArtNix's server edition, ~1,200 derivations) through the driver, each fixed
+at root, each validated by the next full-build attempt building past the
+package that exposed it, and each carried by a unit test where the shape is
+unit-testable:
+
+| class | package that bought it | commit | test |
+|---|---|---|---|
+| out-of-build-dir output: two spellings, one graph node | openfec | b97a3d2 | campaign only (needs a graph) |
+| empty phony target is a no-op | opencl-headers | dcd132a | campaign only |
+| a command that is a graph output | orc (orcc) | 15152f2 | campaign only |
+| rel_path must not climb out of the store output | openfec consumers | fbcbc76 + e9b9f68 | `new_built_file_tests::rel_path_never_climbs` |
+| both rel_path construction sites share one function | attempt-9 drift | e9b9f68 | same test covers the shared fn |
+| cross-file computed includes (`#include MACRO`) | lzo | 27fcdd9 | `computed_include_through_cross_file_define_is_declared`, with a never-defined negative control |
+| depfile read-back replaces the scan when fresh | upstream #17 | 50fad25 | `depfile_read_back_tests::fresh_stale_and_empty` |
+
+The `test`/`install` targets are handled in the CALLER's shim (ArtNix
+`scripts/nn-ninja-shim.sh`, 30-row argv table): both build `all` with every
+output materialized and then run the build system's own installer or test
+driver in the outer derivation. That policy belongs at the shim layer, not
+the driver, because only the caller knows the outer derivation's phases -
+recorded here so a reader looking for the mechanism in this tree knows where
+it lives and why it is absent.
