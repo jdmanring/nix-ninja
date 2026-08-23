@@ -2981,6 +2981,10 @@ fn wl_file_candidates(group: &str) -> Vec<&str> {
     out
 }
 
+/// Uniquifies every temp copy this driver writes; see the nn-outer and
+/// shebang sites for the race a pid-only name loses.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn new_opaque_files(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &std::path::Path,
@@ -3053,9 +3057,16 @@ fn new_opaque_file(
         let data = fs::read(&canonical_path)?;
         match rewrite_bytes(&data, &map) {
             Some(rewritten) => {
+                // UNIQUE PER CALL, not per pid: batched adds run this
+                // concurrently, and two uploads of one file racing a
+                // pid-keyed tmp name hand the daemon a truncated stream
+                // ("string is too long" / "reached end of FramedSource",
+                // gperf 2026-08-23) - and the truncated moment is also
+                // where the empty-config.h spelling came from.
                 let tmp = std::env::temp_dir().join(format!(
-                    "nn-outer-{}-{}",
+                    "nn-outer-{}-{}-{}",
                     std::process::id(),
+                    TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     canonical_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
                 ));
                 fs::write(&tmp, rewritten)?;
@@ -3132,9 +3143,12 @@ fn patched_env_shebang(path: &Path) -> Result<Option<PathBuf>> {
     }
     let dir = std::env::temp_dir().join(format!("nix-ninja-shebang-{}", std::process::id()));
     fs::create_dir_all(&dir)?;
+    // TMP_SEQ, not memo.len(): two concurrent misses could draw the same
+    // length and write one file from two threads (same race as the
+    // nn-outer copies).
     let out = dir.join(format!(
         "{}-{}",
-        memo.lock().unwrap().len(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("script")
