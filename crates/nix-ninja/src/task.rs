@@ -2857,6 +2857,42 @@ fn outer_output_paths() -> Vec<String> {
         .collect()
 }
 
+/// Concurrent `new_opaque_file` over a batch, order-preserving.
+///
+/// Each add is a daemon round trip (NAR upload or a dedup-cache hit), so a
+/// task with N undeclared includes paid N sequential round trips on its
+/// critical path. Upstream #18 names exactly this. Bounded scoped threads,
+/// mirroring the include scanner's own pattern; the client's connection
+/// pool is the daemon-side bound, this const only caps threads per task.
+/// Duplicates are NOT deduped: a duplicate include previously produced a
+/// duplicate DerivedFile entry, and this helper must not change what the
+/// driver emits - an emission change moves every banked hash mid-campaign.
+/// The client's stamp cache makes the duplicate upload a map lookup anyway.
+fn new_opaque_files(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &std::path::Path,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<DerivedFile>> {
+    const PER_TASK_ADDS: usize = 8;
+    let mut out = Vec::with_capacity(paths.len());
+    for chunk in paths.chunks(PER_TASK_ADDS) {
+        let results: Vec<Result<DerivedFile>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|p| scope.spawn(move || new_opaque_file(rpc_client, build_dir, p.clone())))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("upload thread panicked"))))
+                .collect()
+        });
+        for r in results {
+            out.push(r?);
+        }
+    }
+    Ok(out)
+}
+
 fn new_opaque_file(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &std::path::Path,
@@ -4362,11 +4398,9 @@ fn walk_dir_capped_uncached(
         }
     }
     // Upload only after the whole walk fits the cap, so an over-cap dir
-    // costs a directory scan and zero store writes.
-    let mut out = Vec::with_capacity(paths.len());
-    for p in paths {
-        out.push(new_opaque_file(rpc_client, build_dir, p)?);
-    }
+    // costs a directory scan and zero store writes. Batched adds: a
+    // node_modules tree is thousands of files at one round trip each.
+    let out = new_opaque_files(rpc_client, build_dir, paths)?;
     Ok(Some(out))
 }
 
@@ -5110,6 +5144,7 @@ pub fn discover_c_includes(
     };
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
+    let mut to_upload: Vec<PathBuf> = Vec::new();
 
     // Convert input files to a set for filtering
     let input_files: HashSet<PathBuf> = files.into_iter().collect();
@@ -5141,10 +5176,10 @@ pub fn discover_c_includes(
             }
         }
 
-        // Regular file, add to nix store and treat as derived dependency
-        let derived_file = new_opaque_file(rpc_client, build_dir, include)?;
-        discovered_deps.push(derived_file);
+        // Regular file: queued for a batched store add below.
+        to_upload.push(include);
     }
+    discovered_deps.extend(new_opaque_files(rpc_client, build_dir, to_upload)?);
 
     USED_HEADERS.fetch_add(
         used_declared.len() as u64,
