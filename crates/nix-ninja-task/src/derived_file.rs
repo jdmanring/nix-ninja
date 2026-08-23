@@ -137,6 +137,16 @@ pub fn create_symlinks(
     inputs: Vec<DerivedFile>,
     overwrite: bool,
 ) -> Result<()> {
+    // DIRECTORY INPUTS LAST. A tree and an individually declared file can
+    // name the same build path from the same rule - the tree output carries
+    // a copy of every public forwarding header, and each is also its own
+    // output. Whichever is linked first wins, and the second is then a
+    // CONFLICT by the check below: same content, different store path.
+    // The individually declared file is the authoritative one, so the tree
+    // goes last and fills only what is missing, which is what link_tree
+    // already does.
+    let mut inputs = inputs;
+    inputs.sort_by_key(|i| i.absolute_path(store_dir).is_dir());
     for input in inputs {
         let source_path = input.absolute_path(store_dir);
         let dest_path = prefix.join(&input.build_path);

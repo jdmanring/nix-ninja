@@ -232,6 +232,30 @@ fn main() -> Result<()> {
         // parents up the chain, converts every prefix the file can carry.
         let before = content.len();
         let content = rewrite_rsp_roots(&content, &rsp);
+        // SYNCQT SILENTLY IGNORES RELATIVE PATHS, and that is the whole of
+        // why no Qt module could build through this tool.
+        //
+        // Reproduced outside nix, same binary, same source tree, same
+        // argument list, differing only in path form:
+        //     absolute -> 36 files, include/<M>/<ver>/<M>/private populated
+        //     relative ->  6 files, no private tree at all
+        // Both exit 0 and neither prints a word. The driver's rewrite makes
+        // every path in an rspfile relative - correct and necessary for a
+        // compiler, which resolves them from its working directory - and
+        // syncqt discards them instead of resolving them. A translation unit
+        // three tasks later then fails on QtSvg/private/*, which is the
+        // first visible symptom of an argument list thrown away here.
+        //
+        // So put them back, for this tool only. The base is where the command
+        // will actually run: the cd prologue's target if it has one, the
+        // build dir otherwise. Absolutizing every rspfile would be wrong -
+        // a compiler's rsp is correct as it stands and store paths must not
+        // move - which is why this is gated on the tool that needs it.
+        let content = if cli.cmdline.contains("syncqt") {
+            absolutize_rsp(&content, &cli.cmdline)
+        } else {
+            content
+        };
         // FIRED OR NOT, once per rspfile. A rewrite that returns its input
         // unchanged and a rewrite that never ran produce the same file, and
         // the failure they cause is identical and appears three tasks later.
@@ -257,6 +281,33 @@ fn main() -> Result<()> {
     // rewrite reaches them. See rewrite_autogen_info.
     rewrite_autogen_info(&cli.cmdline, &build_dir)?;
 
+    // WHAT THE COMMAND CAN SEE OF A SOURCE TREE ABOVE THE BUILD DIR. An
+    // input materialised at `../src/...` and a command told to look at
+    // `../../../src/...` from a subdirectory resolve to the same place only
+    // if the depth compensation is right, and when it is not the tool finds
+    // an EMPTY directory rather than a missing one: syncqt then generates
+    // forwarding headers for nothing, exits zero, and says nothing.
+    if cli.cmdline.contains("syncqt") {
+        for probe in ["../src", "src"] {
+            let n = fs::read_dir(probe)
+                .map(|rd| rd.flatten().count())
+                .unwrap_or(usize::MAX);
+            println!(
+                "nix-ninja-task: probe {probe}: {}",
+                if n == usize::MAX { "absent".to_string() } else { format!("{n} entries") }
+            );
+        }
+        for probe in ["../src/svg", "src/svg"] {
+            let n = fs::read_dir(probe)
+                .map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "h")).count())
+                .unwrap_or(usize::MAX);
+            println!(
+                "nix-ninja-task: probe {probe}: {}",
+                if n == usize::MAX { "absent".to_string() } else { format!("{n} header(s)") }
+            );
+        }
+    }
+
     // Spawn cmdline process via sh like ninja upstream does.
     println!("nix-ninja-task: Running: /bin/sh -c \"{}\"", cli.cmdline);
     let exit_code = spawn_process(&cli.cmdline)?;
@@ -277,6 +328,43 @@ fn main() -> Result<()> {
         "nix-ninja-task: Finished! Copying {} build outputs to derivation output paths",
         outputs.len(),
     );
+    // WHAT A DIRECTORY OUTPUT ACTUALLY HOLDS, before it is copied out. A
+    // tree output is the only output whose CONTENTS are not knowable from the
+    // graph, so it is the only one where "the task succeeded" and "the task
+    // produced what its consumers need" come apart silently. syncqt exits
+    // zero having written five forwarding headers or five hundred, and the
+    // difference does not surface until a translation unit three tasks later
+    // fails on a header nobody can trace back here.
+    for output in &outputs {
+        if output.build_path.is_dir() {
+            let mut n = 0usize;
+            let mut sample: Vec<String> = Vec::new();
+            let mut stack = vec![output.build_path.clone()];
+            while let Some(d) = stack.pop() {
+                if let Ok(rd) = fs::read_dir(&d) {
+                    for e in rd.flatten() {
+                        let q = e.path();
+                        match fs::metadata(&q) {
+                            Ok(m) if m.is_dir() => stack.push(q),
+                            Ok(_) => {
+                                n += 1;
+                                if sample.len() < 6 {
+                                    sample.push(q.display().to_string());
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+            println!(
+                "nix-ninja-task: tree output {} holds {} file(s): {}",
+                output.build_path.display(),
+                n,
+                sample.join(" ")
+            );
+        }
+    }
     copy_outputs_to_placeholders(&cli.store_dir, &outputs)?;
 
     Ok(())
@@ -426,6 +514,62 @@ fn rewrite_rsp_roots(content: &str, rsp: &Path) -> String {
     for (i, (_, t)) in pairs.iter().enumerate() {
         out = out.replace(&format!("\0NNR{i}\0"), t.as_str());
     }
+    out
+}
+
+/// Make an rspfile's relative paths absolute against the directory the
+/// command will run in. Only paths: a flag, a bare word with no separator, an
+/// already-absolute path and anything that does not resolve are all left
+/// alone, so a token that is not a path cannot be turned into one.
+fn absolutize_rsp(content: &str, cmdline: &str) -> String {
+    let base = match cd_prologue_dir(cmdline) {
+        Some(d) => PathBuf::from(d),
+        None => PathBuf::from("."),
+    };
+    let base = match base.canonicalize() {
+        Ok(b) => b,
+        Err(_) => return content.to_string(),
+    };
+    let mut out = String::with_capacity(content.len() * 2);
+    let mut n = 0usize;
+    // A `-...Dir` flag's VALUE is a directory syncqt may be about to CREATE,
+    // so existence cannot decide for it. `-privateIncludeDir` names the tree
+    // that does not exist until syncqt makes it, and leaving that one
+    // relative is enough on its own to lose every private forwarding header
+    // while the header list is absolute and correct - measured, 30 paths
+    // absolutized and still no private tree. Positional, because the value
+    // is the next token whatever it looks like.
+    let mut prev_is_dir_flag = false;
+    for line in content.split_inclusive('\n') {
+        let tok = line.trim_end_matches(['\n', '\r']);
+        let tail = &line[tok.len()..];
+        let is_dir_value = prev_is_dir_flag;
+        prev_is_dir_flag = tok.starts_with('-') && tok.ends_with("Dir");
+        if tok.starts_with('-') || tok.starts_with('/') || !tok.contains('/') {
+            out.push_str(line);
+            continue;
+        }
+        if is_dir_value {
+            let joined = lexical_normalize(&format!("{}/{}", base.display(), tok));
+            out.push_str(&joined);
+            out.push_str(tail);
+            n += 1;
+            continue;
+        }
+        // EXISTENCE DECIDES, as it does everywhere else in this tool. A
+        // relative token that resolves to nothing is not a path we can
+        // repair, and inventing an absolute spelling for it would replace a
+        // silent miss with a confident wrong answer.
+        let joined = lexical_normalize(&format!("{}/{}", base.display(), tok));
+        if Path::new(&joined).exists() {
+            out.push_str(&joined);
+            out.push_str(tail);
+            n += 1;
+        } else {
+            out.push_str(line);
+        }
+    }
+    println!("nix-ninja-task: absolutized {n} rspfile path(s) for syncqt");
     out
 }
 
