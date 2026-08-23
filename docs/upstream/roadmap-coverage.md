@@ -240,4 +240,12 @@ New whole-graph classes, same format as the table above:
 | `#  define` / `#  include` (whitespace after the hash) invisible to the computed-include scanner | lzo, second failure on the same symptom | 41dc03a | `directive_with_space_after_hash_still_scans`, with a `#definexyz` negative |
 | files named inside `-Wl,` groups (version scripts) never declared | json-c | 1fb92f8 | `wl_groups_yield_files_and_skip_output_flags` |
 | store-add errors name neither the string nor the call | libconfig ("string is too long") | 4509ca7 | instrumentation, not a rule |
-| one build path uploaded at two contents when the outer build regenerates a file mid-scan | gperf (config.h, automake remake rule under make -j) | 9f79161 | campaign only (needs a mutating file); deterministic repro recorded on the gperf drv |
+| one build path uploaded at two contents | gperf (config.h) | 9f79161 (guard) + 95b1b9a (cause) | campaign only; deterministic repro on the gperf drv |
+
+Correction, same day: the gperf two-contents row was first attributed to
+automake regenerating config.h mid-build. Wrong - the named-add-error
+instrumentation showed the empty spelling was a TRUNCATED TEMP COPY: the
+batched adds raced two uploads of one file onto a pid-keyed nn-outer temp
+name (95b1b9a is the cause fix; 9f79161 stays as defense for genuinely
+mutating files). A mechanism claim written before the instrument had
+answered.
