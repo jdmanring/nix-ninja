@@ -207,6 +207,7 @@ pub fn scan_directives(path: &Path) -> Result<Arc<Vec<Directive>>> {
     let f =
         File::open(path).map_err(|e| anyhow!("Failed to open file {}: {}", path.display(), e))?;
     let mut directives = Vec::new();
+    let mut macro_paths: std::collections::HashMap<String, String> = Default::default();
     for line in BufReader::new(f).lines() {
         let line = match line {
             Ok(l) => l,
@@ -218,6 +219,35 @@ pub fn scan_directives(path: &Path) -> Result<Arc<Vec<Directive>>> {
                 quoted: captures.get(1).unwrap().as_str() == "\"",
                 name: PathBuf::from(captures.get(2).unwrap().as_str()),
             });
+            continue;
+        }
+        // A COMPUTED INCLUDE THROUGH A SAME-FILE MACRO:
+        //   #define SIMD_HEADER "simd-support/simd-sse2.h"
+        //   #include SIMD_HEADER
+        // The regex above sees neither, the header is never declared, and
+        // the task dies "No such file or directory" (fftw, every SIMD
+        // codelet, 2026-08-23). Only the one-file, string-literal form is
+        // resolved - the general case is the preprocessor, which is not
+        // this parser's job; an unresolved computed include still fails
+        // loudly in the task, never silently.
+        if let Some(rest) = line.trim_start().strip_prefix("#define ") {
+            let mut it = rest.splitn(2, char::is_whitespace);
+            if let (Some(name), Some(val)) = (it.next(), it.next()) {
+                let val = val.trim();
+                if val.len() > 2 && val.starts_with('"') && val.ends_with('"') && !name.contains('(') {
+                    macro_paths.insert(name.to_string(), val[1..val.len() - 1].to_string());
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = line.trim_start().strip_prefix("#include ") {
+            let token = rest.trim();
+            if let Some(path) = macro_paths.get(token) {
+                directives.push(Directive {
+                    quoted: true,
+                    name: PathBuf::from(path),
+                });
+            }
         }
     }
 
@@ -360,6 +390,23 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// Both counter-touching tests take this: the scan counters are global,
+    /// so two scanning tests in parallel see each other's increments.
+    static SCAN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn computed_include_through_same_file_define_is_declared() {
+        let _g = SCAN_TEST_LOCK.lock().unwrap();
+        let f = std::env::temp_dir().join(format!("nn-ci-test-{}.c", std::process::id()));
+        std::fs::write(&f, "#define SIMD_HEADER \"simd-support/simd-sse2.h\"\n#include SIMD_HEADER\n#include <math.h>\n#define FN(x) \"not-a-path\"\n#include UNKNOWN_MACRO\n").unwrap();
+        let dirs = super::scan_directives(&f).unwrap();
+        let names: Vec<String> = dirs.iter().map(|d| d.name.to_string_lossy().into_owned()).collect();
+        assert!(names.contains(&"simd-support/simd-sse2.h".to_string()), "{names:?}");
+        assert!(names.contains(&"math.h".to_string()));
+        assert!(!names.iter().any(|n| n.contains("not-a-path")));
+        assert_eq!(names.len(), 2);
+    }
+
     #[test]
     fn lexical_normalize_keeps_symlinks_and_leading_parents() {
         use super::lexical_normalize;
@@ -434,6 +481,7 @@ mod tests {
     /// the build silently stops tracking a header.
     #[test]
     fn directive_cache_hits_across_tus_and_invalidates_on_edit() {
+        let _g = SCAN_TEST_LOCK.lock().unwrap();
         use std::io::Write;
         let dir = std::env::temp_dir().join(format!("nnscan{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
