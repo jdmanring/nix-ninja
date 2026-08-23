@@ -255,6 +255,19 @@ fn file_key(path: &Path) -> Option<(u64, u128)> {
     Some((md.len(), mtime))
 }
 
+/// Strip `#\s*<kw>\s+` from a directive line, returning the trimmed rest.
+/// The main INCLUDE_REGEX tolerates whitespace after the `#` and so must
+/// this scanner: lzo writes `#  define LZO_SEARCH_MATCH_INCLUDE_FILE ...`
+/// and `#  include LZO_SEARCH_MATCH_INCLUDE_FILE` (two spaces), which the
+/// glued-literal `strip_prefix("#define ")` missed while the ordinary
+/// include regex matched fine - so only the computed-include half went
+/// blind, and the task died on the undeclared header (2026-08-23).
+fn directive_rest<'a>(line: &'a str, kw: &str) -> Option<&'a str> {
+    let s = line.trim_start().strip_prefix('#')?.trim_start();
+    let rest = s.strip_prefix(kw)?;
+    if rest.starts_with(char::is_whitespace) { Some(rest.trim_start()) } else { None }
+}
+
 /// Parse a file's include directives, memoized across translation units.
 pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
     use std::sync::atomic::Ordering::Relaxed;
@@ -298,7 +311,7 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
         // resolved - the general case is the preprocessor, which is not
         // this parser's job; an unresolved computed include still fails
         // loudly in the task, never silently.
-        if let Some(rest) = line.trim_start().strip_prefix("#define ") {
+        if let Some(rest) = directive_rest(&line, "define") {
             let mut it = rest.splitn(2, char::is_whitespace);
             if let (Some(name), Some(val)) = (it.next(), it.next()) {
                 let val = val.trim();
@@ -308,7 +321,7 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
             }
             continue;
         }
-        if let Some(rest) = line.trim_start().strip_prefix("#include ") {
+        if let Some(rest) = directive_rest(&line, "include") {
             let token = rest.trim();
             if let Some(path) = macro_paths.get(token) {
                 directives.push(Directive {
@@ -499,6 +512,22 @@ mod tests {
         let got2 = bfs_parse_includes(
             vec![d.join("main2.c")], &[], None).unwrap();
         assert_eq!(got2.len(), 1, "only the source itself: {:?}", got2);
+    }
+
+    #[test]
+    fn directive_with_space_after_hash_still_scans() {
+        // lzo again, 2026-08-23: it spells the pair `#  define` and
+        // `#  include`. The first fix matched the glued literal only, so
+        // lzo failed a second time on the identical symptom with the fix
+        // for it already shipped. Same fixture, indented spelling.
+        let _g = SCAN_TEST_LOCK.lock().unwrap();
+        let f = std::env::temp_dir().join(format!("nn-sp-test-{}.c", std::process::id()));
+        std::fs::write(&f, "#  define SM_INC \"sm2_impl.h\"\n#  include SM_INC\n").unwrap();
+        let dirs = super::scan_directives(&f).unwrap();
+        let names: Vec<String> = dirs.directives.iter().map(|d| d.name.to_string_lossy().into_owned()).collect();
+        assert!(names.contains(&"sm2_impl.h".to_string()), "{names:?}");
+        // `#definexyz` must not parse as a define.
+        assert!(super::directive_rest("#definexyz A \"b.h\"", "define").is_none());
     }
 
     #[test]
