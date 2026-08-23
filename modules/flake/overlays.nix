@@ -95,6 +95,10 @@
         inherit (self) nix-ninja nix-ninja-task;
         nix = inputs.nix.packages.${self.system}.nix;
       };
+      mkCMakePackage = self.callPackage ./pkgs/mkCMakePackage {
+        inherit (self) nix-ninja nix-ninja-task;
+        nix = inputs.nix.packages.${self.system}.nix;
+      };
 
       # meson --internal symbolextractor depends on readelf.
       # meson = super.meson.overrideAttrs(o: {
@@ -172,6 +176,12 @@
         src = ./examples/dynamic-deps;
         target = "main";
         nativeBuildInputs = [ self.nlohmann_json self.pkg-config ];
+      };
+
+      example-cmake-hello = self.mkCMakePackage {
+        name = "example-cmake-hello";
+        src = ./examples/cmake-hello;
+        target = "hello";
       };
 
       example-nix = self.callPackage ./examples/nix { src = inputs.nix; };

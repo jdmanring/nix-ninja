@@ -133,21 +133,36 @@ where
     let mut handles = Vec::new();
 
     for entry in paths {
-        let path = match entry {
-            Ok(value) => canonicalize_cached(value.clone(), virtual_paths.as_ref().as_ref())
-                .map_err(|e| anyhow!("{:?}", e))?
-                .ok_or(anyhow!(
-                    "Required file not found {}",
-                    value.to_string_lossy()
-                ))?,
+        // The canonical path is where the CONTENT is read (a virtual or
+        // symlinked file resolves to its real bytes); the path AS QUEUED
+        // is where the compiler stands when it resolves the file's quoted
+        // includes, so resolution must run from the spelled parent. nspr,
+        // 2026-08-23: canonicalizing before the scan collapsed
+        // dist/include/nspr/prtypes.h (a symlink) to its source location,
+        // so its "obsolete/protypes.h" was declared only at the source
+        // spelling and the sandbox compile died at the dist one.
+        let (spelled, path) = match entry {
+            Ok(value) => {
+                let canon = canonicalize_cached(value.clone(), virtual_paths.as_ref().as_ref())
+                    .map_err(|e| anyhow!("{:?}", e))?
+                    .ok_or(anyhow!(
+                        "Required file not found {}",
+                        value.to_string_lossy()
+                    ))?;
+                (value, canon)
+            }
             Err(e) => return Err(anyhow!("{:?}", e)),
         };
         let includes = includes.clone();
         let virtual_paths = virtual_paths.clone();
 
         handles.push(std::thread::spawn(move || {
-            let includes = match extract_includes(&path, &includes, virtual_paths.as_ref().as_ref())
-            {
+            let includes = match extract_includes(
+                &path,
+                &spelled,
+                &includes,
+                virtual_paths.as_ref().as_ref(),
+            ) {
                 Ok(value) => value,
                 Err(e) => {
                     return Err(e);
@@ -159,7 +174,11 @@ where
                 Ok(scan) => (scan.path_defines.clone(), scan.macro_uses.clone()),
                 Err(_) => (Vec::new(), Vec::new()),
             };
-            Ok(SourceWithIncludes { path, includes, path_defines, macro_uses })
+            // `path` carries the SPELLED location onward: bfs resolves a
+            // later computed include from this file's parent, and the
+            // compiler resolves from where the file was reached, not from
+            // its canonical home.
+            Ok(SourceWithIncludes { path: spelled, includes, path_defines, macro_uses })
         }));
     }
 
@@ -358,11 +377,15 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
 /// Also, C23 `#embed` resolves quoted names the same way.
 pub fn extract_includes(
     path: &PathBuf,
+    spelled: &Path,
     include_dirs: &[PathBuf],
     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
     let scan = scan_directives(path)?;
-    let parent_dir = PathBuf::from(path.parent().unwrap());
+    // Quoted includes resolve from where the file was REACHED (spelled),
+    // which differs from the canonical parent when the file was reached
+    // through a symlink; see the caller.
+    let parent_dir = PathBuf::from(spelled.parent().unwrap_or_else(|| path.parent().unwrap()));
     let mut result = Vec::new();
 
     // A HEADER REACHED THROUGH A SYMLINKED DIRECTORY IS DECLARED TWICE: at
@@ -528,6 +551,49 @@ mod tests {
         assert!(names.contains(&"sm2_impl.h".to_string()), "{names:?}");
         // `#definexyz` must not parse as a define.
         assert!(super::directive_rest("#definexyz A \"b.h\"", "define").is_none());
+    }
+
+    #[test]
+    fn symlinked_include_dir_declares_nested_quoted_include_at_both_spellings() {
+        // nspr, 2026-08-23: dist/include/nspr/prtypes.h is a symlink to
+        // pr/include/prtypes.h, which includes "obsolete/protypes.h";
+        // dist/include/nspr/obsolete/protypes.h is also a symlink. The
+        // compiler resolves the nested quoted include at the SPELLED
+        // location, so the scan must declare it there too, not only at
+        // the canonical source spelling.
+        let _g = SCAN_TEST_LOCK.lock().unwrap();
+        let d = std::env::temp_dir().join(format!("nn-nspr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for sub in ["pr/include/obsolete", "dist/include/nspr/obsolete", "lib"] {
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+        }
+        std::fs::write(d.join("pr/include/prtypes.h"),
+            "#include \"obsolete/protypes.h\"\n").unwrap();
+        std::fs::write(d.join("pr/include/obsolete/protypes.h"), "\n").unwrap();
+        std::os::unix::fs::symlink("../../../pr/include/prtypes.h",
+            d.join("dist/include/nspr/prtypes.h")).unwrap();
+        std::os::unix::fs::symlink("../../../../pr/include/obsolete/protypes.h",
+            d.join("dist/include/nspr/obsolete/protypes.h")).unwrap();
+        std::fs::write(d.join("lib/strlen.c"), "#include \"prtypes.h\"\n").unwrap();
+        // Relative paths, as the real cmdline spells them
+        // (-I../../../dist/include/nspr from lib/libc/src): the spelled
+        // declaration is gated on is_relative, so an absolute fixture
+        // tests a different branch than the defect lives in.
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(d.join("lib")).unwrap();
+        let got = bfs_parse_includes(
+            vec![PathBuf::from("strlen.c")],
+            &[PathBuf::from("../dist/include/nspr")],
+            None,
+        );
+        std::env::set_current_dir(prev).unwrap();
+        let got = got.unwrap();
+        let names: Vec<String> =
+            got.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert!(
+            names.iter().any(|n| n.contains("dist/include/nspr/obsolete/protypes.h")),
+            "nested quoted include missing its spelled location: {names:?}"
+        );
     }
 
     #[test]
