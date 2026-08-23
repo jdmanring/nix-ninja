@@ -34,8 +34,13 @@ fn bfs_parse_includes(
     // and uses wait until their macro appears - preprocessing order is not
     // modeled, which can only OVER-declare (harmless: an extra input), never
     // under-declare relative to the old behavior of dropping the use.
-    let mut tu_defines: rustc_hash::FxHashMap<String, String> = Default::default();
+    // Name -> every value seen this TU, because a use resolves against
+    // ALL of them (guarded defaults vs root overrides; over-declaration is
+    // the safe direction). Uses are kept for the whole walk so a value
+    // arriving after the use still resolves; `resolved` dedups the pairs.
+    let mut tu_defines: rustc_hash::FxHashMap<String, Vec<String>> = Default::default();
     let mut pending_uses: Vec<(PathBuf, String)> = Vec::new();
+    let mut resolved: rustc_hash::FxHashSet<(PathBuf, String, String)> = Default::default();
 
     // Initialize queue with starting files
     for file in files {
@@ -66,7 +71,10 @@ fn bfs_parse_includes(
                 }
             }
             for (k, v) in source.path_defines {
-                tu_defines.entry(k).or_insert(v);
+                let vals = tu_defines.entry(k).or_default();
+                if !vals.contains(&v) {
+                    vals.push(v);
+                }
             }
             if let Some(dir) = source.path.parent() {
                 for u in source.macro_uses {
@@ -80,31 +88,34 @@ fn bfs_parse_includes(
         // after. Unresolved uses stay pending for a later batch's defines;
         // one never defined stays undeclared, and the task then fails
         // loudly, which is the old behavior.
-        let mut still_pending = Vec::new();
-        for (dir, name) in pending_uses.drain(..) {
-            let Some(val) = tu_defines.get(&name) else {
-                still_pending.push((dir, name));
+        for (dir, name) in pending_uses.iter() {
+            let Some(vals) = tu_defines.get(name) else {
                 continue;
             };
-            let tail = PathBuf::from(val);
-            let resolved = try_resolve(&dir, &tail, virtual_paths.as_ref())
-                .or_else(|| {
+            for val in vals {
+                let key = (dir.clone(), name.clone(), val.clone());
+                if resolved.contains(&key) {
+                    continue;
+                }
+                let tail = PathBuf::from(val);
+                let hit = try_resolve(dir, &tail, virtual_paths.as_ref()).or_else(|| {
                     include_dirs
                         .iter()
                         .find_map(|i| try_resolve(i, &tail, virtual_paths.as_ref()))
                 });
-            if let Some(p) = resolved {
-                let spelled = lexical_normalize(&dir.join(&tail));
-                if spelled != p && spelled.is_relative() && visited.insert(spelled.clone()) {
-                    result.push(spelled);
-                }
-                if visited.insert(p.clone()) {
-                    queue.push_back(p.clone());
-                    result.push(p);
+                if let Some(p) = hit {
+                    resolved.insert(key);
+                    let spelled = lexical_normalize(&dir.join(&tail));
+                    if spelled != p && spelled.is_relative() && visited.insert(spelled.clone()) {
+                        result.push(spelled);
+                    }
+                    if visited.insert(p.clone()) {
+                        queue.push_back(p.clone());
+                        result.push(p);
+                    }
                 }
             }
         }
-        pending_uses = still_pending;
     }
 
     Ok(result)
@@ -347,6 +358,16 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
                     quoted: true,
                     name: PathBuf::from(path),
                 });
+                // AND still a use for the walk. A same-file define is often
+                // a GUARDED DEFAULT (#if !defined ... #define ... "x.ch")
+                // that the TU's root file overrides two files up, so the
+                // same-file value alone under-declares exactly the header
+                // the preprocessor picks (lzo, third failure, 2026-08-23).
+                // The walk over-declares both candidates; an extra input is
+                // harmless, a missing one kills the task.
+                if token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    macro_uses.push(token.to_string());
+                }
             } else if !token.is_empty()
                 && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
             {
@@ -535,6 +556,32 @@ mod tests {
         let got2 = bfs_parse_includes(
             vec![d.join("main2.c")], &[], None).unwrap();
         assert_eq!(got2.len(), 1, "only the source itself: {:?}", got2);
+    }
+
+    #[test]
+    fn guarded_default_declares_both_candidate_headers() {
+        // lzo's third failure, 2026-08-23: lzo1_99.c defines
+        // LZO_CODE_MATCH_INCLUDE_FILE "lzo1_cm.ch", then includes a .ch
+        // that carries a guarded default for the same macro and the
+        // `#include MACRO`. The same-file resolution alone declares only
+        // the default; the preprocessor picks the root's value. Both must
+        // be declared.
+        let _g = SCAN_TEST_LOCK.lock().unwrap();
+        let d = std::env::temp_dir().join(format!("nn-gd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("root.c"),
+            "#define CM_FILE \"root_cm.ch\"\n#include \"body.ch\"\n").unwrap();
+        std::fs::write(d.join("body.ch"),
+            "#if !defined(CM_FILE)\n#  define CM_FILE \"body_cm.ch\"\n#endif\n#  include CM_FILE\n").unwrap();
+        std::fs::write(d.join("root_cm.ch"), "\n").unwrap();
+        std::fs::write(d.join("body_cm.ch"), "\n").unwrap();
+        let got = bfs_parse_includes(vec![d.join("root.c")], &[], None).unwrap();
+        let names: Vec<String> = got.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert!(names.iter().any(|n| n.ends_with("root_cm.ch")),
+            "root override missing: {names:?}");
+        assert!(names.iter().any(|n| n.ends_with("body_cm.ch")),
+            "guarded default missing: {names:?}");
     }
 
     #[test]
