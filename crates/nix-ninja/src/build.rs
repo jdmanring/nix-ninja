@@ -7,6 +7,7 @@ use n2::graph::{Build, BuildId, FileId, Graph};
 use n2::{canon, load, scanner};
 use nix_builder_rpc_client::BuilderRpcClient;
 use nix_ninja_task::derived_file::DerivedFile;
+use harmonia_store_derivation::derived_path::SingleDerivedPath;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,6 +94,32 @@ pub fn build(
                 outputs.push(df);
             }
         }
+    }
+    // EVERY TASK OUTPUT, not only the requested targets', when asked. The
+    // drop-in's install step runs in the OUTER derivation: CMake's
+    // cmake_install.cmake copies libraries, plugins, the syncqt include
+    // tree and generated .pri files out of the build dir by absolute path,
+    // and `ninja install` through this driver cannot do that - a task
+    // sandbox has no $out and no view of the other tasks' outputs
+    // (qtsvg: "file INSTALL cannot find .../lib/libQt6Svg.so.6.11.1",
+    // 2026-08-23). So the build dir has to look built before the installer
+    // runs, and `all` alone leaves every intermediate absent. Opt-in by
+    // environment because it is what the ninja drop-in wants and not what
+    // a plain `nix-ninja <target>` caller expects to find on disk.
+    if std::env::var_os("NIX_NINJA_MATERIALIZE_ALL").is_some() {
+        let mut extra: Vec<DerivedFile> = runner
+            .derived_files
+            .values()
+            .filter(|df| matches!(df.derived_path, SingleDerivedPath::Built { .. }))
+            .filter(|df| seen.insert(df.build_path.clone()))
+            .cloned()
+            .collect();
+        extra.sort();
+        eprintln!(
+            "nix-ninja: NIX_NINJA_MATERIALIZE_ALL: {} further task output(s) will be linked",
+            extra.len()
+        );
+        outputs.extend(extra);
     }
     outputs.sort();
 

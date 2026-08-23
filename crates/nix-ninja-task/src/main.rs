@@ -90,7 +90,38 @@ fn main() -> Result<()> {
     // a `..`-heavy input escaping the writable tree (mkdir /src, EACCES).
     // The task knows its FINAL input list, so it deepens its own build
     // dir with synthetic components until every climb stays under /build.
+    //
+    // THE MEASURE IS WHERE A CLIMB LANDS, NOT HOW FAR IT CLIMBS. When the
+    // driver hands over the real build dir (`/build/<src>/build`, the
+    // drop-in case), inputs arrive as the model's absolute-path alias,
+    // `../../../../../build/<src>/tests/x`: more `..` than the dir is deep,
+    // because the chain was compensated for a `cd <subdir>` the input is
+    // not resolved from. Under POSIX a `..` at `/` is a no-op, so that
+    // alias resolves to `/build/<src>/tests/x` - exactly where the file
+    // belongs - and deepening the dir to "absorb" the climb is what moved
+    // it away (qtsvg, 2026-08-23: cwd became `build/nnd0` and CMake's
+    // autogen plan, rewritten against the cwd, lost its sources). Resolve
+    // each input with the root clamped and deepen only for one that ends
+    // OUTSIDE /build, which is the case the defence was written for.
     let build_dir = {
+        let escapes = |dir: &std::path::Path| -> usize {
+            inputs
+                .iter()
+                .filter(|i| {
+                    let mut p = dir.to_path_buf();
+                    for c in i.build_path.components() {
+                        match c {
+                            std::path::Component::ParentDir => {
+                                p.pop(); // false at "/" and that is the clamp
+                            }
+                            std::path::Component::CurDir => {}
+                            other => p.push(other),
+                        }
+                    }
+                    !p.starts_with("/build")
+                })
+                .count()
+        };
         let max_up = inputs
             .iter()
             .map(|i| leading_ups(&i.build_path))
@@ -102,7 +133,7 @@ fn main() -> Result<()> {
             .map(|r| r.components().count())
             .unwrap_or(usize::MAX);
         let mut b = cli.build_dir.clone();
-        if below_build != usize::MAX && max_up > below_build {
+        if below_build != usize::MAX && max_up > below_build && escapes(&b) > 0 {
             for i in 0..(max_up - below_build) {
                 b.push(format!("nnd{i}"));
             }
@@ -271,6 +302,49 @@ fn main() -> Result<()> {
         fs::write(&rsp, &content)
             .map_err(|e| anyhow::anyhow!("writing rspfile {rsp_path}: {e}"))?;
         println!("nix-ninja-task: wrote rspfile {rsp_path} ({} bytes)", content.len());
+        // THE ARGUMENT LIST syncqt RAN WITH, verbatim. Every syncqt
+        // failure so far has been "exit 0, wrong files", with the cause
+        // in the rspfile and nothing in the log saying what it held.
+        if cli.cmdline.contains("syncqt") {
+            for l in content.lines() {
+                println!("nix-ninja-task: rsp| {l}");
+            }
+            // syncqt SKIPS A HEADER THAT IS A SYMLINK, silently. It
+            // weakly_canonical()s every header (qtbase 6.11
+            // src/tools/syncqt/main.cpp:1687), which resolves our store
+            // symlink to /nix/store/..., then asks whether that string
+            // starts with -sourceDir (:824, :852); it never does, so the
+            // header is "outside the sync directories", no forwarding
+            // header is written, and it exits 0. Reproduced outside nix,
+            // same binary, same rspfile, differing only in whether the
+            // headers are files or links: 14 files against 6. So for this
+            // one consumer the inputs it names are materialized as COPIES.
+            // Narrow on purpose: everything else reads through a link.
+            let n = dereference_rsp_headers(&content)?;
+            println!("nix-ninja-task: syncqt: {n} symlinked header(s) replaced by copies");
+            // NO INHERITED STAGING STATE. syncqt reads `<includeDir>/
+            // .syncqt_staging` to decide the sync is already done, and a
+            // materialized one (from a prior run's tree, via the build-dir
+            // blanket) makes it skip and succeed generating nothing. The
+            // tree output now carries the staging dir because the install
+            // rule needs it, so the guard moves here: whatever arrived is
+            // removed before the tool runs, and what it writes is its own.
+            let mut it = content.split_whitespace();
+            while let Some(t) = it.next() {
+                if t == "-includeDir" {
+                    if let Some(inc) = it.next() {
+                        let staging = Path::new(inc).join(".syncqt_staging");
+                        if staging.symlink_metadata().is_ok() {
+                            fs::remove_dir_all(&staging).or_else(|_| fs::remove_file(&staging)).map_err(|e| {
+                                anyhow::anyhow!("removing inherited {}: {e}", staging.display())
+                            })?;
+                            println!("nix-ninja-task: syncqt: removed inherited {}", staging.display());
+                        }
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     if let Some(desc) = cli.description {
@@ -442,7 +516,15 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         // three of them staging, and no private forwarding headers ever.
         // Dot-directories generally, because this is what tools use for the
         // purpose and none of them belongs in a declared output.
-        if entry.file_name().to_string_lossy().starts_with('.') {
+        // EXCEPT `.syncqt_staging` ITSELF, since 2026-08-23: Qt's install
+        // rule installs the module's public headers FROM that directory
+        // (`file(INSTALL ... include/QtSvg/.syncqt_staging)`), so a tree
+        // without it installs a library with no headers. The short circuit
+        // the exclusion guarded against is closed at its cause instead: the
+        // syncqt branch in main() deletes any staging dir that arrived as an
+        // input before the tool runs, so syncqt never finds a sync "done".
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && name != ".syncqt_staging" {
             continue;
         }
         let md = match fs::metadata(&from) {
@@ -528,6 +610,43 @@ fn rewrite_rsp_roots(content: &str, rsp: &Path) -> String {
         out = out.replace(&format!("\0NNR{i}\0"), t.as_str());
     }
     out
+}
+
+/// Replace every symlinked path named under `-headers` / `-generatedHeaders`
+/// in a syncqt rspfile with a regular-file copy of its target, mode kept.
+/// Returns how many were replaced. A path that is not a symlink, or not a
+/// file, is left alone; a copy that fails is an error, because a header
+/// silently left as a link is exactly the failure this exists to stop.
+fn dereference_rsp_headers(content: &str) -> Result<usize> {
+    let mut n = 0usize;
+    let mut in_headers = false;
+    for tok in content.lines().map(str::trim) {
+        if tok.starts_with('-') {
+            in_headers = tok == "-headers" || tok == "-generatedHeaders";
+            continue;
+        }
+        if !in_headers || tok.is_empty() {
+            continue;
+        }
+        let p = Path::new(tok);
+        let Ok(md) = fs::symlink_metadata(p) else { continue };
+        if !md.file_type().is_symlink() {
+            continue;
+        }
+        let target = fs::canonicalize(p)
+            .map_err(|e| anyhow::anyhow!("canonicalize({}) for syncqt header: {e}", p.display()))?;
+        if !target.is_file() {
+            continue;
+        }
+        let perms = fs::metadata(&target)?.permissions();
+        fs::remove_file(p)
+            .map_err(|e| anyhow::anyhow!("remove_file({}) for syncqt header: {e}", p.display()))?;
+        fs::copy(&target, p)
+            .map_err(|e| anyhow::anyhow!("copy({} -> {}) for syncqt header: {e}", target.display(), p.display()))?;
+        fs::set_permissions(p, perms)?;
+        n += 1;
+    }
+    Ok(n)
 }
 
 /// Make an rspfile's relative paths absolute against the directory the
@@ -634,7 +753,12 @@ fn absolutize_rsp(content: &str, cmdline: &str) -> String {
 fn cd_prologue_dir(cmdline: &str) -> Option<&str> {
     let after = cmdline.strip_prefix("cd ")?;
     let (dir, _) = after.split_once(" && ")?;
-    if dir.is_empty() || dir.starts_with('/') {
+    // An absolute target is a sandbox escape UNLESS it is under /build,
+    // which is this task's own writable tree: under the exact mirror the
+    // driver ships the original command line, whose cd target is the
+    // configure-time `/build/<src>/src/...` (qtsvg, 2026-08-23: "can't cd
+    // to /build/.../src/plugins/iconengines/svgiconengine").
+    if dir.is_empty() || (dir.starts_with('/') && !dir.starts_with("/build/")) {
         return None;
     }
     Some(dir)

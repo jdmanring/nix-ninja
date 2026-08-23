@@ -432,6 +432,18 @@ impl Runner {
             if key.starts_with("NIX_CFLAGS_COMPILE") {
                 *value = remove_frandom_seed(value);
             }
+            // SAME CLASS, OTHER VARIABLE. In a drop-in the outer
+            // derivation's cc-wrapper puts `-rpath $out/lib` into
+            // NIX_LDFLAGS, and $out is the OUTER output path: it moves with
+            // every change to the outer derivation, a source edit included,
+            // so every task re-keyed on it and a one-line edit rebuilt all
+            // 105 of qtsvg's TUs (measured 2026-08-23, after the input
+            // blanket was already off for compiles - this was the last
+            // term). Nothing inside a task needs it: a compile never links,
+            // and the install step rewrites RPATH off the build tree anyway.
+            if key.starts_with("NIX_LDFLAGS") {
+                *value = remove_outer_rpath(value);
+            }
         }
 
         // Extract store paths from wrapper variables once
@@ -783,7 +795,7 @@ impl Runner {
                 // graph DOES know, which is what the caller does below.
                 let paths: Vec<PathBuf> =
                     drv_outputs.iter().map(|d| d.build_path.clone()).collect();
-                if let Some(dir) = common_include_root(&paths) {
+                for dir in undeclared_outputs(&paths, task.cmdline.as_deref(), &config.build_dir) {
                     if !paths.contains(&dir) {
                         drv_outputs.push(new_built_file(final_derived_path.clone(), dir));
                     }
@@ -841,22 +853,21 @@ impl Runner {
         // forwarding headers already travel - which is how they reach a
         // translation unit's input list today.
         let mut fids: Vec<FileId> = Vec::new();
-        let mut tree_fid: Option<FileId> = None;
+        let mut tree_fids: Vec<FileId> = Vec::new();
         for derived_file in result.derived_files {
-            let is_tree = derived_file.build_path.components().count() == 2
-                && derived_file.build_path.starts_with("include");
+            let is_tree = is_tree_path(&derived_file.build_path);
             let fid = self.add_derived_file(files, derived_file.clone());
             if is_tree {
-                tree_fid = Some(fid);
+                tree_fids.push(fid);
             } else {
                 fids.push(fid);
             }
         }
-        if let Some(tf) = tree_fid {
+        for tf in &tree_fids {
             for fid in &fids {
                 let entry = self.co_outputs.entry(*fid).or_insert_with(|| vec![*fid]);
-                if !entry.contains(&tf) {
-                    entry.push(tf);
+                if !entry.contains(tf) {
+                    entry.push(*tf);
                 }
             }
         }
@@ -869,7 +880,17 @@ impl Runner {
         files: &mut graph::GraphFiles,
         derived_file: DerivedFile,
     ) -> FileId {
-        let path_str = derived_file.build_path.to_string_lossy().into_owned();
+        let mut path_str = derived_file.build_path.to_string_lossy().into_owned();
+        // A TREE IS KEYED APART FROM THE GRAPH NODE OF THE SAME NAME. CMake
+        // emits a phony target called `<T>_autogen`, the directory's own
+        // name; keyed by that string the tree took the phony's FileId, and
+        // consumer expansion followed phony_aliases to the timestamp and
+        // never reached the tree (main.moc missing, 2026-08-23). The key
+        // is only ever reached through co_outputs, so the marker changes
+        // nothing but the lookup; the DerivedFile keeps its real path.
+        if is_tree_path(&derived_file.build_path) {
+            path_str.push_str("/.nn-tree");
+        }
         let fid = match files.lookup(&path_str) {
             Some(fid) => fid,
             None => files.id_from_canonical(path_str),
@@ -995,11 +1016,23 @@ impl Runner {
             // buildflags header on the edge itself) are never filtered.
             if via_phony && is_gcc_task {
                 let name = &files.by_id[fid].name;
+                // A MODULE INCLUDE TREE IS HEADERS BY CONSTRUCTION and has
+                // no suffix to say so: syncqt's `include/<Module>` rides
+                // its real outputs as a co-output (wait(), above), arrives
+                // here via_phony, and this filter dropped it from every
+                // compile task - so `cmake_pch.hxx`'s `#include
+                // <QtSvg/QtSvg>`, the undeclared master header the tree
+                // exists to carry, was absent from the SvgWidgets PCH
+                // task while the Svg syncqt task's log listed it among
+                // the tree's eight files (qtsvg, 2026-08-23). Same
+                // predicate wait() uses to recognise the tree.
+                let tree_like = is_tree_path(Path::new(name.as_str()));
                 let header_like = name.ends_with(".h")
                     || name.ends_with(".hpp")
                     || name.ends_with(".hh")
                     || name.ends_with(".inc")
-                    || name.ends_with(".ipp");
+                    || name.ends_with(".ipp")
+                    || tree_like;
                 if !header_like {
                     continue;
                 }
@@ -1092,6 +1125,9 @@ impl Runner {
         // after the loop (the loop holds cmdline borrowed).
         let mut extra_rspfile: Option<(PathBuf, String)> = None;
         let mut arg_rewrites: Vec<(String, String)> = Vec::new();
+        // Indices into the split argv that the `@` branch respelled, so the
+        // same respelling can be applied to the ORIGINAL argv below.
+        let mut rewritten_idx: Vec<usize> = Vec::new();
         if let Some(cmdline) = &cmdline {
             let args = shell_words::split(cmdline)?;
             // CMake custom commands open with `cd <subdir> &&`; every
@@ -1122,7 +1158,7 @@ impl Runner {
             // extension: any schema arg to compiler.py implies its schema
             // directory.
             let schema_tool = cmdline.contains("json_schema_compiler/compiler.py");
-            for arg in args {
+            for (arg_i, arg) in args.into_iter().enumerate() {
                 // The schema-dir rule must sit ABOVE the node dispatch: the
                 // schema file is a DECLARED input on these edges, so
                 // files.lookup succeeds and the else-branches below never
@@ -1182,6 +1218,8 @@ impl Runner {
                                     rewrite_ancestor_paths(&raw, &self.config.build_dir);
                                 let mut _rsp_dirs = 0usize;
                                 let mut _rsp_files = 0usize;
+                                let is_syncqt = cmdline.contains("syncqt");
+                                let mut syncqt_headers: Vec<FileId> = Vec::new();
                                 for tok in root_view.split_whitespace() {
                                     // BUILD-DIR-RELATIVE TOKENS COUNT TOO.
                                     // The `../` requirement admits only paths
@@ -1230,8 +1268,37 @@ impl Runner {
                                             &self.config.build_dir,
                                             p.to_path_buf(),
                                         )? {
-                                            self.add_derived_file(files, input.clone());
+                                            let hfid = self.add_derived_file(files, input.clone());
+                                            if is_syncqt {
+                                                syncqt_headers.push(hfid);
+                                            }
                                             input_set.insert(input.build_path.clone(), input);
+                                        }
+                                    }
+                                }
+                                // A FORWARDING HEADER IMPLIES ITS TARGET. syncqt
+                                // writes `include/<M>/x.h` as one line,
+                                // `#include "/build/<src>/src/<m>/x.h"`, absolute
+                                // by design, and the source header behind it is
+                                // named by no edge: a translation unit that
+                                // reaches the tree reads the forwarding header
+                                // and dies on the target (SvgWidgets PCH via
+                                // QtSvg/qtsvgglobal.h, 2026-08-23). The targets
+                                // are exactly the `-headers` this rspfile names
+                                // and were just uploaded, so ride them on this
+                                // edge's outputs beside the tree: every consumer
+                                // that expands to the tree gets its sources too,
+                                // and the `.h` suffix clears the gcc filter.
+                                if is_syncqt && !syncqt_headers.is_empty() {
+                                    for out in build.outs() {
+                                        let entry = self
+                                            .co_outputs
+                                            .entry(*out)
+                                            .or_insert_with(|| vec![*out]);
+                                        for h in &syncqt_headers {
+                                            if !entry.contains(h) {
+                                                entry.push(*h);
+                                            }
                                         }
                                     }
                                 }
@@ -1253,11 +1320,20 @@ impl Runner {
                                     _rsp_dirs,
                                     _rsp_files,
                                 );
-                                let content = rewrite_ancestor_paths_ups(
-                                    &raw,
-                                    &self.config.build_dir,
-                                    cd_depth,
-                                );
+                                // Verbatim under the exact mirror, for the
+                                // same reason the command line is: the
+                                // configure-time absolute paths inside are
+                                // correct as written, and the relativized
+                                // form is the one syncqt discards.
+                                let content = if self.config.build_dir.starts_with("/build/") {
+                                    raw.clone()
+                                } else {
+                                    rewrite_ancestor_paths_ups(
+                                        &raw,
+                                        &self.config.build_dir,
+                                        cd_depth,
+                                    )
+                                };
                                 // Write under a FRESH name: the original is
                                 // usually also a declared input, materialized
                                 // as a read-only store symlink the task's
@@ -1268,6 +1344,7 @@ impl Runner {
                                 extra_rspfile =
                                     Some((PathBuf::from(format!("{rsp_rel}.nn-rsp")), content));
                                 arg_rewrites.push((arg.clone(), format!("{arg}.nn-rsp")));
+                                rewritten_idx.push(arg_i);
                             }
                         }
                         continue;
@@ -1488,7 +1565,16 @@ impl Runner {
                 implicit_limit,
             );
         });
-        if self.build_dir_inputs.len() <= implicit_limit {
+        // NEVER FOR A COMPILE. A deps=gcc task discovers its headers by
+        // include scanning, and the blanket on top of that makes every
+        // translation unit depend on every configure-generated file -
+        // including cmake_install.cmake, which carries the OUTER $out. So
+        // any change to the outer derivation (a source edit, a shim edit)
+        // re-keyed all 105 of qtsvg's TUs, twice, measured 2026-08-23:
+        // per-TU resumability existed only as long as nothing changed.
+        // Custom commands keep the blanket: they read configure files no
+        // edge declares (the version-script step died without it).
+        if !is_gcc_task && self.build_dir_inputs.len() <= implicit_limit {
             for input in self.build_dir_inputs.values() {
                 input_set.insert(input.build_path.clone(), input.clone());
             }
@@ -1668,6 +1754,36 @@ impl Runner {
                 }
                 c
             })
+        };
+        // UNDER THE EXACT MIRROR THE TASK RUNS THE ORIGINAL COMMAND LINE.
+        // The rewrite above turned configure-time absolute paths into `../`
+        // chains so they would resolve in a relocated sandbox; with the
+        // sandbox at the identical path they resolve as written, and the
+        // rewritten form is what breaks: CMake's `file(RELATIVE_PATH)`
+        // refuses a `-D` value of `../../lib` ("must be passed a full
+        // path", qtsvg's prl step, 2026-08-23). Discovery above still reads
+        // the rewritten view, which is what its existence checks expect;
+        // only what the task EXECUTES changes. The `@rsp` respelling is
+        // re-applied by argv index, since it appends a suffix to whichever
+        // spelling the token had.
+        let cmdline = if self.config.build_dir.starts_with("/build/") {
+            match (&build.cmdline, &cmdline) {
+                (Some(orig), Some(_)) => {
+                    // Textual, like the rewrite above: re-joining split
+                    // argv would quote `&&` and break the cd prologue.
+                    let orig_args = shell_words::split(orig)?;
+                    let mut c = orig.clone();
+                    for i in &rewritten_idx {
+                        if let Some(a) = orig_args.get(*i) {
+                            c = c.replace(a.as_str(), &format!("{a}.nn-rsp"));
+                        }
+                    }
+                    Some(c)
+                }
+                _ => cmdline,
+            }
+        } else {
+            cmdline
         };
 
         let mut input_srcs = self.wrapper_store_paths.clone();
@@ -1907,7 +2023,31 @@ fn build_task_derivation(
         .max()
         .unwrap_or(0)
         .max(cmd_climb);
-    if max_up > 0 {
+    // EXACT MIRROR FIRST. A drop-in runs this driver inside the package's
+    // own derivation, so the real build dir is already under the sandbox
+    // root (`/build/<src>/build`) and the task's own /build is an empty
+    // writable tree: the task can place every input at the IDENTICAL
+    // absolute path. That is the only placement under which the absolute
+    // paths CMake writes into generated FILES resolve - `cmake_pch.hxx`
+    // opens with `#include "/build/<src>/build/include/QtSvg/QtSvg"` and
+    // AutogenInfo.json carries `SRC:`/`BUILD:` roots; the trailing-
+    // components mirror below rewrites command lines and cannot reach
+    // file contents (qtsvg, 2026-08-23; GN emits relative paths, which
+    // is why the chromium rounds never met it). Every relative input and
+    // every cd-compensated `../` chain still lands, because under POSIX a
+    // `..` at `/` is a no-op: a five-up alias from a two-deep dir climbs
+    // to the root and re-descends into `build/<src>/...` - the same file.
+    // The mirror is kept for a build dir outside /build (a dev shell).
+    if task.build_dir.starts_with("/build/") {
+        drv.args.push(b"--build-dir"[..].into());
+        drv.args.push(
+            task.build_dir
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes()
+                .into(),
+        );
+    } else if max_up > 0 {
         let comps: Vec<_> = task.build_dir.components().collect();
         if comps.len() < max_up {
             return Err(anyhow!(
@@ -1929,9 +2069,17 @@ fn build_task_derivation(
         );
     }
 
-    // Sort NIX_NINJA_INPUTS to ensure determinism.
+    // Sort NIX_NINJA_INPUTS to ensure determinism - BY BUILD PATH, not by
+    // the encoded string. The string opens with the store path, and for a
+    // Built input that is a placeholder derived from the PRODUCER'S drv
+    // hash: when the producer re-keys (an autogen task after a source
+    // edit), its placeholder sorts elsewhere, the RESOLVED consumer
+    // derivation then carries the same input set in a different order,
+    // and content-addressed early cutoff never fires - the set was equal,
+    // the bytes were not (qsvgutils.cpp.o re-ran on an edit to
+    // qsvgrenderer.cpp, measured 2026-08-23). The build path is stable.
     let mut inputs: Vec<String> = input_set.into_iter().collect();
-    inputs.sort();
+    inputs.sort_by(|a, b| encoded_build_path(a).cmp(encoded_build_path(b)).then(a.cmp(b)));
 
     drv.env.insert(
         b"NIX_NINJA_INPUTS"[..].into(),
@@ -2004,7 +2152,7 @@ fn build_task_derivation(
     // does not exist - a dangling reference rather than a missing header.
     // For a task that is not syncqt the rule declares a directory holding
     // exactly its own declared outputs, which is redundant and correct.
-    if let Some(dir) = common_include_root(&task_outputs) {
+    for dir in undeclared_outputs(&task_outputs, task.cmdline.as_deref(), &task.build_dir) {
         if !task_outputs.contains(&dir) {
             task_outputs.push(dir);
         }
@@ -2192,7 +2340,8 @@ fn build_dynamic_task_derivation(
         .iter()
         .map(|input| input.to_encoded(store_dir))
         .collect();
-    inputs.sort();
+    // Same ordering rule as build_task_derivation, same reason.
+    inputs.sort_by(|a, b| encoded_build_path(a).cmp(encoded_build_path(b)).then(a.cmp(b)));
     drv.env.insert(
         b"NIX_NINJA_INPUTS"[..].into(),
         inputs.join(" ").into_bytes().into(),
@@ -2708,6 +2857,16 @@ fn dedup_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// its own parent the "common" root, which for `include/QtSvg/QtSvgDepends`
 /// is right and for anything else is a guess, so two is the floor.
 fn common_include_root(outputs: &[PathBuf]) -> Option<PathBuf> {
+    // CMAKE AUTOGEN IS THE SECOND WRITER OF AN UNDECLARED TREE. Its edge
+    // declares `<T>_autogen/mocs_compilation.cpp` and a timestamp, and moc
+    // writes every `<name>.moc` a source `#include`s into
+    // `<T>_autogen/include/` - declared nowhere, consumed by the compile of
+    // that source (qtsvg's imageformats plugin, `main.moc: No such file`,
+    // 2026-08-23). Same remedy as syncqt: the directory rides the declared
+    // outputs as a co-output, and is_tree_path() recognises it downstream.
+    if let Some(r) = autogen_include_root(outputs) {
+        return Some(r);
+    }
     let mut roots: Vec<PathBuf> = Vec::new();
     for o in outputs {
         let mut comps = o.components();
@@ -2739,6 +2898,145 @@ fn common_include_root(outputs: &[PathBuf]) -> Option<PathBuf> {
     // this be structural rather than gated on the command.
     let named = outputs.iter().filter(|o| o.starts_with(&root)).count();
     if named >= 1 { Some(root) } else { None }
+}
+
+/// `<dir>/<T>_autogen` when every declared output sits directly under one
+/// `<T>_autogen` component; None otherwise. One root, like the syncqt rule,
+/// because two targets' autogen dirs in one edge is not a shape CMake emits.
+fn autogen_include_root(outputs: &[PathBuf]) -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for o in outputs {
+        // ONLY THE AUTOGEN EDGE ITSELF, recognised by what it declares:
+        // `<T>_autogen/mocs_compilation.cpp` or `<T>_autogen/timestamp`.
+        // The object that COMPILES mocs_compilation.cpp lives at
+        // `CMakeFiles/<T>.dir/<T>_autogen/mocs_compilation.cpp.o`, which
+        // also contains an `_autogen` component, and the first version of
+        // this matched it and declared a tree that no task writes -
+        // `canonicalize(.../<T>.dir/<T>_autogen/include): No such file`.
+        let Some(parent) = o.parent() else { continue };
+        let file = o.file_name().map(|f| f.to_string_lossy().into_owned());
+        if !matches!(file.as_deref(), Some("mocs_compilation.cpp") | Some("timestamp")) {
+            continue;
+        }
+        if !parent
+            .file_name()
+            .is_some_and(|d| d.to_string_lossy().ends_with("_autogen"))
+        {
+            continue;
+        }
+        let r = parent.to_path_buf();
+        if !roots.contains(&r) {
+            roots.push(r);
+        }
+    }
+    if roots.len() != 1 {
+        return None;
+    }
+    // THE WHOLE `<T>_autogen` DIRECTORY, not only its include/ half: moc
+    // writes `<T>_autogen/<HASH>/moc_x.cpp` and mocs_compilation.cpp
+    // `#include`s them by that relative path (SvgWidgets: "EWIEGA46WW/
+    // moc_qsvgwidget.cpp: No such file", 2026-08-23). The declared outputs
+    // sit inside it too, which is the redundant-and-correct case. The graph
+    // node named `<T>_autogen` is CMake's phony; add_derived_file keys the
+    // tree apart from it.
+    Some(roots.remove(0))
+}
+
+/// Every undeclared directory an edge is known to write, from its declared
+/// outputs: syncqt's `include/<Module>`, and for CMake's autogen edge both
+/// `<T>_autogen` and `CMakeFiles/<T>_autogen.dir`. ONE function for the two
+/// places that need the list - new_task, which declares them as task
+/// outputs, and the build-result path in start(), which records what the
+/// task produced. They computed it separately until 2026-08-23, the second
+/// knew only the first tree, and the AUTOMOC-extraction edge then opened
+/// `CMakeFiles/Svg_autogen.dir/ParseCache.txt` that the task had written
+/// and the driver had never recorded.
+fn undeclared_trees(outputs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Some(d) = common_include_root(outputs) {
+        v.push(d);
+    }
+    // THE AUTOGEN EDGE WRITES A SECOND UNDECLARED DIRECTORY:
+    // `CMakeFiles/<T>_autogen.dir/` holds ParseCache.txt, which the later
+    // AUTOMOC-extraction edge for the same target opens by absolute path
+    // ("Could not open: .../CMakeFiles/Svg_autogen.dir/ParseCache.txt",
+    // qtsvg, 2026-08-23). Its AutogenInfo.json is a configure-time input
+    // living in the same directory, which link_tree leaves in place.
+    if let Some(d) = autogen_cache_dir(outputs) {
+        if !v.contains(&d) {
+            v.push(d);
+        }
+    }
+    v
+}
+
+/// Every output an edge is known to write and ninja does not declare: the
+/// directory trees, plus Qt's FINAL .prl FILE. QtPrlHelpers.cmake says in
+/// as many words that the final prl "should not be specified as a
+/// BYPRODUCT": the step2 edge's script writes it as a side effect, to the
+/// path recorded in the edge's own `-DIN_META_FILE` as
+/// `FINAL_PRL_FILE_PATH = <abs>`, and `qt_install(FILES)` then installs it
+/// ("file INSTALL cannot find .../lib/libQt6Svg.prl", 2026-08-23). The
+/// meta file is configure-time content in the build dir, so it is readable
+/// at planning. One function for both the planning and the result paths.
+fn undeclared_outputs(declared: &[PathBuf], cmdline: Option<&str>, build_dir: &Path) -> Vec<PathBuf> {
+    let mut v = undeclared_trees(declared);
+    if let Some(c) = cmdline {
+        if c.contains("QtFinishPrlFile.cmake") {
+            if let Some(meta) = c
+                .split_whitespace()
+                .find_map(|t| t.strip_prefix("-DIN_META_FILE="))
+            {
+                let meta = meta.trim_matches('"');
+                let meta_path = if Path::new(meta).is_absolute() {
+                    PathBuf::from(meta)
+                } else {
+                    build_dir.join(meta)
+                };
+                if let Ok(text) = fs::read_to_string(&meta_path) {
+                    for line in text.lines() {
+                        if let Some(p) = line.strip_prefix("FINAL_PRL_FILE_PATH = ") {
+                            let p = p.trim();
+                            let rel = relative_from(Path::new(p), build_dir)
+                                .unwrap_or_else(|| PathBuf::from(p));
+                            if !v.contains(&rel) {
+                                v.push(rel);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    v
+}
+
+/// `<dir>/CMakeFiles/<T>_autogen.dir` for an autogen edge whose outputs
+/// sit under `<dir>/<T>_autogen`; None for any other edge.
+fn autogen_cache_dir(outputs: &[PathBuf]) -> Option<PathBuf> {
+    let root = autogen_include_root(outputs)?;
+    let t = root.file_name()?.to_string_lossy().into_owned();
+    Some(root.parent()?.join("CMakeFiles").join(format!("{t}.dir")))
+}
+
+/// The shape wait() attaches as a co-output and the gcc header filter
+/// must let through: a syncqt module tree (`include/<Module>`) or a CMake
+/// autogen dir (`.../<T>_autogen`). One predicate, so the
+/// three sites that need it cannot drift.
+fn is_tree_path(p: &Path) -> bool {
+    // The lookup-key spelling from add_derived_file.
+    let p = match p.to_str().and_then(|s| s.strip_suffix("/.nn-tree")) {
+        Some(stripped) => Path::new(stripped),
+        None => p,
+    };
+    let comps: Vec<_> = p.components().collect();
+    if comps.len() == 2 && p.starts_with("include") {
+        return true;
+    }
+    p.file_name().is_some_and(|f| {
+        let f = f.to_string_lossy();
+        f.ends_with("_autogen") || f.ends_with("_autogen.dir")
+    })
 }
 
 fn leading_parent_components(p: &Path) -> usize {
@@ -4449,6 +4747,37 @@ pub fn discover_c_includes(
 }
 
 /// Removes -frandom-seed flag from a string of CFLAGS.
+/// Drop every `-rpath <path>` pair whose path names one of the OUTER
+/// derivation's outputs ($out, $dev, ... as the `outputs` env lists them).
+/// Other rpath entries (store libraries) are inputs and stay.
+fn remove_outer_rpath(value: &str) -> String {
+    let outer: Vec<String> = std::env::var("outputs")
+        .unwrap_or_else(|_| "out".into())
+        .split_whitespace()
+        .filter_map(|o| std::env::var(o).ok())
+        .collect();
+    let toks: Vec<&str> = value.split_whitespace().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i] == "-rpath"
+            && i + 1 < toks.len()
+            && outer.iter().any(|o| toks[i + 1].starts_with(o.as_str()))
+        {
+            i += 2;
+            continue;
+        }
+        out.push(toks[i]);
+        i += 1;
+    }
+    out.join(" ")
+}
+
+/// The build-path field of an encoded `store:build_path:rel` input.
+fn encoded_build_path(e: &str) -> &str {
+    e.split(':').nth(1).unwrap_or(e)
+}
+
 fn remove_frandom_seed(flags: &str) -> String {
     flags
         .split_whitespace()

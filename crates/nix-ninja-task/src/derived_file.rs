@@ -169,7 +169,12 @@ pub fn create_symlinks(
             ));
         }
 
-        if overwrite && dest_path.exists() {
+        // A TREE OUTPUT IS NEVER REMOVED WHOLE: it is linked file by file
+        // below, over whatever the directory already holds (in the outer
+        // build dir that is CMake's configure-time content), and the
+        // per-file links inside overwrite on their own. `remove_file` on
+        // it is EISDIR (materialize-all, qtsvg, 2026-08-23).
+        if overwrite && dest_path.exists() && !source_path.is_dir() {
             fs::remove_file(&dest_path).map_err(|e| anyhow::anyhow!("remove_file({}): {e}", dest_path.display()))?;
         }
 
