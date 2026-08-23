@@ -475,6 +475,27 @@ impl BuilderRpcClient {
         Ok(sp)
     }
 
+    /// Snapshot of the NAR stamp cache, for cross-run persistence
+    /// (upstream #18's restart half): (key path, size, mtime_ns, store path).
+    pub fn nar_stamps_snapshot(&self) -> Vec<(PathBuf, u64, u128, StorePath)> {
+        self.nar_uploads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, (s, m, sp))| (k.clone(), *s, *m, sp.clone()))
+            .collect()
+    }
+
+    /// Seed the NAR stamp cache from a previous run's snapshot. Entries
+    /// are still validated per hit by size+mtime against the live file;
+    /// the caller filters for store paths that still exist on disk.
+    pub fn seed_nar_stamps(&self, entries: Vec<(PathBuf, u64, u128, StorePath)>) {
+        let mut map = self.nar_uploads.lock().unwrap();
+        for (k, s, m, sp) in entries {
+            map.entry(k).or_insert((s, m, sp));
+        }
+    }
+
     /// NAR `path` and upload it, STREAMING rather than buffering.
     ///
     /// This built the whole NAR into a `Vec<u8>` first, so every concurrent

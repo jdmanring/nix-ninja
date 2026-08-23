@@ -22,7 +22,7 @@
 //! different cap encode different truncation decisions.
 
 use anyhow::Result;
-use harmonia_store_path::StoreDir;
+use harmonia_store_path::{StoreDir, StorePath};
 use nix_ninja_task::derived_file::DerivedFile;
 use std::collections::HashMap;
 use std::fs;
@@ -251,6 +251,75 @@ pub fn flush() -> Result<()> {
     Ok(())
 }
 
+const NAR_FILE: &str = ".nix-ninja-nar-stamps.v1";
+const NAR_HEADER: &str = "nix-ninja-nar-stamps v1";
+
+/// The previous run's NAR stamp snapshot, filtered to store paths that
+/// still exist on disk (a GC between rounds drops the entry; the failure
+/// direction is re-upload). Size+mtime are still validated per hit by
+/// the client against the live file, same trust model as the memo
+/// entries above.
+pub fn load_nar_stamps() -> Vec<(PathBuf, u64, u128, StorePath)> {
+    let Some(cache) = CACHE.get().and_then(|c| c.as_ref()) else {
+        return Vec::new();
+    };
+    let path = cache.build_dir.join(NAR_FILE);
+    let Ok(body) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut lines = body.lines();
+    if lines.next() != Some(NAR_HEADER) {
+        let _ = fs::remove_file(&path);
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        let mut f = line.split('\t');
+        let (Some(key), Some(sz), Some(mt), Some(sp)) = (f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        let (Ok(size), Ok(mtime)) = (sz.parse(), mt.parse()) else {
+            continue;
+        };
+        let Ok(sp): std::result::Result<StorePath, _> = cache.store_dir.parse(sp) else {
+            continue;
+        };
+        if !sp.to_absolute_path(&cache.store_dir).exists() {
+            continue;
+        }
+        out.push((PathBuf::from(key), size, mtime, sp));
+    }
+    out
+}
+
+/// Rewrite the stamp file wholesale from the current snapshot, atomically
+/// (tmp + rename), so a killed driver leaves the previous complete file
+/// rather than a torn one. Keys with a tab or newline are unencodable and
+/// skipped; no real path here carries either.
+pub fn save_nar_stamps(entries: &[(PathBuf, u64, u128, StorePath)]) -> Result<()> {
+    let Some(cache) = CACHE.get().and_then(|c| c.as_ref()) else {
+        return Ok(());
+    };
+    let path = cache.build_dir.join(NAR_FILE);
+    let tmp = path.with_extension("v1.tmp");
+    let mut body = String::from(NAR_HEADER);
+    body.push('\n');
+    for (key, size, mtime, sp) in entries {
+        let k = key.display().to_string();
+        if k.contains('\t') || k.contains('\n') {
+            continue;
+        }
+        body.push_str(&format!(
+            "{k}\t{size}\t{mtime}\t{}\n",
+            cache.store_dir.display(sp)
+        ));
+    }
+    fs::write(&tmp, body)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +368,27 @@ mod tests {
         flush().unwrap();
         let body = fs::read_to_string(bd.join(FILE_NAME)).unwrap();
         assert_eq!(body.matches("py\tsrcs").count(), 2);
+
+        // NAR stamps: a saved entry whose store path no longer exists is
+        // filtered at load (the failure direction is re-upload), and a
+        // wrong header discards the file. The existence-positive needs a
+        // real store object and is exercised by every warm restart.
+        let ghost: StorePath = "/nix/store"
+            .parse::<StoreDir>()
+            .unwrap()
+            .parse("/nix/store/11111111111111111111111111111111-ghost")
+            .unwrap();
+        save_nar_stamps(&[(PathBuf::from("/src/a.c"), 5, 7, ghost)]).unwrap();
+        let body = fs::read_to_string(bd.join(NAR_FILE)).unwrap();
+        assert!(body.starts_with(NAR_HEADER), "{body}");
+        assert!(body.contains("/src/a.c\t5\t7\t/nix/store/"), "{body}");
+        assert!(
+            load_nar_stamps().is_empty(),
+            "a GC'd store path must not seed the cache"
+        );
+        fs::write(bd.join(NAR_FILE), "wrong-header\njunk\n").unwrap();
+        assert!(load_nar_stamps().is_empty());
+        assert!(!bd.join(NAR_FILE).exists(), "bad header must discard the file");
         fs::remove_dir_all(&bd).unwrap();
     }
 }

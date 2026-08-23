@@ -411,8 +411,12 @@ impl Runner {
         );
         let store_regex = Regex::new(&pattern)?;
 
-        // Load the cross-round resolve cache before any task resolves.
+        // Load the cross-round resolve cache before any task resolves,
+        // and seed the client's NAR stamp cache from the previous run so
+        // a restart's source-file adds become stat calls (upstream #18's
+        // restart half; entries validate per hit by size+mtime).
         crate::resolve_cache::init(config.store_dir.clone(), config.build_dir.clone());
+        rpc_client.seed_nar_stamps(crate::resolve_cache::load_nar_stamps());
 
         let mut wrapper_vars = HashMap::new();
         for (key, value) in env::vars() {
@@ -628,6 +632,11 @@ impl Runner {
             // a killed driver loses at most one tick's worth.
             if let Err(e) = crate::resolve_cache::flush() {
                 eprintln!("nix-ninja: resolve cache flush failed: {e}");
+            }
+            if let Err(e) =
+                crate::resolve_cache::save_nar_stamps(&self.rpc_client.nar_stamps_snapshot())
+            {
+                eprintln!("nix-ninja: nar stamp save failed: {e}");
             }
             // Each stats() call is a fresh pair of atomic loads, so calling
             // one twice in an argument list samples two different instants
