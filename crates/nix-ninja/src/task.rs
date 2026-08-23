@@ -926,7 +926,38 @@ impl Runner {
         }
         let fid = match files.lookup(&path_str) {
             Some(fid) => fid,
-            None => files.id_from_canonical(path_str),
+            None => {
+                // AN OUTPUT OUTSIDE THE BUILD DIR HAS TWO SPELLINGS AND THE
+                // GRAPH ONLY KNOWS ONE. CMake declares such an output
+                // ABSOLUTE in build.ninja (openfec sets its library dir to
+                // ${SRC}/bin/Release, a SIBLING of the build dir), while
+                // normalize_build_path hands the task - and therefore this
+                // registration - the `../` climb. Keyed by the climb, the
+                // finished output takes a fresh FileId, the graph node's
+                // consumers miss it in derived_files, and input assembly
+                // falls through to an opaque upload of a file that only
+                // ever existed in the producer's sandbox: `canonicalize
+                // ../bin/Release/libopenfec.so.1.4.2: No such file`
+                // (openfec 1.4.2.12, server edition attempt 5,
+                // 2026-08-23). Try the absolute spelling before minting a
+                // new id; the DerivedFile keeps its relative build_path,
+                // which is the one the sandbox layout is built from.
+                let abs_fid = if path_str.starts_with("../") {
+                    let mut abs = format!(
+                        "{}/{}",
+                        self.config.build_dir.to_string_lossy(),
+                        path_str
+                    );
+                    canon::canonicalize_path(&mut abs);
+                    files.lookup(&abs)
+                } else {
+                    None
+                };
+                match abs_fid {
+                    Some(fid) => fid,
+                    None => files.id_from_canonical(path_str),
+                }
+            }
         };
 
         self.derived_files.entry(fid).or_insert(derived_file);
