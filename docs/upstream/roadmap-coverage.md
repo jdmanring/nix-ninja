@@ -249,3 +249,21 @@ batched adds raced two uploads of one file onto a pid-keyed nn-outer temp
 name (95b1b9a is the cause fix; 9f79161 stays as defense for genuinely
 mutating files). A mechanism claim written before the instrument had
 answered.
+
+Third sweep, same day:
+
+- **#20 (CMake example): done end to end.** `mkCMakePackage`
+  (modules/flake/pkgs/mkCMakePackage) mirrors the meson builder with two
+  differences: `-GNinja`, and `CMAKE_MAKE_PROGRAM` pointed at a dispatch
+  script that sends CMake's configure-time cmTC_* try-compiles to real
+  ninja - in NIX_NINJA_DRV mode a probe would submit the outer output and
+  be refused as a duplicate - and everything else to nix-ninja.
+  `example-cmake-hello` builds and runs (0c53804).
+- New class: **quoted includes must resolve from the SPELLED parent.**
+  nspr's dist/include tree is symlinks; the BFS canonicalized every queued
+  file before scanning, so a symlinked header's nested quoted include was
+  declared only at its source spelling and the sandbox compile died at
+  the dist one. Reproduced first as a failing test in the exact symlink
+  shape (f56bc0f, `symlinked_include_dir_declares_nested_quoted_include_at_both_spellings`).
+- The empty-`config.h` conflict root cause: pid-keyed temp names raced
+  under the batched adds (95b1b9a); see the correction note above.
