@@ -369,6 +369,11 @@ mod tests {
     // None (the failure direction is recompute, never a stale path).
     #[test]
     fn validated_hit_and_stale_drop() {
+        // Force the gate on: under `nix build` NIX_BUILD_TOP is set and
+        // init() would return None, failing every assertion below with
+        // "matching entry must validate" - which is how this test found
+        // the gate's blind spot on the first sandboxed build of the fix.
+        std::env::set_var("NIX_NINJA_RESOLVE_CACHE", "1");
         let bd = std::env::temp_dir().join(format!("nn-rc-{}", std::process::id()));
         fs::create_dir_all(bd.join("srcs")).unwrap();
         fs::write(bd.join("srcs/a.py"), "x = 1\n").unwrap();
