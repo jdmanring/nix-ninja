@@ -947,7 +947,21 @@ impl BuilderRpcClient {
                                 | DaemonErrorKind::NoSinkForLoggerWrite
                                 | DaemonErrorKind::NoSourceForLoggerRead
                         );
-                        if !connection_level {
+                        // ONE daemon-reported error is transient and named:
+                        // the daemon's own cgroup teardown races its other
+                        // builds, so a worker opens
+                        // nix-build-uid-N/cgroup.{kill,procs} after a
+                        // sibling finished and removed it - ENOENT on a
+                        // path the daemon itself manages (libxcrypt under
+                        // make -j, 2026-08-23; an upstream nix bug, not a
+                        // verdict about this request). Retry it like a
+                        // connection error, bounded by the same counter and
+                        // logged, so a genuine failure still surfaces.
+                        let cgroup_race = {
+                            let msg = e.to_string();
+                            msg.contains("/sys/fs/cgroup/") && msg.contains("No such file")
+                        };
+                        if !connection_level && !cgroup_race {
                             break Err(Error::from(e));
                         }
                         drop(guard);
