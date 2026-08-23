@@ -134,6 +134,11 @@ pub fn discover_dynamic_dependencies(
         cmdline,
         files,
         Some(built_paths),
+        // The dynamic task reconstructs its build dir fresh inside the
+        // sandbox, so no prior run's depfile can exist there; the scan is
+        // the only source. Upstream #17's read-back applies to the outer,
+        // persistent build dir path only.
+        None,
     )
 }
 

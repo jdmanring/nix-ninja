@@ -2047,6 +2047,7 @@ fn build_task_derivation(
                 cmdline,
                 files,
                 None,
+                task.depfile.as_deref().map(Path::new),
             )?;
 
             // Add discovered store paths as input sources only
@@ -2397,6 +2398,33 @@ fn build_task_derivation(
                     return Err(e);
                 }
             }
+        }
+        // UPSTREAM #52: meson bakes `-fuse-ld=<linker>` from CC_LD/CXX_LD
+        // into link lines, and gcc then execs `ld.<linker>` found on PATH -
+        // a PATH this sandbox builds from cc, coreutils and the command
+        // binary alone, so the link dies "cannot find ld.lld" (or silently
+        // falls to bfd on toolchains where the driver only warns, which is
+        // the wrong-linker case nobody notices). Resolve the requested
+        // linker OUTSIDE the sandbox, where the caller's PATH still has it,
+        // and carry its store path in as an input and PATH entry. Both
+        // spellings are tried because the flag takes both: `ld.gold` for
+        // gcc's traditional names, the bare name for mold and wild.
+        for tok in cmdline.split_whitespace() {
+            let Some(name) = tok.strip_prefix("-fuse-ld=") else { continue };
+            let name = name.trim_matches(|c| c == '"' || c == '\'');
+            if name.is_empty() || name == "bfd" {
+                continue; // bfd is binutils' own, already beside gcc
+            }
+            let resolved = which_store_path_opt(&task.store_dir, &format!("ld.{name}"))
+                .ok()
+                .flatten()
+                .or_else(|| which_store_path_opt(&task.store_dir, name).ok().flatten());
+            if let Some(sp) = resolved {
+                path.push(format!("{}/bin", task.store_dir.display(&sp)));
+                drv.inputs.insert(SingleDerivedPath::Opaque(sp));
+            }
+            // Unresolved: leave the command as written and let the link
+            // fail with the compiler's own message, which names the linker.
         }
         drv.env
             .insert(b"PATH"[..].into(), path.join(":").into_bytes().into());
@@ -4818,6 +4846,38 @@ mod rewrite_ancestor_paths_tests {
 }
 
 #[cfg(test)]
+mod depfile_read_back_tests {
+    use super::depfile_read_back;
+    use std::path::PathBuf;
+
+    #[test]
+    fn fresh_stale_and_empty() {
+        let d = std::env::temp_dir().join(format!("nndf{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let src = d.join("a.c");
+        std::fs::write(&src, "int x;\n").unwrap();
+        let dep = d.join("a.o.d");
+        std::fs::write(&dep, "a.o: a.c \\\n hdr/one.h\n").unwrap();
+        // Fresh depfile (written after the source): its answer is used.
+        let got = depfile_read_back(&d, Some(PathBuf::from("a.o.d").as_path()),
+                                    &[PathBuf::from("a.c")]).unwrap();
+        assert_eq!(got, vec![PathBuf::from("a.c"), PathBuf::from("hdr/one.h")]);
+        // Source newer than the depfile: no answer, fall back to the scan.
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::open(&src).unwrap().set_times(
+            std::fs::FileTimes::new().set_modified(newer)).unwrap();
+        assert!(depfile_read_back(&d, Some(PathBuf::from("a.o.d").as_path()),
+                                  &[PathBuf::from("a.c")]).is_none());
+        // Empty depfile is no answer, not an empty answer.
+        std::fs::write(&dep, "").unwrap();
+        assert!(depfile_read_back(&d, Some(PathBuf::from("a.o.d").as_path()),
+                                  &[]).is_none());
+        // No depfile declared: the scan is the only source.
+        assert!(depfile_read_back(&d, None, &[]).is_none());
+    }
+}
+
+#[cfg(test)]
 mod new_built_file_tests {
     use super::new_built_file;
     use harmonia_store_derivation::derived_path::SingleDerivedPath;
@@ -4995,6 +5055,38 @@ mod normalize_output_tests {
 /// Returns (discovered_deps, discovered_store_paths) where:
 /// - discovered_deps: DerivedFiles that need to be encoded and added to NIX_NINJA_INPUTS
 /// - discovered_store_paths: Store paths that only need to be added as input sources
+/// The freshness-guarded depfile parse behind upstream #17. Returns None -
+/// meaning "run the scan" - unless the depfile exists and is at least as
+/// new as every source file offered, and parses cleanly.
+fn depfile_read_back(
+    build_dir: &Path,
+    depfile: Option<&Path>,
+    sources: &[PathBuf],
+) -> Option<Vec<PathBuf>> {
+    let d = depfile?;
+    let d = if d.is_absolute() { d.to_path_buf() } else { build_dir.join(d) };
+    let dep_m = std::fs::metadata(&d).ok()?.modified().ok()?;
+    for srcf in sources {
+        let p = if srcf.is_absolute() { srcf.clone() } else { build_dir.join(srcf) };
+        let m = std::fs::metadata(&p).ok()?.modified().ok()?;
+        if m > dep_m {
+            return None;
+        }
+    }
+    let buf = n2::scanner::read_file_with_nul(&d).ok()?;
+    let mut sc = n2::scanner::Scanner::new(&buf);
+    let parsed = n2::depfile::parse(&mut sc).ok()?;
+    let mut out: Vec<PathBuf> = Vec::new();
+    for (_, values) in parsed.iter() {
+        for v in values {
+            out.push(PathBuf::from(v));
+        }
+    }
+    // An empty parse is no answer, not an empty answer: fall back to the
+    // scan rather than declaring a TU with zero includes.
+    if out.is_empty() { None } else { Some(out) }
+}
+
 pub fn discover_c_includes(
     rpc_client: &Arc<BuilderRpcClient>,
     store_dir: &StoreDir,
@@ -5002,8 +5094,20 @@ pub fn discover_c_includes(
     cmdline: &str,
     files: Vec<PathBuf>,
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+    depfile: Option<&Path>,
 ) -> Result<(Vec<DerivedFile>, Vec<StorePath>)> {
-    let c_includes = c_include_parser::retrieve_c_includes(cmdline, files.clone(), virtual_paths)?;
+    // UPSTREAM #17, THE READ-BACK HALF: a depfile already on disk is the
+    // COMPILER'S OWN answer to the question the BFS scan approximates, so
+    // when one exists and is FRESH it replaces the scan outright. Fresh
+    // means at least as new as every source it would speak for: a stale
+    // depfile under-declares the include a later edit added, and the guard
+    // fails toward the scan (the old behavior), never toward trusting a
+    // stale answer. Incremental local builds are where this pays - ninja's
+    // own model, a depfile per object from the previous run.
+    let c_includes = match depfile_read_back(build_dir, depfile, &files) {
+        Some(deps) => deps,
+        None => c_include_parser::retrieve_c_includes(cmdline, files.clone(), virtual_paths)?,
+    };
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
 
