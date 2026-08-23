@@ -101,10 +101,34 @@ fn files_fingerprint(build_dir: &Path, key_dir: &Path, paths: &[PathBuf]) -> Opt
     })
 }
 
-/// Call once from Runner::new. NIX_NINJA_RESOLVE_CACHE=0 disables.
+/// Whether cross-round persistence should run at all.
+///
+/// Inside a nix build sandbox (NIX_BUILD_TOP set) the build directory is
+/// discarded when the derivation finishes, so nothing written here can
+/// ever be replayed - and the files DO land somewhere visible: a drop-in
+/// driver's cwd is the package's own source tree, where a packaging
+/// check that requires an emptied tree (nixpkgs skaware cleanPackaging)
+/// fails the whole build on `.nix-ninja-nar-stamps.v1`. Measured
+/// 2026-08-23 on skalibs. NIX_NINJA_RESOLVE_CACHE=1 forces persistence
+/// on for anyone deliberately testing it in a sandbox; =0 disables it
+/// anywhere.
+fn persistence_enabled(setting: Option<&str>, in_nix_build: bool) -> bool {
+    match setting {
+        Some("0") => false,
+        Some("1") => true,
+        _ => !in_nix_build,
+    }
+}
+
+/// Call once from Runner::new. NIX_NINJA_RESOLVE_CACHE=0 disables;
+/// inside a nix sandbox (NIX_BUILD_TOP) persistence is off by default.
 pub fn init(store_dir: StoreDir, build_dir: PathBuf) {
     CACHE.get_or_init(|| {
-        if std::env::var("NIX_NINJA_RESOLVE_CACHE").as_deref() == Ok("0") {
+        let setting = std::env::var("NIX_NINJA_RESOLVE_CACHE").ok();
+        if !persistence_enabled(
+            setting.as_deref(),
+            std::env::var_os("NIX_BUILD_TOP").is_some(),
+        ) {
             return None;
         }
         let path = build_dir.join(FILE_NAME);
@@ -323,6 +347,21 @@ pub fn save_nar_stamps(entries: &[(PathBuf, u64, u128, StorePath)]) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sandbox gate: default-on outside a nix build, default-off
+    /// inside one (NIX_BUILD_TOP), explicit setting wins in both
+    /// directions. The in-sandbox default is the load-bearing row:
+    /// skalibs failed skaware cleanPackaging on the stamp file.
+    #[test]
+    fn persistence_gate_table() {
+        assert!(persistence_enabled(None, false));
+        assert!(!persistence_enabled(None, true));
+        assert!(!persistence_enabled(Some("0"), false));
+        assert!(!persistence_enabled(Some("0"), true));
+        assert!(persistence_enabled(Some("1"), true));
+        assert!(persistence_enabled(Some("junk"), false));
+        assert!(!persistence_enabled(Some("junk"), true));
+    }
 
     // One process-wide CACHE means one test may init it; this test owns
     // it. Covers: parse, validated hit, and the negative control - an
