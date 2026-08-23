@@ -2362,10 +2362,36 @@ fn build_task_derivation(
         // from the source tree) is a task input handled by
         // `new_opaque_file` — it reaches the sandbox as an input symlink,
         // so only store binaries become inputs and PATH entries here.
-        if let Some(cmdline_path) = which_store_path_opt(&task.store_dir, cmdline_binary)? {
-            drv.inputs
-                .insert(SingleDerivedPath::Opaque(cmdline_path.clone()));
-            path.push(format!("{}/bin", task.store_dir.display(&cmdline_path)));
+        //
+        // A COMMAND CAN ALSO BE A GRAPH OUTPUT, and then `which` MUST fail:
+        // orc's meson graph compiles tools/orcc in one edge and runs it as
+        // the command of every .orc->.c edge (`Failed to find
+        // /build/orc-0.4.42/build/tools/orcc`, server edition attempt 7,
+        // 2026-08-23). The tool is already in this task's input set - the
+        // cmdline node scan routes it as a Built input - so it reaches the
+        // sandbox at its build-dir-relative path and the absolute-path
+        // rewrite pass has already respelled the command to match. The
+        // discriminator is the input set, not the error: a which failure
+        // whose token matches a task input needs no store binary; one that
+        // matches nothing is still the missing tool the error names.
+        match which_store_path_opt(&task.store_dir, cmdline_binary) {
+            Ok(Some(cmdline_path)) => {
+                drv.inputs
+                    .insert(SingleDerivedPath::Opaque(cmdline_path.clone()));
+                path.push(format!("{}/bin", task.store_dir.display(&cmdline_path)));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let rel = relative_from(Path::new(cmdline_binary), &task.build_dir)
+                    .unwrap_or_else(|| PathBuf::from(cmdline_binary));
+                let is_task_input = task
+                    .inputs
+                    .iter()
+                    .any(|i| i.build_path == rel || i.build_path == Path::new(cmdline_binary));
+                if !is_task_input {
+                    return Err(e);
+                }
+            }
         }
         drv.env
             .insert(b"PATH"[..].into(), path.join(":").into_bytes().into());
