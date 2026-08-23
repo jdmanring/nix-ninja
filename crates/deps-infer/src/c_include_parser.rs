@@ -30,6 +30,12 @@ fn bfs_parse_includes(
     let mut visited = rustc_hash::FxHashSet::default();
     let mut result = Vec::new();
     let mut queue = VecDeque::new();
+    // CROSS-FILE COMPUTED INCLUDES. Defines accumulate over the whole walk
+    // and uses wait until their macro appears - preprocessing order is not
+    // modeled, which can only OVER-declare (harmless: an extra input), never
+    // under-declare relative to the old behavior of dropping the use.
+    let mut tu_defines: rustc_hash::FxHashMap<String, String> = Default::default();
+    let mut pending_uses: Vec<(PathBuf, String)> = Vec::new();
 
     // Initialize queue with starting files
     for file in files {
@@ -59,7 +65,46 @@ fn bfs_parse_includes(
                     result.push(include);
                 }
             }
+            for (k, v) in source.path_defines {
+                tu_defines.entry(k).or_insert(v);
+            }
+            if let Some(dir) = source.path.parent() {
+                for u in source.macro_uses {
+                    pending_uses.push((dir.to_path_buf(), u));
+                }
+            }
         }
+
+        // Resolve any use whose macro is now defined, exactly as a quoted
+        // directive from its includer: includer dir first, include dirs
+        // after. Unresolved uses stay pending for a later batch's defines;
+        // one never defined stays undeclared, and the task then fails
+        // loudly, which is the old behavior.
+        let mut still_pending = Vec::new();
+        for (dir, name) in pending_uses.drain(..) {
+            let Some(val) = tu_defines.get(&name) else {
+                still_pending.push((dir, name));
+                continue;
+            };
+            let tail = PathBuf::from(val);
+            let resolved = try_resolve(&dir, &tail, virtual_paths.as_ref())
+                .or_else(|| {
+                    include_dirs
+                        .iter()
+                        .find_map(|i| try_resolve(i, &tail, virtual_paths.as_ref()))
+                });
+            if let Some(p) = resolved {
+                let spelled = lexical_normalize(&dir.join(&tail));
+                if spelled != p && spelled.is_relative() && visited.insert(spelled.clone()) {
+                    result.push(spelled);
+                }
+                if visited.insert(p.clone()) {
+                    queue.push_back(p.clone());
+                    result.push(p);
+                }
+            }
+        }
+        pending_uses = still_pending;
     }
 
     Ok(result)
@@ -69,6 +114,8 @@ fn bfs_parse_includes(
 pub struct SourceWithIncludes {
     pub path: PathBuf,
     pub includes: Vec<PathBuf>,
+    pub path_defines: Vec<(String, String)>,
+    pub macro_uses: Vec<String>,
 }
 
 /// Given a list of paths, figure out their dependencies
@@ -107,7 +154,12 @@ where
                 }
             };
 
-            Ok(SourceWithIncludes { path, includes })
+            let (path_defines, macro_uses) = match scan_directives(&path) {
+                // The scan is memoized, so this re-read is a cache hit.
+                Ok(scan) => (scan.path_defines.clone(), scan.macro_uses.clone()),
+                Err(_) => (Vec::new(), Vec::new()),
+            };
+            Ok(SourceWithIncludes { path, includes, path_defines, macro_uses })
         }));
     }
 
@@ -164,8 +216,23 @@ pub struct Directive {
 // in place would hit. The hash is one read per unique header, which a miss
 // already pays, so the upgrade is cheap whenever that consumer appears.
 // Raised by the specification session, addendum 730.
+/// One file's scan: its include/embed directives, plus the raw material for
+/// CROSS-FILE computed includes. `path_defines` are object-like macros whose
+/// whole body is one string literal (path-shaped by construction);
+/// `macro_uses` are `#include MACRO` tokens with no same-file define. The
+/// same-file case resolves inside the scan (fftw); the cross-file case can
+/// only resolve at the translation-unit walk, which sees every file's
+/// defines (lzo: lzo1b_c.ch includes LZO_SEARCH_MATCH_INCLUDE_FILE, defined
+/// in a config header two files away, 2026-08-23).
+#[derive(Debug)]
+pub struct ScanResult {
+    pub directives: Vec<Directive>,
+    pub path_defines: Vec<(String, String)>,
+    pub macro_uses: Vec<String>,
+}
+
 type DirectiveCache =
-    Arc<RwLock<rustc_hash::FxHashMap<PathBuf, (u64, u128, Arc<Vec<Directive>>)>>>;
+    Arc<RwLock<rustc_hash::FxHashMap<PathBuf, (u64, u128, Arc<ScanResult>)>>>;
 static DIRECTIVE_CACHE: LazyLock<DirectiveCache> = LazyLock::new(Default::default);
 
 pub static SCAN_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -189,7 +256,7 @@ fn file_key(path: &Path) -> Option<(u64, u128)> {
 }
 
 /// Parse a file's include directives, memoized across translation units.
-pub fn scan_directives(path: &Path) -> Result<Arc<Vec<Directive>>> {
+pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
     use std::sync::atomic::Ordering::Relaxed;
     let key = file_key(path);
 
@@ -208,6 +275,7 @@ pub fn scan_directives(path: &Path) -> Result<Arc<Vec<Directive>>> {
         File::open(path).map_err(|e| anyhow!("Failed to open file {}: {}", path.display(), e))?;
     let mut directives = Vec::new();
     let mut macro_paths: std::collections::HashMap<String, String> = Default::default();
+    let mut macro_uses: Vec<String> = Vec::new();
     for line in BufReader::new(f).lines() {
         let line = match line {
             Ok(l) => l,
@@ -247,11 +315,21 @@ pub fn scan_directives(path: &Path) -> Result<Arc<Vec<Directive>>> {
                     quoted: true,
                     name: PathBuf::from(path),
                 });
+            } else if !token.is_empty()
+                && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                // A macro token with no same-file define: recorded for the
+                // per-TU walk, where another file's define may resolve it.
+                macro_uses.push(token.to_string());
             }
         }
     }
 
-    let directives = Arc::new(directives);
+    let directives = Arc::new(ScanResult {
+        directives,
+        path_defines: macro_paths.into_iter().collect(),
+        macro_uses,
+    });
     SCAN_MISSES.fetch_add(1, Relaxed);
     if let Some((len, mtime)) = key {
         if let Ok(mut cache) = DIRECTIVE_CACHE.write() {
@@ -270,7 +348,7 @@ pub fn extract_includes(
     include_dirs: &[PathBuf],
     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
-    let directives = scan_directives(path)?;
+    let scan = scan_directives(path)?;
     let parent_dir = PathBuf::from(path.parent().unwrap());
     let mut result = Vec::new();
 
@@ -292,7 +370,7 @@ pub fn extract_includes(
         }
         result.push(canonical);
     };
-    for d in directives.iter() {
+    for d in scan.directives.iter() {
         if d.quoted {
             if let Some(p) = try_resolve(&parent_dir, &d.name, virtual_paths) {
                 push_both(&parent_dir, &d.name, p);
@@ -395,12 +473,41 @@ mod tests {
     static SCAN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn computed_include_through_cross_file_define_is_declared() {
+        // lzo, 2026-08-23: lzo1b_c.ch writes `#include
+        // LZO_SEARCH_MATCH_INCLUDE_FILE` and the define lives in a config
+        // header the same TU includes earlier. Same-file resolution cannot
+        // see it; the walk-level table must.
+        let _g = SCAN_TEST_LOCK.lock().unwrap();
+        let d = std::env::temp_dir().join(format!("nnxf{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("config.h"),
+            "#define SM_FILE \"sm_impl.h\"\n").unwrap();
+        std::fs::write(d.join("body.h"),
+            "#include SM_FILE\n").unwrap();
+        std::fs::write(d.join("sm_impl.h"), "\n").unwrap();
+        std::fs::write(d.join("main.c"),
+            "#include \"config.h\"\n#include \"body.h\"\n").unwrap();
+        let got = bfs_parse_includes(
+            vec![d.join("main.c")], &[], None).unwrap();
+        assert!(got.iter().any(|p| p.ends_with("sm_impl.h")),
+            "cross-file computed include not declared: {:?}", got);
+        // The negative control: a use whose macro is never defined stays
+        // undeclared rather than inventing a path.
+        std::fs::write(d.join("main2.c"),
+            "#include NEVER_DEFINED\n").unwrap();
+        let got2 = bfs_parse_includes(
+            vec![d.join("main2.c")], &[], None).unwrap();
+        assert_eq!(got2.len(), 1, "only the source itself: {:?}", got2);
+    }
+
+    #[test]
     fn computed_include_through_same_file_define_is_declared() {
         let _g = SCAN_TEST_LOCK.lock().unwrap();
         let f = std::env::temp_dir().join(format!("nn-ci-test-{}.c", std::process::id()));
         std::fs::write(&f, "#define SIMD_HEADER \"simd-support/simd-sse2.h\"\n#include SIMD_HEADER\n#include <math.h>\n#define FN(x) \"not-a-path\"\n#include UNKNOWN_MACRO\n").unwrap();
         let dirs = super::scan_directives(&f).unwrap();
-        let names: Vec<String> = dirs.iter().map(|d| d.name.to_string_lossy().into_owned()).collect();
+        let names: Vec<String> = dirs.directives.iter().map(|d| d.name.to_string_lossy().into_owned()).collect();
         assert!(names.contains(&"simd-support/simd-sse2.h".to_string()), "{names:?}");
         assert!(names.contains(&"math.h".to_string()));
         assert!(!names.iter().any(|n| n.contains("not-a-path")));
@@ -493,13 +600,13 @@ mod tests {
 
         let before = scan_stats();
         let first = scan_directives(&h).unwrap();
-        assert_eq!(first.len(), 1, "one directive parsed");
-        assert_eq!(first[0].name, PathBuf::from("a.h"));
+        assert_eq!(first.directives.len(), 1, "one directive parsed");
+        assert_eq!(first.directives[0].name, PathBuf::from("a.h"));
 
         // Every later translation unit that reaches this header must hit.
         for _ in 0..5 {
             let again = scan_directives(&h).unwrap();
-            assert_eq!(again.len(), 1);
+            assert_eq!(again.directives.len(), 1);
         }
         let after = scan_stats();
         assert_eq!(after.1 - before.1, 1, "parsed exactly once");
@@ -513,8 +620,8 @@ mod tests {
             .write_all(b"#include \"a.h\"\n#include <b.h>\n")
             .unwrap();
         let edited = scan_directives(&h).unwrap();
-        assert_eq!(edited.len(), 2, "edit was NOT seen - cache is pinning stale deps");
-        assert!(!edited[1].quoted, "angle-bracket form preserved");
+        assert_eq!(edited.directives.len(), 2, "edit was NOT seen - cache is pinning stale deps");
+        assert!(!edited.directives[1].quoted, "angle-bracket form preserved");
         assert_eq!(scan_stats().1 - after.1, 1, "the edit cost one re-parse");
 
         std::fs::remove_dir_all(&dir).ok();
