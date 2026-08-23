@@ -2265,11 +2265,16 @@ fn build_task_derivation(
         let placeholder = Placeholder::standard_output(
             &OutputName::from_str(&normalized_name).context("While creating placeholder")?,
         );
+        // build_path keeps a ../ climb (sandbox location); rel_path maps it
+        // to .nn-up so the copy lands INSIDE the output. Must agree with
+        // new_built_file, which is where consumers derive the same location
+        // - attempt 9 proved the two sites drift: only the consumer side
+        // learned .nn-up and the producer kept copying outside $out.
         let encoded = format!(
             "{}:{}:{}",
             placeholder.render().display(),
             output_path.display(),
-            output_path.display(),
+            store_rel_path(output_path).display(),
         );
         outputs.push(encoded);
     }
@@ -4351,21 +4356,20 @@ fn normalize_build_path(build_dir: &Path, p: PathBuf) -> Result<PathBuf> {
     }
 }
 
-fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> DerivedFile {
-    let output_name = normalize_output(&build_path.to_string_lossy());
-    // rel_path IS A LOCATION INSIDE THE STORE OUTPUT AND MUST NOT CLIMB.
-    // An out-of-build-dir output (openfec's ../bin/Release/libopenfec.so)
-    // keeps its ../ in build_path, which is a SANDBOX location and is
-    // correct there - but carried verbatim into rel_path, the producer's
-    // copy target `$out/../bin/...` lands OUTSIDE the output (an empty
-    // store dir that reads as success) and the consumer's symlink source
-    // `store-path/../bin/...` names a path that cannot exist. Map each
-    // `..` component to a literal `.nn-up` directory: both sides derive
-    // the location from this one construction, so the producer writes and
-    // the consumer reads the same in-output path. (Server edition attempt
-    // 8, 2026-08-23: `symlink source does not exist:
-    // .../4qv7...so.1.4.2/../bin/Release/libopenfec.so.1.4.2`.)
-    let rel_path: PathBuf = build_path
+/// rel_path IS A LOCATION INSIDE THE STORE OUTPUT AND MUST NOT CLIMB.
+/// An out-of-build-dir output (openfec's ../bin/Release/libopenfec.so)
+/// keeps its ../ in build_path, which is a SANDBOX location and is
+/// correct there - but carried verbatim into rel_path, the producer's
+/// copy target `$out/../bin/...` lands OUTSIDE the output (an empty
+/// store dir that reads as success) and the consumer's symlink source
+/// `store-path/../bin/...` names a path that cannot exist. Map each
+/// `..` component to a literal `.nn-up` directory. BOTH construction
+/// sites - the producer's NIX_NINJA_OUTPUTS encoding and the consumer's
+/// new_built_file - must call this, and attempt 9 (2026-08-23) is why
+/// that sentence is a function rather than a comment: only the consumer
+/// side learned .nn-up first, and the producer kept copying outside $out.
+fn store_rel_path(build_path: &Path) -> PathBuf {
+    build_path
         .components()
         .map(|c| {
             if c == std::path::Component::ParentDir {
@@ -4374,7 +4378,12 @@ fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> Deriv
                 c.as_os_str()
             }
         })
-        .collect();
+        .collect()
+}
+
+fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> DerivedFile {
+    let output_name = normalize_output(&build_path.to_string_lossy());
+    let rel_path = store_rel_path(&build_path);
     DerivedFile {
         derived_path: SingleDerivedPath::Built {
             drv_path: Arc::new(derived_path),
