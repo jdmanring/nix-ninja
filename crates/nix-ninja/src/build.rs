@@ -49,7 +49,17 @@ pub fn build(
             load_limit: config.load_limit,
         },
     )?;
-    runner.read_build_dir(&mut loader.graph.files)?;
+    // THE BUILD-DIR WALK IS OFF FOR A ONE-EDGE COMPILE. The compiler drop-in
+    // (ArtNix scripts/nn-cc-shim.sh) starts one driver per `cc -c` under
+    // make's own -j, and every file in the tree registered as an opaque
+    // input, per driver, is both the cost that dominates a small compile and
+    // a race: libtool's transient `x.loT` vanished between the walk listing
+    // it and canonicalize (alsa-lib, 2026-08-23). A gcc task takes no
+    // implicit-input blanket, so the walk bought it nothing; its headers
+    // arrive through deps = gcc.
+    if std::env::var_os("NIX_NINJA_NO_BUILD_DIR_SCAN").is_none() {
+        runner.read_build_dir(&mut loader.graph.files)?;
+    }
 
     let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner);
 

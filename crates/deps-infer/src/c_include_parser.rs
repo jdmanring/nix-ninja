@@ -244,22 +244,62 @@ pub fn extract_includes(
     let parent_dir = PathBuf::from(path.parent().unwrap());
     let mut result = Vec::new();
 
+    // A HEADER REACHED THROUGH A SYMLINKED DIRECTORY IS DECLARED TWICE: at
+    // its canonical path, which is what the cache and dedup key on, and at
+    // the path AS SPELLED by the include dir plus the directive, which is
+    // what the compiler will open inside the task sandbox. The sandbox
+    // reproduces files, not the symlinks between them: alsa-lib's make runs
+    // `ln -s ../include include/alsa` and its headers say
+    // `#include <alsa/sound/type_compat.h>`; canonical alone put the file
+    // at include/sound/type_compat.h and the compile died "No such file"
+    // (2026-08-23, the first make package through the compiler drop-in).
+    // Only relative spellings are added - an absolute spelling is a store
+    // path or a system header, where symlinks are the store's own business.
+    let mut push_both = |head: &Path, tail: &Path, canonical: PathBuf| {
+        let spelled = lexical_normalize(&head.join(tail));
+        if spelled != canonical && spelled.is_relative() {
+            result.push(spelled);
+        }
+        result.push(canonical);
+    };
     for d in directives.iter() {
         if d.quoted {
             if let Some(p) = try_resolve(&parent_dir, &d.name, virtual_paths) {
-                result.push(p);
+                push_both(&parent_dir, &d.name, p);
                 continue;
             }
         }
-        if let Some(p) = include_dirs
+        if let Some((i, p)) = include_dirs
             .iter()
-            .find_map(|i| try_resolve(i, &d.name, virtual_paths))
+            .find_map(|i| try_resolve(i, &d.name, virtual_paths).map(|p| (i, p)))
         {
-            result.push(p);
+            push_both(i, &d.name, p);
         }
     }
 
     Ok(result)
+}
+
+/// Remove `.` and collapse `a/..` components without touching the
+/// filesystem, so a symlink in the path is NOT followed - that is the point.
+fn lexical_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let last_is_parent = out
+                    .components()
+                    .next_back()
+                    .is_some_and(|c| c == std::path::Component::ParentDir);
+                if last_is_parent || !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn try_resolve(
@@ -320,6 +360,16 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lexical_normalize_keeps_symlinks_and_leading_parents() {
+        use super::lexical_normalize;
+        use std::path::PathBuf;
+        assert_eq!(lexical_normalize(&PathBuf::from("../../include/./alsa/sound/x.h")),
+                   PathBuf::from("../../include/alsa/sound/x.h"));
+        assert_eq!(lexical_normalize(&PathBuf::from("a/b/../c.h")), PathBuf::from("a/c.h"));
+        assert_eq!(lexical_normalize(&PathBuf::from("../a/../../c.h")), PathBuf::from("../../c.h"));
+    }
+
     use super::*;
 
     // The virtual-path check moved from a pairwise Path == scan to a keyed

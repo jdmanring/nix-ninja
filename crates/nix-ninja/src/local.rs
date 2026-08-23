@@ -59,7 +59,34 @@ pub fn symlink_derived_files(
         })
         .collect();
 
-    create_symlinks(prefix, store_dir, opaque_files, true)?;
+    create_symlinks(prefix, store_dir, opaque_files.clone(), true)?;
+
+    // PLACEHOLDER -> REAL OUTER PATH, by COPY. A task output that names an
+    // outer output path carries the placeholder (task.rs outer_rewrite_map);
+    // the build tree needs the real one, and a store file is read-only, so
+    // such an output is materialized as a rewritten copy rather than a
+    // symlink. Outputs with no placeholder stay symlinks.
+    let restore = crate::task::outer_restore_map();
+    if !restore.is_empty() {
+        for df in &opaque_files {
+            let dest = prefix.join(&df.build_path);
+            if !dest.is_symlink() {
+                continue;
+            }
+            let Ok(target) = std::fs::read_link(&dest) else { continue };
+            if !target.is_file() {
+                continue;
+            }
+            let data = std::fs::read(&target)?;
+            if let Some(rewritten) = crate::task::rewrite_bytes(&data, &restore) {
+                std::fs::remove_file(&dest)?;
+                std::fs::write(&dest, rewritten)?;
+                if let Ok(md) = std::fs::metadata(&target) {
+                    let _ = std::fs::set_permissions(&dest, md.permissions());
+                }
+            }
+        }
+    }
 
     Ok(())
 }

@@ -416,10 +416,18 @@ impl Runner {
 
         let mut wrapper_vars = HashMap::new();
         for (key, value) in env::vars() {
+            // NIX_HARDENING_ENABLE TOO, OR A TASK COMPILES WITH NO HARDENING
+            // AT ALL. cc-wrapper's add-hardening.sh reads the target-suffixed
+            // NIX_HARDENING_ENABLE_<triple>, which the stdenv setup hook
+            // exports into the outer build and which no task sandbox has;
+            // an empty map enables nothing. Measured 2026-08-23 on alsa-lib:
+            // same compiler, .text 637 kB through the drop-in against 702 kB
+            // stock, and every earlier drop-in build carried the same gap.
             if key.starts_with("NIX_CFLAGS_COMPILE")
                 || key.starts_with("NIX_LDFLAGS")
                 || key.starts_with("NIX_CC_WRAPPER")
                 || key.starts_with("NIX_BINTOOLS_WRAPPER")
+                || key.starts_with("NIX_HARDENING_ENABLE")
             {
                 wrapper_vars.insert(key, value);
             }
@@ -442,8 +450,23 @@ impl Runner {
             // term). Nothing inside a task needs it: a compile never links,
             // and the install step rewrites RPATH off the build tree anyway.
             if key.starts_with("NIX_LDFLAGS") {
+                let before = value.clone();
                 *value = remove_outer_rpath(value);
+                if std::env::var_os("NIX_NINJA_DIAG").is_some() {
+                    eprintln!(
+                        "nix-ninja: DIAG {key} outer={:?} before=[{}] after=[{}]",
+                        outer_output_paths(),
+                        &before[..before.len().min(120)],
+                        &value[..value.len().min(120)]
+                    );
+                }
             }
+        }
+
+        // Outer output paths -> placeholders in the forwarded env too.
+        let rewrite = outer_rewrite_map();
+        for value in wrapper_vars.values_mut() {
+            *value = rewrite_str(value, &rewrite);
         }
 
         // Extract store paths from wrapper variables once
@@ -488,14 +511,24 @@ impl Runner {
                 !e.file_name().to_string_lossy().starts_with("meson-")
             })
         {
-            let entry = entry?;
+            // A file that vanishes between listing and reading is a build
+            // in progress, not an error: skip it rather than failing the
+            // whole driver on a temp file (libtool's `.loT`, alsa-lib).
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) if e.io_error().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => continue,
+                Err(e) => return Err(e.into()),
+            };
             if !entry.file_type().is_file() {
                 continue;
             }
 
             let path = entry.into_path();
-            let derived_file =
-                new_opaque_file(&self.rpc_client, &self.config.build_dir, path.clone())?;
+            let derived_file = match new_opaque_file(&self.rpc_client, &self.config.build_dir, path.clone()) {
+                Ok(d) => d,
+                Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => continue,
+                Err(e) => return Err(e),
+            };
             let fid = self.add_derived_file(files, derived_file.clone());
             self.build_dir_inputs.insert(fid, derived_file);
         }
@@ -1841,6 +1874,8 @@ fn build_task_derivation(
         .into(),
     );
 
+    // Outer output paths -> placeholders (see outer_rewrite_map).
+    let cmdline = &rewrite_str(cmdline, &outer_rewrite_map());
     drv.args.push(cmdline.to_string().into_bytes().into());
 
     if let Some(desc) = &task.desc {
@@ -2225,7 +2260,7 @@ fn build_task_derivation(
         );
         drv.env.insert(
             b"NIX_NINJA_RSPFILE_CONTENT"[..].into(),
-            rsp_content.clone().into_bytes().into(),
+            rewrite_str(rsp_content, &outer_rewrite_map()).into_bytes().into(),
         );
         pass_as_file.push_str(" NIX_NINJA_RSPFILE_CONTENT");
     }
@@ -2616,9 +2651,111 @@ fn extract_store_paths(
         if !store_path.to_absolute_path(store_dir).exists() {
             continue;
         }
+        // THE OUTER DERIVATION'S OWN OUTPUTS ARE NEVER INPUTS. They do not
+        // exist during the build phase, so the check above skipped them
+        // and nothing noticed; at install time they exist on disk and are
+        // not yet valid, so declaring one is an AddToStore the daemon
+        // refuses ("path ... is not valid": alsa-lib, make install
+        // recompiling aserver.o, 2026-08-23). Same list remove_outer_rpath
+        // reads.
+        if outer_output_paths()
+            .iter()
+            .any(|o| o == &store_path.to_absolute_path(store_dir).to_string_lossy())
+        {
+            continue;
+        }
         store_paths.push(store_path);
     }
     Ok(store_paths)
+}
+
+/// THE OUTER OUTPUT PATHS ARE REWRITTEN TO SAME-LENGTH PLACEHOLDERS IN
+/// EVERYTHING A TASK SEES, AND BACK IN EVERYTHING IT PRODUCES.
+///
+/// `$out` of the outer derivation moves with every change to that
+/// derivation, a one-line source edit included, and configure writes it
+/// into generated headers (`ALSA_CONFIG_DIR` in alsa-lib's config.h, which
+/// every TU includes) and into command lines. Measured 2026-08-23: one
+/// edited .c file rebuilt 110 of 116 translation units. This is the same
+/// problem Nix solves for content-addressed outputs the same way: a
+/// placeholder of identical length stands in during the build, and the
+/// real path is substituted into the result afterwards. Same length
+/// because the substitution has to be valid inside an object file.
+///
+/// The task derivation and its output carry ONLY the placeholder, which is
+/// what makes the derivation stable and its cached output reusable under
+/// a different `$out`; the driver alone holds the mapping and applies it
+/// when it materializes an output into the build tree (`local.rs`).
+pub fn outer_rewrite_map() -> Vec<(String, String)> {
+    let store_dir = std::env::var("NIX_STORE").unwrap_or_else(|_| "/nix/store".into());
+    std::env::var("outputs")
+        .unwrap_or_else(|_| "out".into())
+        .split_whitespace()
+        .filter_map(|name| std::env::var(name).ok().map(|p| (name.to_string(), p)))
+        .filter_map(|(name, real)| {
+            // /nix/store/<32 base32 chars>-<rest>
+            let rel = real.strip_prefix(&format!("{store_dir}/"))?;
+            let (hash, rest) = rel.split_once('-')?;
+            if hash.len() != 32 {
+                return None;
+            }
+            let digest = Sha256::digest(format!("nix-ninja-outer-output:{name}").as_bytes());
+            let alphabet = b"0123456789abcdfghijklmnpqrsvwxyz";
+            let fake: String = digest
+                .iter()
+                .take(32)
+                .map(|b| alphabet[(*b as usize) % 32] as char)
+                .collect();
+            Some((real.clone(), format!("{store_dir}/{fake}-{rest}")))
+        })
+        .collect()
+}
+
+/// Apply `map` (from -> to) to `s`; a no-op where nothing matches.
+pub fn rewrite_str(s: &str, map: &[(String, String)]) -> String {
+    let mut out = s.to_string();
+    for (from, to) in map {
+        if out.contains(from.as_str()) {
+            out = out.replace(from.as_str(), to);
+        }
+    }
+    out
+}
+
+/// Byte-wise form for file contents, which may be binary.
+pub fn rewrite_bytes(data: &[u8], map: &[(String, String)]) -> Option<Vec<u8>> {
+    let mut out = data.to_vec();
+    let mut changed = false;
+    for (from, to) in map {
+        let (f, t) = (from.as_bytes(), to.as_bytes());
+        debug_assert_eq!(f.len(), t.len());
+        let mut i = 0;
+        while i + f.len() <= out.len() {
+            if &out[i..i + f.len()] == f {
+                out[i..i + f.len()].copy_from_slice(t);
+                changed = true;
+                i += f.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    changed.then_some(out)
+}
+
+/// The reverse map: placeholder -> real.
+pub fn outer_restore_map() -> Vec<(String, String)> {
+    outer_rewrite_map().into_iter().map(|(r, p)| (p, r)).collect()
+}
+
+/// The outer derivation's output paths, from the `outputs` env var the
+/// builder is given (`$out`, `$dev`, ...). Empty outside a build.
+fn outer_output_paths() -> Vec<String> {
+    std::env::var("outputs")
+        .unwrap_or_else(|_| "out".into())
+        .split_whitespace()
+        .filter_map(|o| std::env::var(o).ok())
+        .collect()
 }
 
 fn new_opaque_file(
@@ -2658,6 +2795,32 @@ fn new_opaque_file(
     // affected store objects re-key. Scripts INVOKED as `python3 x.py`
     // never read their shebang, so the rewrite is inert for them.
     let upload_src = patched_env_shebang(&canonical_path)?;
+    // A file that names an outer output path is uploaded with the path
+    // rewritten to its placeholder (config.h carrying $out/share/alsa),
+    // so the upload's hash, and every task reading it, is stable across
+    // changes to the outer derivation. Regular files only; a directory
+    // is uploaded as it is.
+    let upload_src = if upload_src.is_none() && canonical_path.is_file() {
+        let map = outer_rewrite_map();
+        let data = fs::read(&canonical_path)?;
+        match rewrite_bytes(&data, &map) {
+            Some(rewritten) => {
+                let tmp = std::env::temp_dir().join(format!(
+                    "nn-outer-{}-{}",
+                    std::process::id(),
+                    canonical_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                ));
+                fs::write(&tmp, rewritten)?;
+                if let Ok(md) = fs::metadata(&canonical_path) {
+                    let _ = fs::set_permissions(&tmp, md.permissions());
+                }
+                Some(tmp)
+            }
+            None => None,
+        }
+    } else {
+        upload_src
+    };
     let store_path = rpc_client.add_to_store_nar_cached(
         &name,
         upload_src.as_deref().unwrap_or(&canonical_path),
@@ -4751,11 +4914,7 @@ pub fn discover_c_includes(
 /// derivation's outputs ($out, $dev, ... as the `outputs` env lists them).
 /// Other rpath entries (store libraries) are inputs and stay.
 fn remove_outer_rpath(value: &str) -> String {
-    let outer: Vec<String> = std::env::var("outputs")
-        .unwrap_or_else(|_| "out".into())
-        .split_whitespace()
-        .filter_map(|o| std::env::var(o).ok())
-        .collect();
+    let outer = outer_output_paths();
     let toks: Vec<&str> = value.split_whitespace().collect();
     let mut out: Vec<&str> = Vec::with_capacity(toks.len());
     let mut i = 0;
@@ -5088,6 +5247,39 @@ mod self_rss_tests {
 
 #[cfg(test)]
 mod ninja_pool_tests {
+    #[test]
+    fn outer_rewrite_map_is_same_length_stable_and_reversible() {
+        std::env::set_var("outputs", "out dev");
+        std::env::set_var("out", "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-1.2.16.1");
+        std::env::set_var("dev", "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-alsa-lib-1.2.16.1-dev");
+        let m = super::outer_rewrite_map();
+        assert_eq!(m.len(), 2);
+        for (real, fake) in &m {
+            assert_eq!(real.len(), fake.len());
+            assert_ne!(real, fake);
+            assert!(fake.starts_with("/nix/store/"));
+        }
+        // Stable under a different $out hash: the placeholder depends on the
+        // output NAME only.
+        std::env::set_var("out", "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-alsa-lib-1.2.16.1");
+        assert_eq!(super::outer_rewrite_map()[0].1, m[0].1);
+        let data = format!("#define DIR \"{}/share\"\0bin", m[0].0);
+        let fwd = super::rewrite_bytes(data.as_bytes(), &m).expect("rewritten");
+        assert!(!fwd.windows(m[0].0.len()).any(|w| w == m[0].0.as_bytes()));
+        let back: Vec<(String, String)> = m.iter().map(|(r, p)| (p.clone(), r.clone())).collect();
+        assert_eq!(super::rewrite_bytes(&fwd, &back).unwrap(), data.as_bytes());
+        assert!(super::rewrite_bytes(b"nothing here", &m).is_none());
+    }
+
+    #[test]
+    fn remove_outer_rpath_strips_the_out_lib_pair() {
+        std::env::set_var("outputs", "out dev");
+        std::env::set_var("out", "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-cc-dropin-1.2.16.1");
+        std::env::set_var("dev", "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-alsa-lib-cc-dropin-1.2.16.1-dev");
+        let v = "-rpath /nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-cc-dropin-1.2.16.1/lib  -L/nix/store/klkb81wkzlz3bpfv6brnh3gwcapy5b4w-boost-1.89.0/lib";
+        assert_eq!(super::remove_outer_rpath(v), "-L/nix/store/klkb81wkzlz3bpfv6brnh3gwcapy5b4w-boost-1.89.0/lib");
+    }
+
     use super::pool_permits_from_depths;
     use std::collections::HashMap;
 
