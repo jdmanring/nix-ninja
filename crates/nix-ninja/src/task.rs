@@ -1926,6 +1926,13 @@ impl Runner {
     }
 }
 
+/// End-of-run persistence for the cross-run caches; see build.rs. Public
+/// because the build loop, not the runner, knows when the run is over.
+pub fn resolve_cache_final_flush(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> {
+    crate::resolve_cache::flush()?;
+    crate::resolve_cache::save_nar_stamps(&rpc_client.nar_stamps_snapshot())
+}
+
 fn build_task_derivation(
     tools: Tools,
     rpc_client: &Arc<BuilderRpcClient>,
