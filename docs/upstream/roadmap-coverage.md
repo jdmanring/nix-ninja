@@ -208,3 +208,36 @@ driver in the outer derivation. That policy belongs at the shim layer, not
 the driver, because only the caller knows the outer derivation's phases -
 recorded here so a reader looking for the mechanism in this tree knows where
 it lives and why it is absent.
+
+## 2026-08-23, second sweep: #18 landed, plus four more classes
+
+Roadmap movement this sweep:
+
+- **#18 (async `nix store add`): both halves built.** Within a run,
+  `new_opaque_files` batches a task's source-file adds over bounded scoped
+  threads (8 per task; the connection pool stays the daemon-side bound), and
+  deliberately does NOT dedup so emitted derivations are byte-identical to
+  the sequential path (4a commit be123e1). Across runs, the per-file NAR
+  stamp map (size, mtime, store path) persists to
+  `.nix-ninja-nar-stamps.v1` beside build.ninja and seeds the client at
+  startup, so a restart's uploads become stat calls; entries still validate
+  per hit against the live file, and a store path missing on disk drops at
+  load (cfba53e). Flushed on the 500-task tick AND at end of run - the
+  drop-in mode runs one task per driver and never reached the tick (4a7edff).
+- **#4 / #7 (benchmarks): the instrument already exists.** The driver
+  prints a per-phase breakdown (resolve, realise, dyn, nar, scan) every 500
+  tasks with counters behind each; a generation-phase benchmark is one run
+  of that instrument with a warm daemon, where realise cost is early-cutoff
+  only. What this fork can offer upstream is the phase-timer mechanism and
+  campaign-scale readings, not a NixOS/Nix-tree reproduction of their
+  reference numbers - that workload should be timed on their hardware with
+  the same instrument.
+
+New whole-graph classes, same format as the table above:
+
+| class | package that bought it | commit | test |
+|---|---|---|---|
+| `#  define` / `#  include` (whitespace after the hash) invisible to the computed-include scanner | lzo, second failure on the same symptom | 41dc03a | `directive_with_space_after_hash_still_scans`, with a `#definexyz` negative |
+| files named inside `-Wl,` groups (version scripts) never declared | json-c | 1fb92f8 | `wl_groups_yield_files_and_skip_output_flags` |
+| store-add errors name neither the string nor the call | libconfig ("string is too long") | 4509ca7 | instrumentation, not a rule |
+| one build path uploaded at two contents when the outer build regenerates a file mid-scan | gperf (config.h, automake remake rule under make -j) | 9f79161 | campaign only (needs a mutating file); deterministic repro recorded on the gperf drv |
