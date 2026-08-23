@@ -2107,6 +2107,46 @@ fn build_task_derivation(
         }
     }
 
+    // ONE BUILD PATH, ONE CONTENT. A file the outer build regenerates
+    // while discovery is scanning (gperf: automake's remake rule re-runs
+    // `config.status config.h` under make -j beside the compiles) gets
+    // uploaded at two different contents by two scans; both encodings
+    // survive the string-keyed dedup above, and the task then dies in
+    // sandbox setup: "Two different files claim one build path." Group
+    // opaque inputs by build path; on a collision, upload the file AS IT
+    // NOW STANDS and keep only that spelling - failing toward a fresh
+    // read, never toward picking one of two stale spellings.
+    {
+        let mut by_bp: HashMap<PathBuf, Vec<DerivedFile>> = HashMap::new();
+        for i in task.inputs.iter().chain(discovered_inputs.iter()) {
+            if matches!(i.derived_path, SingleDerivedPath::Opaque(_)) {
+                by_bp.entry(i.build_path.clone()).or_default().push(i.clone());
+            }
+        }
+        for (bp, group) in by_bp {
+            if group.len() < 2
+                || group
+                    .iter()
+                    .all(|g| g.derived_path == group[0].derived_path)
+            {
+                continue;
+            }
+            eprintln!(
+                "nix-ninja: {} was uploaded at {} different contents in one task                  (regenerated mid-build?); re-reading it now and using that alone",
+                bp.display(),
+                group.len(),
+            );
+            let abs = task.build_dir.join(&bp);
+            let fresh = new_opaque_file(rpc_client, &task.build_dir, abs)?;
+            for stale in &group {
+                input_set.remove(&stale.to_encoded(&task.store_dir));
+                drv.inputs.remove(&stale.derived_path);
+            }
+            input_set.insert(fresh.to_encoded(&task.store_dir));
+            drv.inputs.insert(fresh.derived_path.clone());
+        }
+    }
+
     // The sandbox build dir must be at least as DEEP as the longest
     // `..` climb any input or command token makes: the default
     // /build/source/build is 3 deep, and Chromium's GN graph references
