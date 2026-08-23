@@ -55,6 +55,16 @@ pub enum Error {
     NoDaemon,
     #[error("nar encode: {0}")]
     Nar(String),
+    // "string is too long" from the daemon names neither the string nor
+    // the call; this wrapper names the object being added so the failing
+    // upload is identifiable from the build log (libconfig, 2026-08-23).
+    #[error("add_to_store of {name:?} ({detail}): {source}")]
+    AddToStore {
+        name: String,
+        detail: String,
+        #[source]
+        source: Box<Error>,
+    },
     #[error("build of {path} failed: {error_msg}")]
     BuildFailed { path: String, error_msg: String },
     #[error("daemon returned no build result for {0}")]
@@ -426,6 +436,11 @@ impl BuilderRpcClient {
                     })
                     .await
             }
+        })
+        .map_err(|e| Error::AddToStore {
+            name: name.to_string(),
+            detail: format!("text, {} bytes", bytes.len()),
+            source: Box::new(Error::from(e)),
         })?;
         Ok(info.path)
     }
@@ -578,6 +593,11 @@ impl BuilderRpcClient {
             // RPC's own error needs converting rather than being handed back
             // raw the way it was before the join existed.
             out.map_err(Error::from)
+        })
+        .map_err(|e| Error::AddToStore {
+            name: name.to_string(),
+            detail: format!("nar of {}", path.display()),
+            source: Box::new(e),
         })?;
         Ok(info.path)
     }
