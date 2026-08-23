@@ -982,6 +982,15 @@ impl Runner {
         resolve_target_in(&self.derived_files, &self.phony_aliases, fid)
     }
 
+    /// Whether a target is a phony alias. A header-only CMake project emits
+    /// `build all: phony` with ZERO inputs (opencl-headers: every real edge
+    /// is a utility target outside `all`), so resolving it is legitimately
+    /// empty and real ninja succeeds doing nothing. The caller uses this to
+    /// tell that no-op apart from a target that failed to resolve.
+    pub fn is_phony(&self, fid: FileId) -> bool {
+        self.phony_aliases.contains_key(&fid)
+    }
+
     fn new_task(&mut self, files: &mut graph::GraphFiles, build: &Build) -> Result<Task> {
         // Section clocks for the serial-resolution bottleneck, read by
         // the heartbeat in start(). Wall time between checkpoints lands

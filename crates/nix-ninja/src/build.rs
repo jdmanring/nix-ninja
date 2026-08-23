@@ -93,6 +93,16 @@ pub fn build(
     for (name, fid) in target_fids {
         let resolved = runner.resolve_target(fid);
         if resolved.is_empty() {
+            // AN EMPTY PHONY TARGET IS A SUCCESSFUL NO-OP, not a missing
+            // file. A header-only CMake project emits `build all: phony`
+            // with zero inputs (opencl-headers 2026.05.29: every real edge
+            // is a utility target outside `all`), and real ninja exits 0
+            // having done nothing. Only a target that is NOT a phony and
+            // still resolved to nothing is the defect this error names.
+            if runner.is_phony(fid) {
+                eprintln!("nix-ninja: target {name} is an empty phony; nothing to build");
+                continue;
+            }
             return Err(anyhow!(
                 "Missing derived file {:?} for target {}",
                 fid,
