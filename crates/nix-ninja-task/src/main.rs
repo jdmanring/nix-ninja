@@ -488,8 +488,150 @@ fn main() -> Result<()> {
         }
     }
     copy_outputs_to_placeholders(&cli.store_dir, &outputs)?;
+    producer_alias_symlinks(&cli.store_dir, &outputs);
 
     Ok(())
+}
+
+/// The PRODUCER side of the SONAME-alias class. The build-dir aliases
+/// above make a consumer's sandbox look like a real build dir, but a
+/// consumer whose RUNPATH was rewritten to the ABSOLUTE store path of
+/// this task's output (nix's cc-wrapper does that at link time) never
+/// looks in its build dir at all: the loader opens
+/// `<store-object>/orc/` and finds only the real versioned file,
+/// because meson's configure-time symlinks are no task's declared
+/// output. Measured on orc 0.4.42: `tools/orcc` NEEDs
+/// `liborc-0.4.so.0`, RUNPATH names the liborc output object, and the
+/// object holds only `liborc-0.4.so.0.42.0` - exit 127 with every
+/// input present. So after copying a file output, recreate any alias
+/// whose (same-dir, single-component) target chain ends at that file,
+/// INSIDE the output object, where the relative link resolves against
+/// the real file sitting beside it.
+fn producer_alias_symlinks(store_dir: &StoreDir, outputs: &[DerivedFile]) {
+    let Ok(raw) = env::var("NIX_NINJA_ALIASES") else {
+        return;
+    };
+    let aliases = same_dir_aliases(&raw);
+    if aliases.is_empty() {
+        return;
+    }
+    for output in outputs {
+        let target_path = output.absolute_path(store_dir);
+        if target_path.is_dir() {
+            continue;
+        }
+        let (Some(out_dir), Some(name)) = (target_path.parent(), output.build_path.file_name())
+        else {
+            continue;
+        };
+        let build_rel_dir = output
+            .build_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        for (link_name, target) in
+            alias_closure(&build_rel_dir, &name.to_string_lossy(), &aliases)
+        {
+            let link_abs = out_dir.join(&link_name);
+            if link_abs.exists() || link_abs.is_symlink() {
+                continue;
+            }
+            match std::os::unix::fs::symlink(&target, &link_abs) {
+                Ok(()) => println!(
+                    "nix-ninja-task: output alias {} -> {target}",
+                    link_abs.display()
+                ),
+                Err(e) => println!(
+                    "nix-ninja-task: output alias {} -> {target}: {e}",
+                    link_abs.display()
+                ),
+            }
+        }
+    }
+}
+
+/// Parse NIX_NINJA_ALIASES down to the pairs this mechanism can carry:
+/// a link whose target is a bare filename, i.e. a sibling in the same
+/// directory. Anything else (a `..` target, an absolute path) cannot
+/// resolve inside a single output object and is left to the build-dir
+/// half above.
+fn same_dir_aliases(raw: &str) -> Vec<(PathBuf, String, String)> {
+    let mut out = Vec::new();
+    for pair in raw.split_whitespace() {
+        let Some((link, target)) = pair.split_once('=') else {
+            continue;
+        };
+        let link = Path::new(link);
+        if link.is_absolute() || target.is_empty() || target.contains('/') {
+            continue;
+        }
+        let Some(name) = link.file_name() else {
+            continue;
+        };
+        out.push((
+            link.parent().unwrap_or_else(|| Path::new("")).to_path_buf(),
+            name.to_string_lossy().to_string(),
+            target.to_string(),
+        ));
+    }
+    out
+}
+
+/// Every alias in `dir` reachable by target-chains ending at `filename`:
+/// `liborc-0.4.so.0 -> liborc-0.4.so.0.42.0` first, then
+/// `liborc-0.4.so -> liborc-0.4.so.0` once the first exists. Returns
+/// (link filename, symlink target) in creation order.
+fn alias_closure(
+    dir: &Path,
+    filename: &str,
+    aliases: &[(PathBuf, String, String)],
+) -> Vec<(String, String)> {
+    let mut present: Vec<String> = vec![filename.to_string()];
+    let mut created: Vec<(String, String)> = Vec::new();
+    loop {
+        let mut advanced = false;
+        for (adir, link, target) in aliases {
+            if adir == dir && present.iter().any(|p| p == target) && !present.iter().any(|p| p == link)
+            {
+                present.push(link.clone());
+                created.push((link.clone(), target.clone()));
+                advanced = true;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    created
+}
+
+#[cfg(test)]
+mod producer_alias_tests {
+    use super::*;
+
+    #[test]
+    fn the_orc_chain_lands_and_a_foreign_dir_does_not() {
+        let raw = "orc/liborc-0.4.so=liborc-0.4.so.0 \
+                   orc/liborc-0.4.so.0=liborc-0.4.so.0.42.0 \
+                   orc-test/liborc-test-0.4.so.0=liborc-test-0.4.so.0.42.0 \
+                   bad/esc=../out.so bad/abs=/nix/store/x.so";
+        let aliases = same_dir_aliases(raw);
+        // the `..` target and the absolute target are refused at parse
+        assert_eq!(aliases.len(), 3);
+        // the full chain, in dependency order
+        let got = alias_closure(Path::new("orc"), "liborc-0.4.so.0.42.0", &aliases);
+        assert_eq!(
+            got,
+            vec![
+                ("liborc-0.4.so.0".to_string(), "liborc-0.4.so.0.42.0".to_string()),
+                ("liborc-0.4.so".to_string(), "liborc-0.4.so.0".to_string()),
+            ]
+        );
+        // same filename in a dir with no aliases: nothing
+        assert!(alias_closure(Path::new("tools"), "liborc-0.4.so.0.42.0", &aliases).is_empty());
+        // an output that is not any alias target: nothing
+        assert!(alias_closure(Path::new("orc"), "orcc", &aliases).is_empty());
+    }
 }
 
 fn copy_outputs_to_placeholders(store_dir: &StoreDir, outputs: &[DerivedFile]) -> Result<()> {
