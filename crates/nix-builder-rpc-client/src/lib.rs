@@ -1542,7 +1542,15 @@ mod nar_upload_memo_tests {
 ///   Polarity: a GENUINE misconfiguration (a root-uid group member)
 ///   fails every retry and still surfaces after the bounded ladder.
 fn transient_daemon_error(msg: &str) -> bool {
-    (msg.contains("/sys/fs/cgroup/") && msg.contains("No such file"))
+    // The cgroup race has TWO signatures, one per side of the same
+    // daemon defect: a worker tearing down a per-uid cgroup another
+    // worker still holds reads ENOENT, and a worker CREATING one that a
+    // dying worker has not yet removed reads EEXIST ("creating cgroup
+    // .../nix-build-uid-N: File exists" - fftw, 2026-08-23). Both are
+    // scoped to the cgroup path so an unrelated File exists (a real
+    // output collision) stays a verdict.
+    (msg.contains("/sys/fs/cgroup/")
+        && (msg.contains("No such file") || msg.contains("File exists")))
         || msg.contains("should not be a member of")
 }
 
@@ -1558,11 +1566,19 @@ mod transient_error_tests {
         assert!(transient_daemon_error(
             "BuildPathsWithResults: remote error: the Nix user should not be a member of 'nixbld'"
         ));
+        // The create side of the same cgroup race (fftw, 2026-08-23).
+        assert!(transient_daemon_error(
+            "creating cgroup \"/sys/fs/cgroup/nixbuild/nix-daemon/nix-build-uid-939\": File exists"
+        ));
         // Negative controls: real verdicts must stay terminal.
         assert!(!transient_daemon_error("builder failed with exit code 2"));
         assert!(!transient_daemon_error(
             "cannot build '/nix/store/x.drv' in recursive Nix because path is unknown"
         ));
         assert!(!transient_daemon_error("missing system features: builder-rpc-v0"));
+        // A File exists OUTSIDE the cgroup path is a real collision.
+        assert!(!transient_daemon_error(
+            "copying '/build/out' to '/nix/store/x': File exists"
+        ));
     }
 }
