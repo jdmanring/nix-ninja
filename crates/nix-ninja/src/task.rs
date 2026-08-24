@@ -1549,6 +1549,32 @@ impl Runner {
                     // a task input; upload it. is_file skips -I dirs and
                     // not-yet-existing outputs; absolute and flag-shaped
                     // args never reach the check.
+                    // A `VAR=relpath` value is invisible to the bare
+                    // relative branch below: Path::new("INPUT_FILE=../x")
+                    // is never a file. The absolute twin is handled by
+                    // absolute_file_candidate above, but rewrite_cmdline
+                    // rebases in-tree absolutes to ../ chains BEFORE this
+                    // loop, so cmake's `-D INPUT_FILE=/build/...` arrives
+                    // here respelled relative and matched nothing - the
+                    // task then ran with the script uploaded (a bare -P
+                    // arg) and its input absent (svt-av1's EbVersion.h,
+                    // 2026-08-24, reproduced minimally before the fix).
+                    if let Some((_, v)) = arg.split_once('=') {
+                        if !v.starts_with('/')
+                            && v.contains('/')
+                            && !v.starts_with('$')
+                            && Path::new(v).is_file()
+                        {
+                            for input in upload_referenced_file(
+                                &self.rpc_client,
+                                &self.config.build_dir,
+                                PathBuf::from(v),
+                            )? {
+                                self.add_derived_file(files, input.clone());
+                                input_set.insert(input.build_path.clone(), input);
+                            }
+                        }
+                    }
                     if !arg.starts_with('-')
                         && !arg.starts_with('/')
                         && arg.contains('/')

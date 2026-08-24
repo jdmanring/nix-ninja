@@ -438,6 +438,36 @@ fn main() -> Result<()> {
         std::process::exit(exit_code);
     }
 
+    // A CMAKE CUSTOM-TARGET STAMP IS A DECLARED OUTPUT NO COMMAND WRITES.
+    // cmake's ninja generator gives every add_custom_target an output named
+    // CMakeFiles/<target>, and under real ninja the file simply never
+    // exists - the edge re-runs every build, which is the always-run
+    // semantics custom targets have. A task collects its declared outputs,
+    // so the absent stamp failed the task AFTER the command had succeeded
+    // (svt-av1's EbVersionHeaderGen, 2026-08-24, reproduced minimally).
+    // Create the empty stamp for exactly this shape - exit 0, path under
+    // CMakeFiles/, extensionless basename - and keep every other missing
+    // output the loud error it must be: a compile whose .o is absent is a
+    // broken build, and rule-of-polarity says only the stamp class may be
+    // quietly satisfied.
+    for output in &outputs {
+        let bp = &output.build_path;
+        if !bp.exists()
+            && bp.components().any(|c| c.as_os_str() == "CMakeFiles")
+            && bp.extension().is_none()
+        {
+            if let Some(parent) = bp.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if fs::write(bp, b"").is_ok() {
+                println!(
+                    "nix-ninja-task: created empty custom-target stamp {}",
+                    bp.display()
+                );
+            }
+        }
+    }
+
     // Fix ELF RPATH to ensure it's linked against /nix/store paths rather
     // than relative path binaries in the build dir.
     patchelf::fix_rpaths(cli.store_dir.to_path(), &outputs)?;
