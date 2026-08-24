@@ -998,11 +998,7 @@ impl BuilderRpcClient {
                         // verdict about this request). Retry it like a
                         // connection error, bounded by the same counter and
                         // logged, so a genuine failure still surfaces.
-                        let cgroup_race = {
-                            let msg = e.to_string();
-                            msg.contains("/sys/fs/cgroup/") && msg.contains("No such file")
-                        };
-                        if !connection_level && !cgroup_race {
+                        if !connection_level && !transient_daemon_error(&e.to_string()) {
                             break Err(Error::from(e));
                         }
                         drop(guard);
@@ -1523,5 +1519,50 @@ mod nar_upload_memo_tests {
     fn an_unstattable_key_is_not_cacheable() {
         let missing = std::path::Path::new("/nonexistent/nn-memo-probe");
         assert!(std::fs::metadata(missing).is_err());
+    }
+}
+
+/// Daemon-REPORTED errors that are races in the daemon rather than
+/// verdicts about the request, retried bounded exactly like a
+/// connection error so a genuine failure still surfaces.
+///
+/// - cgroup teardown race: the daemon's own cgroup teardown races its
+///   other builds, so a worker opens nix-build-uid-N/cgroup.{kill,procs}
+///   after a sibling finished and removed it - ENOENT on a path the
+///   daemon itself manages (libxcrypt under make -j, 2026-08-23).
+/// - user-lock euid race: "the Nix user should not be a member of
+///   'nixbld'" from SimpleUserLock::acquire's sanity check
+///   (lock->uid == getuid() || geteuid()) inside the multithreaded
+///   daemon worker, whose euid another thread can hold at a build
+///   user's uid at the instant the recursive daemon thread acquires a
+///   lock. Measured 2026-08-23: one refusal among concurrent successes
+///   in the same gnutar sandbox, unreproducible serially on the same
+///   derivation; no nixbld member shares a uid with the daemon, so a
+///   clean acquire cannot throw. An upstream nix bug, not a verdict.
+///   Polarity: a GENUINE misconfiguration (a root-uid group member)
+///   fails every retry and still surfaces after the bounded ladder.
+fn transient_daemon_error(msg: &str) -> bool {
+    (msg.contains("/sys/fs/cgroup/") && msg.contains("No such file"))
+        || msg.contains("should not be a member of")
+}
+
+#[cfg(test)]
+mod transient_error_tests {
+    use super::transient_daemon_error;
+
+    #[test]
+    fn the_two_named_races_are_transient_and_verdicts_are_not() {
+        assert!(transient_daemon_error(
+            "opening file '/sys/fs/cgroup/nixbuild/nix-daemon/nix-build-uid-952/cgroup.kill': No such file or directory"
+        ));
+        assert!(transient_daemon_error(
+            "BuildPathsWithResults: remote error: the Nix user should not be a member of 'nixbld'"
+        ));
+        // Negative controls: real verdicts must stay terminal.
+        assert!(!transient_daemon_error("builder failed with exit code 2"));
+        assert!(!transient_daemon_error(
+            "cannot build '/nix/store/x.drv' in recursive Nix because path is unknown"
+        ));
+        assert!(!transient_daemon_error("missing system features: builder-rpc-v0"));
     }
 }
