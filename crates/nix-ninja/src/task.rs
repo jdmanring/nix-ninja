@@ -5447,8 +5447,16 @@ fn generate_frandom_seed(cmdline: &str) -> String {
 /// (spaced or fused). The rspfile is part of the command line.
 fn command_writes_depfile(cmdline: Option<&str>, rsp: Option<&str>) -> bool {
     let writes = |s: &str| {
-        s.split_whitespace()
-            .any(|t| t == "-MD" || t == "-MMD" || t.starts_with("-MF"))
+        s.split_whitespace().any(|t| {
+            t == "-MD"
+                || t == "-MMD"
+                || t.starts_with("-MF")
+                // The LINKER spelling: CMake 3.27+ link edges write their
+                // depfile via `-Wl,--dependency-file=...` (capstone's LTO
+                // link died writing link.d into a directory only the
+                // declared-output path used to create).
+                || t.contains("--dependency-file")
+        })
     };
     cmdline.is_some_and(writes) || rsp.is_some_and(writes)
 }
@@ -5506,6 +5514,11 @@ mod target_resolution_tests {
         assert!(w(Some("gcc -MFa.o.d -o a.o -c a.c"), None));
         // Flags riding an rspfile count as the command.
         assert!(w(Some("gcc @rsp"), Some("-MD -MF a.o.d -c a.c")));
+        // The linker spelling: CMake 3.27+ link edges.
+        assert!(w(
+            Some("gcc -shared -Wl,--dependency-file=CMakeFiles/x.dir/link.d -o libx.so a.o"),
+            None
+        ));
         // A path merely CONTAINING the letters is not a flag.
         assert!(!w(Some("gcc -I/opt/x-MD/include -o a.o -c a.c"), None));
         assert!(!w(None, None));
