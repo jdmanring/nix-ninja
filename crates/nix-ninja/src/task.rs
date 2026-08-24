@@ -1470,6 +1470,33 @@ impl Runner {
                         }
                         continue;
                     }
+                    // An ABSOLUTE arg (bare, or a VAR=/abs value) naming a
+                    // real file outside the store: rebase to a ../ chain
+                    // from the build dir and upload it like any other
+                    // discovered source. Every branch below guards
+                    // !starts_with('/'), so without this route an edge
+                    // that references its script and inputs absolutely -
+                    // and declares nothing - materializes nothing. Files
+                    // only: an absolute DIR here is usually the project
+                    // root itself.
+                    if let Some(abs) = absolute_file_candidate(&arg) {
+                        let p = Path::new(abs);
+                        if !p.starts_with(&self.config.store_dir)
+                            && same_project_tree(&self.config.build_dir, p)
+                            && p.is_file()
+                        {
+                            if let Some(rel) = relative_from(p, &self.config.build_dir) {
+                                for input in upload_referenced_file(
+                                    &self.rpc_client,
+                                    &self.config.build_dir,
+                                    rel,
+                                )? {
+                                    self.add_derived_file(files, input.clone());
+                                    input_set.insert(input.build_path.clone(), input);
+                                }
+                            }
+                        }
+                    }
                     // Not a graph node - but GN commands reference source
                     // scripts the graph never declares (gcc_link_wrapper.py
                     // in every host link rule), assuming the runner shares
@@ -5437,6 +5464,38 @@ fn generate_frandom_seed(cmdline: &str) -> String {
 /// store-path lib is already visible in every sandbox) or meson's SHSYM
 /// `.symbols` relink guard, the only edge-visible handle on the lib it
 /// certifies.
+/// An absolute path candidate in a cmdline argument: the arg itself, or
+/// the value of a `VAR=/abs` token (CMake `-D INPUT_FILE=/...`). CMake
+/// CUSTOM_COMMAND edges reference source files by absolute path and may
+/// declare no inputs at all (svt-av1's version-header step, 2026-08-23),
+/// so absolute spellings need their own discovery route.
+fn absolute_file_candidate(arg: &str) -> Option<&str> {
+    if arg.starts_with('/') {
+        return Some(arg);
+    }
+    arg.split_once('=')
+        .map(|(_, v)| v)
+        .filter(|v| v.starts_with('/'))
+}
+
+/// Whether `target` sits in the same top-level tree as `base` (their
+/// first real path component agrees) - a target sharing only the root
+/// (`/etc/...` against `/build/...`) is outside the project tree and not
+/// ours to upload.
+fn same_project_tree(base: &Path, target: &Path) -> bool {
+    let first = |p: &Path| {
+        p.components()
+            .find_map(|c| match c {
+                std::path::Component::Normal(n) => Some(n.to_owned()),
+                _ => None,
+            })
+    };
+    match (first(base), first(target)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Whether a compile command will actually WRITE a depfile. CMake's LTO
 /// capability probe (`_CMakeLTOTest-CXX`) generates an edge declaring
 /// `deps = gcc` and a depfile while its command carries no -MD/-MF, so
@@ -5503,6 +5562,33 @@ mod target_resolution_tests {
     /// .symbols pull in; store-path libs, objects, and sources stay out.
     /// The orc failure row is `liborc-0.4.so.0.42.0` reached through
     /// `liborc-0.4.so.0.42.0.symbols`.
+    #[test]
+    fn absolute_cmdline_args_rebase_into_the_build_tree() {
+        use super::absolute_file_candidate as cand;
+        use crate::relative_from::relative_from;
+        use std::path::{Path, PathBuf};
+        // svt-av1's two spellings.
+        assert_eq!(
+            cand("/build/source/Source/Lib/Codec/ConfigureGitVersion.cmake"),
+            Some("/build/source/Source/Lib/Codec/ConfigureGitVersion.cmake")
+        );
+        assert_eq!(
+            cand("INPUT_FILE=/build/source/Source/Lib/Codec/EbVersion.h.in"),
+            Some("/build/source/Source/Lib/Codec/EbVersion.h.in")
+        );
+        // Not candidates: relative, flag-shaped, VAR=relative.
+        assert_eq!(cand("../Source/x.c"), None);
+        assert_eq!(cand("OUTPUT_FILE=EbVersion.h"), None);
+        let base = Path::new("/build/source/build");
+        assert_eq!(
+            relative_from(Path::new("/build/source/Source/a.cmake"), base),
+            Some(PathBuf::from("../Source/a.cmake"))
+        );
+        // Sharing only the root is outside the project tree.
+        assert!(!super::same_project_tree(base, Path::new("/etc/passwd")));
+        assert!(super::same_project_tree(base, Path::new("/build/source/x")));
+    }
+
     #[test]
     fn depfile_only_declared_when_the_command_writes_it() {
         use super::command_writes_depfile as w;
