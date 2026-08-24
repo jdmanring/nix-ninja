@@ -225,9 +225,9 @@ Roadmap movement this sweep:
   load (cfba53e). Flushed on the 500-task tick AND at end of run - the
   drop-in mode runs one task per driver and never reached the tick (4a7edff).
 - **#4 / #7 (benchmarks): the instrument already exists.** The driver
-  prints a per-phase breakdown (resolve, realise, dyn, nar, scan) every 500
+  prints a per-phase breakdown (`resolve`, `realise`, `dyn`, `nar`, `scan`) every 500
   tasks with counters behind each; a generation-phase benchmark is one run
-  of that instrument with a warm daemon, where realise cost is early-cutoff
+  of that instrument with a warm daemon, where `realise` cost is early-cutoff
   only. What this fork can offer upstream is the phase-timer mechanism and
   campaign-scale readings, not a NixOS/Nix-tree reproduction of their
   reference numbers - that workload should be timed on their hardware with
