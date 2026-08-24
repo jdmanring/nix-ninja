@@ -2094,8 +2094,15 @@ fn build_task_derivation(
         .into(),
     );
 
-    // Outer output paths -> placeholders (see outer_rewrite_map).
-    let cmdline = &rewrite_str(cmdline, &outer_rewrite_map());
+    // Outer output paths -> placeholders (see outer_rewrite_map), EXCEPT
+    // for an LTO compile, which keeps the real paths everywhere: see
+    // cmdline_is_lto for the measured reason.
+    let lto_raw = task.deps.as_deref() == Some("gcc") && task_is_lto(cmdline, &task.wrapper_vars);
+    let cmdline = &if lto_raw {
+        cmdline.to_string()
+    } else {
+        rewrite_str(cmdline, &outer_rewrite_map())
+    };
     drv.args.push(cmdline.to_string().into_bytes().into());
 
     if let Some(desc) = &task.desc {
@@ -2103,8 +2110,12 @@ fn build_task_derivation(
             .push(format!("--description={desc}").into_bytes().into());
     }
 
-    // Propagate wrapper environment variables to the task.
+    // Propagate wrapper environment variables to the task. They were
+    // placeholdered at task creation; an LTO task gets them restored,
+    // the exact inverse map, because its output cannot be restored.
+    let env_restore = if lto_raw { outer_restore_map() } else { Vec::new() };
     for (key, value) in &task.wrapper_vars {
+        let value = &if lto_raw { rewrite_str(value, &env_restore) } else { value.clone() };
         let final_value = if key.starts_with("NIX_CFLAGS_COMPILE") {
             // Also add a deterministic random seed based on the task's
             // cmdline for reproducible builds.
@@ -2300,6 +2311,37 @@ fn build_task_derivation(
             }
             input_set.insert(fresh.to_encoded(&task.store_dir));
             drv.inputs.insert(fresh.derived_path.clone());
+        }
+    }
+
+    // lto_task_keeps_real_outer_paths, the input half: any input this
+    // task reads that was uploaded with the placeholder substituted is
+    // re-uploaded raw and swapped in. See cmdline_is_lto.
+    if lto_raw {
+        let rewritten = rewritten_uploads().lock().unwrap().clone();
+        if !rewritten.is_empty() {
+            let mut swapped = 0usize;
+            for i in task.inputs.iter().chain(discovered_inputs.iter()) {
+                if !matches!(i.derived_path, SingleDerivedPath::Opaque(_)) {
+                    continue;
+                }
+                let abs = task.build_dir.join(&i.build_path);
+                let Ok(canonical) = fs::canonicalize(&abs) else { continue };
+                if !rewritten.contains(&canonical) {
+                    continue;
+                }
+                let fresh = new_opaque_file_raw(rpc_client, &task.build_dir, abs)?;
+                input_set.remove(&i.to_encoded(&task.store_dir));
+                drv.inputs.remove(&i.derived_path);
+                input_set.insert(fresh.to_encoded(&task.store_dir));
+                drv.inputs.insert(fresh.derived_path.clone());
+                swapped += 1;
+            }
+            if swapped > 0 {
+                eprintln!(
+                    "nix-ninja: LTO task keeps real outer paths in {swapped} input(s) (resumable only while $out is unchanged)"
+                );
+            }
         }
     }
 
@@ -3244,6 +3286,9 @@ fn new_opaque_file(
                 if let Ok(md) = fs::metadata(&canonical_path) {
                     let _ = fs::set_permissions(&tmp, md.permissions());
                 }
+                // Remembered, so an LTO task can ask for the raw form
+                // (lto_task_keeps_real_outer_paths).
+                rewritten_uploads().lock().unwrap().insert(canonical_path.clone());
                 Some(tmp)
             }
             None => None,
@@ -3262,6 +3307,105 @@ fn new_opaque_file(
         build_path: relative_path,
         rel_path: None, // None for opaque files - store path points directly to file
     })
+}
+
+/// Canonical paths whose upload carried an outer output path and was
+/// therefore uploaded with the placeholder substituted. An LTO task must
+/// not read those (see lto_task_keeps_real_outer_paths).
+fn rewritten_uploads() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// The RAW upload of a build-dir file: no outer-output placeholder, and
+/// past the NAR stamp cache, which is keyed by canonical path and would
+/// otherwise hand back the placeholder-carrying object for the same
+/// path. Content-addressed on the daemon side, so a repeat costs one
+/// dedup round trip.
+fn new_opaque_file_raw(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &std::path::Path,
+    path: PathBuf,
+) -> Result<DerivedFile> {
+    let relative_path = relative_from(&path, build_dir).unwrap_or(path);
+    let mut path = relative_path
+        .to_str()
+        .context("Path was not valid UTF-8")?
+        .to_owned();
+    canon::canonicalize_path(&mut path);
+    let canonical_path = fs::canonicalize(&path).with_context(|| format!("canonicalize {path}"))?;
+    let name = canonical_path
+        .file_name()
+        .map(|n| normalize_output(&n.to_string_lossy()))
+        .unwrap_or_else(|| "source".to_string());
+    let upload_src = patched_env_shebang(&canonical_path)?;
+    let store_path =
+        rpc_client.add_to_store_nar(&name, upload_src.as_deref().unwrap_or(&canonical_path))?;
+    Ok(DerivedFile {
+        derived_path: SingleDerivedPath::Opaque(store_path),
+        build_path: relative_path,
+        rel_path: None,
+    })
+}
+
+/// Does this compile emit LTO bytecode? The last of `-flto*` / `-fno-lto`
+/// on the line wins, as it does for gcc. `-ffat-lto-objects` changes
+/// nothing here: the linker still consumes the IR half.
+///
+/// WHY IT MATTERS - lto_task_keeps_real_outer_paths. The outer-output
+/// placeholder is restored in task OUTPUTS by an equal-length byte
+/// rewrite (rewrite_bytes, local.rs). That is sound for a plain object,
+/// whose literals sit verbatim in .rodata, and UNSOUND for LTO
+/// bytecode: gcc streams the IR through a compressed, checksummed
+/// section, so the placeholder is invisible to the byte search at the
+/// default level and the object is corrupted by the rewrite at
+/// -flto-compression-level=0 ("compressed stream: data error" from
+/// lto1, measured 2026-08-24). Nothing downstream can repair it either:
+/// the link that consumes the IR embeds the placeholder into the final
+/// binary, where it names a path that does not exist. bison under the
+/// make drop-in shipped PKGDATADIR as the placeholder and failed 698 of
+/// 744 tests, twice, the first time misattributed to a materialization
+/// window (the local.rs comment); the window was real and was not the
+/// cause. So an LTO compile task never sees a placeholder at all: real
+/// paths on its command line and in its environment, and a raw upload
+/// of every input the global rewrite touched. Such a task re-keys when
+/// the outer output path moves, which is the honest cost - only tasks
+/// that actually read an outer path pay it, and a wrong artifact is not
+/// a cache hit.
+fn cmdline_is_lto(cmdline: &str) -> bool {
+    scan_lto_flags(cmdline, false)
+}
+
+/// Last-wins scan of `-flto*` / `-fno-lto` over one flag string, from a
+/// starting state.
+fn scan_lto_flags(flags: &str, start: bool) -> bool {
+    let mut lto = start;
+    for tok in flags.split_whitespace() {
+        if tok == "-fno-lto" {
+            lto = false;
+        } else if tok == "-flto" || tok.starts_with("-flto=") {
+            lto = true;
+        }
+    }
+    lto
+}
+
+/// The compiler's view, not the command line's. A stdenv can inject
+/// -flto from INSIDE its cc wrapper (nixpkgs `cc-cflags-before`), where
+/// neither the ninja edge nor the task env shows it, so a task whose
+/// command reads `gcc -O2 -c` is LTO all the same. The wrapper's order
+/// decides precedence and is reproduced here: the wrapper's own
+/// baseline first (NIX_NINJA_ASSUME_LTO=1, set by a stdenv that injects
+/// -flto globally), then the command line, then NIX_CFLAGS_COMPILE,
+/// which the wrapper appends AFTER the command line - so a package's
+/// -fno-lto opt-out delivered that way wins, exactly as it does for gcc.
+fn task_is_lto(cmdline: &str, wrapper_vars: &HashMap<String, String>) -> bool {
+    let assume = std::env::var("NIX_NINJA_ASSUME_LTO").map(|v| v == "1").unwrap_or(false);
+    let after_cmdline = scan_lto_flags(cmdline, assume);
+    match wrapper_vars.get("NIX_CFLAGS_COMPILE") {
+        Some(extra) => scan_lto_flags(extra, after_cmdline),
+        None => after_cmdline,
+    }
 }
 
 /// Where `path` is an executable regular file opening with
@@ -6082,6 +6226,43 @@ mod ninja_pool_tests {
     /// and stripped nothing). Poisoning is survivable: a panicking holder
     /// must not fail the other test twice.
     static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn cmdline_is_lto_last_flag_wins_and_fat_changes_nothing() {
+        assert!(super::cmdline_is_lto("gcc -O3 -flto=8 -c a.c -o a.o"));
+        assert!(super::cmdline_is_lto("gcc -flto -c a.c"));
+        assert!(super::cmdline_is_lto("gcc -flto=auto -ffat-lto-objects -c a.c"));
+        assert!(!super::cmdline_is_lto("gcc -flto=8 -fno-lto -c a.c"), "later -fno-lto wins");
+        assert!(super::cmdline_is_lto("gcc -fno-lto -flto -c a.c"), "later -flto wins");
+        assert!(!super::cmdline_is_lto("gcc -O3 -c a.c -o a.o"));
+        // the placeholder-restore hazard is about IR, not the word: a
+        // path containing 'flto' is not a flag
+        assert!(!super::cmdline_is_lto("gcc -c /src/flto/a.c"));
+    }
+
+    #[test]
+    fn task_is_lto_sees_the_wrapper_baseline_and_the_opt_out_after_it() {
+        // Never read the real environment here; the baseline is
+        // exercised through scan_lto_flags's start state, which is what
+        // task_is_lto folds NIX_NINJA_ASSUME_LTO into.
+        let mut vars: std::collections::HashMap<String, String> = Default::default();
+        // no baseline, nothing on the line: not LTO
+        assert!(!super::scan_lto_flags("gcc -O2 -c a.c", false));
+        // wrapper baseline with a bare command line (the bison shape): LTO
+        assert!(super::scan_lto_flags("gcc -O2 -c a.c", true));
+        // a package's -fno-lto opt-out arrives via NIX_CFLAGS_COMPILE and
+        // wins over the baseline, as the wrapper appends it last
+        vars.insert("NIX_CFLAGS_COMPILE".into(), "-O3 -fno-lto".into());
+        assert!(!super::scan_lto_flags(
+            vars["NIX_CFLAGS_COMPILE"].as_str(),
+            super::scan_lto_flags("gcc -O2 -c a.c", true)
+        ));
+        // and the env-driven path with no baseline set in this process
+        std::env::remove_var("NIX_NINJA_ASSUME_LTO");
+        assert!(!super::task_is_lto("gcc -O2 -c a.c", &vars));
+        vars.insert("NIX_CFLAGS_COMPILE".into(), "-O3 -flto=8".into());
+        assert!(super::task_is_lto("gcc -O2 -c a.c", &vars));
+    }
 
     #[test]
     fn outer_rewrite_map_is_same_length_stable_and_reversible() {

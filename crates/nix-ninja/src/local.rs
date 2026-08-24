@@ -65,13 +65,18 @@ pub fn symlink_derived_files(
     // needs the real one, and a store file is read-only, so such an output
     // is materialized as a rewritten copy. The first version symlinked
     // everything and THEN replaced the placeholder-carrying ones - a window
-    // in which a parallel consumer reads the placeholder. bison under
-    // make -j24 linked src/bison inside that window, the installed binary
-    // kept the placeholder in PKGDATADIR, and installcheck - the one
-    // consumer with no wrapper env to hide it - failed 698 of 744 tests
-    // (2026-08-24). Restore-needing outputs are now written to a temp name
-    // and renamed into place, so every visible state is post-restore;
-    // everything else stays a symlink, created afterwards.
+    // in which a parallel consumer reads the placeholder. Restore-needing
+    // outputs are now written to a temp name and renamed into place, so
+    // every visible state is post-restore; everything else stays a
+    // symlink, created afterwards.
+    // THE WINDOW WAS REAL AND WAS NOT bison's CAUSE. This comment first
+    // credited the temp-and-rename with fixing bison's 698-of-744
+    // installcheck failure (PKGDATADIR left as the placeholder); the
+    // failure recurred 2026-08-24 with the window closed, because a slim
+    // LTO object carries its literals inside compressed, checksummed IR
+    // that no byte rewrite can reach - measured both ways in
+    // task.rs::cmdline_is_lto. LTO compile tasks now never see a
+    // placeholder; this restore stays correct for everything else.
     let restore = crate::task::outer_restore_map();
     let mut symlink_files: Vec<DerivedFile> = Vec::new();
     for (df, store_path) in opaque_files.iter().zip(store_paths.iter()) {
