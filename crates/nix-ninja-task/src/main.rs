@@ -208,6 +208,22 @@ fn main() -> Result<()> {
             }
         }
     }
+    // A `..`-spelled path in the command needs its INTERMEDIATE
+    // directory to exist: the kernel resolves `..` component-wise, so
+    // `-I/build/source/build/cmake/../../lib` first walks into
+    // build/cmake, and when no input materializes anything under it the
+    // whole path is ENOENT even though the normalized target
+    // (../lib/lz4.h) was materialized. gcc then reports the HEADER
+    // missing, which sends a reader to the scanner - the scanner was
+    // right (lz4 0.4.42's cmake spells every include dir through
+    // build/cmake/../.., 2026-08-23). Pre-create the prefix before the
+    // first `..` for every build-dir path token; an empty directory is
+    // exactly what the real build dir has there, and creating one that
+    // ends up unused costs nothing. Confined to the sandbox: only
+    // relative tokens and absolutes under $NIX_BUILD_TOP or /build.
+    for pp in dotdot_prefixes(&cli.cmdline, env::var("NIX_BUILD_TOP").ok().as_deref()) {
+        let _ = fs::create_dir_all(&pp);
+    }
     println!(
         "nix-ninja-task: Setup source directory in {}",
         build_dir.display()
@@ -1094,5 +1110,67 @@ mod rsp_root_tests {
             rewrite_rsp_roots("-binaryDir src/svg -x y", rsp),
             "-binaryDir src/svg -x y"
         );
+    }
+}
+
+/// The confined prefix-before-`..` of every path token in a command.
+/// See the call site for why these directories must exist.
+fn dotdot_prefixes(cmdline: &str, build_top: Option<&str>) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for tok in cmdline.split_whitespace() {
+        let t = tok
+            .trim_matches('"')
+            .trim_start_matches("-I")
+            .trim_start_matches("-iquote")
+            .trim_start_matches("-isystem")
+            .trim_start_matches("-idirafter");
+        let Some(dotdot) = t.find("/..") else { continue };
+        let prefix = &t[..dotdot];
+        if prefix.is_empty() || prefix.contains('=') {
+            continue;
+        }
+        let pp = std::path::Path::new(prefix);
+        let confined = !pp.is_absolute()
+            || pp.starts_with("/build")
+            || build_top.map(|top| pp.starts_with(top)).unwrap_or(false);
+        if confined {
+            out.push(pp.to_path_buf());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod dotdot_prefix_tests {
+    use super::dotdot_prefixes;
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_lz4_include_and_the_refusals() {
+        // The measured case: cmake spells the include dir through a
+        // directory no input materializes.
+        assert_eq!(
+            dotdot_prefixes(
+                "gcc -I/build/source/build/cmake/../../lib -c x.c",
+                None
+            ),
+            vec![PathBuf::from("/build/source/build/cmake")]
+        );
+        // Relative form counts too.
+        assert_eq!(
+            dotdot_prefixes("gcc -Isub/dir/../inc -c x.c", None),
+            vec![PathBuf::from("sub/dir")]
+        );
+        // An absolute path outside the sandbox is refused unless
+        // NIX_BUILD_TOP names it.
+        assert!(dotdot_prefixes("gcc -I/nix/store/x/../y", None).is_empty());
+        assert_eq!(
+            dotdot_prefixes("gcc -I/tmp/top/a/../b", Some("/tmp/top")),
+            vec![PathBuf::from("/tmp/top/a")]
+        );
+        // A -D define carrying dots is not a path to create.
+        assert!(dotdot_prefixes("gcc -DFOO=a/../b -c x.c", None).is_empty());
+        // No `..` anywhere: nothing to do.
+        assert!(dotdot_prefixes("gcc -I/build/source/lib -c x.c", None).is_empty());
     }
 }
