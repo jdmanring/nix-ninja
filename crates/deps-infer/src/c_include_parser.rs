@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fs::canonicalize;
-use std::fs::File;
 use std::hash::Hash;
 
 use std::path::{Path, PathBuf};
@@ -222,6 +221,16 @@ static INCLUDE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r##"^\s*#\s*(?:include|embed)\s*(["<])([^">]*)[">]"##).unwrap()
 });
 
+/// nasm/yasm spell an include `%include "name"` - always quoted, resolved
+/// through the includer's directory and then -I dirs, same as a quoted C
+/// include. The C regex is anchored on `#`, so .asm sources scanned as
+/// zero includes and their x86inc.asm-style helpers were never uploaded:
+/// libvmaf's cpuid.asm died `unable to open include file` with the file
+/// sitting in the source tree (tenth class, 2026-08-23).
+static NASM_INCLUDE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*%\s*include\s+"([^"]*)""#).unwrap()
+});
+
 /// One `#include`/`#embed` directive as written, before resolution.
 /// `quoted` is true for `"name"`, false for `<name>`.
 #[derive(Clone, Debug, PartialEq)]
@@ -343,6 +352,13 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
             directives.push(Directive {
                 quoted: captures.get(1).unwrap().as_str() == "\"",
                 name: PathBuf::from(captures.get(2).unwrap().as_str()),
+            });
+            continue;
+        }
+        if let Some(captures) = NASM_INCLUDE_REGEX.captures(&line) {
+            directives.push(Directive {
+                quoted: true,
+                name: PathBuf::from(captures.get(1).unwrap().as_str()),
             });
             continue;
         }
@@ -617,6 +633,18 @@ mod tests {
         assert!(names.iter().any(|n| n.ends_with("contrib/x.c")), "{names:?}");
         assert!(!names.iter().any(|n| n.contains("mips/contrib")),
             "fabricated spelling declared: {names:?}");
+    }
+
+    #[test]
+    fn nasm_percent_include_is_scanned() {
+        let dir = std::env::temp_dir().join(format!("nn-nasm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("cpuid.asm");
+        std::fs::write(&src, b"; x86 helpers\n%include \"ext/x86/x86inc.asm\"\n%include\t\"config.asm\"\ncglobal cpu_cpuid\n").unwrap();
+        let scan = scan_directives(&src).unwrap();
+        let names: Vec<_> = scan.directives.iter().map(|d| d.name.clone()).collect();
+        assert_eq!(names, vec![PathBuf::from("ext/x86/x86inc.asm"), PathBuf::from("config.asm")]);
+        assert!(scan.directives.iter().all(|d| d.quoted));
     }
 
     #[test]

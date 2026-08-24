@@ -1181,7 +1181,15 @@ impl Runner {
                         &self.rpc_client,
                         &self.config.build_dir,
                         PathBuf::from(&file.name),
-                    )?;
+                    )
+                    .with_context(|| {
+                        format!(
+                            "declared input {} of edge producing {:?} (via_phony={})",
+                            file.name,
+                            build.outs().first().map(|f| files.by_id[*f].name.clone()),
+                            via_phony,
+                        )
+                    })?;
                     for extra in &uploaded[1..] {
                         self.add_derived_file(files, extra.clone());
                         input_set.insert(extra.build_path.clone(), extra.clone());
@@ -2135,9 +2143,20 @@ fn build_task_derivation(
 
     // Handle when rule's dep = gcc, which means we need to find all the
     // implicit header dependencies normally handled by gcc's depfiles.
+    //
+    // A DEPFILE WITHOUT deps=gcc IS THE SAME PROMISE IN ANOTHER SPELLING.
+    // meson's nasm rule declares `depfile =` and no `deps`, so its .asm
+    // sources took the no-discovery path and their %include helpers were
+    // never uploaded: libvmaf's cpuid.asm died `unable to open include
+    // file 'ext/x86/x86inc.asm'` with the file in the source tree (tenth
+    // class, 2026-08-23). The scan over a non-source input is inert - a
+    // file with no include directives contributes nothing - so the wider
+    // gate can only over-declare, which is the pipeline's safe polarity.
     let mut discovered_inputs: Vec<DerivedFile> = Vec::new();
-    if let Some(deps) = &task.deps {
-        if deps == "gcc" {
+    {
+        let wants_discovery =
+            task.deps.as_deref() == Some("gcc") || task.depfile.is_some();
+        if wants_discovery {
             // Only opaque inputs are processed by gcc
             let files: Vec<PathBuf> = task
                 .inputs
@@ -3527,7 +3546,17 @@ fn is_tree_path(p: &Path) -> bool {
         None => p,
     };
     let comps: Vec<_> = p.components().collect();
-    if comps.len() == 2 && p.starts_with("include") {
+    // A syncqt module tree is `include/<Module>` where Module is a
+    // DIRECTORY with no extension (include/QtSvg). A plain generated
+    // FILE directly under include/ matches the same two-component shape:
+    // meson's vcs_tag writes include/vcs_version.h, this predicate
+    // classified it as a tree, add_derived_file keyed it under the
+    // `/.nn-tree` marker, and the graph node's consumers missed it in
+    // derived_files - so every compile order-only-depending on it fell
+    // through to a disk upload of a file that never exists outside the
+    // producer's sandbox (libvmaf, ninth class, 2026-08-23). The
+    // extension is the discriminator: Qt module dirs have none.
+    if comps.len() == 2 && p.starts_with("include") && p.extension().is_none() {
         return true;
     }
     p.file_name().is_some_and(|f| {
@@ -5587,6 +5616,18 @@ mod target_resolution_tests {
         // Sharing only the root is outside the project tree.
         assert!(!super::same_project_tree(base, Path::new("/etc/passwd")));
         assert!(super::same_project_tree(base, Path::new("/build/source/x")));
+    }
+
+    #[test]
+    fn a_generated_header_under_include_is_not_a_tree() {
+        // libvmaf's meson vcs_tag output: a FILE, not a module tree - the
+        // old predicate classified it as one, keyed it under /.nn-tree,
+        // and every consumer missed it in derived_files (ninth class).
+        assert!(!is_tree_path(Path::new("include/vcs_version.h")));
+        // The shapes the predicate exists for still match.
+        assert!(is_tree_path(Path::new("include/QtSvg")));
+        assert!(is_tree_path(Path::new("include/QtSvg/.nn-tree")));
+        assert!(is_tree_path(Path::new("foo/bar_autogen")));
     }
 
     #[test]
