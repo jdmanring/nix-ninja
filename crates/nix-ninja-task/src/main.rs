@@ -176,6 +176,38 @@ fn main() -> Result<()> {
     // sources. This ensures relative includes and other path-dependent
     // references remain valid.
     create_symlinks(&build_dir, &cli.store_dir, inputs, false)?;
+
+    // Configure-time alias symlinks the driver harvested from the build
+    // dir (meson SONAME aliases: no ninja edge produces them, so input
+    // materialization cannot). Recreated AFTER create_symlinks so the
+    // relative target resolves against whatever this task materialized;
+    // a dangling one is harmless, exactly as it is in a real build dir
+    // before the library links. Encoding is `link=target`,
+    // space-separated; the driver refused any path carrying ' ' or '='.
+    if let Ok(raw) = env::var("NIX_NINJA_ALIASES") {
+        for pair in raw.split_whitespace() {
+            let Some((link, target)) = pair.split_once('=') else {
+                continue;
+            };
+            let link = std::path::Path::new(link);
+            // Defense in depth: the driver only emits relative, confined
+            // pairs; refuse anything else that reaches this env var.
+            if link.is_absolute() || std::path::Path::new(target).is_absolute() {
+                continue;
+            }
+            if let Some(parent) = link.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if !link.exists() && !link.is_symlink() {
+                if let Err(e) = std::os::unix::fs::symlink(target, link) {
+                    println!(
+                        "nix-ninja-task: alias symlink {} -> {target}: {e}",
+                        link.display()
+                    );
+                }
+            }
+        }
+    }
     println!(
         "nix-ninja-task: Setup source directory in {}",
         build_dir.display()

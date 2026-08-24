@@ -80,6 +80,9 @@ struct Task {
     files: HashMap<FileId, File>,
     inputs: Vec<DerivedFile>,
     outputs: Vec<PathBuf>,
+    // Configure-time relative symlinks to recreate in the sandbox; see
+    // Runner::alias_symlinks.
+    alias_symlinks: Vec<(String, String)>,
 }
 
 impl Deref for Task {
@@ -393,6 +396,25 @@ pub struct Runner {
     /// transitively. Measured: orc's orcc dies with `liborc-0.4.so.0:
     /// cannot open shared object file` in every generator task.
     runtime_lib_deps: HashMap<FileId, Vec<FileId>>,
+    /// Configure-time alias symlinks: (build-dir-relative link path,
+    /// link target text), both relative, target confined to the build
+    /// dir. Meson creates shared-library SONAME aliases
+    /// (`liborc-0.4.so.0 -> liborc-0.4.so.0.42.0`) with os.symlink AT
+    /// CONFIGURE TIME - no ninja edge produces them, the only graph
+    /// trace is the `meson-implicit-outs` phony that lists them as
+    /// INPUTS. runtime_lib_deps delivers the real library into a task
+    /// that executes a just-built tool, and the loader then dies anyway:
+    /// DT_NEEDED names the SONAME, which exists only as the alias.
+    /// read_build_dir cannot upload them as opaque files either - at
+    /// scan time the target may not be built yet, so canonicalize fails
+    /// - and a store-level symlink object would dangle, because task
+    /// materialization symlinks build paths AT the store object, making
+    /// a relative target resolve against /nix/store. So the link TEXT
+    /// rides NIX_NINJA_ALIASES and nix-ninja-task recreates the symlink
+    /// after input setup, where the relative target resolves against
+    /// whatever the task actually materialized (orc, thirteenth class,
+    /// 2026-08-23).
+    alias_symlinks: Vec<(String, String)>,
 
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
@@ -496,6 +518,7 @@ impl Runner {
         Ok(Runner {
             derived_files: HashMap::new(),
             build_dir_inputs: HashMap::new(),
+            alias_symlinks: Vec::new(),
             phony_aliases: HashMap::new(),
             stamp_inputs: HashMap::new(),
             stamp_input_files: HashMap::new(),
@@ -534,6 +557,15 @@ impl Runner {
                 Err(e) if e.io_error().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => continue,
                 Err(e) => return Err(e.into()),
             };
+            if entry.file_type().is_symlink() {
+                let path = entry.into_path();
+                if let Some(pair) =
+                    alias_symlink_entry(&self.config.build_dir, &path)
+                {
+                    self.alias_symlinks.push(pair);
+                }
+                continue;
+            }
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -547,6 +579,11 @@ impl Runner {
             let fid = self.add_derived_file(files, derived_file.clone());
             self.build_dir_inputs.insert(fid, derived_file);
         }
+        // Deterministic order: the encoded env value must be a function
+        // of the SET, not of readdir order, or every run re-keys every
+        // task derivation.
+        self.alias_symlinks.sort();
+        self.alias_symlinks.dedup();
         Ok(())
     }
 
@@ -1996,6 +2033,7 @@ impl Runner {
             files: build_files,
             inputs,
             outputs,
+            alias_symlinks: self.alias_symlinks.clone(),
         })
     }
 }
@@ -2328,6 +2366,22 @@ fn build_task_derivation(
         b"NIX_NINJA_INPUTS"[..].into(),
         inputs.join(" ").into_bytes().into(),
     );
+
+    // Configure-time alias symlinks (see Runner::alias_symlinks). Encoded
+    // `link=target` space-separated; alias_symlink_entry already refused
+    // any path carrying a space or '='. Inserted only when non-empty so
+    // graphs with no aliases keep their existing derivation hashes.
+    if !task.alias_symlinks.is_empty() {
+        let encoded: Vec<String> = task
+            .alias_symlinks
+            .iter()
+            .map(|(l, t)| format!("{l}={t}"))
+            .collect();
+        drv.env.insert(
+            b"NIX_NINJA_ALIASES"[..].into(),
+            encoded.join(" ").into_bytes().into(),
+        );
+    }
 
     // UPSTREAM #17, STEP ONE: the depfile becomes a declared output.
     //
@@ -3563,6 +3617,47 @@ fn is_tree_path(p: &Path) -> bool {
         let f = f.to_string_lossy();
         f.ends_with("_autogen") || f.ends_with("_autogen.dir")
     })
+}
+
+/// Classify one build-dir symlink for the alias carry. Accepts only a
+/// link whose TARGET TEXT is relative and stays inside the build dir
+/// lexically (each `..` must not climb past the link's own directory),
+/// and whose link path and target both survive the `link=target`
+/// space-separated encoding. Everything else is skipped, and skipping is
+/// the safe direction: the pre-fix behavior for every symlink.
+fn alias_symlink_entry(
+    build_dir: &Path,
+    link_abs: &Path,
+) -> Option<(String, String)> {
+    let target = std::fs::read_link(link_abs).ok()?;
+    if target.is_absolute() {
+        return None;
+    }
+    let rel_link = link_abs.strip_prefix(build_dir).ok()?;
+    // Lexical confinement: resolve `..` against the link's directory
+    // depth. A target climbing out of the build dir is not an alias to a
+    // build product and must not be recreated in a sandbox.
+    let link_depth = rel_link.components().count().saturating_sub(1);
+    let mut depth = link_depth as isize;
+    for c in target.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    let l = rel_link.to_str()?;
+    let t = target.to_str()?;
+    if l.contains([' ', '=']) || t.contains([' ', '=']) {
+        return None;
+    }
+    Some((l.to_string(), t.to_string()))
 }
 
 fn leading_parent_components(p: &Path) -> usize {
@@ -6000,5 +6095,62 @@ mod ninja_pool_tests {
     #[test]
     fn no_pools_is_an_empty_map() {
         assert!(pool_permits_from_depths(&HashMap::new()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod alias_symlink_tests {
+    use super::alias_symlink_entry;
+    use std::os::unix::fs::symlink;
+
+    // The measured case: meson's configure-time SONAME alias, dangling at
+    // scan time (the library links later). The old scan skipped every
+    // symlink; the entry must survive precisely because it does not read
+    // the target's content.
+    #[test]
+    fn a_dangling_soname_alias_is_carried_and_an_escape_is_not() {
+        let d = std::env::temp_dir().join(format!(
+            "nn-alias-test-{}",
+            std::process::id()
+        ));
+        let orc = d.join("orc");
+        std::fs::create_dir_all(&orc).unwrap();
+
+        // Dangling relative alias inside the build dir: carried.
+        let link = orc.join("liborc-0.4.so.0");
+        symlink("liborc-0.4.so.0.42.0", &link).unwrap();
+        assert_eq!(
+            alias_symlink_entry(&d, &link),
+            Some((
+                "orc/liborc-0.4.so.0".to_string(),
+                "liborc-0.4.so.0.42.0".to_string()
+            ))
+        );
+
+        // A `..` that stays inside the build dir: carried.
+        let up = orc.join("sibling");
+        symlink("../orc/liborc-0.4.so.0.42.0", &up).unwrap();
+        assert!(alias_symlink_entry(&d, &up).is_some());
+
+        // Negative controls, each refused for a different reason, because
+        // an entry that accepts everything passes the positives above.
+        let esc = orc.join("escape");
+        symlink("../../etc/passwd", &esc).unwrap();
+        assert_eq!(alias_symlink_entry(&d, &esc), None, "escaping target");
+
+        let abs = orc.join("absolute");
+        symlink("/nix/store/whatever", &abs).unwrap();
+        assert_eq!(alias_symlink_entry(&d, &abs), None, "absolute target");
+
+        let sp = orc.join("has space");
+        symlink("target", &sp).unwrap();
+        assert_eq!(alias_symlink_entry(&d, &sp), None, "space breaks encoding");
+
+        // Not a symlink at all: refused (read_link fails).
+        let plain = orc.join("plain");
+        std::fs::write(&plain, b"x").unwrap();
+        assert_eq!(alias_symlink_entry(&d, &plain), None, "regular file");
+
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }
