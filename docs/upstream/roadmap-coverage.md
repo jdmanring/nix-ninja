@@ -102,8 +102,8 @@ cannot enumerate from the source.
    This is still the item that makes most of our own largest PR unnecessary,
    which is the argument for finishing it rather than defending the
    heuristics.
-2. **#18 async `nix store add`.** The maintainer's own note calls it "probably
-   biggest perf bottleneck". Our driver timers now attribute the realize RPC
+2. **#18 async `nix store add`.** The maintainer's own note ranks it the
+   biggest perf bottleneck and hedges the ranking. Our driver timers now attribute the realize RPC
    separately, so we can measure whether that holds at our scale, which is a
    cheaper first contribution than the change itself.
 3. **#16 configure caching.** Above.
