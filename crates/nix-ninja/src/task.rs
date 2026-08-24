@@ -2355,7 +2355,13 @@ fn build_task_derivation(
         }
     }
     let depfile_out: Option<PathBuf> = match (&task.depfile, task.deps.as_deref()) {
-        (Some(d), Some("gcc")) if !d.is_empty() => {
+        (Some(d), Some("gcc"))
+            if !d.is_empty()
+                && command_writes_depfile(
+                    task.cmdline.as_deref(),
+                    task.rspfile.as_ref().map(|(_, c)| c.as_str()),
+                ) =>
+        {
             let p = PathBuf::from(d);
             // An absolute or escaping depfile path is not ours to copy: the
             // task's outputs are build-dir-relative by construction, and a
@@ -5431,6 +5437,22 @@ fn generate_frandom_seed(cmdline: &str) -> String {
 /// store-path lib is already visible in every sandbox) or meson's SHSYM
 /// `.symbols` relink guard, the only edge-visible handle on the lib it
 /// certifies.
+/// Whether a compile command will actually WRITE a depfile. CMake's LTO
+/// capability probe (`_CMakeLTOTest-CXX`) generates an edge declaring
+/// `deps = gcc` and a depfile while its command carries no -MD/-MF, so
+/// gcc never writes the file and a task that declared it as an output
+/// dies collecting it (`canonicalize(...o.d): No such file`). The edge
+/// declaration is a promise about the RULE; the command is the truth.
+/// -MMD implies -MD's writing behaviour; -MF names the file explicitly
+/// (spaced or fused). The rspfile is part of the command line.
+fn command_writes_depfile(cmdline: Option<&str>, rsp: Option<&str>) -> bool {
+    let writes = |s: &str| {
+        s.split_whitespace()
+            .any(|t| t == "-MD" || t == "-MMD" || t.starts_with("-MF"))
+    };
+    cmdline.is_some_and(writes) || rsp.is_some_and(writes)
+}
+
 fn lib_shaped(name: &str) -> bool {
     if name.starts_with('/') {
         return false;
@@ -5473,6 +5495,22 @@ mod target_resolution_tests {
     /// .symbols pull in; store-path libs, objects, and sources stay out.
     /// The orc failure row is `liborc-0.4.so.0.42.0` reached through
     /// `liborc-0.4.so.0.42.0.symbols`.
+    #[test]
+    fn depfile_only_declared_when_the_command_writes_it() {
+        use super::command_writes_depfile as w;
+        // CMake LTO probe: depfile declared, command writes none.
+        assert!(!w(Some("g++ -g -flto=auto -fPIC -o foo.o -c foo.cpp"), None));
+        // Ordinary CMake/meson compile lines.
+        assert!(w(Some("gcc -MD -MT a.o -MF a.o.d -o a.o -c a.c"), None));
+        assert!(w(Some("gcc -MMD -o a.o -c a.c"), None));
+        assert!(w(Some("gcc -MFa.o.d -o a.o -c a.c"), None));
+        // Flags riding an rspfile count as the command.
+        assert!(w(Some("gcc @rsp"), Some("-MD -MF a.o.d -c a.c")));
+        // A path merely CONTAINING the letters is not a flag.
+        assert!(!w(Some("gcc -I/opt/x-MD/include -o a.o -c a.c"), None));
+        assert!(!w(None, None));
+    }
+
     #[test]
     fn lib_shape_table() {
         assert!(lib_shaped("orc/liborc-0.4.so.0.42.0"));
