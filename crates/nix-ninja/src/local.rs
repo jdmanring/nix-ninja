@@ -59,34 +59,48 @@ pub fn symlink_derived_files(
         })
         .collect();
 
-    create_symlinks(prefix, store_dir, opaque_files.clone(), true)?;
-
-    // PLACEHOLDER -> REAL OUTER PATH, by COPY. A task output that names an
-    // outer output path carries the placeholder (task.rs outer_rewrite_map);
-    // the build tree needs the real one, and a store file is read-only, so
-    // such an output is materialized as a rewritten copy rather than a
-    // symlink. Outputs with no placeholder stay symlinks.
+    // PLACEHOLDER -> REAL OUTER PATH, by COPY, and NEVER exposed as the
+    // placeholder first. A task output that names an outer output path
+    // carries the placeholder (task.rs outer_rewrite_map); the build tree
+    // needs the real one, and a store file is read-only, so such an output
+    // is materialized as a rewritten copy. The first version symlinked
+    // everything and THEN replaced the placeholder-carrying ones - a window
+    // in which a parallel consumer reads the placeholder. bison under
+    // make -j24 linked src/bison inside that window, the installed binary
+    // kept the placeholder in PKGDATADIR, and installcheck - the one
+    // consumer with no wrapper env to hide it - failed 698 of 744 tests
+    // (2026-08-24). Restore-needing outputs are now written to a temp name
+    // and renamed into place, so every visible state is post-restore;
+    // everything else stays a symlink, created afterwards.
     let restore = crate::task::outer_restore_map();
-    if !restore.is_empty() {
-        for df in &opaque_files {
-            let dest = prefix.join(&df.build_path);
-            if !dest.is_symlink() {
-                continue;
-            }
-            let Ok(target) = std::fs::read_link(&dest) else { continue };
-            if !target.is_file() {
-                continue;
-            }
+    let mut symlink_files: Vec<DerivedFile> = Vec::new();
+    for (df, store_path) in opaque_files.iter().zip(store_paths.iter()) {
+        let target = store_path.to_absolute_path(store_dir);
+        let mut restored = false;
+        if !restore.is_empty() && target.is_file() {
             let data = std::fs::read(&target)?;
             if let Some(rewritten) = crate::task::rewrite_bytes(&data, &restore) {
-                std::fs::remove_file(&dest)?;
-                std::fs::write(&dest, rewritten)?;
-                if let Ok(md) = std::fs::metadata(&target) {
-                    let _ = std::fs::set_permissions(&dest, md.permissions());
+                let dest = prefix.join(&df.build_path);
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
                 }
+                let tmp = dest.with_extension("nn-restore-tmp");
+                std::fs::write(&tmp, rewritten)?;
+                if let Ok(md) = std::fs::metadata(&target) {
+                    let _ = std::fs::set_permissions(&tmp, md.permissions());
+                }
+                if dest.is_symlink() || dest.exists() {
+                    let _ = std::fs::remove_file(&dest);
+                }
+                std::fs::rename(&tmp, &dest)?;
+                restored = true;
             }
         }
+        if !restored {
+            symlink_files.push(df.clone());
+        }
     }
+    create_symlinks(prefix, store_dir, symlink_files, true)?;
 
     Ok(())
 }
