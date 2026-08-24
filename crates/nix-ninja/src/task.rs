@@ -3603,6 +3603,32 @@ fn undeclared_outputs(declared: &[PathBuf], cmdline: Option<&str>, build_dir: &P
                 }
             }
         }
+        // `cmake -E create_symlink <target> <link>`: cmake's custom-target
+        // symlink shape (lz4cat, unlz4). The edge declares only the
+        // CMakeFiles stamp; the link itself is an undeclared side effect
+        // that real ninja leaves in the build tree and a sandboxed task
+        // discards. The link is relative to the command's `cd <dir> &&`
+        // prefix when one is present, the build dir otherwise.
+        let toks: Vec<&str> = c.split_whitespace().collect();
+        for w in toks.windows(4) {
+            if w[0] == "-E" && w[1] == "create_symlink" {
+                let link = w[3].trim_matches('"');
+                let base = if toks.first() == Some(&"cd") && toks.get(2) == Some(&"&&") {
+                    PathBuf::from(toks[1].trim_matches('"'))
+                } else {
+                    build_dir.to_path_buf()
+                };
+                let abs = if Path::new(link).is_absolute() {
+                    PathBuf::from(link)
+                } else {
+                    base.join(link)
+                };
+                let rel = relative_from(&abs, build_dir).unwrap_or_else(|| PathBuf::from(link));
+                if !v.contains(&rel) {
+                    v.push(rel);
+                }
+            }
+        }
     }
     v
 }
@@ -6178,5 +6204,35 @@ mod alias_symlink_tests {
         assert_eq!(alias_symlink_entry(&d, &plain), None, "regular file");
 
         std::fs::remove_dir_all(&d).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod create_symlink_undeclared_output_tests {
+    use super::*;
+
+    #[test]
+    fn create_symlink_link_is_an_output_with_and_without_cd() {
+        let bd = Path::new("/build/source/build-dist");
+        // lz4's literal shape: cd into the build dir first.
+        let v = undeclared_outputs(
+            &[],
+            Some("cd /build/source/build-dist && /nix/store/x-cmake/bin/cmake -E create_symlink lz4 lz4cat"),
+            bd,
+        );
+        assert_eq!(v, vec![PathBuf::from("lz4cat")]);
+        // No cd prefix: link resolves against the build dir.
+        let v = undeclared_outputs(&[], Some("cmake -E create_symlink hello hellocat"), bd);
+        assert_eq!(v, vec![PathBuf::from("hellocat")]);
+        // A cd elsewhere: link comes back build-dir-relative.
+        let v = undeclared_outputs(
+            &[],
+            Some("cd /build/source/build-dist/sub && cmake -E create_symlink a b"),
+            bd,
+        );
+        assert_eq!(v, vec![PathBuf::from("sub/b")]);
+        // Negative control: an unrelated -E command adds nothing.
+        let v = undeclared_outputs(&[], Some("cmake -E copy a b"), bd);
+        assert!(v.is_empty());
     }
 }
