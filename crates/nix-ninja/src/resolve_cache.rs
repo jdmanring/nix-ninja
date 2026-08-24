@@ -36,7 +36,37 @@ const FILE_NAME: &str = ".nix-ninja-resolve-cache.v1";
 /// with any change to what an upload CONTAINS: v2 discards entries
 /// recorded before env-shebang patching, whose store paths hold the
 /// unpatched bytes and would otherwise replay forever.
-const HEADER: &str = "nix-ninja-resolve-cache v2 cap=1024";
+const HEADER_BASE: &str = "nix-ninja-resolve-cache v2 cap=1024";
+
+/// The full header also stamps the DRIVER BINARY's identity (size and
+/// mtime of the running executable), because a memo entry encodes what
+/// the scanner DISCOVERED, and the scanner is compiled into the driver.
+/// Measured 2026-08-23 iterating on the include scanner: a rebuilt
+/// driver with a fixed scanner replayed memos computed by the broken
+/// one, re-failing the same derivation until the file was deleted by
+/// hand. Any rebuild changes the mtime, so the stale file discards
+/// itself; the failure direction is recompute, never a wrong replay.
+/// If the executable cannot be introspected the stamp is "unknown",
+/// which still self-invalidates against any stamped file.
+fn header() -> &'static str {
+    static H: OnceLock<String> = OnceLock::new();
+    H.get_or_init(|| {
+        let stamp = std::env::current_exe()
+            .ok()
+            .and_then(|p| fs::metadata(p).ok())
+            .and_then(|md| {
+                let m = md
+                    .modified()
+                    .ok()?
+                    .duration_since(UNIX_EPOCH)
+                    .ok()?
+                    .as_nanos();
+                Some(format!("{}.{}", md.len(), m))
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        format!("{HEADER_BASE} driver={stamp}")
+    })
+}
 /// Separates encoded DerivedFiles within one line; never appears in a
 /// store path or a build-relative path.
 const SEP: char = '\x1f';
@@ -135,7 +165,7 @@ pub fn init(store_dir: StoreDir, build_dir: PathBuf) {
         let mut unvalidated = HashMap::new();
         if let Ok(body) = fs::read_to_string(&path) {
             let mut lines = body.lines();
-            if lines.next() == Some(HEADER) {
+            if lines.next() == Some(header()) {
                 for line in lines {
                     let mut f = line.split('\t');
                     let (Some(kind), Some(key), Some(dm), Some(n), Some(sz), Some(mm), Some(enc)) = (
@@ -267,7 +297,7 @@ pub fn flush() -> Result<()> {
         .append(true)
         .open(&cache.path)?;
     if new {
-        writeln!(f, "{HEADER}")?;
+        writeln!(f, "{}", header())?;
     }
     for line in lines {
         writeln!(f, "{line}")?;
@@ -393,8 +423,9 @@ mod tests {
         fs::write(
             bd.join(FILE_NAME),
             format!(
-                "{HEADER}\npy\tsrcs\t{dm}\t1\t{size}\t{mt}\t{enc}\n\
+                "{}\npy\tsrcs\t{dm}\t1\t{size}\t{mt}\t{enc}\n\
                  dir\tsrcs\t{dm}\t1\t{}\t{mt}\t{enc}\n",
+                header(),
                 size + 1
             ),
         )
@@ -434,5 +465,21 @@ mod tests {
         assert!(load_nar_stamps().is_empty());
         assert!(!bd.join(NAR_FILE).exists(), "bad header must discard the file");
         fs::remove_dir_all(&bd).unwrap();
+    }
+
+    /// A cache file stamped by a DIFFERENT driver build must not load.
+    /// The un-stamped base header is exactly what such a file's first
+    /// line looks like relative to this driver's header(): the load
+    /// predicate is a whole-line equality, so a mismatched (or absent)
+    /// driver stamp fails it and the file is recomputed. CACHE is a
+    /// process-global OnceLock consumed by the test above, so this
+    /// exercises the predicate rather than a second init.
+    #[test]
+    fn stale_driver_stamp_fails_the_header_predicate() {
+        let h = header();
+        assert!(h.starts_with(HEADER_BASE), "{h}");
+        assert!(h.contains(" driver="), "{h}");
+        assert_ne!(h, HEADER_BASE, "a pre-stamp file must not match");
+        assert_eq!(header(), h, "stamp must be stable within one process");
     }
 }
