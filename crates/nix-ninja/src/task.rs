@@ -383,6 +383,16 @@ pub struct Runner {
     /// a consumer depending on ONE of them gets the co-outputs too, since
     /// tools follow a declared output to files written beside it.
     co_outputs: HashMap<FileId, Vec<FileId>>,
+    /// Edge outputs -> that edge's lib-shaped dependency fids: relative
+    /// `.so*` files and meson's SHSYM `.symbols` indirection. A task that
+    /// EXECUTES a build-produced binary (meson custom commands running a
+    /// just-built tool) needs the binary's runtime libraries, and the
+    /// graph hides them: the tool's link edge depends on the lib's
+    /// `.symbols` file, never the lib. Expanding this map in the worklist
+    /// follows .symbols -> SHSYM edge -> real lib -> its own lib deps
+    /// transitively. Measured: orc's orcc dies with `liborc-0.4.so.0:
+    /// cannot open shared object file` in every generator task.
+    runtime_lib_deps: HashMap<FileId, Vec<FileId>>,
 
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
@@ -490,6 +500,7 @@ impl Runner {
             stamp_inputs: HashMap::new(),
             stamp_input_files: HashMap::new(),
             co_outputs: HashMap::new(),
+            runtime_lib_deps: HashMap::new(),
             permits,
             pool_permits,
             tx,
@@ -599,6 +610,23 @@ impl Runner {
             let outs: Vec<FileId> = build.outs().to_vec();
             for fid in build.outs() {
                 self.co_outputs.insert(*fid, outs.clone());
+            }
+        }
+
+        // Record lib-shaped deps BEFORE building the task, same ordering
+        // argument again. Shape: a RELATIVE path (a store-path .so is
+        // already visible in every sandbox) whose basename carries `.so`
+        // as an extension boundary, or meson's `.symbols` relink guard,
+        // which is the only edge-visible handle on the lib it certifies.
+        let libs: Vec<FileId> = build
+            .dirtying_ins()
+            .iter()
+            .filter(|f| lib_shaped(&files.by_id[**f].name))
+            .copied()
+            .collect();
+        if !libs.is_empty() {
+            for fid in build.outs() {
+                self.runtime_lib_deps.insert(*fid, libs.clone());
             }
         }
 
@@ -1089,6 +1117,17 @@ impl Runner {
             // is not yet a file drops silently rather than erroring.
             if let Some(sibs) = self.co_outputs.get(&fid) {
                 worklist.extend(sibs.iter().filter(|s| **s != fid).map(|s| (*s, true)));
+            }
+            // A build-produced binary this task may EXECUTE needs its
+            // runtime libraries materialized; enqueueing the producing
+            // edge's lib-shaped deps lets the worklist follow meson's
+            // .symbols indirection to the real lib transitively. Compile
+            // tasks never execute build outputs, and their closures are
+            // kept lean by the same is_gcc_task gate as the phony filter.
+            if !is_gcc_task {
+                if let Some(libs) = self.runtime_lib_deps.get(&fid) {
+                    worklist.extend(libs.iter().map(|f| (*f, true)));
+                }
             }
             // For a compile (deps=gcc), a phony-EXPANDED order-only dep is
             // only a real input if it is header-shaped: expansion of GN's
@@ -5387,6 +5426,19 @@ fn generate_frandom_seed(cmdline: &str) -> String {
 /// The body of [`Runner::resolve_target`], taking its two maps directly so it
 /// can be tested without standing up a Runner (which needs a store, an RPC
 /// client and a populated graph).
+/// Whether a dependency name is a runtime-library handle worth pulling
+/// into an executing task's closure: a RELATIVE `.so`/`.so.N` path (a
+/// store-path lib is already visible in every sandbox) or meson's SHSYM
+/// `.symbols` relink guard, the only edge-visible handle on the lib it
+/// certifies.
+fn lib_shaped(name: &str) -> bool {
+    if name.starts_with('/') {
+        return false;
+    }
+    let base = name.rsplit('/').next().unwrap_or(name);
+    base.ends_with(".symbols") || base.ends_with(".so") || base.contains(".so.")
+}
+
 fn resolve_target_in(
     derived_files: &HashMap<FileId, DerivedFile>,
     phony_aliases: &HashMap<FileId, Vec<FileId>>,
@@ -5416,6 +5468,25 @@ fn resolve_target_in(
 #[cfg(test)]
 mod target_resolution_tests {
     use super::*;
+
+    /// The runtime-lib shape table: relative .so and .so.N and meson
+    /// .symbols pull in; store-path libs, objects, and sources stay out.
+    /// The orc failure row is `liborc-0.4.so.0.42.0` reached through
+    /// `liborc-0.4.so.0.42.0.symbols`.
+    #[test]
+    fn lib_shape_table() {
+        assert!(lib_shaped("orc/liborc-0.4.so.0.42.0"));
+        assert!(lib_shaped("orc/liborc-0.4.so"));
+        assert!(lib_shaped(
+            "orc/liborc-0.4.so.0.42.0.p/liborc-0.4.so.0.42.0.symbols"
+        ));
+        assert!(!lib_shaped(
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc/lib/libm.so"
+        ));
+        assert!(!lib_shaped("orc/liborc-0.4.so.0.42.0.p/orc.c.o"));
+        assert!(!lib_shaped("../orc/orc.c"));
+        assert!(!lib_shaped("tools/orcc"));
+    }
     use harmonia_store_path::StorePath;
     use nix_ninja_task::derived_file::DerivedFile;
 
