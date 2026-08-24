@@ -5749,8 +5749,18 @@ mod self_rss_tests {
 
 #[cfg(test)]
 mod ninja_pool_tests {
+    /// $out/$dev are PROCESS globals and cargo runs tests on parallel
+    /// threads, so the two tests below - which set the same vars to
+    /// DIFFERENT values - race: whichever writes last wins under the
+    /// other's assertions. Latent until the sandboxed check phase hit the
+    /// interleaving (remove_outer_rpath saw the rewrite-map test's $out
+    /// and stripped nothing). Poisoning is survivable: a panicking holder
+    /// must not fail the other test twice.
+    static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn outer_rewrite_map_is_same_length_stable_and_reversible() {
+        let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("outputs", "out dev");
         std::env::set_var("out", "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-1.2.16.1");
         std::env::set_var("dev", "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-alsa-lib-1.2.16.1-dev");
@@ -5775,6 +5785,7 @@ mod ninja_pool_tests {
 
     #[test]
     fn remove_outer_rpath_strips_the_out_lib_pair() {
+        let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("outputs", "out dev");
         std::env::set_var("out", "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-cc-dropin-1.2.16.1");
         std::env::set_var("dev", "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-alsa-lib-cc-dropin-1.2.16.1-dev");
