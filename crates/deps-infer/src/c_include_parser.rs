@@ -16,6 +16,22 @@ pub fn retrieve_c_includes(
     files: Vec<PathBuf>,
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
+    Ok(retrieve_c_includes_checked(cmdline, files, virtual_paths)?.0)
+}
+
+/// The same walk, plus whether the scan KNOWS it is incomplete.
+///
+/// The bool is true when some translation unit carries an `#include` this
+/// parser cannot resolve - a function-like macro call, a concatenation - or
+/// a plain macro use that no file in the walk ever defined. The caller is
+/// expected to fall back to the preprocessor for that TU. Returning it
+/// separately keeps the fast path fast: nothing extra runs for the
+/// overwhelming majority of translation units, where the scan is exact.
+pub fn retrieve_c_includes_checked(
+    cmdline: &str,
+    files: Vec<PathBuf>,
+    virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+) -> Result<(Vec<PathBuf>, bool)> {
     let includes = gcc_include_parser::parse_include_dirs(cmdline)?;
     bfs_parse_includes(files, &includes, virtual_paths)
 }
@@ -25,7 +41,9 @@ fn bfs_parse_includes(
     files: Vec<PathBuf>,
     include_dirs: &[PathBuf],
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
-) -> Result<Vec<PathBuf>> {
+) -> Result<(Vec<PathBuf>, bool)> {
+    // Set by any file carrying a directive this parser cannot expand.
+    let mut incomplete = false;
     let mut visited = rustc_hash::FxHashSet::default();
     let mut result = Vec::new();
     let mut queue = VecDeque::new();
@@ -74,6 +92,9 @@ fn bfs_parse_includes(
                 if !vals.contains(&v) {
                     vals.push(v);
                 }
+            }
+            if !source.computed_unresolvable.is_empty() {
+                incomplete = true;
             }
             if let Some(dir) = source.path.parent() {
                 for u in source.macro_uses {
@@ -126,7 +147,18 @@ fn bfs_parse_includes(
         }
     }
 
-    Ok(result)
+    // A use whose macro no file ever defined is the OTHER way the scan can
+    // be wrong, and it had the same silent ending: the loop above simply
+    // skips it. It is the same verdict - this walk cannot say what that
+    // directive names - so it takes the same fallback.
+    if pending_uses
+        .iter()
+        .any(|(_, name)| !tu_defines.contains_key(name))
+    {
+        incomplete = true;
+    }
+
+    Ok((result, incomplete))
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]
@@ -135,6 +167,7 @@ pub struct SourceWithIncludes {
     pub includes: Vec<PathBuf>,
     pub path_defines: Vec<(String, String)>,
     pub macro_uses: Vec<String>,
+    pub computed_unresolvable: Vec<String>,
 }
 
 /// Given a list of paths, figure out their dependencies
@@ -188,16 +221,26 @@ where
                 }
             };
 
-            let (path_defines, macro_uses) = match scan_directives(&path) {
+            let (path_defines, macro_uses, computed_unresolvable) = match scan_directives(&path) {
                 // The scan is memoized, so this re-read is a cache hit.
-                Ok(scan) => (scan.path_defines.clone(), scan.macro_uses.clone()),
-                Err(_) => (Vec::new(), Vec::new()),
+                Ok(scan) => (
+                    scan.path_defines.clone(),
+                    scan.macro_uses.clone(),
+                    scan.computed_unresolvable.clone(),
+                ),
+                Err(_) => (Vec::new(), Vec::new(), Vec::new()),
             };
             // `path` carries the SPELLED location onward: bfs resolves a
             // later computed include from this file's parent, and the
             // compiler resolves from where the file was reached, not from
             // its canonical home.
-            Ok(SourceWithIncludes { path: spelled, includes, path_defines, macro_uses })
+            Ok(SourceWithIncludes {
+                path: spelled,
+                includes,
+                path_defines,
+                macro_uses,
+                computed_unresolvable,
+            })
         }));
     }
 
@@ -277,6 +320,14 @@ pub struct ScanResult {
     pub directives: Vec<Directive>,
     pub path_defines: Vec<(String, String)>,
     pub macro_uses: Vec<String>,
+    /// `#include` tokens this parser can NEVER resolve: function-like macro
+    /// calls and concatenations, which need real macro expansion. Recorded
+    /// rather than dropped, because a scan that cannot say it is incomplete
+    /// is indistinguishable from one that found everything, and the caller
+    /// then declares an input set it has no reason to trust. cmake's kwsys
+    /// is the measured case: `#include KWSYS_HEADER(Directory.hxx)` with
+    /// `-DKWSYS_NAMESPACE=cmsys`, resolvable only by the preprocessor.
+    pub computed_unresolvable: Vec<String>,
 }
 
 type DirectiveCache =
@@ -345,6 +396,7 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
     let mut directives = Vec::new();
     let mut macro_paths: std::collections::HashMap<String, String> = Default::default();
     let mut macro_uses: Vec<String> = Vec::new();
+    let mut computed_unresolvable: Vec<String> = Vec::new();
     for raw in data.split(|&b| b == b'\n') {
         let line = String::from_utf8_lossy(raw);
         let line = line.as_ref();
@@ -404,6 +456,14 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
                 // A macro token with no same-file define: recorded for the
                 // per-TU walk, where another file's define may resolve it.
                 macro_uses.push(token.to_string());
+            } else if !token.is_empty() {
+                // ANYTHING ELSE IS BEYOND THIS PARSER, AND SAYING SO IS THE
+                // POINT. A function-like call or a concatenation needs macro
+                // expansion with the command line's -D set. Dropping it
+                // silently is what let cmake's kwsys reach a task with no
+                // cmsys/ headers declared; recording it lets the caller
+                // fall back to the preprocessor for this TU alone.
+                computed_unresolvable.push(token.to_string());
             }
         }
     }
@@ -412,6 +472,7 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
         directives,
         path_defines: macro_paths.into_iter().collect(),
         macro_uses,
+        computed_unresolvable,
     });
     SCAN_MISSES.fetch_add(1, Relaxed);
     if let Some((len, mtime)) = key {
@@ -560,6 +621,58 @@ mod tests {
     static SCAN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn function_like_computed_include_reports_the_scan_incomplete() {
+        // cmake's kwsys, 2026-08-24: kwsysPrivate.h defines
+        //   #define KWSYS_HEADER1(x) <x>
+        //   #define KWSYS_HEADER(x)  KWSYS_HEADER1(KWSYS_NAMESPACE/x)
+        // and every source writes `#include KWSYS_HEADER(Directory.hxx)`,
+        // with KWSYS_NAMESPACE=cmsys arriving as -D on the command line.
+        // No textual parser resolves that. What it must NOT do is stay
+        // silent: the driver declared the task's inputs from a scan that
+        // had quietly dropped the directive, and every kwsys TU died on a
+        // missing cmsys/ header.
+        let _g = SCAN_TEST_LOCK.lock().unwrap();
+        let d = std::env::temp_dir().join(format!("nnkw{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("kwsysPrivate.h"),
+            "#define KWSYS_HEADER1(x) <x>\n\
+             #define KWSYS_HEADER(x) KWSYS_HEADER1(KWSYS_NAMESPACE/x)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("Directory.cxx"),
+            "#include \"kwsysPrivate.h\"\n#include KWSYS_HEADER(Directory.hxx)\n",
+        )
+        .unwrap();
+        let (_got, incomplete) =
+            bfs_parse_includes(vec![d.join("Directory.cxx")], &[], None).unwrap();
+        assert!(
+            incomplete,
+            "a function-like computed include must report the scan incomplete, \
+             or the driver declares inputs it has no reason to trust"
+        );
+
+        // THE NEGATIVE CONTROL, and it is the half that keeps this cheap.
+        // The fallback runs a real preprocessor, so a detector that fired on
+        // ordinary sources would pay that per object and hand back exactly
+        // the time per-TU derivations exist to save. An everyday file with
+        // plain quoted and angled includes must come back complete.
+        std::fs::write(d.join("plain.h"), "\n").unwrap();
+        std::fs::write(
+            d.join("plain.c"),
+            "#include <stdio.h>\n#include \"plain.h\"\n",
+        )
+        .unwrap();
+        let (got2, incomplete2) =
+            bfs_parse_includes(vec![d.join("plain.c")], &[], None).unwrap();
+        assert!(
+            !incomplete2,
+            "an ordinary source must NOT trigger the preprocessor fallback: {got2:?}"
+        );
+    }
+
+    #[test]
     fn computed_include_through_cross_file_define_is_declared() {
         // lzo, 2026-08-23: lzo1b_c.ch writes `#include
         // LZO_SEARCH_MATCH_INCLUDE_FILE` and the define lives in a config
@@ -576,7 +689,7 @@ mod tests {
         std::fs::write(d.join("main.c"),
             "#include \"config.h\"\n#include \"body.h\"\n").unwrap();
         let got = bfs_parse_includes(
-            vec![d.join("main.c")], &[], None).unwrap();
+            vec![d.join("main.c")], &[], None).unwrap().0;
         assert!(got.iter().any(|p| p.ends_with("sm_impl.h")),
             "cross-file computed include not declared: {:?}", got);
         // The negative control: a use whose macro is never defined stays
@@ -584,7 +697,7 @@ mod tests {
         std::fs::write(d.join("main2.c"),
             "#include NEVER_DEFINED\n").unwrap();
         let got2 = bfs_parse_includes(
-            vec![d.join("main2.c")], &[], None).unwrap();
+            vec![d.join("main2.c")], &[], None).unwrap().0;
         assert_eq!(got2.len(), 1, "only the source itself: {:?}", got2);
     }
 
@@ -606,7 +719,7 @@ mod tests {
             "#if !defined(CM_FILE)\n#  define CM_FILE \"body_cm.ch\"\n#endif\n#  include CM_FILE\n").unwrap();
         std::fs::write(d.join("root_cm.ch"), "\n").unwrap();
         std::fs::write(d.join("body_cm.ch"), "\n").unwrap();
-        let got = bfs_parse_includes(vec![d.join("root.c")], &[], None).unwrap();
+        let got = bfs_parse_includes(vec![d.join("root.c")], &[], None).unwrap().0;
         let names: Vec<String> = got.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         assert!(names.iter().any(|n| n.ends_with("root_cm.ch")),
             "root override missing: {names:?}");
@@ -628,7 +741,7 @@ mod tests {
         std::fs::write(d.join("mips/init.c"),
             "#define F \"contrib/x.c\"\n#include F\n").unwrap();
         let got = bfs_parse_includes(
-            vec![d.join("mips/init.c")], &[d.clone()], None).unwrap();
+            vec![d.join("mips/init.c")], &[d.clone()], None).unwrap().0;
         let names: Vec<String> = got.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         assert!(names.iter().any(|n| n.ends_with("contrib/x.c")), "{names:?}");
         assert!(!names.iter().any(|n| n.contains("mips/contrib")),
@@ -717,7 +830,7 @@ mod tests {
             None,
         );
         std::env::set_current_dir(prev).unwrap();
-        let got = got.unwrap();
+        let got = got.unwrap().0;
         let names: Vec<String> =
             got.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         assert!(

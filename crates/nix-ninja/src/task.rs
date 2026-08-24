@@ -5683,7 +5683,56 @@ pub fn discover_c_includes(
     // own model, a depfile per object from the previous run.
     let c_includes = match depfile_read_back(build_dir, depfile, &files) {
         Some(deps) => deps,
-        None => c_include_parser::retrieve_c_includes(cmdline, files.clone(), virtual_paths)?,
+        None => {
+            let (scanned, incomplete) = c_include_parser::retrieve_c_includes_checked(
+                cmdline,
+                files.clone(),
+                virtual_paths,
+            )?;
+            // THE SCAN NOW SAYS WHEN IT CANNOT ANSWER, AND THIS IS WHAT
+            // ACTS ON IT. A computed include through a function-like macro
+            // needs real expansion against the command line's -D set, which
+            // a textual parser cannot do and which the preprocessor does by
+            // definition. Measured 2026-08-24 on cmake-minimal's bootstrap:
+            // `#include KWSYS_HEADER(Directory.hxx)` with
+            // -DKWSYS_NAMESPACE=cmsys, so every kwsys TU reached its task
+            // with no cmsys/ header declared and died "No such file or
+            // directory" - the scan's silence read as a complete answer.
+            //
+            // It runs for those TUs ALONE. The scan is exact for the
+            // overwhelming majority, and paying a preprocess per object
+            // would hand back the time per-TU derivations exist to save.
+            //
+            // The fallback's polarity is deliberate: if gcc itself fails
+            // here, keep the scan's answer and let the TASK fail loudly.
+            // Substituting an empty or partial set on a failed preprocess
+            // would turn a build error into a wrong artifact, which is the
+            // one outcome worse than the bug being fixed.
+            if incomplete {
+                match deps_infer::gcc_depfile::retrieve_c_includes(cmdline) {
+                    Ok(deps) => {
+                        eprintln!(
+                            "nix-ninja: computed include unresolvable by scan; \
+                             preprocessor declared {} input(s)",
+                            deps.len()
+                        );
+                        deps
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "nix-ninja: computed include unresolvable by scan and the \
+                             preprocessor fallback failed ({e}); keeping the scan's {} \
+                             input(s), so the task fails loudly rather than silently \
+                             building with the wrong ones",
+                            scanned.len()
+                        );
+                        scanned
+                    }
+                }
+            } else {
+                scanned
+            }
+        }
     };
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
