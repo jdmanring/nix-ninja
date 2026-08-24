@@ -28,6 +28,28 @@ pub fn parse_include_dirs(cmdline: &str) -> Result<Vec<PathBuf>> {
         else if let Some(stripped) = arg.strip_prefix("-I=") {
             include_dirs.push(stripped.to_string().into());
         }
+        // -iquote, -isystem, -idirafter: gcc's other include-dir flags,
+        // attached or separate. -iquote is where skarnet builds put their
+        // GENERATED headers (s6-linux-init: `-iquote src/include-local`
+        // holding initctl.h and defaults.h), and a flag this parser does
+        // not read is a directory the scanner cannot resolve through - the
+        // header exists, gcc finds it, and the task never receives it
+        // (eighth class, 2026-08-23). Search-order nuances between the
+        // three are irrelevant here: the scanner's result set OVER-declares
+        // safely, an extra input is harmless, a missing one kills the task.
+        else if let Some(rest) = ["-iquote", "-isystem", "-idirafter"]
+            .iter()
+            .find_map(|f| arg.strip_prefix(f))
+        {
+            if rest.is_empty() {
+                if i + 1 < args.len() {
+                    include_dirs.push(args[i + 1].to_string().into());
+                    i += 1;
+                }
+            } else {
+                include_dirs.push(rest.to_string().into());
+            }
+        }
 
         i += 1;
     }
@@ -42,6 +64,23 @@ mod tests {
     // Helper function to convert string slices to PathBufs
     fn paths(dirs: &[&str]) -> Vec<PathBuf> {
         dirs.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn iquote_isystem_idirafter_are_include_dirs() {
+        // s6-linux-init's real shape: generated headers reachable only
+        // through -iquote. Attached and separate forms both count.
+        assert_eq!(
+            parse_include_dirs(
+                "gcc -iquote src/include-local -Isrc/include -c x.c"
+            )
+            .unwrap(),
+            paths(&["src/include-local", "src/include"])
+        );
+        assert_eq!(
+            parse_include_dirs("gcc -isystem/opt/inc -idirafter late -c x.c").unwrap(),
+            paths(&["/opt/inc", "late"])
+        );
     }
 
     #[test]
