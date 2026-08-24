@@ -8,7 +8,7 @@ use std::fmt::Debug;
 use std::fs::canonicalize;
 use std::fs::File;
 use std::hash::Hash;
-use std::io::{BufRead, BufReader};
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -323,17 +323,22 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
         }
     }
 
-    let f =
-        File::open(path).map_err(|e| anyhow!("Failed to open file {}: {}", path.display(), e))?;
+    // BYTES, NOT lines(): BufReader::lines errors on the first line that
+    // is not valid UTF-8, and the old `Err(_) => break` ABANDONED the rest
+    // of the file - a comment said "skip" while the code said stop. groff's
+    // lbp.cpp is ISO-8859 (an accented author name on LINE 2), so the scan
+    // saw zero of its includes, the task shipped with only the TU, and the
+    // compile died on <config.h> (2026-08-23, seventh class). Directives
+    // are ASCII; a lossy per-line decode preserves every one of them and
+    // mangles only the prose the scanner never reads.
+    let data = std::fs::read(path)
+        .map_err(|e| anyhow!("Failed to read file {}: {}", path.display(), e))?;
     let mut directives = Vec::new();
     let mut macro_paths: std::collections::HashMap<String, String> = Default::default();
     let mut macro_uses: Vec<String> = Vec::new();
-    for line in BufReader::new(f).lines() {
-        let line = match line {
-            Ok(l) => l,
-            // Usually this means the file isn't UTF-8 and we can skip.
-            Err(_) => break,
-        };
+    for raw in data.split(|&b| b == b'\n') {
+        let line = String::from_utf8_lossy(raw);
+        let line = line.as_ref();
         if let Some(captures) = INCLUDE_REGEX.captures(&line) {
             directives.push(Directive {
                 quoted: captures.get(1).unwrap().as_str() == "\"",
@@ -612,6 +617,26 @@ mod tests {
         assert!(names.iter().any(|n| n.ends_with("contrib/x.c")), "{names:?}");
         assert!(!names.iter().any(|n| n.contains("mips/contrib")),
             "fabricated spelling declared: {names:?}");
+    }
+
+    #[test]
+    fn non_utf8_line_does_not_end_the_scan() {
+        // groff's lbp.cpp: an ISO-8859 byte in a comment on line 2, every
+        // include after it. The old lines()-based loop broke at the bad
+        // byte and declared ZERO includes; the task then died on the first
+        // missing header. The scan must survive the byte and keep every
+        // directive that follows it.
+        let dir = std::env::temp_dir().join(format!("nn-8859-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("lbp.cpp");
+        let mut body = b"/*\n   Written by Francisco Andr\xe9s Verd\xfa\n*/\n".to_vec();
+        body.extend_from_slice(b"#include <config.h>\n#include \"lbp.h\"\n");
+        std::fs::write(&src, body).unwrap();
+        let scan = scan_directives(&src).unwrap();
+        let names: Vec<_> = scan.directives.iter().map(|d| d.name.clone()).collect();
+        assert_eq!(names, vec![PathBuf::from("config.h"), PathBuf::from("lbp.h")]);
+        assert!(!scan.directives[0].quoted);
+        assert!(scan.directives[1].quoted);
     }
 
     #[test]
