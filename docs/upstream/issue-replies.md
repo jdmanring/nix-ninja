@@ -353,7 +353,7 @@ It does not say #31 is fixed. Nobody here has run nix-ninja in a Docker
 container, and the reporter's environment is not reproduced. The claim is
 narrower and is checkable by them: the mechanism their hypothesis names was
 replaced by a merged PR, so the evidence in the thread no longer describes the
-code. Saying "this is probably fixed" would be a guess about somebody else's
+code. Calling it fixed outright would be a guess about somebody else's
 environment presented as a finding, which is the thing this directory keeps
 catching in itself.
 
