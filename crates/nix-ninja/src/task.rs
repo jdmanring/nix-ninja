@@ -6544,4 +6544,64 @@ mod create_symlink_undeclared_output_tests {
             "the overlap was declared twice: {got:?}"
         );
     }
+
+    /// This test changes the process working directory, which is global.
+    static CHDIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // LIVES IN THIS CRATE ON PURPOSE, NOT IN deps-infer WHERE ITS SUBJECT IS.
+    // nix-ninja-task's src fileset covers crates/deps-infer, so ANY edit
+    // there - a test included - re-keys the task binary, and the task binary
+    // is an input of every per-TU derivation. Measured 2026-08-24: adding
+    // this test to c_include_parser.rs moved nix-ninja-task's drvPath from
+    // 2ai4n9fh to da3j2y88 and would have invalidated all 37,704 banked
+    // outputs of the campaign. crates/nix-ninja is NOT in that fileset, and
+    // the function under test is pub, so the coverage costs nothing.
+    #[test]
+    fn angle_include_resolves_against_dash_i_dot() {
+        // m4-1.4.21, 2026-08-24, the first REAL failure of the campaign that
+        // was not a daemon disconnect. gnulib GENERATES a replacement
+        // `wchar.h` into the build directory and declares `mbszero` in it;
+        // quotearg.c reaches it as `#include <wchar.h>`, an ANGLE include
+        // resolved through `-I.` alone, since automake's DEFAULT_INCLUDES is
+        // exactly `-I.`. If that header is not materialized into the task,
+        // the angle include silently finds the SYSTEM wchar.h, which has no
+        // mbszero, and the compile dies with an implicit declaration - a
+        // wrong-header failure wearing a missing-prototype message.
+        //
+        // The failure direction is what makes it worth a test: a quoted
+        // include that is missing fails as "No such file", loudly and at the
+        // right place. An angle include that is missing SUCCEEDS at finding
+        // the wrong file.
+        let _g = CHDIR_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("nn-angle-i-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("wchar.h"), b"#ifndef GEN_WCHAR\n#define GEN_WCHAR\nstatic void mbszero(void*p){(void)p;}\n#endif\n").unwrap();
+        std::fs::write(dir.join("config.h"), b"#define PACKAGE \"m4\"\n").unwrap();
+        std::fs::write(dir.join("quotearg.h"), b"#ifndef QA_H\n#define QA_H\n#endif\n").unwrap();
+        let src = dir.join("quotearg.c");
+        std::fs::write(&src, b"#include <config.h>\n#include \"quotearg.h\"\n#include <wchar.h>\n").unwrap();
+
+        // `-I.` is resolved against the process working directory, which is
+        // what the compile itself does, so the test stands where the
+        // compiler would.
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let got = deps_infer::c_include_parser::retrieve_c_includes("gcc -I. -g -O2 -c -o q.o quotearg.c", vec![PathBuf::from("quotearg.c")], None);
+        std::env::set_current_dir(prev).unwrap();
+        let got = got.unwrap();
+        let names: Vec<String> = got
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        assert!(names.iter().any(|n| n == "wchar.h"),
+            "the generated wchar.h reached only through -I. was not collected: {names:?}");
+        // The quoted include is the POSITIVE CONTROL. Without it a walk that
+        // collected nothing at all would fail the assertion above for a
+        // reason that has nothing to do with angle includes.
+        assert!(names.iter().any(|n| n == "quotearg.h"),
+            "the quoted include was not collected either, so this says nothing \
+             about angle includes: {names:?}");
+    }
+
 }
