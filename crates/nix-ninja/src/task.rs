@@ -5664,6 +5664,22 @@ fn depfile_read_back(
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// Union of the textual scan and the preprocessor's depfile, scan order
+/// first, deduped. See the call site for why neither alone is sufficient.
+fn merge_scan_and_preprocessor(
+    scanned: Vec<PathBuf>,
+    preprocessed: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = scanned.iter().cloned().collect();
+    let mut out = scanned;
+    for p in preprocessed {
+        if seen.insert(p.clone()) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 pub fn discover_c_includes(
     rpc_client: &Arc<BuilderRpcClient>,
     store_dir: &StoreDir,
@@ -5711,12 +5727,36 @@ pub fn discover_c_includes(
             if incomplete {
                 match deps_infer::gcc_depfile::retrieve_c_includes(cmdline) {
                     Ok(deps) => {
+                        // THE PREPROCESSOR ADDS TO THE SCAN, IT DOES NOT REPLACE IT.
+                        // `-MM` (include_system_headers: false) omits every header gcc
+                        // considers a SYSTEM header, and that is a property of the
+                        // FILE rather than of where it lives: gnulib writes
+                        // `#pragma GCC system_header` into the replacement headers it
+                        // GENERATES INTO THE BUILD DIRECTORY. So the depfile answer
+                        // silently drops build-dir files that must be materialized.
+                        // Measured 2026-08-24 on gnum4-1.4.21: `gcc -MM -I. quotearg.c`
+                        // declares 15 headers with lib/wchar.h and lib/limits.h absent,
+                        // `gcc -M` lists both, and the textual scan finds both. The
+                        // task then compiled against the SYSTEM wchar.h and died
+                        // `implicit declaration of function 'mbszero'` - a wrong-header
+                        // failure wearing a missing-prototype message, because an angle
+                        // include that was never materialized SUCCEEDS at finding the
+                        // wrong file.
+                        //
+                        // Neither answer is a superset of the other: the scan is blind
+                        // to computed includes (cmake's kwsys), the depfile is blind to
+                        // pragma-marked build-dir headers (every autotools package
+                        // carrying gnulib). Union them, scan order first. Over-declaring
+                        // is the pipeline's safe polarity - an extra input costs one
+                        // upload - while under-declaring is silent and ships the wrong
+                        // artifact.
+                        let merged = merge_scan_and_preprocessor(scanned, deps);
                         eprintln!(
                             "nix-ninja: computed include unresolvable by scan; \
-                             preprocessor declared {} input(s)",
-                            deps.len()
+                             scan and preprocessor union to {} input(s)",
+                            merged.len()
                         );
-                        deps
+                        merged
                     }
                     Err(e) => {
                         eprintln!(
@@ -6464,5 +6504,44 @@ mod create_symlink_undeclared_output_tests {
         // Negative control: an unrelated -E command adds nothing.
         let v = undeclared_outputs(&[], Some("cmake -E copy a b"), bd);
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn preprocessor_fallback_adds_to_the_scan_rather_than_replacing_it() {
+        // gnum4-1.4.21, 2026-08-24. quotearg.c trips the computed-include
+        // detector, so the driver fell back to `gcc -MM`. That depfile omits
+        // every header gcc marks as a system header, and gnulib writes
+        // `#pragma GCC system_header` into the wchar.h it GENERATES INTO THE
+        // BUILD DIRECTORY - so the fallback dropped a file that had to be
+        // materialized, the task compiled against the system wchar.h, and it
+        // died on an implicit declaration of mbszero.
+        //
+        // The second assertion is the negative control: a "fix" that simply
+        // kept `scanned` and discarded the depfile satisfies the first one,
+        // so the computed include the preprocessor exists to find has to
+        // survive as well, or this test passes on a reintroduced kwsys bug.
+        let scanned = vec![
+            PathBuf::from("quotearg.c"),
+            PathBuf::from("wchar.h"),
+            PathBuf::from("limits.h"),
+        ];
+        let preprocessed = vec![
+            PathBuf::from("quotearg.c"),
+            PathBuf::from("cmsys/Directory.hxx"),
+        ];
+        let got = merge_scan_and_preprocessor(scanned, preprocessed);
+        assert!(
+            got.contains(&PathBuf::from("wchar.h")),
+            "the scan's pragma-marked build-dir header was dropped: {got:?}"
+        );
+        assert!(
+            got.contains(&PathBuf::from("cmsys/Directory.hxx")),
+            "the preprocessor's computed include was dropped: {got:?}"
+        );
+        assert_eq!(
+            got.iter().filter(|p| *p == &PathBuf::from("quotearg.c")).count(),
+            1,
+            "the overlap was declared twice: {got:?}"
+        );
     }
 }
