@@ -1,4 +1,5 @@
 mod build;
+mod dyndep;
 pub mod cli;
 mod local;
 mod relative_from;
