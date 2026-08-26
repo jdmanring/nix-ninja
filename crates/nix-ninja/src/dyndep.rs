@@ -27,9 +27,12 @@
 //! public parser - the same lexer, so escapes and line continuations cannot
 //! drift between the two passes.
 
-use anyhow::{anyhow, bail, Result};
-use std::collections::HashMap;
+use anyhow::{anyhow, bail, Context, Result};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
+use n2::canon;
+use n2::graph::{BuildId, Graph};
 use n2::parse::{Parser, Statement};
 
 /// What a dyndep file adds to one already-declared build edge.
@@ -224,14 +227,139 @@ pub fn scan_bindings(bytes: &[u8]) -> Result<HashMap<String, String>> {
     Ok(out)
 }
 
+/// Walk a ninja file and everything it pulls in, collecting dyndep
+/// bindings.
+///
+/// `include` and `subninja` are followed because a generator is free to
+/// put build statements anywhere: CMake keeps rules in `rules.ninja`, GN
+/// splits build statements across a `subninja` per target. Scanning only
+/// the root file would find nothing in the GN case and read as "this
+/// project has no dyndep", which is the reassuring direction.
+///
+/// Paths resolve against the working directory, matching n2's loader
+/// rather than resolving relative to the including file.
+pub fn scan_bindings_from_file(root: &Path) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    let mut queue: Vec<PathBuf> = vec![root.to_path_buf()];
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    while let Some(path) = queue.pop() {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading ninja file {}", path.display()))?;
+
+        // The precheck is applied PER FILE rather than once at the root,
+        // because the root of a GN build mentions neither and every real
+        // build statement is in a subninja. A file that pulls in others
+        // still has to be parsed even when it has no dyndep of its own.
+        let mentions_include =
+            find_bytes(&bytes, b"include") || find_bytes(&bytes, b"subninja");
+        if !mentions_dyndep(&bytes) && !mentions_include {
+            continue;
+        }
+
+        let buf = with_nul(&bytes);
+        let mut parser = Parser::new(&buf);
+        while let Some(stmt) = parser.read().map_err(|e| anyhow!("{}: {e:?}", path.display()))? {
+            match stmt {
+                Statement::Build(build) => {
+                    let Some(binding) = build.vars.get("dyndep") else {
+                        continue;
+                    };
+                    let dd = binding.evaluate(&[]);
+                    if dd.is_empty() {
+                        bail!(
+                            "{}:{}: dyndep binding did not resolve to a literal path; \
+                             rule- or variable-scoped bindings are not implemented",
+                            path.display(),
+                            build.line
+                        );
+                    }
+                    if build.explicit_outs == 0 {
+                        bail!(
+                            "{}:{}: edge with a dyndep binding has no output",
+                            path.display(),
+                            build.line
+                        );
+                    }
+                    out.insert(build.outs[0].evaluate(&[]), dd);
+                }
+                Statement::Include(p) | Statement::Subninja(p) => {
+                    queue.push(PathBuf::from(p.evaluate(&[])));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Cheap pre-check so a project with no dyndep pays nothing for this
 /// feature. The second parse is only worth its cost when the word appears
 /// at all, and it does not appear in the ninja files of any package this
 /// project builds today except the Fortran ones.
 pub fn mentions_dyndep(bytes: &[u8]) -> bool {
-    bytes
-        .windows(b"dyndep".len())
-        .any(|w| w == b"dyndep")
+    find_bytes(bytes, b"dyndep")
+}
+
+/// Fold one dyndep entry into the loaded graph, as if the edge had
+/// declared these inputs and outputs all along.
+///
+/// Doing it this way rather than patching the task builder is what keeps
+/// the rest of the driver honest: every later computation - the input
+/// worklist, the output set, the compile-task test, the derivation hash -
+/// reads the edge's dependencies, so an edge amended here is complete
+/// everywhere with no second code path to keep in step.
+///
+/// The implicit-OUTPUT half is the load-bearing one. Implicit inputs alone
+/// would give a consumer whose `.mod` has no producing derivation, which
+/// fails no differently from today.
+pub fn apply_entry(graph: &mut Graph, bid: BuildId, entry: &DyndepEntry) -> Result<()> {
+    for name in &entry.implicit_ins {
+        let fid = graph
+            .files
+            .id_from_canonical(canon::to_owned_canon_path(name.as_str()));
+        let ins = &mut graph.builds[bid].dependencies.ins;
+        if ins.ids.contains(&fid) {
+            continue;
+        }
+        // ins.ids is laid out explicit, implicit, order-only, validation,
+        // with the counts naming the boundaries; an implicit input has to
+        // land inside its own run or every later count is off by one and
+        // an order-only input silently becomes dirtying.
+        let pos = ins.explicit + ins.implicit;
+        ins.ids.insert(pos, fid);
+        ins.implicit += 1;
+        graph.files.by_id[fid].dependents.push(bid);
+    }
+
+    for name in &entry.implicit_outs {
+        let fid = graph
+            .files
+            .id_from_canonical(canon::to_owned_canon_path(name.as_str()));
+        let outs = &mut graph.builds[bid].dependencies.outs;
+        if !outs.ids.contains(&fid) {
+            // Implicit outputs go after the explicit ones, so `explicit`
+            // keeps naming the same boundary.
+            outs.ids.push(fid);
+        }
+        match graph.files.by_id[fid].input {
+            None => graph.files.by_id[fid].input = Some(bid),
+            Some(prev) if prev == bid => {}
+            Some(_) => bail!(
+                "dyndep names {name:?} as an output of two different edges"
+            ),
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -372,6 +500,146 @@ rule cc
 build a.o: cc a.c
 ";
         assert!(scan_bindings(ninja.as_bytes()).unwrap().is_empty());
+    }
+
+    /// The two-edge shape the whole feature exists for: one Fortran
+    /// compile produces a module, a second consumes it, and `build.ninja`
+    /// says nothing about either fact.
+    const FORTRAN_NINJA: &str = "\
+rule fc
+  command = gfortran -c $in -o $out
+
+build mymodule.f90.o: fc mymodule.f90
+build call_mod.f90.o: fc call_mod.f90
+";
+
+    fn graph_of(text: &str) -> n2::graph::Graph {
+        // Via Loader rather than n2::load::parse: inside load.rs that name
+        // is shadowed by the private `parse` module it imports, so the
+        // free function is not reachable from outside the crate.
+        let mut loader = n2::load::Loader::new();
+        let mut content = text.as_bytes().to_vec();
+        content.push(0);
+        loader
+            .parse(std::path::PathBuf::from("build.ninja"), &content)
+            .unwrap();
+        loader.graph
+    }
+
+    fn bid_of(g: &n2::graph::Graph, out: &str) -> n2::graph::BuildId {
+        g.files.by_id[g.files.lookup(out).unwrap()].input.unwrap()
+    }
+
+    #[test]
+    fn applying_dyndep_connects_producer_to_consumer() {
+        let mut g = graph_of(FORTRAN_NINJA);
+        let producer = bid_of(&g, "mymodule.f90.o");
+        let consumer = bid_of(&g, "call_mod.f90.o");
+
+        // Before: the module is not in the graph at all, which is exactly
+        // why the consumer's derivation was built without it.
+        assert!(g.files.lookup("mymodule.mod").is_none());
+
+        apply_entry(
+            &mut g,
+            producer,
+            &DyndepEntry {
+                implicit_outs: vec!["mymodule.mod".into()],
+                restat: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        apply_entry(
+            &mut g,
+            consumer,
+            &DyndepEntry {
+                implicit_ins: vec!["mymodule.mod".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let m = g.files.lookup("mymodule.mod").expect("module now known");
+
+        // The producing edge owns it, which is what lets the consumer
+        // resolve it to a derivation output instead of a missing file.
+        assert_eq!(g.files.by_id[m].input, Some(producer));
+        assert!(g.builds[producer].outs().contains(&m));
+
+        // And the consumer both depends on it and orders after it.
+        assert!(g.builds[consumer].dirtying_ins().contains(&m));
+        assert!(g.builds[consumer].ordering_ins().contains(&m));
+        assert!(g.files.by_id[m].dependents.contains(&consumer));
+    }
+
+    #[test]
+    fn an_implicit_input_does_not_disturb_the_existing_ones() {
+        // The counts in BuildIns name the boundaries between explicit,
+        // implicit and order-only. Inserting in the wrong place would
+        // silently reclassify a neighbour - an order-only input becoming
+        // dirtying is invisible until something rebuilds too often.
+        let text = "\
+rule cc
+  command = gcc -c $in -o $out
+
+build a.o: cc a.c b.h || order.stamp
+";
+        let mut g = graph_of(text);
+        let bid = bid_of(&g, "a.o");
+        let before_explicit: Vec<_> = g.builds[bid].explicit_ins().to_vec();
+        let stamp = g.files.lookup("order.stamp").unwrap();
+
+        apply_entry(
+            &mut g,
+            bid,
+            &DyndepEntry {
+                implicit_ins: vec!["extra.mod".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let extra = g.files.lookup("extra.mod").unwrap();
+        assert_eq!(g.builds[bid].explicit_ins(), before_explicit.as_slice());
+        assert!(g.builds[bid].dirtying_ins().contains(&extra));
+        // The order-only input stays order-only: present in ordering_ins,
+        // absent from dirtying_ins.
+        assert!(g.builds[bid].ordering_ins().contains(&stamp));
+        assert!(!g.builds[bid].dirtying_ins().contains(&stamp));
+    }
+
+    #[test]
+    fn applying_the_same_entry_twice_is_a_no_op() {
+        // A dyndep file names several edges and is loaded once per file,
+        // but nothing structurally prevents a second application; doing it
+        // twice must not double-count the implicit run.
+        let mut g = graph_of(FORTRAN_NINJA);
+        let bid = bid_of(&g, "mymodule.f90.o");
+        let e = DyndepEntry {
+            implicit_outs: vec!["mymodule.mod".into()],
+            ..Default::default()
+        };
+        apply_entry(&mut g, bid, &e).unwrap();
+        let outs_once = g.builds[bid].outs().len();
+        apply_entry(&mut g, bid, &e).unwrap();
+        assert_eq!(g.builds[bid].outs().len(), outs_once);
+    }
+
+    #[test]
+    fn two_edges_claiming_one_module_is_refused() {
+        // Two Fortran files defining the same module name is a real user
+        // error. Letting the second silently win would produce a build
+        // that links whichever object happened to run last.
+        let mut g = graph_of(FORTRAN_NINJA);
+        let a = bid_of(&g, "mymodule.f90.o");
+        let b = bid_of(&g, "call_mod.f90.o");
+        let e = DyndepEntry {
+            implicit_outs: vec!["mymodule.mod".into()],
+            ..Default::default()
+        };
+        apply_entry(&mut g, a, &e).unwrap();
+        assert!(apply_entry(&mut g, b, &e).is_err());
     }
 
     #[test]
