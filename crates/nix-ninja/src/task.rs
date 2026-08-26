@@ -1101,7 +1101,35 @@ impl Runner {
         // pure-ordering token that is not a file (CMake emits `phony || .`,
         // the build dir itself) is silently dropped there, whereas a
         // missing DIRECT input stays a loud error as before.
-        let is_gcc_task = build.deps.as_deref() == Some("gcc");
+        // A COMPILE, WHICH IS WHAT ALL FOUR USES BELOW SAY THEY MEAN.
+        // `deps = gcc` was the same set when this was written, and CMake
+        // broke the equivalence: since it began generating link depfiles
+        // (`-Wl,--dependency-file`), its own CMakeFiles/rules.ninja carries
+        // `depfile = $DEP_FILE` and `deps = gcc` on the LINKER rules too,
+        // not just the compiler ones. Read off a generated rules.ninja
+        // 2026-08-26: rule C_SHARED_LIBRARY_LINKER__capstone_shared_Release
+        // has both lines.
+        //
+        // So every link was classified as a compile and lost the four
+        // things this gate withholds from compiles - most consequentially
+        // the implicit-input blanket, whose own comment names the failure
+        // that came back: zlib-ng's link died with `cannot open linker
+        // script file .../zlib-ng.map`, a configure-generated file no edge
+        // declares. The gate was added to keep TU closures lean and to stop
+        // a shared-file edit re-keying every TU; both of those are about
+        // compiles, and neither argument reaches a link.
+        //
+        // Object-shaped outputs are the discriminator because they are what
+        // a compile IS, and the polarity is deliberate: anything not
+        // provably a compile falls to the conservative side and keeps the
+        // blanket. A link misread as a compile fails to build; a link
+        // correctly excluded merely carries a larger input set, which is
+        // what it did before the gate existed. `.lo` is here for libtool,
+        // which drives fftw's per-TU compiles through this same path.
+        let is_gcc_task = is_compile_task(
+            build.deps.as_deref(),
+            build.outs().iter().map(|fid| files.by_id[*fid].name.as_str()),
+        );
         let mut worklist: Vec<(FileId, bool)> =
             build.ordering_ins().iter().map(|f| (*f, false)).collect();
         let mut seen: rustc_hash::FxHashSet<FileId> = rustc_hash::FxHashSet::default();
@@ -4998,6 +5026,85 @@ fn normalize_output(output: &str) -> String {
         format!("-{mapped}")
     } else {
         mapped
+    }
+}
+
+/// Whether a ninja edge is a COMPILE, for the four closure-narrowing rules
+/// that say "compile" and used to test `deps == gcc`. Kept a free function
+/// over names so the CMake case that broke the old test is expressible in a
+/// unit test without constructing a graph.
+///
+/// Object-shaped outputs are the discriminator, and the polarity is
+/// deliberate: anything not provably a compile answers false and keeps the
+/// wider input set, which is what every edge had before the gate existed.
+/// A link misread as a compile fails to build; a link correctly excluded
+/// only carries more inputs.
+fn is_compile_task<'a>(deps: Option<&str>, mut outs: impl Iterator<Item = &'a str>) -> bool {
+    if deps != Some("gcc") {
+        return false;
+    }
+    let object_shaped = |n: &str| {
+        n.ends_with(".o")
+            || n.ends_with(".obj")
+            || n.ends_with(".lo")
+            || n.ends_with(".gch")
+            || n.ends_with(".pch")
+    };
+    match outs.next() {
+        None => false,
+        Some(first) => object_shaped(first) && outs.all(object_shaped),
+    }
+}
+
+#[cfg(test)]
+mod compile_task_tests {
+    use super::is_compile_task;
+
+    // THE CASE THAT REGRESSED. CMake emits link depfiles, so its
+    // CMakeFiles/rules.ninja carries `deps = gcc` on the LINKER rules as
+    // well as the compiler ones - read off a generated file 2026-08-26,
+    // rule C_SHARED_LIBRARY_LINKER__capstone_shared_Release. Classifying
+    // that as a compile withheld the implicit-input blanket from every
+    // link, and zlib-ng died on a configure-generated version script its
+    // edge does not declare.
+    #[test]
+    fn a_link_with_gcc_deps_is_not_a_compile() {
+        assert!(!is_compile_task(Some("gcc"), ["libz-ng.so.2.3.3"].into_iter()));
+        assert!(!is_compile_task(Some("gcc"), ["libcapstone.a"].into_iter()));
+        assert!(!is_compile_task(Some("gcc"), ["zlib-ng-test"].into_iter()));
+    }
+
+    #[test]
+    fn a_compile_still_is_one() {
+        assert!(is_compile_task(Some("gcc"), ["CMakeFiles/z.dir/deflate.c.o"].into_iter()));
+        assert!(is_compile_task(Some("gcc"), [".libs/hf_64.lo"].into_iter()));
+        assert!(is_compile_task(
+            Some("gcc"),
+            ["a.o", "b.obj"].into_iter()
+        ));
+    }
+
+    // A mixed edge is not a compile: one non-object output is enough,
+    // because the rules this gates are all about a TU's closure.
+    #[test]
+    fn mixed_outputs_are_not_a_compile() {
+        assert!(!is_compile_task(Some("gcc"), ["a.o", "libz.so"].into_iter()));
+    }
+
+    // No outputs cannot be a compile, and the old expression would have
+    // said true for it: `all` over an empty iterator is vacuously true.
+    #[test]
+    fn no_outputs_is_not_a_compile() {
+        let empty: [&str; 0] = [];
+        assert!(!is_compile_task(Some("gcc"), empty.into_iter()));
+    }
+
+    // The deps half still gates: a custom command producing an object is
+    // not a compile edge, and never was.
+    #[test]
+    fn other_deps_are_never_a_compile() {
+        assert!(!is_compile_task(None, ["x.o"].into_iter()));
+        assert!(!is_compile_task(Some("msvc"), ["x.o"].into_iter()));
     }
 }
 
