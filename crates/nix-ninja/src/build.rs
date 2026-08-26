@@ -1,3 +1,5 @@
+use crate::dyndep;
+use crate::local;
 use crate::task;
 use anyhow::bail;
 use anyhow::{anyhow, Result};
@@ -9,7 +11,8 @@ use nix_builder_rpc_client::BuilderRpcClient;
 use nix_ninja_task::derived_file::DerivedFile;
 use harmonia_store_derivation::derived_path::SingleDerivedPath;
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct BuildConfig {
@@ -33,6 +36,9 @@ pub fn build(
     let mut loader = load_file(build_filename)?;
 
     let tools = task::Tools::new(&config.store_dir)?;
+    // Kept because `config.store_dir` is moved into the runner below and
+    // the dyndep pass still needs it to realise the dyndep files.
+    let store_dir = config.store_dir.clone();
 
     let mut runner = task::Runner::new(
         tools,
@@ -62,6 +68,31 @@ pub fn build(
     }
 
     let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner);
+
+    // DYNDEP, AND IT HAS TO HAPPEN BEFORE ANY REAL TARGET IS WANTED.
+    //
+    // A dyndep file is produced by one edge and amends others: a Fortran
+    // compile that writes `mymodule.mod` declares it as an implicit
+    // output there, and the sibling that consumes it declares it as an
+    // implicit input. Neither fact is in build.ninja.
+    //
+    // Ninja loads each dyndep file when an edge bound to it becomes
+    // ready. That is not enough here, and the ground truth says why: the
+    // consuming edge's ONLY order-only input is its OWN dyndep file, so
+    // nothing orders it after the dyndep file of the target that produces
+    // the module. Loading lazily would let a consumer be scheduled while
+    // `mymodule.mod` still has no producing edge, and a module with no
+    // producer looks exactly like a source file that is simply missing.
+    //
+    // So every dyndep file is built first, in its own pass, and applied
+    // before the real schedule starts. That is affordable because dyndep
+    // files are cheap by construction - a scan of preprocessed sources,
+    // never a compile - and it removes the ordering question entirely
+    // rather than answering it per generator.
+    let bindings = dyndep::scan_bindings_from_file(Path::new(build_filename))?;
+    if !bindings.is_empty() {
+        scheduler.load_all_dyndep(rpc_client, &store_dir, &bindings)?;
+    }
 
     // Multiple targets, adopted from upstream PR 43 onto this fork's phony
     // model rather than taking that PR's mechanism with it. The two are
@@ -375,6 +406,85 @@ impl<'a> Scheduler<'a> {
             }
             self.build_states.set(bid, BuildState::Ready);
         }
+    }
+
+    /// Build every dyndep file, then fold what they say into the graph.
+    ///
+    /// `bindings` maps an edge's first explicit output to the dyndep file
+    /// it named. The edges are recovered from the graph rather than
+    /// trusted from the file, so a dyndep file that names an edge which
+    /// never asked for it is refused instead of silently amending
+    /// something unrelated.
+    fn load_all_dyndep(
+        &mut self,
+        rpc_client: &Arc<BuilderRpcClient>,
+        store_dir: &StoreDir,
+        bindings: &HashMap<String, String>,
+    ) -> Result<()> {
+        // dyndep file -> the edges that named it.
+        let mut by_file: HashMap<FileId, HashSet<BuildId>> = HashMap::new();
+        for (out, dd) in bindings {
+            let Some(out_fid) = self.lookup(out) else {
+                continue;
+            };
+            let Some(bid) = self.graph.files.by_id[out_fid].input else {
+                continue;
+            };
+            let dd_fid = self
+                .lookup(dd)
+                .ok_or_else(|| anyhow!("dyndep file {dd} is not in the build graph"))?;
+            by_file.entry(dd_fid).or_default().insert(bid);
+        }
+        if by_file.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!(
+            "nix-ninja: dyndep: building {} file(s) before scheduling",
+            by_file.len()
+        );
+        for &dd_fid in by_file.keys() {
+            self.want_file(dd_fid)?;
+        }
+        self.run()?;
+
+        for (dd_fid, bound) in &by_file {
+            let name = self.graph.files.by_id[*dd_fid].name.clone();
+            let derived = self.runner.resolve_target(*dd_fid);
+            if derived.is_empty() {
+                bail!("dyndep file {name} produced no output");
+            }
+            let built = local::build_derived_files(rpc_client, store_dir, &derived)?;
+            let host = built
+                .get(&derived[0].build_path)
+                .ok_or_else(|| anyhow!("dyndep file {name} was not materialized"))?;
+            let bytes = std::fs::read(host)
+                .map_err(|e| anyhow!("reading dyndep file {name} at {}: {e}", host.display()))?;
+            let entries = dyndep::parse_dyndep(&bytes)
+                .map_err(|e| anyhow!("parsing dyndep file {name}: {e}"))?;
+
+            for (out, entry) in &entries {
+                let Some(out_fid) = self.lookup(out) else {
+                    // A dyndep file may name edges outside the requested
+                    // target set; those are simply not our concern.
+                    continue;
+                };
+                let Some(bid) = self.graph.files.by_id[out_fid].input else {
+                    continue;
+                };
+                if !bound.contains(&bid) {
+                    bail!(
+                        "dyndep file {name} amends {out}, which did not name it; \
+                         refusing rather than applying dependencies to an edge \
+                         that never asked for them"
+                    );
+                }
+                dyndep::apply_entry(self.graph, bid, entry)
+                    .map_err(|e| anyhow!("applying dyndep file {name}: {e}"))?;
+            }
+        }
+
+        Ok(())
     }
 
     fn run(&mut self) -> Result<()> {
