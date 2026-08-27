@@ -29,6 +29,7 @@ use which::which;
 
 #[derive(Clone)]
 pub struct Tools {
+    pub bash: StorePath,
     pub cc: StorePath,
     pub coreutils: StorePath,
     pub nix: StorePath,
@@ -40,6 +41,7 @@ pub struct Tools {
 impl Tools {
     pub fn new(store_dir: &StoreDir) -> Result<Self> {
         Ok(Tools {
+            bash: which_store_path(store_dir, "bash")?,
             cc: which_store_path(store_dir, "cc")?,
             coreutils: which_store_path(store_dir, "coreutils")?,
             nix: which_store_path(store_dir, "nix")?,
@@ -2225,6 +2227,8 @@ fn build_task_derivation(
 
     // Needed by all tasks.
     drv.inputs
+        .insert(SingleDerivedPath::Opaque(tools.bash.clone()));
+    drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.cc.clone()));
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.coreutils.clone()));
@@ -2270,13 +2274,22 @@ fn build_task_derivation(
                 })
                 .collect();
 
+            // Static analysis virtual paths: map build paths of known
+            // generated inputs to themselves so canonicalize_cached
+            // resolves them even if they do not yet exist on disk.
+            let virtual_paths: HashMap<PathBuf, PathBuf> = task
+                .inputs
+                .iter()
+                .map(|i| (i.build_path.clone(), i.build_path.clone()))
+                .collect();
+
             let (discovered_deps, discovered_store_paths) = discover_c_includes(
                 rpc_client,
                 &task.store_dir,
                 &task.build_dir,
                 cmdline,
                 files,
-                None,
+                Some(virtual_paths),
                 task.depfile.as_deref().map(Path::new),
             )?;
 
@@ -2645,8 +2658,9 @@ fn build_task_derivation(
         .insert(b"passAsFile"[..].into(), pass_as_file.into_bytes().into());
 
     {
-        // Prepare $PATH to have coreutils.
+        // Prepare $PATH to have coreutils and bash.
         let mut path: Vec<String> = vec![
+            format!("{}/bin", task.store_dir.display(&tools.bash)),
             format!("{}/bin", task.store_dir.display(&tools.cc)),
             format!("{}/bin", task.store_dir.display(&tools.coreutils)),
             format!("{}/bin", task.store_dir.display(&tools.patchelf)),
