@@ -2280,6 +2280,7 @@ fn build_task_derivation(
             let virtual_paths: HashMap<PathBuf, PathBuf> = task
                 .inputs
                 .iter()
+                .filter(|i| !task.outputs.contains(&i.build_path))
                 .map(|i| (i.build_path.clone(), i.build_path.clone()))
                 .collect();
 
