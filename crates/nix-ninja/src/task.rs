@@ -30,7 +30,14 @@ use which::which;
 #[derive(Clone)]
 pub struct Tools {
     pub bash: StorePath,
-    pub cc: StorePath,
+    /// `cc` IS RESOLVED LAZILY, and the Option is the whole fix. Resolution
+    /// used to be eager and fallible in `new()`, so a package with ZERO
+    /// compile targets - hicolor-icon-theme is the one that bit us - died on
+    /// `cc: command not found` before doing any work, having asked for a tool
+    /// it was never going to use.
+    /// Emission is unchanged wherever `cc` resolves: the same store path is
+    /// inserted and the same `$PATH` is written, so this costs no re-key.
+    pub cc: Option<StorePath>,
     pub coreutils: StorePath,
     pub nix: StorePath,
     pub nix_ninja: StorePath,
@@ -42,12 +49,24 @@ impl Tools {
     pub fn new(store_dir: &StoreDir) -> Result<Self> {
         Ok(Tools {
             bash: which_store_path(store_dir, "bash")?,
-            cc: which_store_path(store_dir, "cc")?,
+            cc: which_store_path(store_dir, "cc").ok(),
             coreutils: which_store_path(store_dir, "coreutils")?,
             nix: which_store_path(store_dir, "nix")?,
             nix_ninja: which_store_path(store_dir, "nix-ninja")?,
             nix_ninja_task: which_store_path(store_dir, "nix-ninja-task")?,
             patchelf: which_store_path(store_dir, "patchelf")?,
+        })
+    }
+
+    /// The compiler, for the paths that genuinely need one. A build with no
+    /// compile edges never reaches here, which is the point.
+    pub fn require_cc(&self) -> Result<&StorePath> {
+        self.cc.as_ref().ok_or_else(|| {
+            anyhow!(
+                "`cc` is not on PATH, and this build has a task that needs a \
+                 compiler. A build with no compile targets does not reach \
+                 this point."
+            )
         })
     }
 }
@@ -2229,7 +2248,7 @@ fn build_task_derivation(
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.bash.clone()));
     drv.inputs
-        .insert(SingleDerivedPath::Opaque(tools.cc.clone()));
+        .insert(SingleDerivedPath::Opaque(tools.require_cc()?.clone()));
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.coreutils.clone()));
     drv.inputs
@@ -2662,7 +2681,7 @@ fn build_task_derivation(
         // Prepare $PATH to have coreutils and bash.
         let mut path: Vec<String> = vec![
             format!("{}/bin", task.store_dir.display(&tools.bash)),
-            format!("{}/bin", task.store_dir.display(&tools.cc)),
+            format!("{}/bin", task.store_dir.display(tools.require_cc()?)),
             format!("{}/bin", task.store_dir.display(&tools.coreutils)),
             format!("{}/bin", task.store_dir.display(&tools.patchelf)),
         ];
