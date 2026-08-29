@@ -10,108 +10,72 @@ Opened 2026-08-29. Four entries were retired that day (bison,
 hicolor-icon-theme, libvmaf, liblapack) and are not repeated here; the
 thirteen below are what remains.
 
-## The split that decides what can be worked today
+## SIGNATURES RECOVERED 2026-08-29, AND THE FAMILIES BELOW ARE WRONG
 
-Eight have a RECORDED CAUSE and can be worked from the code. Five do not: the
-`--keep-going` round of 2026-08-26 that produced the list recorded them as
-"each with its own signature in that round's log", and that log has not
-survived. They are recoverable only by another `--keep-going` pass.
+The list said five packages had no surviving signature and were recoverable
+only by another `--keep-going` pass. That was wrong, and the error was
+stopping at "the round log is gone" instead of asking what else records a
+failed build. **Nix keeps a per-derivation log for every build it runs**, at
+`/nix/var/log/nix/drvs/<first-two>/<rest>.drv.bz2`. All twelve packages have
+them. No rebuild was needed for any of this.
 
-**Do not guess at the five.** A fix aimed at an unseen failure is a change
-whose only evidence is that it compiled.
+Where a task fails inside a resolved derivation, the outer log names the inner
+`.drv` and the real cause is in the INNER log. Chase the hash; the outer error
+is routing information, not a diagnosis.
 
-## Family 1 - undeclared SOURCE inputs to a custom command
+What the logs actually say, against what this file believed:
 
-`onetbb` (reads `integration/linux/env/vars.sh.in`), `svt-av1` (reads
-`ConfigureGitVersion.cmake`).
+| package | believed | ACTUAL signature |
+|---|---|---|
+| onetbb | undeclared source input | `CMake Error: File .../integration/linux/env/vars.sh.in does not exist` |
+| svt-av1 | undeclared source input | task for generated `Source-Lib-Codec-EbVersion.h` fails |
+| dav1d | meson depfile, missing `.obj.ndep` | `Failed to read file include/vcs_version.h: No such file (os error 2)` |
+| p11-kit | its own signature | `Failed to read file common/pkix.asn.h: No such file (os error 2)` |
+| valgrind | its own signature | `mallinfo.c:5:10: fatal error: ../config.h: No such file` |
+| openblas | blanket off past the 512 limit | `cannot register realisation ... because it lacks a signature by a trusted key` |
+| openh264 | its own signature | `read_dir() for python closure: No such file (os error 2)` |
+| x265 | its own signature | `ld.bfd: cannot find -lx265-10` / `-lx265-12` |
+| libssh | its own signature | UNRECOVERED - the surviving logs carry no cause |
+| c-ares, wildmidi, corrosion | as recorded | UNRECOVERED - opted out, so their recent logs are SUCCESSES |
 
-A custom command reads a file that lives in the SOURCE tree and that no ninja
-edge declares. The build-dir blanket cannot carry these because it walks the
-build directory, and these are not in it.
+### Three consequences, and the first is the valuable one
 
-Nearest existing machinery: the `virtual_paths` map added in `2f7b8f2`, which
-solved the same shape for GENERATED headers by mapping build paths from
-`task.inputs`. The source-tree case needs the equivalent for paths that are
-neither declared inputs nor build-dir residents.
+**The generated-header family is much larger than one entry.** dav1d, p11-kit
+and valgrind all fail on a header that does not exist when the scanner reads
+it, which is the same defect as libvmaf and liblapack - and that already has a
+fix, the `virtual_paths` map in `2f7b8f2` with `dc296f3`. svt-av1's
+`EbVersion.h` is the same shape one level out. So up to five more entries may
+retire with NO NEW CODE, on a fix that is already on `main` and was sitting
+discarded in a dangling commit until 2026-08-29.
+Test them first. That is the cheapest work available on this list.
+valgrind adds one twist worth keeping: its include is spelled `../config.h`,
+so whatever resolves virtual paths has to handle a dotdot-relative spelling
+rather than only a plain build-relative one.
 
-## Family 2 - cmake_install.cmake file operations
+**openblas is not a nix-ninja defect at all.** `cannot register realisation
+... lacks a signature by a trusted key` is the daemon refusing a
+content-addressed realisation, which is trust configuration and not dependency
+discovery. The 8,299-inputs-against-a-512-limit reading was inferred from the
+blanket's own log line, which prints on every build and says nothing about why
+this one failed. Do not spend a scanner rewrite on it. Retest it after the
+trust question is settled, and if the limit turns out to matter it will say so
+with a different error.
 
-`c-ares`, `wildmidi`.
+**x265 is a new family nobody had named**: a link edge whose sibling libraries
+are not among its inputs. x265 builds 8, 10 and 12-bit variants and links them
+together, and `ld` cannot find `-lx265-10` or `-lx265-12`. That is undeclared
+LINK inputs from sibling ninja edges, which is a different problem from
+undeclared header inputs and is not addressed by anything in flight.
 
-## Family 3 - a directory passed where a file is expected
+**openh264** stands alone: `read_dir()` on a python closure path that does not
+exist, inside the upload path rather than the scanner.
 
-`webrtc-audio-processing`, failing `Is a directory (os error 21)`.
+### What remains genuinely unrecovered
 
-The error names a specific unhandled case rather than a design gap, which
-makes this the most likely of the eight to be small. It was.
-
-**Diagnosed 2026-08-29 from the per-derivation nix log, which had survived
-even though the `--keep-going` round log had not**
-(`/nix/var/log/nix/drvs/rd/gsz7fi...-webrtc-audio-processing-2.1.drv.bz2`,
-and three more across 1.3 and 2.1). Every compile edge in the graph, from
-`BuildId(1)` onward:
-
-    Error: Failed to build task derivation for task
-    Caused by:
-        Failed to read file /build/source/webrtc/rtc_base/memory: Is a directory (os error 21)
-
-1.3 adds a second spelling, `modules/audio_processing/utility`.
-
-`rtc_base/memory` is a DIRECTORY holding `aligned_malloc.h`, and
-`rtc_base/platform_thread.cc` and `rtc_base/buffer.h` write
-`#include <memory>`. `canonicalize_cached` accepted it because
-`Path::exists()` is true for a directory, `try_resolve` returned it as the
-resolved include, `bfs_parse_includes` queued it, and `scan_directives`'
-`fs::read` died EISDIR. gcc skips a directory on the include path and keeps
-searching; the scanner stopped there.
-
-Fixed at the single resolution point in
-`crates/deps-infer/src/c_include_parser.rs`: resolution now refuses a
-directory, so the search falls through to the next include dir as the
-compiler's does. Regression test in
-`crates/nix-ninja/tests/include_dir_shadow.rs` - deliberately outside
-`nix-ninja-task`'s src allowlist - which fails on the old `exists()` check.
-
-**Not retired.** The fix is in `crates/deps-infer`, inside that allowlist, so
-it re-keys the task binary and every banked per-TU output; and the package
-has not been rebuilt. Batch it with the other pending re-keying changes and
-take the entry out of `nnOptOut` when webrtc-audio-processing builds.
-
-## Family 4 - meson depfile handling
-
-`dav1d`, missing `.obj.ndep`.
-
-## Family 5 - the implicit-input blanket past its limit
-
-`openblas`, at 8,299 build-dir inputs against `IMPLICIT_INPUTS_LIMIT = 512`.
-
-**Raising the limit is the wrong fix and the comment at that constant says
-why**: at Chromium scale the blanket is a memory bomb, measured at seven
-daemon workers holding ~2 GiB each. The limit is doing its job; openblas
-loses because the blanket is a blunt instrument, not because the bound is
-wrong.
-
-The direction is named in the code, a few lines above the constant: parse the
-includes and add them to the search path, so dependencies are discovered
-precisely rather than injected wholesale. That retires the blanket for the
-compile case instead of tuning it.
-
-## Family 6 - a directory-shaped unit
-
-`corrosion`. Its cmake tests drive `cargo rustc`, and cargo works on a crate
-DIRECTORY rather than the file set a ninja edge declares. Every failure read
-`can't find library ..., rename file to src/lib.rs`.
-
-This is a shape mismatch rather than a scanner gap, and it may be genuinely
-out of scope. If it is, that conclusion belongs here in writing, with what
-was tried - "out of scope" and "nobody has tried" produce identical evidence.
-
-## Signature unrecovered
-
-`openh264`, `p11-kit`, `libssh`, `valgrind`, `x265`.
-
-Recover with a `--keep-going` pass over `.#artnix-server` and record each
-signature HERE as it appears, before proposing any fix for it.
+`libssh`, `c-ares`, `wildmidi`, `corrosion`. The first has logs with no cause
+in them; the other three are opted out, so every log they have is of a
+successful ordinary build. These four, and only these four, need a
+`--keep-going` pass to characterise.
 
 ## Working rules for this list
 
