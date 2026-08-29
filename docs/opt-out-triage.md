@@ -43,7 +43,39 @@ neither declared inputs nor build-dir residents.
 `webrtc-audio-processing`, failing `Is a directory (os error 21)`.
 
 The error names a specific unhandled case rather than a design gap, which
-makes this the most likely of the eight to be small.
+makes this the most likely of the eight to be small. It was.
+
+**Diagnosed 2026-08-29 from the per-derivation nix log, which had survived
+even though the `--keep-going` round log had not**
+(`/nix/var/log/nix/drvs/rd/gsz7fi...-webrtc-audio-processing-2.1.drv.bz2`,
+and three more across 1.3 and 2.1). Every compile edge in the graph, from
+`BuildId(1)` onward:
+
+    Error: Failed to build task derivation for task
+    Caused by:
+        Failed to read file /build/source/webrtc/rtc_base/memory: Is a directory (os error 21)
+
+1.3 adds a second spelling, `modules/audio_processing/utility`.
+
+`rtc_base/memory` is a DIRECTORY holding `aligned_malloc.h`, and
+`rtc_base/platform_thread.cc` and `rtc_base/buffer.h` write
+`#include <memory>`. `canonicalize_cached` accepted it because
+`Path::exists()` is true for a directory, `try_resolve` returned it as the
+resolved include, `bfs_parse_includes` queued it, and `scan_directives`'
+`fs::read` died EISDIR. gcc skips a directory on the include path and keeps
+searching; the scanner stopped there.
+
+Fixed at the single resolution point in
+`crates/deps-infer/src/c_include_parser.rs`: resolution now refuses a
+directory, so the search falls through to the next include dir as the
+compiler's does. Regression test in
+`crates/nix-ninja/tests/include_dir_shadow.rs` - deliberately outside
+`nix-ninja-task`'s src allowlist - which fails on the old `exists()` check.
+
+**Not retired.** The fix is in `crates/deps-infer`, inside that allowlist, so
+it re-keys the task binary and every banked per-TU output; and the package
+has not been rebuilt. Batch it with the other pending re-keying changes and
+take the entry out of `nnOptOut` when webrtc-audio-processing builds.
 
 ## Family 4 - meson depfile handling
 

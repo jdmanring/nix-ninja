@@ -602,10 +602,22 @@ where
     }
 
     // If cache-miss, then look it up ourselves.
-    let result = if path.as_ref().exists() {
-        Some(canonicalize(&path)?)
-    } else {
-        None
+    // A DIRECTORY IS NOT A HEADER, AND `exists()` SAYS YES TO ONE. gcc
+    // skips a directory found on the include path and keeps searching;
+    // this returned it as the resolved include, the BFS queued it, and
+    // scan_directives' fs::read died EISDIR:
+    //     Failed to read file /build/source/webrtc/rtc_base/memory: Is a
+    //     directory (os error 21)
+    // webrtc-audio-processing 1.3 and 2.1, every compile edge in the
+    // graph: `#include <memory>` against an include dir holding a
+    // `memory/` subdirectory (`modules/audio_processing/utility` the
+    // same way). Same shape as the directory-output defect fixed in
+    // patchelf.rs, and the same remedy - refusing here, at the single
+    // resolution point, lets the search fall through to the next include
+    // dir exactly as the compiler does.
+    let result = match std::fs::metadata(path.as_ref()) {
+        Ok(md) if !md.is_dir() => Some(canonicalize(&path)?),
+        _ => None,
     };
 
     let mut cache = PATH_CACHE.write().unwrap();
