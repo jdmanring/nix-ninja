@@ -51,10 +51,30 @@ fn is_elf_dynamic(path: &Path) -> Result<bool> {
 }
 
 fn fix_rpath(store_dir: &Path, elf_path: &Path) -> Result<()> {
-    if let Some(new_rpath) = compute_new_rpath(store_dir, elf_path)? {
+    let raw_rpath = get_raw_rpath(elf_path)?;
+    let has_trailing_colon = raw_rpath.ends_with(':');
+    if let Some(mut new_rpath) = compute_new_rpath(store_dir, elf_path)? {
+        if has_trailing_colon {
+            new_rpath.push("".to_string());
+        }
         apply_rpath(elf_path, &new_rpath)?;
     }
     Ok(())
+}
+
+fn get_raw_rpath(elf_path: &Path) -> Result<String> {
+    let output = Command::new("patchelf")
+        .arg("--print-rpath")
+        .arg(elf_path)
+        .output()
+        .map_err(|e| anyhow!("Failed to execute patchelf --print-rpath: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("patchelf --print-rpath failed: {stderr}"));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim_end_matches('\n').to_string())
 }
 
 fn compute_new_rpath(store_dir: &Path, elf_path: &Path) -> Result<Option<Vec<String>>> {
