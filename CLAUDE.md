@@ -27,7 +27,7 @@ mirror and was wrong in the direction that stops people committing.
 
 `upstream`'s push url is deliberately invalid. **James files upstream; sessions
 stage.** Never push to `upstream`, never open a PR against it, never file an
-issue there. Staged contributions live in `docs/upstream/` and are James's to
+issue there. Staged contributions live in `local/upstream/` (gitignored, fork-only) and are James's to
 send.
 
 Default branch is `main`. Commits carry **no AI attribution** - no
@@ -130,7 +130,7 @@ redirect exists to prevent.
 ## Open failure classes
 
 Four packages ArtNix cannot drive through nix-ninja. Traced 2026-08-28 in
-`docs/incidents/2026-08-28-four-failure-classes.md`. Code has landed for three
+`local/incidents/2026-08-28-four-failure-classes.md`. Code has landed for three
 of them; classes 3 and 4 now have a package behind them and 1 and 2 do not,
 which is a different state from fixed. The per-class notes say which commit and
 what is still owed. Read the verification rule at the end of this section before
@@ -178,7 +178,7 @@ the layer above it was fixed:
 Then it built: 345 tasks, 446 derivations, 371 s
 (`bench/records/2026-08-30-example-nix.json`). libvmaf and liblapack have still
 not been driven through it and are the ones that named the class;
-`docs/opt-out-triage.md` reads dav1d, p11-kit and valgrind as the same class,
+`local/opt-out-triage.md` reads dav1d, p11-kit and valgrind as the same class,
 so driving one of them is still the cheapest work in the tree and can now
 retire up to five opt-outs with no new code.
 
@@ -309,12 +309,12 @@ invocation, not a machine-wide edit:
 | the design, and why dynamic derivations | `docs/design.md` |
 | dynamic dependencies, and generated sources | `docs/dynamic-deps.md` |
 | ninja `dyndep`, Fortran `.mod` and C++20 modules | the header comment of `crates/nix-ninja/src/dyndep.rs`, which is where that subject is written down; `docs/` has nothing on it |
-| the daemon wedge: incident and failed reproduction | `docs/daemon-wedge.md` |
-| what is staged for upstream, and its plan | `docs/upstream/`, and `docs/upstream/ledger.tsv` is the CHECKABLE list - run `scripts/upstream-ledger.py`, which fails when a path deviating from `upstream/main` belongs to no item. Do not answer "is everything staged" from prose or memory |
-| incidents, per date | `docs/incidents/` |
-| ArtNix's thirteen opt-outs, in six families | `docs/opt-out-triage.md` |
+| the daemon wedge: incident and failed reproduction | `local/daemon-wedge.md` |
+| what is staged for upstream, and its plan | `local/upstream/`, and `local/upstream/ledger.tsv` is the CHECKABLE list - run `local/upstream-ledger.py`, which fails when a path deviating from `upstream/main` belongs to no item. Do not answer "is everything staged" from prose or memory |
+| incidents, per date | `local/incidents/` |
+| ArtNix's thirteen opt-outs, in six families | `local/opt-out-triage.md` |
 | dynamic derivations, from the beginning | `docs/dynamic-derivations.md` |
-| what is next | `docs/todo.md` |
+| what is next | `docs/todo.md` (THEIRS - upstream-facing, keep our staging out of it) |
 | the benchmarks, and what they do NOT cover | `bench/e2e.sh` and `crates/nix-ninja/benches/generate.rs`, both with their scope in the file header |
 | commit and prose conventions | `docs/conventions.md` |
 

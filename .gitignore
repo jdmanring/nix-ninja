@@ -20,3 +20,8 @@ vendor/
 # python bytecode from scripts/
 __pycache__/
 *.pyc
+
+# Fork-only working area: notes, staging drafts and dev tooling with no
+# upstream value. Anything that IS useful to upstream or other users belongs
+# in a tracked path with a ledger entry naming its destination.
+/local/

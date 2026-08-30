@@ -108,8 +108,7 @@
     nixpkgs stops carrying `5883212`. The seven code-quality checks are
     unaffected and pass.
   - It is nix's bug rather than nixpkgs'. If it survives a bump it belongs
-    upstream at NixOS/nix, not in `docs/upstream/`, which is for
-    pdtpartners/nix-ninja.
+    upstream at NixOS/nix rather than here.
 - [ ] `dyn` is 82% of a campaign's wall clock and its instrument names none of it
   - `handle_derivation_result`'s four sub-timers - realise, discover, update,
     adddrv - all live INSIDE the `!built_inputs.is_empty()` branch. The

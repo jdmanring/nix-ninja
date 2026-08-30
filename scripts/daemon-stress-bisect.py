@@ -2,9 +2,8 @@
 """Probe the nix-daemon for the concurrent-build_paths wedge.
 
 RESULT SO FAR, 2026-08-20: this script has not reproduced the wedge at any
-level it has been run at. Read docs/daemon-wedge.md for the exact coverage of
-each shape before using or quoting that - it is NOT "any concurrency in either
-shape", and an earlier version of this line said so wrongly. The incident is real and
+level it has been run at, which is NOT the same as "any concurrency in either
+shape" - the coverage per shape is recorded with the run. The incident is real and
 separately evidenced; concurrency alone is not its trigger, so it is not a
 threshold-finder today and the name "bisect" describes its protocol rather
 than a result it has ever produced.
@@ -47,7 +46,7 @@ The stress builder BURNS CPU rather than sleeping, and for long enough to
 outlive --settle. Both properties are load-bearing and both were absent
 first time round: a builder that exits early leaves the oracle with no
 subject, and a sleeping one reads zero ticks, which is the wedge signature
-itself. See docs/daemon-wedge.md for the three verdicts that cost.
+itself.
 
 Exit codes: 0 = round completed, no wedged child (healthy);
 3 = wedge observed (the finding); 1 = the round itself failed to run.

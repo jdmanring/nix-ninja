@@ -77,18 +77,11 @@ modifying your main nix, please contribute!
 
 ### Iterating without touching your system nix
 
-One answer to the invitation above, offered rather than closing it:
-
-
 `contrib/devstore.sh` runs a daemon on a throwaway store as your own user, so
 you can iterate without making a patched nix your system daemon. The daemon
 comes from this repository's own `nix` flake input - the version already
 pinned here, rather than one the script picked - built or substituted once
 like any other input.
-
-Note that this supersedes the pinned revision in the snippet above, which is
-stale: `flake.lock` resolves the `nix` input to `bcd3bec` and the snippet says
-`d904921`. The lock is what actually builds.
 
 Builds in this store are UNSANDBOXED - it has no build users group and runs as
 you - so the host filesystem is visible to them. That is fine for iteration
@@ -100,8 +93,7 @@ contrib/devstore.sh run -- cargo test
 contrib/devstore.sh stop
 ```
 
-Two settings are required and both fail by appearing to blame the client, so
-they are worth knowing before you debug one:
+Two settings are required and both fail by appearing to blame the client:
 
 - `trusted-users` must name you in the DAEMON's config. Without it the daemon
   discards client settings and reports `experimental Nix feature

@@ -8,24 +8,12 @@
 # daemon, which is a large thing to ask of a contributor and impossible on a
 # shared machine.
 #
-# ISSUE 26 IS THE SAME QUESTION AND ALREADY HOLDS A MAINTAINER'S YES, so this
-# belongs in that thread rather than arriving beside it. jaen opened it as
-# "Use `nix-portable` to allow using the devshell without installing
-# DD-enabled nix globally", and Ericson2314 endorsed the approach on
-# 2026-07-23: "one may still want to not enable experimental features in their
-# main store, so I think thinking about the chroot store for demos is still
-# prudent." That comment also records that `nix flake check` no longer
-# requires experimental features on the main store, which dates any
-# justification for this script written without reading the thread.
-#
-# This takes the `--store` approach the maintainer pointed jaen at, rather
-# than nix-portable, and does NOT attempt jaen's sync-back to the global
-# store - the hard part of that PR and the reason it grew into a separate
-# Rust tool.
-#
 #   contrib/devstore.sh selftest        # prove the store works
 #   contrib/devstore.sh run -- <cmd>    # run a command against it
 #   contrib/devstore.sh stop
+#
+# It uses a `--store` under your own directory. It does NOT sync paths back to
+# the global store.
 #
 # The daemon comes from this repository's own `nix` flake input, so it is the
 # version this project already pins rather than one this script chose. It is
@@ -55,11 +43,8 @@
 #      conf it was pointed at. The error text is identical to (1), so the two
 #      are indistinguishable from the message and fixing one leaves the other.
 #
-# Two things concluded before those were found, recorded so nobody re-concludes
-# them: that an unprivileged daemon cannot serve CA derivations, and that a
-# `local?root=` store does not support ca-derivations. Both false. The obstacle
-# that IS real: a daemon left on the default store cannot open the root-owned
-# /nix/var/nix/db/big-lock, which is why the store has to move.
+# The obstacle that makes the store move at all: a daemon left on the default
+# store cannot open the root-owned /nix/var/nix/db/big-lock.
 set -u
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
