@@ -299,3 +299,51 @@ Not offered, and deliberately: the input bump and the harmonia
 `DerivationInputs` port (2e8bc87, 45f90dc) are fork-local maintenance against
 our own flake pins, and the ArtNix opt-out triage (ce2d2a1, 99846d2) is a
 record of the consumer's failures, not of nix-ninja's.
+
+## Fifth sweep, 2026-08-29: developed or not, per open issue, read from the code
+
+Earlier sweeps map commits to issues. This one asks the blunter question and
+answers it the same way for every row: is there CODE IN THIS TREE that
+implements it. Not staged, not drafted, not discussed - developed. Twelve
+issues open on the forge, read the same day.
+
+DEVELOPED - code exists and was located, not recalled:
+
+| # | Where it lives |
+|---|---|
+| 52 | `task.rs:2795-2806`, and the comment names the issue: `-fuse-ld=` is stripped from the cmdline and the linker resolved into the task's PATH |
+| 20 | `modules/flake/pkgs/mkCMakePackage` and `modules/flake/examples/cmake-hello`, neither of which exists in `upstream/main` |
+| 5 | `build.rs:125-139` distinguishes a phony from a real output when resolving requested targets |
+| 18 | `nix-builder-rpc-client/src/lib.rs:566` and `:1494` stream NARs through `tokio::io::duplex` rather than materialising them |
+| 17 | `task.rs:5888` `depfile_read_back`, the freshness-guarded parse. Step one of the issue, not all of it |
+
+ANSWERED, and there is nothing for us to develop:
+
+| # | Why |
+|---|---|
+| 31 | The error is nix's, not nix-ninja's: the daemon has to implement building a dynamic derivation end to end and the container image's does not. Our contribution is the configuration that works plus a four-second probe, drafted in `issue-replies.md`. No code of ours can fix somebody else's daemon |
+
+NOT DEVELOPED - no code in this tree, stated plainly:
+
+| # | What is actually there |
+|---|---|
+| 16 | Nothing. `mkMesonPackage/default.nix` contains zero occurrences of `configure`; splitting configure into its own derivation is unstarted, and `docs/todo.md` has carried it unchecked since it was written |
+| 14 | Nothing. `aarch64` appears nowhere in `flake.nix` or `modules/flake/` |
+| 7 | Nothing of ours. The `[[bench]]` sections and the `divan` dependency are vendor-n2's own and predate this fork; no benchmark of end-to-end NixOS/Nix compilation exists here |
+| 4 | Nothing of ours, same evidence as 7. No benchmark of derivation GENERATION exists |
+| 41 | Nothing. Testing n2 with mmap has not been attempted |
+| 6 | Nothing. A snix backend has not been investigated |
+
+**So six of twelve are developed or answered and six are not.** That is the
+honest count and it has not been written down in this form before, which is
+why "what is covered" kept reading better than the tree deserved.
+
+Two of the six are the cheapest work available and are labelled `help wanted`
+by the maintainer: 4 and 7 are both benchmarks, and this fork already has the
+instrumentation they would report - `RESOLVE_MS`, the `dyn` breakdown, and the
+`plain adddrv` pair added in `e285861`. A benchmark is the natural home for
+numbers this fork keeps producing ad hoc and then arguing about in prose.
+
+`docs/todo.md` lists both as unchecked items, in upstream's own words, which
+means upstream wrote them down, labelled them help wanted, and we have been
+reading past them for weeks.
