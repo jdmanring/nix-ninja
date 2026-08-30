@@ -1,6 +1,14 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+# vendor-n2 is a member so the gate reaches it. It is a path dependency that
+# every build.ninja in every consumer is parsed by, and until 2026-08-30 it sat
+# outside BOTH gates: `cargo clippy --all-targets -- --deny warnings` never
+# linted it, and its 41 e2e tests never ran, in the workspace or in nextest.
+# Its files were already inside nix-ninja-task's fileset, so they were in the
+# derivation key while being covered by nothing.
+# Its own [profile.release] was already ignored as a non-root package; making
+# it a member changes nothing there beyond silencing the warning that said so.
+members = ["crates/*", "vendor-n2"]
 
 [workspace.package]
 version = "0.1.0"
