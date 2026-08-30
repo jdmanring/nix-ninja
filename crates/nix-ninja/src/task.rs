@@ -352,18 +352,13 @@ impl Runner {
         // paths at configure time. Those paths do not exist inside the task
         // sandbox, where inputs are symlinked at their build-dir-relative
         // locations, so rewrite in-tree absolute paths to relative ones
-        // (mirroring `relative_from` in `new_opaque_file`).
-        let cmdline = build.cmdline.as_ref().map(|cmdline| {
-            let mut cmdline = cmdline.clone();
-            let build_dir = &self.config.build_dir;
-            if let Some(dir) = build_dir.to_str() {
-                cmdline = cmdline.replace(&format!("{dir}/"), "");
-            }
-            if let Some(dir) = build_dir.parent().and_then(|p| p.to_str()) {
-                cmdline = cmdline.replace(&format!("{dir}/"), "../");
-            }
-            cmdline
-        });
+        // (mirroring `relative_from` in `new_opaque_file`). See
+        // rewrite_cmdline for the ancestors above the build dir's parent
+        // and for the `cd <subdir> &&` prologue.
+        let cmdline = build
+            .cmdline
+            .as_ref()
+            .map(|cmdline| rewrite_cmdline(cmdline, &self.config.build_dir));
 
         // TODO: Can we avoid this? Technically the build rule isn't complete.
         //
@@ -559,8 +554,18 @@ fn build_task_derivation(
     );
 
     // Add all ninja build outputs.
+    // A REPEATED OUTPUT IS DROPPED, ORDER PRESERVED. An edge that declares
+    // one path twice makes nix-ninja-task copy it twice, and the copy takes
+    // the SOURCE's mode: CMake writes generated version scripts read-only,
+    // so the first copy leaves a 0444 file and the second dies EACCES -
+    //     copy(src/svg/Svg.version -> /nix/store/...): Permission denied
+    // measured on qtsvg 6.11.1, 2026-08-22. The message names the store as
+    // the unwritable thing, which sends a reader to sandbox permissions.
+    // Order is preserved because the encoded list is positional for the
+    // reader on the other side.
+    let task_outputs = dedup_paths(&task.outputs);
     let mut outputs: Vec<String> = Vec::new();
-    for output_path in &task.outputs {
+    for output_path in &task_outputs {
         // Declare a content addressed output.
         let normalized_name = normalize_output(&output_path.to_string_lossy());
         drv.outputs.insert(
@@ -953,6 +958,121 @@ pub fn discover_c_includes(
     Ok((discovered_deps, discovered_store_paths))
 }
 
+/// An ABSOLUTE build_path is a sandbox escape: nix-ninja-task joins it
+/// onto its build dir with Path::join, whose semantics DISCARD the
+/// prefix for absolute paths, so the task then mkdirs the host path
+/// inside the sandbox and dies EACCES (CMake's ${cmake_ninja_workdir}
+/// and GN actions both emit absolute workdir paths; meson never does,
+/// which is why five packages built before Chromium's graph hit this).
+/// Relativize against the build dir; refuse LOUDLY anything that
+/// escapes it rather than silently relocating an unknown path.
+/// Number of leading `..` components of a relative path: how many
+/// levels above its base directory it reaches before descending.
+/// Rewrite absolute paths under any ancestor of the build dir into
+/// build-dir-relative ones. Meson bakes `files(...)` results and GN bakes
+/// arguments like gen_icui18n_shim's `--headers-root` as absolute host
+/// paths; neither exists inside the task sandbox, where the source tree is
+/// materialized at build-dir-relative locations. Each occurrence of
+/// "<ancestor>/" becomes the "../" chain reaching it from the build dir.
+/// Deepest first, because a deeper prefix contains every shallower one;
+/// stops above 3 path components so "/home/", "/nix/" and "/" are never
+/// rewritten. The cmd_climb scan below the discovery loop keeps the sandbox
+/// deep enough for whatever "../" chains this emits.
+fn rewrite_ancestor_paths(cmdline: &str, build_dir: &Path) -> String {
+    rewrite_ancestor_paths_ups(cmdline, build_dir, 0)
+}
+
+/// Like rewrite_ancestor_paths, but every emitted `../` chain gets
+/// `extra_ups` more levels. For content resolved by a process whose cwd
+/// is `extra_ups` components BELOW the build dir (a `cd <subdir> &&`
+/// command prologue), the compensation is what makes the rewritten
+/// relative paths land where the absolute originals pointed.
+fn rewrite_ancestor_paths_ups(cmdline: &str, build_dir: &Path, extra_ups: usize) -> String {
+    let mut cmdline = cmdline.to_string();
+    let mut ups = extra_ups;
+    let mut ancestor = Some(build_dir);
+    while let Some(dir) = ancestor {
+        if dir.components().count() < 3 {
+            break;
+        }
+        if let Some(dir) = dir.to_str() {
+            cmdline = cmdline.replace(&format!("{dir}/"), &"../".repeat(ups));
+        }
+        ups += 1;
+        ancestor = dir.parent();
+    }
+    cmdline
+}
+
+/// The whole-command rewrite. A CMake custom command opens with
+/// `cd <subdir> && rest`, and every path in `rest` - arguments, @-files,
+/// `cmake -E touch` targets - resolves from that subdir, not the build
+/// root (round 74: syncqt's @-file and then the touch beside it, one
+/// re-launch each). Rewrite the cd target root-relative and the rest
+/// with the subdir's depth compensated; commands with no cd prologue
+/// keep the plain rewrite.
+fn rewrite_cmdline(cmdline: &str, build_dir: &Path) -> String {
+    if let Some(after_cd) = cmdline.strip_prefix("cd ") {
+        if let Some((dir, tail)) = after_cd.split_once(" && ") {
+            let rel = rewrite_ancestor_paths(dir, build_dir);
+            if !rel.starts_with('/') && !rel.starts_with("../") {
+                let depth = Path::new(&rel)
+                    .components()
+                    .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                    .count();
+                return format!(
+                    "cd {rel} && {}",
+                    rewrite_ancestor_paths_ups(tail, build_dir, depth)
+                );
+            }
+            // A CD TARGET ABOVE THE BUILD DIR: DROP THE PROLOGUE RATHER
+            // THAN COMPENSATE FOR IT.
+            // CMake configured out-of-source at <src>/build emits rules
+            // that cd into the SOURCE tree, and those used to fall through
+            // to the plain rewrite - which rewrites the tail build-dir
+            // relative AND leaves the cd in place, so every path resolved
+            // from the wrong directory:
+            //     cd ../src/svg && cmake -DIN_FILE=src/svg/Svg.version.in ...
+            // `Svg.version.in` is generated into the build dir, so CMake
+            // reported "Input file ... doesn't exists" - a missing INPUT,
+            // which is not what was wrong.
+            // The tail is ALREADY correct for a process running in the
+            // build dir, because that is what the plain rewrite produces.
+            // So the prologue is not merely uncompensated, it is the
+            // defect: remove it and the command is right.
+            // WHY NOT RE-EXPRESS THE TAIL AGAINST THE CD TARGET, which is
+            // the other obvious repair and was tried first: it changes the
+            // SPELLING of every path in the command, and several passes
+            // below turn command tokens into input build paths by reading
+            // that spelling. Measured 2026-08-22 - every input in a qtsvg
+            // task registered TWICE, once correctly and once at a path one
+            // component off, and the task then died materialising two
+            // symlinks at one destination. Changing the emitted paths is a
+            // wide change; deleting three characters is a narrow one, and
+            // both fix the same command.
+            // Bounded to a target with no absolute prefix, and the tail is
+            // rewritten exactly as the fallback below would rewrite it, so
+            // nothing downstream sees a spelling it has not always seen.
+            if !rel.starts_with('/') {
+                return rewrite_ancestor_paths(tail, build_dir);
+            }
+        }
+    }
+    rewrite_ancestor_paths(cmdline, build_dir)
+}
+
+/// First occurrence of each path, order preserved.
+fn dedup_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        if seen.insert(p.clone()) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
 /// Removes -frandom-seed flag from a string of CFLAGS.
 fn remove_frandom_seed(flags: &str) -> String {
     flags
@@ -968,4 +1088,136 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+#[cfg(test)]
+mod cmdline_rewrite_tests {
+    use super::rewrite_ancestor_paths;
+    use std::path::Path;
+
+    // The syncqt shape (round 74): a command that cd's into a subdir and
+    // reads an @-file whose content carries absolute host paths. The
+    // rewrite must compensate every emitted ../ chain by the cd depth,
+    // and the in-build-dir prefix (ups=0 uncompensated) must gain
+    // exactly the compensation - that arithmetic is the fix.
+    #[test]
+    fn ancestor_rewrite_compensates_for_cd_depth() {
+        use super::{rewrite_ancestor_paths, rewrite_ancestor_paths_ups};
+        use std::path::Path;
+        let bd = Path::new("/work/qt/build");
+        let raw = "/work/qt/build/src/core/api/x\n/work/qt/src/core/api\n";
+        assert_eq!(
+            rewrite_ancestor_paths_ups(raw, bd, 3),
+            "../../../src/core/api/x\n../../../../src/core/api\n"
+        );
+        // ups=0 delegation unchanged: in-build paths lose the prefix
+        // entirely, the source sibling climbs one.
+        assert_eq!(
+            rewrite_ancestor_paths(raw, bd),
+            "src/core/api/x\n../src/core/api\n"
+        );
+        // The whole-command form: cd target root-relative, everything
+        // after the && compensated by its depth (the syncqt-then-touch
+        // chain that cost round 74 two re-launches).
+        use super::rewrite_cmdline;
+        assert_eq!(
+            rewrite_cmdline(
+                "cd /work/qt/build/src/core/api && tool @/work/qt/build/src/core/api/a && touch /work/qt/build/src/core/api/ts",
+                bd
+            ),
+            "cd src/core/api && tool @../../../src/core/api/a && touch ../../../src/core/api/ts"
+        );
+        // A REPEATED OUTPUT IS DROPPED, ORDER PRESERVED. The positional
+        // encoding on the other side makes order load-bearing, so a
+        // dedupe that reorders would be a different defect.
+        use super::dedup_paths;
+        use std::path::PathBuf;
+        assert_eq!(
+            dedup_paths(&[
+                PathBuf::from("src/svg/Svg.version"),
+                PathBuf::from("include/QtSvg/QtSvg"),
+                PathBuf::from("src/svg/Svg.version"),
+            ]),
+            vec![
+                PathBuf::from("src/svg/Svg.version"),
+                PathBuf::from("include/QtSvg/QtSvg"),
+            ]
+        );
+        // NEGATIVE CONTROL: a list with no repeat must come back untouched,
+        // or the helper is deleting outputs rather than duplicates.
+        let distinct = vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")];
+        assert_eq!(dedup_paths(&distinct), distinct);
+        // No cd prologue: plain rewrite.
+        assert_eq!(rewrite_cmdline("tool /work/qt/build/x", bd), "tool x");
+        // A CD TARGET ABOVE THE BUILD DIR - qtsvg's version-script rule.
+        // The tail names a file GENERATED into the build dir, so from the
+        // source subdir it has to climb out and back down. Before this
+        // case existed the command fell through to the plain rewrite and
+        // the tail came out build-dir-relative under a different cwd.
+        // A CD TARGET ABOVE THE BUILD DIR: the prologue is DROPPED and the
+        // tail is left exactly as the plain rewrite spells it, so the
+        // command runs in the build dir where those paths resolve.
+        assert_eq!(
+            rewrite_cmdline(
+                "cd /work/qt/src/svg && cmake -DIN_FILE=/work/qt/build/src/svg/Svg.version.in -P /nix/store/x/G.cmake",
+                bd
+            ),
+            "cmake -DIN_FILE=src/svg/Svg.version.in -P /nix/store/x/G.cmake"
+        );
+        // NEGATIVE CONTROL: a store path must survive untouched, because the
+        // rewrite stops above three components and a task's tools are all
+        // under /nix/store.
+        assert_eq!(
+            rewrite_cmdline("cd /work/qt/src/svg && /nix/store/t/bin/tool", bd),
+            "/nix/store/t/bin/tool"
+        );
+        // AND THE DESCENT CASE IS UNTOUCHED, which is what bounds this
+        // change: its prologue stays and its tail keeps the depth
+        // compensation every downstream pass reads.
+        assert!(rewrite_cmdline(
+            "cd /work/qt/build/src/core/api && tool @/work/qt/build/src/core/api/a",
+            bd
+        )
+        .starts_with("cd src/core/api && "));
+    }
+
+    #[test]
+    fn build_dir_itself_strips_to_relative() {
+        let bd = Path::new("/work/qtwe/build/out");
+        assert_eq!(
+            rewrite_ancestor_paths("cp /work/qtwe/build/out/a.h b.h", bd),
+            "cp a.h b.h"
+        );
+    }
+
+    // The gen_icui18n_shim shape: build dir 5 deep under the work root,
+    // an argument pointing at the work root's src tree.
+    #[test]
+    fn deep_ancestor_becomes_up_chain() {
+        let bd = Path::new("/work/qtwe/build/src/core/Release/x86_64");
+        let cmd = "python3 gen.py --headers-root /work/qtwe/src/3p/icu/unicode --out gen";
+        assert_eq!(
+            rewrite_ancestor_paths(cmd, bd),
+            "python3 gen.py --headers-root ../../../../../src/3p/icu/unicode --out gen"
+        );
+    }
+
+    #[test]
+    fn store_and_system_paths_untouched() {
+        let bd = Path::new("/work/qtwe/build/out");
+        let cmd = "/nix/store/abc-python/bin/python3 /bin/sh /home/x";
+        assert_eq!(rewrite_ancestor_paths(cmd, bd), cmd);
+        // AND THE GUARD ITSELF, which the line above does not reach: none
+        // of those paths is an ANCESTOR of the build dir, so they survive
+        // whatever the depth floor is. `/work` IS an ancestor and is two
+        // components deep, so it is exactly what the floor exists to
+        // protect. Loosening the floor by one rewrites it and every
+        // sibling tree under it.
+        // Found 2026-08-30 by mutating `< 3` to `< 2` and watching this
+        // test still pass.
+        assert_eq!(
+            rewrite_ancestor_paths("tool /work/other/x", bd),
+            "tool /work/other/x"
+        );
+    }
 }
