@@ -1313,6 +1313,31 @@ impl Runner {
         // Indices into the split argv that the `@` branch respelled, so the
         // same respelling can be applied to the ORIGINAL argv below.
         let mut rewritten_idx: Vec<usize> = Vec::new();
+        // A TASK'S OWN DECLARED OUTPUTS ARE NEVER ITS INPUTS.
+        //
+        // The command line NAMES them - `-MF hello.p/x.o.d`, `-o x.o` - and
+        // the resolution below turns a cmdline token that is a real file into
+        // an input. On a first run the file does not exist and nothing
+        // happens. The moment anything puts it on disk, the next run
+        // materializes it into the sandbox as a read-only store path and the
+        // compiler dies writing its own output:
+        //
+        //     fatal error: opening dependency file hello.p/src_main.cpp.o.d:
+        //     Permission denied
+        //
+        // Measured 2026-08-30 on the second local-mode run of a two-task
+        // project, which is what put the depfile there: #17's collection
+        // writes it into the build directory by design, so the feature broke
+        // the build it was meant to speed up. Nothing caught it because
+        // nothing had ever run twice.
+        let self_outputs: HashSet<PathBuf> = build
+            .outs()
+            .iter()
+            .map(|fid| PathBuf::from(&files.by_id[*fid].name))
+            .chain(build.depfile.as_ref().map(PathBuf::from))
+            .filter_map(|p| normalize_build_path(&self.config.build_dir, p).ok())
+            .collect();
+
         if let Some(cmdline) = &cmdline {
             let args = shell_words::split(cmdline)?;
             // CMake custom commands open with `cd <subdir> &&`; every
@@ -1819,6 +1844,22 @@ impl Runner {
         if !is_gcc_task && self.build_dir_inputs.len() <= implicit_limit {
             for input in self.build_dir_inputs.values() {
                 input_set.insert(input.build_path.clone(), input.clone());
+            }
+        }
+
+        // ONE CHOKE POINT for the rule above, rather than a guard in each of
+        // the half-dozen branches that can turn a cmdline token into an
+        // input. Whatever route it arrived by, a path this edge DECLARES as
+        // an output is removed before the task is built.
+        for own in &self_outputs {
+            if input_set.remove(own).is_some() {
+                eprintln!(
+                    "nix-ninja: {} is an output of this edge and was also \
+                     resolved as an input; dropped (a stale copy on disk \
+                     would be materialized read-only over the path the \
+                     command writes)",
+                    own.display()
+                );
             }
         }
 
