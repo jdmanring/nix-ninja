@@ -183,8 +183,27 @@
     is NOT the blocker. `docs/design.md:144-162` shows real meson output using
     relative spellings (`src/libexpr/...`, `../src/libexpr/parser.y`).
   - The actual blocker is that this is a COORDINATED change across both
-    binaries. `build_dir_inputs` is consumed at `task.rs:1751` when resolving
-    an argument to a task input, and `nix-ninja-task` materialises inputs by
-    symlinking build paths individually. Moving to one directory output
-    changes what the task binary receives, so driver and task must land
+    binaries. `build_dir_inputs` is consumed in `Runner::new_task` when
+    resolving an argument to a task input, and `nix-ninja-task` materialises
+    inputs by symlinking build paths individually. Moving to one directory
+    output changes what the task binary receives, so driver and task must land
     together or nothing builds. That is the reason this is not an afternoon.
+  - **The blast radius is narrower than it looks, measured rather than
+    guessed.** The code graph ranks `new_opaque_file()` a hub at 20 edges,
+    which reads as "this is everywhere". Degree conflates fan-in with fan-out,
+    so the number that matters is the caller set, and the semantic index gives
+    nine call sites across seven enclosing symbols:
+
+        Runner::read_build_dir            <- the ONLY one #16 is about
+        Runner::start                     generate_grd input files
+        Runner::new_task (x3)             task input resolution
+        build_task_derivation             stale/fresh regrouping
+        new_opaque_files                  the parallel wrapper
+        upload_referenced_file
+        upload_python_closure_uncached
+
+    Only `read_build_dir` walks the configured build directory. The other
+    eight upload files for unrelated reasons and must keep working unchanged,
+    so #16 replaces one caller rather than a hub. That is a smaller change
+    than the earlier note implied and it is the difference between a design
+    task and a rewrite.
