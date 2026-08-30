@@ -60,29 +60,51 @@
   - It is nix's bug rather than nixpkgs'. If it survives a bump it belongs
     upstream at NixOS/nix, not in `docs/upstream/`, which is for
     pdtpartners/nix-ninja.
-- [ ] The dynamic task copies the whole source tree, once per translation unit
-  - `subtool/dynamic_task.rs:78` calls `copy_dir_all($src, source_dir)` in
-    stage 1, and `copy_dir_all` at `:201` does `fs::copy` per regular file: a
-    byte-for-byte recursive copy of the entire source, inside every per-TU
-    dynamic task.
-  - The multiplier is NOT the TU count, and an earlier draft of this entry
-    said it was. `handle_derivation_result:2931` builds a dynamic task only
-    when `deps == "gcc"` AND the task has at least one `SingleDerivedPath::
-    Built` input, so a TU compiled from a file that is already in `$src` never
-    reaches this path. The cost is source size times the number of TUs
-    consuming a GENERATED input, which concentrates it on codegen-heavy
-    packages and is why qtwebengine is the shape of the failure and alsa-lib
-    is not.
-  - It is there so the include scanner can resolve paths, and scanning only
-    READS. The compile happens later in the derivation this task emits, run by
-    nix-ninja-task, not here.
-  - Fits ArtNix's 2026-08-29 measurement rather than merely being consistent
-    with it: 0.50 cores of 24 with six drivers alive and two gcc processes is
-    what BLOCKED looks like, and raising `--cores` from 4 to 6 LOWERING
-    throughput is what contention on one disk looks like, not what a
-    concurrency cap looks like.
-  - Not measured here. The cheap discriminating probe is bytes copied per
-    task, or the wall time of stage 1 alone, against the same 30s window.
-  - Any fix re-keys every dynamic task derivation: the driver is their builder
-    (see the cost model in `CLAUDE.md`), so this batches with the patchelf
-    repairs rather than landing alone.
+- [ ] `dyn` is 82% of a campaign's wall clock and its instrument names none of it
+  - `handle_derivation_result`'s four sub-timers - realise, discover, update,
+    adddrv - all live INSIDE the `!built_inputs.is_empty()` branch. The
+    `DynDiscoveryTimer` Drop guard at `:2929` spans the whole function, so
+    `dyn` also accumulates every task that takes the other branch, and that
+    branch is untimed.
+  - The other branch is `:3048`, and it is three lines: one
+    `rpc_client.add_drv_to_store(...)` per task, a daemon round trip, with no
+    timer around it. The dynamic branch times exactly this call at `:3039`
+    and the ordinary branch does not.
+  - This accounts for the reading ArtNix took from artnix-{server,kde,xfce}.log
+    on 2026-08-29: `dyn` growing linearly at 0.084 s/task with realise,
+    discover, update and adddrv all reading zero and `realise 0/0 sent` on
+    every line. 84 ms is a daemon round trip. It is corroborated by `nar` and
+    `scan` freezing at the 2000-task line while `dyn` keeps climbing: tasks
+    that send no NAR and parse no scan still cost 0.084 s each, and the only
+    thing left in their path is that call.
+  - The in-code comment at `:3040` already names the fix class for the dynamic
+    copy of this call - "a memo or a batch, not depsets". The same fix applies
+    to the ordinary one, which is the one that runs on every task.
+  - Cheapest next step is the timer, not the fix: the number is currently
+    inferred from a slope and a code read, and a `DYN_PLAIN_ADDDRV_MS/N` pair
+    around `:3049` turns it into a measurement. It re-keys, so it batches.
+- [ ] The driver retains ~74 KiB per task and never releases it
+  - Measured by ArtNix on xfce, same logs: rss 118 MiB at 1000 tasks rising
+    monotonically to 339 MiB at 4000, heap 318 MiB live against 404 MiB
+    retained at the final line. Slope 0.074 MiB/task, clean and linear, and it
+    continues after `nar` and `scan` have stopped moving.
+  - At the ~30,000 TUs of the package that burned a night that projects to
+    roughly 2.2 GiB of driver RSS. The driver runs in the user session rather
+    than the build cgroup, so nothing bounds it.
+  - NOT diagnosed. Nothing in this tree has been read that accounts for it,
+    and the candidates - the resolve cache's `unvalidated` map, the retained
+    `Derivation` per task - are guesses until somebody profiles. Do not write
+    a fix against this entry, write a measurement.
+- [x] ~~The dynamic task copies the whole source tree~~ - RETIRED 2026-08-29,
+  and the retirement is worth more than the entry was
+  - `copy_dir_all` at `dynamic_task.rs:201` really does copy the whole tree per
+    dynamic task, and the code is unchanged. But `realise 0/0 sent` on every
+    resolved line of all three edition logs means no dynamic task was ever
+    built in those runs, so it cost nothing there. Zero sent out of zero
+    REQUESTED is the signature of the `deps == "gcc"` and Built-input gate
+    never firing, checked rather than assumed.
+  - The 1.2 GiB alsa-lib figure and the 44 TiB qtwebengine extrapolation are
+    both withdrawn. They were built on a per-TU multiplier that is wrong.
+  - It stays a latent defect for the codegen-heavy packages that DO emit
+    dynamic tasks, and it should be fixed when that path is next touched. It
+    is not the cost anybody has measured.
