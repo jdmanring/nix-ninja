@@ -2880,6 +2880,37 @@ pub fn report_progress_final(rpc_client: &Arc<BuilderRpcClient>) {
 
 fn report_progress(rpc_client: &Arc<BuilderRpcClient>, n_tasks: u64) {
     use std::sync::atomic::Ordering;
+
+    // Machine-readable counters, in MILLISECONDS, when asked for.
+    //
+    // The human line below reports whole seconds, which is right for a
+    // progress tick on a long build and useless for a benchmark:
+    // example-hello resolves 2 tasks and every phase prints "0 s", so the
+    // first end-to-end run for upstream #7 produced a row of zeros that look
+    // like measurements and are only rounding.
+    //
+    // Additive and opt-in rather than a change of units, because the seconds
+    // line is already being grepped and parsed elsewhere - changing what it
+    // means would break those readers silently, which is the failure this
+    // whole campaign keeps hitting.
+    if std::env::var_os("NIX_NINJA_STATS_JSON").is_some() {
+        println!(
+            "nix-ninja-stats {{\"tasks\":{},\"resolve_ms\":{},\"dyn_ms\":{},\
+             \"dyn_realise_ms\":{},\"dyn_discover_ms\":{},\"dyn_adddrv_ms\":{},\
+             \"dyn_adddrv_calls\":{},\"plain_adddrv_ms\":{},\"plain_adddrv_calls\":{},\
+             \"rss_mib\":{}}}",
+            n_tasks,
+            RESOLVE_MS.load(Ordering::Relaxed),
+            DYN_MS.load(Ordering::Relaxed),
+            DYN_REALISE_MS.load(Ordering::Relaxed),
+            DYN_DISCOVER_MS.load(Ordering::Relaxed),
+            DYN_ADDDRV_MS.load(Ordering::Relaxed),
+            DYN_ADDDRV_N.load(Ordering::Relaxed),
+            DYN_PLAIN_ADDDRV_MS.load(Ordering::Relaxed),
+            DYN_PLAIN_ADDDRV_N.load(Ordering::Relaxed),
+            self_rss_mib(),
+        );
+    }
     // Persist resolve-cache entries computed since the last tick;
     // a killed driver loses at most one tick's worth.
     if let Err(e) = crate::resolve_cache::flush() {

@@ -41,6 +41,9 @@ if nix path-info --extra-experimental-features "$FEATURES" "$drv" >/dev/null 2>&
   prebuilt=true
 fi
 
+# Ask the driver for machine-readable counters. The human line reports whole
+# seconds, which rounds every phase of a small build to zero.
+export NIX_NINJA_STATS_JSON=1
 start=$(date +%s.%N)
 nix build --extra-experimental-features "$FEATURES" --no-link --print-build-logs \
   ".#${TARGET}" >/dev/null 2>"$OUT.log"
@@ -51,10 +54,13 @@ wall=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.3f", b-a}')
 # The driver's own accounting, from the build log. One line per driver run;
 # take the last, which is the completed one.
 resolved=$(grep -h 'nix-ninja: resolved' "$OUT.log" 2>/dev/null | tail -1)
+stats=$(grep -ho 'nix-ninja-stats {.*}' "$OUT.log" 2>/dev/null | tail -1)
+stats="${stats#nix-ninja-stats }"
 
-python3 - "$OUT" "$TARGET" "$wall" "$rc" "$prebuilt" "$drv" "$resolved" <<'PY'
+python3 - "$OUT" "$TARGET" "$wall" "$rc" "$prebuilt" "$drv" "$resolved" "$stats" <<'PY'
 import json, sys, re
 out, target, wall, rc, prebuilt, drv, resolved = sys.argv[1:8]
+stats = sys.argv[8] if len(sys.argv) > 8 else ""
 rec = {
     "target": target,
     "wall_seconds": float(wall),
@@ -63,6 +69,15 @@ rec = {
     "drv": drv,
     "driver_line": resolved or None,
 }
+# Millisecond counters straight from the driver when it emitted them. These
+# are the authority; the regex fallback below reads the human line, which is
+# in whole seconds and rounds a short build to nothing.
+if stats:
+    try:
+        rec["stats_ms"] = json.loads(stats)
+    except ValueError:
+        rec["stats_ms"] = None
+
 # Parse the phases the driver prints, so a diff is per-phase and not just
 # wall clock. Absent keys mean the line was absent, NOT that a phase was zero.
 if resolved:
