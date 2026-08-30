@@ -1,0 +1,21 @@
+--- crates/nix-ninja-task/src/patchelf.rs
++++ delete ! in retained_entries
+@@ -126,17 +126,17 @@
+ /// `$ORIGIN` entries go because the rewrite resolves them to store paths.
+ ///
+ /// Pulled out of compute_new_rpath so the rule is testable: that function
+ /// shells out to patchelf against a real ELF, so nothing asserted on its
+ /// output, which is exactly where the behaviour changed twice this week.
+ fn retained_entries(current_rpath: &[String]) -> Vec<String> {
+     current_rpath
+         .iter()
+-        .filter(|p| !p.is_empty() && !p.contains("$ORIGIN"))
++        .filter(|p| !p.is_empty() &&  /* ~ changed by cargo-mutants ~ */p.contains("$ORIGIN"))
+         .cloned()
+         .collect()
+ }
+ 
+ /// The RPATH a rewritten output should carry, from what it had and the store
+ /// directories its NEEDED libraries resolved to. `None` means nothing was
+ /// added and the binary should be left alone.
+ ///

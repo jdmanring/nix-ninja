@@ -82,6 +82,8 @@ in {
       git
       nix-ninja
       nix-ninja-task
+      # For the RPATH assertion in the test script below.
+      patchelf
     ];
 
     nix.package = self.inputs.nix.packages.${pkgs.stdenv.hostPlatform.system}.nix;
@@ -96,7 +98,33 @@ in {
     start_all()
 
     result = machine.succeed("nix build --print-out-paths ${flakeSrc}#${flakeOutput}").strip()
-    out = machine.succeed(f"{result}/${cmdline}")
+    binary = f"{result}/${cmdline}"
+    out = machine.succeed(binary)
     assert "${expectedStdout}" in out
+
+    # THE ARTIFACT, NOT ONLY ITS OUTPUT. Every test here built a binary, ran
+    # it and checked stdout; none looked at what was linked into it. A
+    # mutation replacing compute_new_rpath wholesale - returning an RPATH of
+    # one EMPTY entry, which the loader reads as the current directory -
+    # survived the entire suite, and the binary still printed the right
+    # string. Running successfully on the build machine is exactly what a
+    # wrong RPATH does.
+    #
+    # Three properties, each a defect this project has actually shipped or
+    # nearly shipped:
+    #   - no empty element      an empty entry means `.` to the loader
+    #   - no $ORIGIN            relative to the OUTPUT, which moved into the
+    #                           store; it resolved somewhere else at link time
+    #   - every entry in /nix/store  a surviving /build/... entry means the
+    #                           rewrite did not happen at all
+    rpath = machine.execute(f"patchelf --print-rpath {binary}")
+    if rpath[0] == 0:
+        entries = [e for e in rpath[1].strip().split(":") if e != ""]
+        raw = rpath[1].strip()
+        if raw:
+            assert "" not in raw.split(":"), f"empty RPATH element (a cwd search): {raw!r}"
+            assert "$ORIGIN" not in raw, f"unresolved $ORIGIN in RPATH: {raw!r}"
+            for e in entries:
+                assert e.startswith("/nix/store"), f"RPATH entry outside the store: {e!r} in {raw!r}"
   '';
 }

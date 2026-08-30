@@ -1,0 +1,21 @@
+--- crates/nix-ninja-task/src/patchelf.rs
++++ replace += with -= in fix_rpaths
+@@ -13,17 +13,17 @@
+     // mostly this message. The count is the part worth reading: it says how
+     // many of the task's outputs were dynamic ELF at all.
+     let mut fixed = 0usize;
+     for output in outputs {
+         let canonical_path = fs::canonicalize(&output.build_path)
+             .map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", output.build_path.display()))?;
+         if is_elf_dynamic(&canonical_path)? {
+             fix_rpath(store_dir, &canonical_path)?;
+-            fixed += 1;
++            fixed -= /* ~ changed by cargo-mutants ~ */ 1;
+         }
+     }
+     if fixed > 0 {
+         println!(
+             "nix-ninja-task: fixed RPATH on {fixed} of {} output(s)",
+             outputs.len()
+         );
+     }

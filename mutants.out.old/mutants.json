@@ -1,0 +1,1346 @@
+[
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace fix_rpaths -> Result<()> with Ok(())\n@@ -7,33 +7,17 @@\n use std::process::Command;\n \n pub fn fix_rpaths(store_dir: &Path, outputs: &[DerivedFile]) -> Result<()> {\n     // ONE LINE PER TASK, not per output. This printed a line for every ELF\n     // it touched, and a task whose output is a tree (Qt's syncqt, cmake\n     // custom targets) has hundreds - so the log of a link-heavy target was\n     // mostly this message. The count is the part worth reading: it says how\n     // many of the task's outputs were dynamic ELF at all.\n-    let mut fixed = 0usize;\n-    for output in outputs {\n-        let canonical_path = fs::canonicalize(&output.build_path)\n-            .map_err(|e| anyhow::anyhow!(\"canonicalize({}): {e}\", output.build_path.display()))?;\n-        if is_elf_dynamic(&canonical_path)? {\n-            fix_rpath(store_dir, &canonical_path)?;\n-            fixed += 1;\n-        }\n-    }\n-    if fixed > 0 {\n-        println!(\n-            \"nix-ninja-task: fixed RPATH on {fixed} of {} output(s)\",\n-            outputs.len()\n-        );\n-    }\n-\n-    Ok(())\n+    Ok(()) /* ~ changed by cargo-mutants ~ */\n }\n \n // Check if this is an executable or shared library that can have RPATH.\n // Skip object files (.o) or non-ELF files.\n fn is_elf_dynamic(path: &Path) -> Result<bool> {\n     // A DIRECTORY OUTPUT IS NOT AN ELF AND READING ONE IS AN ERROR, not a\n     // false. Since the driver can declare a whole tree as an output - the\n     // syncqt include directory, whose contents ninja never names - this is\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "fix_rpaths",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 32
+        },
+        "start": {
+          "column": 1,
+          "line": 9
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:15:5: replace fix_rpaths -> Result<()> with Ok(())",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(())",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 31
+      },
+      "start": {
+        "column": 5,
+        "line": 15
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace += with -= in fix_rpaths\n@@ -13,17 +13,17 @@\n     // mostly this message. The count is the part worth reading: it says how\n     // many of the task's outputs were dynamic ELF at all.\n     let mut fixed = 0usize;\n     for output in outputs {\n         let canonical_path = fs::canonicalize(&output.build_path)\n             .map_err(|e| anyhow::anyhow!(\"canonicalize({}): {e}\", output.build_path.display()))?;\n         if is_elf_dynamic(&canonical_path)? {\n             fix_rpath(store_dir, &canonical_path)?;\n-            fixed += 1;\n+            fixed -= /* ~ changed by cargo-mutants ~ */ 1;\n         }\n     }\n     if fixed > 0 {\n         println!(\n             \"nix-ninja-task: fixed RPATH on {fixed} of {} output(s)\",\n             outputs.len()\n         );\n     }\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "fix_rpaths",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 32
+        },
+        "start": {
+          "column": 1,
+          "line": 9
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:21:19: replace += with -= in fix_rpaths",
+    "package": "nix-ninja-task",
+    "replacement": "-=",
+    "span": {
+      "end": {
+        "column": 21,
+        "line": 21
+      },
+      "start": {
+        "column": 19,
+        "line": 21
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace += with *= in fix_rpaths\n@@ -13,17 +13,17 @@\n     // mostly this message. The count is the part worth reading: it says how\n     // many of the task's outputs were dynamic ELF at all.\n     let mut fixed = 0usize;\n     for output in outputs {\n         let canonical_path = fs::canonicalize(&output.build_path)\n             .map_err(|e| anyhow::anyhow!(\"canonicalize({}): {e}\", output.build_path.display()))?;\n         if is_elf_dynamic(&canonical_path)? {\n             fix_rpath(store_dir, &canonical_path)?;\n-            fixed += 1;\n+            fixed *= /* ~ changed by cargo-mutants ~ */ 1;\n         }\n     }\n     if fixed > 0 {\n         println!(\n             \"nix-ninja-task: fixed RPATH on {fixed} of {} output(s)\",\n             outputs.len()\n         );\n     }\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "fix_rpaths",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 32
+        },
+        "start": {
+          "column": 1,
+          "line": 9
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:21:19: replace += with *= in fix_rpaths",
+    "package": "nix-ninja-task",
+    "replacement": "*=",
+    "span": {
+      "end": {
+        "column": 21,
+        "line": 21
+      },
+      "start": {
+        "column": 19,
+        "line": 21
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace > with == in fix_rpaths\n@@ -16,17 +16,17 @@\n     for output in outputs {\n         let canonical_path = fs::canonicalize(&output.build_path)\n             .map_err(|e| anyhow::anyhow!(\"canonicalize({}): {e}\", output.build_path.display()))?;\n         if is_elf_dynamic(&canonical_path)? {\n             fix_rpath(store_dir, &canonical_path)?;\n             fixed += 1;\n         }\n     }\n-    if fixed > 0 {\n+    if fixed == /* ~ changed by cargo-mutants ~ */ 0 {\n         println!(\n             \"nix-ninja-task: fixed RPATH on {fixed} of {} output(s)\",\n             outputs.len()\n         );\n     }\n \n     Ok(())\n }\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "fix_rpaths",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 32
+        },
+        "start": {
+          "column": 1,
+          "line": 9
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:24:14: replace > with == in fix_rpaths",
+    "package": "nix-ninja-task",
+    "replacement": "==",
+    "span": {
+      "end": {
+        "column": 15,
+        "line": 24
+      },
+      "start": {
+        "column": 14,
+        "line": 24
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace > with < in fix_rpaths\n@@ -16,17 +16,17 @@\n     for output in outputs {\n         let canonical_path = fs::canonicalize(&output.build_path)\n             .map_err(|e| anyhow::anyhow!(\"canonicalize({}): {e}\", output.build_path.display()))?;\n         if is_elf_dynamic(&canonical_path)? {\n             fix_rpath(store_dir, &canonical_path)?;\n             fixed += 1;\n         }\n     }\n-    if fixed > 0 {\n+    if fixed < /* ~ changed by cargo-mutants ~ */ 0 {\n         println!(\n             \"nix-ninja-task: fixed RPATH on {fixed} of {} output(s)\",\n             outputs.len()\n         );\n     }\n \n     Ok(())\n }\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "fix_rpaths",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 32
+        },
+        "start": {
+          "column": 1,
+          "line": 9
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:24:14: replace > with < in fix_rpaths",
+    "package": "nix-ninja-task",
+    "replacement": "<",
+    "span": {
+      "end": {
+        "column": 15,
+        "line": 24
+      },
+      "start": {
+        "column": 14,
+        "line": 24
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace > with >= in fix_rpaths\n@@ -16,17 +16,17 @@\n     for output in outputs {\n         let canonical_path = fs::canonicalize(&output.build_path)\n             .map_err(|e| anyhow::anyhow!(\"canonicalize({}): {e}\", output.build_path.display()))?;\n         if is_elf_dynamic(&canonical_path)? {\n             fix_rpath(store_dir, &canonical_path)?;\n             fixed += 1;\n         }\n     }\n-    if fixed > 0 {\n+    if fixed >= /* ~ changed by cargo-mutants ~ */ 0 {\n         println!(\n             \"nix-ninja-task: fixed RPATH on {fixed} of {} output(s)\",\n             outputs.len()\n         );\n     }\n \n     Ok(())\n }\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "fix_rpaths",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 32
+        },
+        "start": {
+          "column": 1,
+          "line": 9
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:24:14: replace > with >= in fix_rpaths",
+    "package": "nix-ninja-task",
+    "replacement": ">=",
+    "span": {
+      "end": {
+        "column": 15,
+        "line": 24
+      },
+      "start": {
+        "column": 14,
+        "line": 24
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace is_elf_dynamic -> Result<bool> with Ok(true)\n@@ -37,32 +37,17 @@\n     // A DIRECTORY OUTPUT IS NOT AN ELF AND READING ONE IS AN ERROR, not a\n     // false. Since the driver can declare a whole tree as an output - the\n     // syncqt include directory, whose contents ninja never names - this is\n     // reached with a directory, and `fs::read` returns EISDIR:\n     //     Error: read(.../include/QtSvg): Is a directory\n     // which fails the task rather than skipping the entry. Nothing inside an\n     // include tree carries an RPATH; a directory output that does would need\n     // a walk here, and there is no such output today.\n-    if path.is_dir() {\n-        return Ok(false);\n-    }\n-    let data = fs::read(path).map_err(|e| anyhow::anyhow!(\"read({}): {e}\", path.display()))?;\n-\n-    let elf = match ElfBytes::<AnyEndian>::minimal_parse(&data) {\n-        Ok(elf) => elf,\n-        Err(_) => return Ok(false), // Not a valid ELF file\n-    };\n-\n-    // Only process executables (ET_EXEC) and shared libraries (ET_DYN)\n-    // Skip object files (ET_REL) as they don't have RPATH\n-    match elf.ehdr.e_type {\n-        elf::abi::ET_EXEC | elf::abi::ET_DYN => Ok(true),\n-        _ => Ok(false),\n-    }\n+    Ok(true) /* ~ changed by cargo-mutants ~ */\n }\n \n fn fix_rpath(store_dir: &Path, elf_path: &Path) -> Result<()> {\n     // One `patchelf --print-rpath` per file. This used to be two: fix_rpath\n     // read the raw string to spot a trailing colon and compute_new_rpath read\n     // it again through a near-identical helper. This function runs over every\n     // output of every task derivation, so the second one was a subprocess per\n     // output across a whole distribution.\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "is_elf_dynamic",
+      "return_type": "-> Result<bool>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 61
+        },
+        "start": {
+          "column": 1,
+          "line": 36
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:45:5: replace is_elf_dynamic -> Result<bool> with Ok(true)",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(true)",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 60
+      },
+      "start": {
+        "column": 5,
+        "line": 45
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace is_elf_dynamic -> Result<bool> with Ok(false)\n@@ -37,32 +37,17 @@\n     // A DIRECTORY OUTPUT IS NOT AN ELF AND READING ONE IS AN ERROR, not a\n     // false. Since the driver can declare a whole tree as an output - the\n     // syncqt include directory, whose contents ninja never names - this is\n     // reached with a directory, and `fs::read` returns EISDIR:\n     //     Error: read(.../include/QtSvg): Is a directory\n     // which fails the task rather than skipping the entry. Nothing inside an\n     // include tree carries an RPATH; a directory output that does would need\n     // a walk here, and there is no such output today.\n-    if path.is_dir() {\n-        return Ok(false);\n-    }\n-    let data = fs::read(path).map_err(|e| anyhow::anyhow!(\"read({}): {e}\", path.display()))?;\n-\n-    let elf = match ElfBytes::<AnyEndian>::minimal_parse(&data) {\n-        Ok(elf) => elf,\n-        Err(_) => return Ok(false), // Not a valid ELF file\n-    };\n-\n-    // Only process executables (ET_EXEC) and shared libraries (ET_DYN)\n-    // Skip object files (ET_REL) as they don't have RPATH\n-    match elf.ehdr.e_type {\n-        elf::abi::ET_EXEC | elf::abi::ET_DYN => Ok(true),\n-        _ => Ok(false),\n-    }\n+    Ok(false) /* ~ changed by cargo-mutants ~ */\n }\n \n fn fix_rpath(store_dir: &Path, elf_path: &Path) -> Result<()> {\n     // One `patchelf --print-rpath` per file. This used to be two: fix_rpath\n     // read the raw string to spot a trailing colon and compute_new_rpath read\n     // it again through a near-identical helper. This function runs over every\n     // output of every task derivation, so the second one was a subprocess per\n     // output across a whole distribution.\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "is_elf_dynamic",
+      "return_type": "-> Result<bool>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 61
+        },
+        "start": {
+          "column": 1,
+          "line": 36
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:45:5: replace is_elf_dynamic -> Result<bool> with Ok(false)",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(false)",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 60
+      },
+      "start": {
+        "column": 5,
+        "line": 45
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ delete match arm elf::abi::ET_EXEC | elf::abi::ET_DYN in is_elf_dynamic\n@@ -50,17 +50,17 @@\n     let elf = match ElfBytes::<AnyEndian>::minimal_parse(&data) {\n         Ok(elf) => elf,\n         Err(_) => return Ok(false), // Not a valid ELF file\n     };\n \n     // Only process executables (ET_EXEC) and shared libraries (ET_DYN)\n     // Skip object files (ET_REL) as they don't have RPATH\n     match elf.ehdr.e_type {\n-        elf::abi::ET_EXEC | elf::abi::ET_DYN => Ok(true),\n+         /* ~ changed by cargo-mutants ~ */\n         _ => Ok(false),\n     }\n }\n \n fn fix_rpath(store_dir: &Path, elf_path: &Path) -> Result<()> {\n     // One `patchelf --print-rpath` per file. This used to be two: fix_rpath\n     // read the raw string to spot a trailing colon and compute_new_rpath read\n     // it again through a near-identical helper. This function runs over every\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "is_elf_dynamic",
+      "return_type": "-> Result<bool>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 61
+        },
+        "start": {
+          "column": 1,
+          "line": 36
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:58:9: delete match arm elf::abi::ET_EXEC | elf::abi::ET_DYN in is_elf_dynamic",
+    "package": "nix-ninja-task",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 58,
+        "line": 58
+      },
+      "start": {
+        "column": 9,
+        "line": 58
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace fix_rpath -> Result<()> with Ok(())\n@@ -61,21 +61,17 @@\n }\n \n fn fix_rpath(store_dir: &Path, elf_path: &Path) -> Result<()> {\n     // One `patchelf --print-rpath` per file. This used to be two: fix_rpath\n     // read the raw string to spot a trailing colon and compute_new_rpath read\n     // it again through a near-identical helper. This function runs over every\n     // output of every task derivation, so the second one was a subprocess per\n     // output across a whole distribution.\n-    let current_rpath = parse_rpath(&get_raw_rpath(elf_path)?);\n-    if let Some(new_rpath) = compute_new_rpath(store_dir, elf_path, &current_rpath)? {\n-        apply_rpath(elf_path, &new_rpath)?;\n-    }\n-    Ok(())\n+    Ok(()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Split a raw RPATH on ':', PRESERVING empty entries.\n ///\n /// Faithful on the READ side so callers can see what the binary actually\n /// carries. `compute_new_rpath` then drops empties when it rebuilds, and that\n /// asymmetry is the whole point.\n ///\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "fix_rpath",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 74
+        },
+        "start": {
+          "column": 1,
+          "line": 63
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:69:5: replace fix_rpath -> Result<()> with Ok(())",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(())",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 73
+      },
+      "start": {
+        "column": 5,
+        "line": 69
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace parse_rpath -> Vec<String> with vec![]\n@@ -88,23 +88,17 @@\n ///\n /// This function exists to rewrite build-time paths into store paths, so a\n /// build-directory decision is precisely the thing that must not survive it.\n /// `f8bb3bd` argued the opposite - that the trailing empty entry was\n /// \"meaningful\" and should be re-appended - and that reasoning was wrong in a\n /// way that put a cwd search into every patched output. The original splitter\n /// dropped every empty entry, and on the write side it was right to.\n fn parse_rpath(raw: &str) -> Vec<String> {\n-    if raw.is_empty() {\n-        // \"\".split(':') yields one empty entry, which would invent an RPATH\n-        // element for a binary that has none.\n-        Vec::new()\n-    } else {\n-        raw.split(':').map(|s| s.to_string()).collect()\n-    }\n+    vec![] /* ~ changed by cargo-mutants ~ */\n }\n \n fn get_raw_rpath(elf_path: &Path) -> Result<String> {\n     let output = Command::new(\"patchelf\")\n         .arg(\"--print-rpath\")\n         .arg(elf_path)\n         .output()\n         .map_err(|e| anyhow!(\"Failed to execute patchelf --print-rpath: {e}\"))?;\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "parse_rpath",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 103
+        },
+        "start": {
+          "column": 1,
+          "line": 76
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:96:5: replace parse_rpath -> Vec<String> with vec![]",
+    "package": "nix-ninja-task",
+    "replacement": "vec![]",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 102
+      },
+      "start": {
+        "column": 5,
+        "line": 96
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace parse_rpath -> Vec<String> with vec![String::new()]\n@@ -88,23 +88,17 @@\n ///\n /// This function exists to rewrite build-time paths into store paths, so a\n /// build-directory decision is precisely the thing that must not survive it.\n /// `f8bb3bd` argued the opposite - that the trailing empty entry was\n /// \"meaningful\" and should be re-appended - and that reasoning was wrong in a\n /// way that put a cwd search into every patched output. The original splitter\n /// dropped every empty entry, and on the write side it was right to.\n fn parse_rpath(raw: &str) -> Vec<String> {\n-    if raw.is_empty() {\n-        // \"\".split(':') yields one empty entry, which would invent an RPATH\n-        // element for a binary that has none.\n-        Vec::new()\n-    } else {\n-        raw.split(':').map(|s| s.to_string()).collect()\n-    }\n+    vec![String::new()] /* ~ changed by cargo-mutants ~ */\n }\n \n fn get_raw_rpath(elf_path: &Path) -> Result<String> {\n     let output = Command::new(\"patchelf\")\n         .arg(\"--print-rpath\")\n         .arg(elf_path)\n         .output()\n         .map_err(|e| anyhow!(\"Failed to execute patchelf --print-rpath: {e}\"))?;\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "parse_rpath",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 103
+        },
+        "start": {
+          "column": 1,
+          "line": 76
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:96:5: replace parse_rpath -> Vec<String> with vec![String::new()]",
+    "package": "nix-ninja-task",
+    "replacement": "vec![String::new()]",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 102
+      },
+      "start": {
+        "column": 5,
+        "line": 96
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace parse_rpath -> Vec<String> with vec![\"xyzzy\".into()]\n@@ -88,23 +88,17 @@\n ///\n /// This function exists to rewrite build-time paths into store paths, so a\n /// build-directory decision is precisely the thing that must not survive it.\n /// `f8bb3bd` argued the opposite - that the trailing empty entry was\n /// \"meaningful\" and should be re-appended - and that reasoning was wrong in a\n /// way that put a cwd search into every patched output. The original splitter\n /// dropped every empty entry, and on the write side it was right to.\n fn parse_rpath(raw: &str) -> Vec<String> {\n-    if raw.is_empty() {\n-        // \"\".split(':') yields one empty entry, which would invent an RPATH\n-        // element for a binary that has none.\n-        Vec::new()\n-    } else {\n-        raw.split(':').map(|s| s.to_string()).collect()\n-    }\n+    vec![\"xyzzy\".into()] /* ~ changed by cargo-mutants ~ */\n }\n \n fn get_raw_rpath(elf_path: &Path) -> Result<String> {\n     let output = Command::new(\"patchelf\")\n         .arg(\"--print-rpath\")\n         .arg(elf_path)\n         .output()\n         .map_err(|e| anyhow!(\"Failed to execute patchelf --print-rpath: {e}\"))?;\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "parse_rpath",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 103
+        },
+        "start": {
+          "column": 1,
+          "line": 76
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:96:5: replace parse_rpath -> Vec<String> with vec![\"xyzzy\".into()]",
+    "package": "nix-ninja-task",
+    "replacement": "vec![\"xyzzy\".into()]",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 102
+      },
+      "start": {
+        "column": 5,
+        "line": 96
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace get_raw_rpath -> Result<String> with Ok(String::new())\n@@ -98,30 +98,17 @@\n         // element for a binary that has none.\n         Vec::new()\n     } else {\n         raw.split(':').map(|s| s.to_string()).collect()\n     }\n }\n \n fn get_raw_rpath(elf_path: &Path) -> Result<String> {\n-    let output = Command::new(\"patchelf\")\n-        .arg(\"--print-rpath\")\n-        .arg(elf_path)\n-        .output()\n-        .map_err(|e| anyhow!(\"Failed to execute patchelf --print-rpath: {e}\"))?;\n-\n-    if !output.status.success() {\n-        let stderr = String::from_utf8_lossy(&output.stderr);\n-        return Err(anyhow!(\"patchelf --print-rpath failed: {stderr}\"));\n-    }\n-\n-    Ok(String::from_utf8_lossy(&output.stdout)\n-        .trim_end_matches('\\n')\n-        .to_string())\n+    Ok(String::new()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// The entries of an existing RPATH that survive into the rewritten one.\n ///\n /// Empty entries go, because an empty element means the current directory and\n /// this function's output is written into a store binary - see parse_rpath.\n /// `$ORIGIN` entries go because the rewrite resolves them to store paths.\n ///\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "get_raw_rpath",
+      "return_type": "-> Result<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 120
+        },
+        "start": {
+          "column": 1,
+          "line": 105
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:106:5: replace get_raw_rpath -> Result<String> with Ok(String::new())",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(String::new())",
+    "span": {
+      "end": {
+        "column": 22,
+        "line": 119
+      },
+      "start": {
+        "column": 5,
+        "line": 106
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace get_raw_rpath -> Result<String> with Ok(\"xyzzy\".into())\n@@ -98,30 +98,17 @@\n         // element for a binary that has none.\n         Vec::new()\n     } else {\n         raw.split(':').map(|s| s.to_string()).collect()\n     }\n }\n \n fn get_raw_rpath(elf_path: &Path) -> Result<String> {\n-    let output = Command::new(\"patchelf\")\n-        .arg(\"--print-rpath\")\n-        .arg(elf_path)\n-        .output()\n-        .map_err(|e| anyhow!(\"Failed to execute patchelf --print-rpath: {e}\"))?;\n-\n-    if !output.status.success() {\n-        let stderr = String::from_utf8_lossy(&output.stderr);\n-        return Err(anyhow!(\"patchelf --print-rpath failed: {stderr}\"));\n-    }\n-\n-    Ok(String::from_utf8_lossy(&output.stdout)\n-        .trim_end_matches('\\n')\n-        .to_string())\n+    Ok(\"xyzzy\".into()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// The entries of an existing RPATH that survive into the rewritten one.\n ///\n /// Empty entries go, because an empty element means the current directory and\n /// this function's output is written into a store binary - see parse_rpath.\n /// `$ORIGIN` entries go because the rewrite resolves them to store paths.\n ///\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "get_raw_rpath",
+      "return_type": "-> Result<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 120
+        },
+        "start": {
+          "column": 1,
+          "line": 105
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:106:5: replace get_raw_rpath -> Result<String> with Ok(\"xyzzy\".into())",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(\"xyzzy\".into())",
+    "span": {
+      "end": {
+        "column": 22,
+        "line": 119
+      },
+      "start": {
+        "column": 5,
+        "line": 106
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ delete ! in get_raw_rpath\n@@ -104,17 +104,17 @@\n \n fn get_raw_rpath(elf_path: &Path) -> Result<String> {\n     let output = Command::new(\"patchelf\")\n         .arg(\"--print-rpath\")\n         .arg(elf_path)\n         .output()\n         .map_err(|e| anyhow!(\"Failed to execute patchelf --print-rpath: {e}\"))?;\n \n-    if !output.status.success() {\n+    if  /* ~ changed by cargo-mutants ~ */output.status.success() {\n         let stderr = String::from_utf8_lossy(&output.stderr);\n         return Err(anyhow!(\"patchelf --print-rpath failed: {stderr}\"));\n     }\n \n     Ok(String::from_utf8_lossy(&output.stdout)\n         .trim_end_matches('\\n')\n         .to_string())\n }\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "get_raw_rpath",
+      "return_type": "-> Result<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 120
+        },
+        "start": {
+          "column": 1,
+          "line": 105
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:112:8: delete ! in get_raw_rpath",
+    "package": "nix-ninja-task",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 9,
+        "line": 112
+      },
+      "start": {
+        "column": 8,
+        "line": 112
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace retained_entries -> Vec<String> with vec![]\n@@ -124,21 +124,17 @@\n /// Empty entries go, because an empty element means the current directory and\n /// this function's output is written into a store binary - see parse_rpath.\n /// `$ORIGIN` entries go because the rewrite resolves them to store paths.\n ///\n /// Pulled out of compute_new_rpath so the rule is testable: that function\n /// shells out to patchelf against a real ELF, so nothing asserted on its\n /// output, which is exactly where the behaviour changed twice this week.\n fn retained_entries(current_rpath: &[String]) -> Vec<String> {\n-    current_rpath\n-        .iter()\n-        .filter(|p| !p.is_empty() && !p.contains(\"$ORIGIN\"))\n-        .cloned()\n-        .collect()\n+    vec![] /* ~ changed by cargo-mutants ~ */\n }\n \n /// The RPATH a rewritten output should carry, from what it had and the store\n /// directories its NEEDED libraries resolved to. `None` means nothing was\n /// added and the binary should be left alone.\n ///\n /// PURE, AND SEPARATE FROM THE ELF READING, so the retention rule can be\n /// pinned where it is actually applied. Nine tests covered `retained_entries`\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "retained_entries",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 137
+        },
+        "start": {
+          "column": 1,
+          "line": 122
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:132:5: replace retained_entries -> Vec<String> with vec![]",
+    "package": "nix-ninja-task",
+    "replacement": "vec![]",
+    "span": {
+      "end": {
+        "column": 19,
+        "line": 136
+      },
+      "start": {
+        "column": 5,
+        "line": 132
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace retained_entries -> Vec<String> with vec![String::new()]\n@@ -124,21 +124,17 @@\n /// Empty entries go, because an empty element means the current directory and\n /// this function's output is written into a store binary - see parse_rpath.\n /// `$ORIGIN` entries go because the rewrite resolves them to store paths.\n ///\n /// Pulled out of compute_new_rpath so the rule is testable: that function\n /// shells out to patchelf against a real ELF, so nothing asserted on its\n /// output, which is exactly where the behaviour changed twice this week.\n fn retained_entries(current_rpath: &[String]) -> Vec<String> {\n-    current_rpath\n-        .iter()\n-        .filter(|p| !p.is_empty() && !p.contains(\"$ORIGIN\"))\n-        .cloned()\n-        .collect()\n+    vec![String::new()] /* ~ changed by cargo-mutants ~ */\n }\n \n /// The RPATH a rewritten output should carry, from what it had and the store\n /// directories its NEEDED libraries resolved to. `None` means nothing was\n /// added and the binary should be left alone.\n ///\n /// PURE, AND SEPARATE FROM THE ELF READING, so the retention rule can be\n /// pinned where it is actually applied. Nine tests covered `retained_entries`\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "retained_entries",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 137
+        },
+        "start": {
+          "column": 1,
+          "line": 122
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:132:5: replace retained_entries -> Vec<String> with vec![String::new()]",
+    "package": "nix-ninja-task",
+    "replacement": "vec![String::new()]",
+    "span": {
+      "end": {
+        "column": 19,
+        "line": 136
+      },
+      "start": {
+        "column": 5,
+        "line": 132
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace retained_entries -> Vec<String> with vec![\"xyzzy\".into()]\n@@ -124,21 +124,17 @@\n /// Empty entries go, because an empty element means the current directory and\n /// this function's output is written into a store binary - see parse_rpath.\n /// `$ORIGIN` entries go because the rewrite resolves them to store paths.\n ///\n /// Pulled out of compute_new_rpath so the rule is testable: that function\n /// shells out to patchelf against a real ELF, so nothing asserted on its\n /// output, which is exactly where the behaviour changed twice this week.\n fn retained_entries(current_rpath: &[String]) -> Vec<String> {\n-    current_rpath\n-        .iter()\n-        .filter(|p| !p.is_empty() && !p.contains(\"$ORIGIN\"))\n-        .cloned()\n-        .collect()\n+    vec![\"xyzzy\".into()] /* ~ changed by cargo-mutants ~ */\n }\n \n /// The RPATH a rewritten output should carry, from what it had and the store\n /// directories its NEEDED libraries resolved to. `None` means nothing was\n /// added and the binary should be left alone.\n ///\n /// PURE, AND SEPARATE FROM THE ELF READING, so the retention rule can be\n /// pinned where it is actually applied. Nine tests covered `retained_entries`\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "retained_entries",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 137
+        },
+        "start": {
+          "column": 1,
+          "line": 122
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:132:5: replace retained_entries -> Vec<String> with vec![\"xyzzy\".into()]",
+    "package": "nix-ninja-task",
+    "replacement": "vec![\"xyzzy\".into()]",
+    "span": {
+      "end": {
+        "column": 19,
+        "line": 136
+      },
+      "start": {
+        "column": 5,
+        "line": 132
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace && with || in retained_entries\n@@ -126,17 +126,17 @@\n /// `$ORIGIN` entries go because the rewrite resolves them to store paths.\n ///\n /// Pulled out of compute_new_rpath so the rule is testable: that function\n /// shells out to patchelf against a real ELF, so nothing asserted on its\n /// output, which is exactly where the behaviour changed twice this week.\n fn retained_entries(current_rpath: &[String]) -> Vec<String> {\n     current_rpath\n         .iter()\n-        .filter(|p| !p.is_empty() && !p.contains(\"$ORIGIN\"))\n+        .filter(|p| !p.is_empty() || /* ~ changed by cargo-mutants ~ */ !p.contains(\"$ORIGIN\"))\n         .cloned()\n         .collect()\n }\n \n /// The RPATH a rewritten output should carry, from what it had and the store\n /// directories its NEEDED libraries resolved to. `None` means nothing was\n /// added and the binary should be left alone.\n ///\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "retained_entries",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 137
+        },
+        "start": {
+          "column": 1,
+          "line": 122
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:134:35: replace && with || in retained_entries",
+    "package": "nix-ninja-task",
+    "replacement": "||",
+    "span": {
+      "end": {
+        "column": 37,
+        "line": 134
+      },
+      "start": {
+        "column": 35,
+        "line": 134
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ delete ! in retained_entries\n@@ -126,17 +126,17 @@\n /// `$ORIGIN` entries go because the rewrite resolves them to store paths.\n ///\n /// Pulled out of compute_new_rpath so the rule is testable: that function\n /// shells out to patchelf against a real ELF, so nothing asserted on its\n /// output, which is exactly where the behaviour changed twice this week.\n fn retained_entries(current_rpath: &[String]) -> Vec<String> {\n     current_rpath\n         .iter()\n-        .filter(|p| !p.is_empty() && !p.contains(\"$ORIGIN\"))\n+        .filter(|p|  /* ~ changed by cargo-mutants ~ */p.is_empty() && !p.contains(\"$ORIGIN\"))\n         .cloned()\n         .collect()\n }\n \n /// The RPATH a rewritten output should carry, from what it had and the store\n /// directories its NEEDED libraries resolved to. `None` means nothing was\n /// added and the binary should be left alone.\n ///\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "retained_entries",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 137
+        },
+        "start": {
+          "column": 1,
+          "line": 122
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:134:21: delete ! in retained_entries",
+    "package": "nix-ninja-task",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 22,
+        "line": 134
+      },
+      "start": {
+        "column": 21,
+        "line": 134
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ delete ! in retained_entries\n@@ -126,17 +126,17 @@\n /// `$ORIGIN` entries go because the rewrite resolves them to store paths.\n ///\n /// Pulled out of compute_new_rpath so the rule is testable: that function\n /// shells out to patchelf against a real ELF, so nothing asserted on its\n /// output, which is exactly where the behaviour changed twice this week.\n fn retained_entries(current_rpath: &[String]) -> Vec<String> {\n     current_rpath\n         .iter()\n-        .filter(|p| !p.is_empty() && !p.contains(\"$ORIGIN\"))\n+        .filter(|p| !p.is_empty() &&  /* ~ changed by cargo-mutants ~ */p.contains(\"$ORIGIN\"))\n         .cloned()\n         .collect()\n }\n \n /// The RPATH a rewritten output should carry, from what it had and the store\n /// directories its NEEDED libraries resolved to. `None` means nothing was\n /// added and the binary should be left alone.\n ///\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "retained_entries",
+      "return_type": "-> Vec<String>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 137
+        },
+        "start": {
+          "column": 1,
+          "line": 122
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:134:38: delete ! in retained_entries",
+    "package": "nix-ninja-task",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 39,
+        "line": 134
+      },
+      "start": {
+        "column": 38,
+        "line": 134
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace assemble_rpath -> Option<Vec<String>> with None\n@@ -143,29 +143,17 @@\n /// PURE, AND SEPARATE FROM THE ELF READING, so the retention rule can be\n /// pinned where it is actually applied. Nine tests covered `retained_entries`\n /// in isolation and NOTHING covered the fact that this function calls it: a\n /// mutation replacing the call with `current_rpath.to_vec()` left the whole\n /// suite green while restoring the defect `f8bb3bd` fixed - an empty RPATH\n /// element, which the loader reads as the CURRENT DIRECTORY, written into a\n /// store output. The build succeeds and the artifact is wrong.\n pub fn assemble_rpath(current_rpath: &[String], needed_dirs: &[String]) -> Option<Vec<String>> {\n-    let mut new_rpath = retained_entries(current_rpath);\n-    let mut path_added = false;\n-    for lib_str in needed_dirs {\n-        if !new_rpath.contains(lib_str) {\n-            new_rpath.push(lib_str.clone());\n-            path_added = true;\n-        }\n-    }\n-    if path_added {\n-        Some(new_rpath)\n-    } else {\n-        None\n-    }\n+    None /* ~ changed by cargo-mutants ~ */\n }\n \n fn compute_new_rpath(\n     store_dir: &Path,\n     elf_path: &Path,\n     current_rpath: &[String],\n ) -> Result<Option<Vec<String>>> {\n     // Resolve RPATH entries with $ORIGIN expansion\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "assemble_rpath",
+      "return_type": "-> Option<Vec<String>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 164
+        },
+        "start": {
+          "column": 1,
+          "line": 139
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:151:5: replace assemble_rpath -> Option<Vec<String>> with None",
+    "package": "nix-ninja-task",
+    "replacement": "None",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 163
+      },
+      "start": {
+        "column": 5,
+        "line": 151
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace assemble_rpath -> Option<Vec<String>> with Some(vec![])\n@@ -143,29 +143,17 @@\n /// PURE, AND SEPARATE FROM THE ELF READING, so the retention rule can be\n /// pinned where it is actually applied. Nine tests covered `retained_entries`\n /// in isolation and NOTHING covered the fact that this function calls it: a\n /// mutation replacing the call with `current_rpath.to_vec()` left the whole\n /// suite green while restoring the defect `f8bb3bd` fixed - an empty RPATH\n /// element, which the loader reads as the CURRENT DIRECTORY, written into a\n /// store output. The build succeeds and the artifact is wrong.\n pub fn assemble_rpath(current_rpath: &[String], needed_dirs: &[String]) -> Option<Vec<String>> {\n-    let mut new_rpath = retained_entries(current_rpath);\n-    let mut path_added = false;\n-    for lib_str in needed_dirs {\n-        if !new_rpath.contains(lib_str) {\n-            new_rpath.push(lib_str.clone());\n-            path_added = true;\n-        }\n-    }\n-    if path_added {\n-        Some(new_rpath)\n-    } else {\n-        None\n-    }\n+    Some(vec![]) /* ~ changed by cargo-mutants ~ */\n }\n \n fn compute_new_rpath(\n     store_dir: &Path,\n     elf_path: &Path,\n     current_rpath: &[String],\n ) -> Result<Option<Vec<String>>> {\n     // Resolve RPATH entries with $ORIGIN expansion\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "assemble_rpath",
+      "return_type": "-> Option<Vec<String>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 164
+        },
+        "start": {
+          "column": 1,
+          "line": 139
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:151:5: replace assemble_rpath -> Option<Vec<String>> with Some(vec![])",
+    "package": "nix-ninja-task",
+    "replacement": "Some(vec![])",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 163
+      },
+      "start": {
+        "column": 5,
+        "line": 151
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace assemble_rpath -> Option<Vec<String>> with Some(vec![String::new()])\n@@ -143,29 +143,17 @@\n /// PURE, AND SEPARATE FROM THE ELF READING, so the retention rule can be\n /// pinned where it is actually applied. Nine tests covered `retained_entries`\n /// in isolation and NOTHING covered the fact that this function calls it: a\n /// mutation replacing the call with `current_rpath.to_vec()` left the whole\n /// suite green while restoring the defect `f8bb3bd` fixed - an empty RPATH\n /// element, which the loader reads as the CURRENT DIRECTORY, written into a\n /// store output. The build succeeds and the artifact is wrong.\n pub fn assemble_rpath(current_rpath: &[String], needed_dirs: &[String]) -> Option<Vec<String>> {\n-    let mut new_rpath = retained_entries(current_rpath);\n-    let mut path_added = false;\n-    for lib_str in needed_dirs {\n-        if !new_rpath.contains(lib_str) {\n-            new_rpath.push(lib_str.clone());\n-            path_added = true;\n-        }\n-    }\n-    if path_added {\n-        Some(new_rpath)\n-    } else {\n-        None\n-    }\n+    Some(vec![String::new()]) /* ~ changed by cargo-mutants ~ */\n }\n \n fn compute_new_rpath(\n     store_dir: &Path,\n     elf_path: &Path,\n     current_rpath: &[String],\n ) -> Result<Option<Vec<String>>> {\n     // Resolve RPATH entries with $ORIGIN expansion\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "assemble_rpath",
+      "return_type": "-> Option<Vec<String>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 164
+        },
+        "start": {
+          "column": 1,
+          "line": 139
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:151:5: replace assemble_rpath -> Option<Vec<String>> with Some(vec![String::new()])",
+    "package": "nix-ninja-task",
+    "replacement": "Some(vec![String::new()])",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 163
+      },
+      "start": {
+        "column": 5,
+        "line": 151
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace assemble_rpath -> Option<Vec<String>> with Some(vec![\"xyzzy\".into()])\n@@ -143,29 +143,17 @@\n /// PURE, AND SEPARATE FROM THE ELF READING, so the retention rule can be\n /// pinned where it is actually applied. Nine tests covered `retained_entries`\n /// in isolation and NOTHING covered the fact that this function calls it: a\n /// mutation replacing the call with `current_rpath.to_vec()` left the whole\n /// suite green while restoring the defect `f8bb3bd` fixed - an empty RPATH\n /// element, which the loader reads as the CURRENT DIRECTORY, written into a\n /// store output. The build succeeds and the artifact is wrong.\n pub fn assemble_rpath(current_rpath: &[String], needed_dirs: &[String]) -> Option<Vec<String>> {\n-    let mut new_rpath = retained_entries(current_rpath);\n-    let mut path_added = false;\n-    for lib_str in needed_dirs {\n-        if !new_rpath.contains(lib_str) {\n-            new_rpath.push(lib_str.clone());\n-            path_added = true;\n-        }\n-    }\n-    if path_added {\n-        Some(new_rpath)\n-    } else {\n-        None\n-    }\n+    Some(vec![\"xyzzy\".into()]) /* ~ changed by cargo-mutants ~ */\n }\n \n fn compute_new_rpath(\n     store_dir: &Path,\n     elf_path: &Path,\n     current_rpath: &[String],\n ) -> Result<Option<Vec<String>>> {\n     // Resolve RPATH entries with $ORIGIN expansion\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "assemble_rpath",
+      "return_type": "-> Option<Vec<String>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 164
+        },
+        "start": {
+          "column": 1,
+          "line": 139
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:151:5: replace assemble_rpath -> Option<Vec<String>> with Some(vec![\"xyzzy\".into()])",
+    "package": "nix-ninja-task",
+    "replacement": "Some(vec![\"xyzzy\".into()])",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 163
+      },
+      "start": {
+        "column": 5,
+        "line": 151
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ delete ! in assemble_rpath\n@@ -146,17 +146,17 @@\n /// mutation replacing the call with `current_rpath.to_vec()` left the whole\n /// suite green while restoring the defect `f8bb3bd` fixed - an empty RPATH\n /// element, which the loader reads as the CURRENT DIRECTORY, written into a\n /// store output. The build succeeds and the artifact is wrong.\n pub fn assemble_rpath(current_rpath: &[String], needed_dirs: &[String]) -> Option<Vec<String>> {\n     let mut new_rpath = retained_entries(current_rpath);\n     let mut path_added = false;\n     for lib_str in needed_dirs {\n-        if !new_rpath.contains(lib_str) {\n+        if  /* ~ changed by cargo-mutants ~ */new_rpath.contains(lib_str) {\n             new_rpath.push(lib_str.clone());\n             path_added = true;\n         }\n     }\n     if path_added {\n         Some(new_rpath)\n     } else {\n         None\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "assemble_rpath",
+      "return_type": "-> Option<Vec<String>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 164
+        },
+        "start": {
+          "column": 1,
+          "line": 139
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:154:12: delete ! in assemble_rpath",
+    "package": "nix-ninja-task",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 13,
+        "line": 154
+      },
+      "start": {
+        "column": 12,
+        "line": 154
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(None)\n@@ -164,39 +164,17 @@\n }\n \n fn compute_new_rpath(\n     store_dir: &Path,\n     elf_path: &Path,\n     current_rpath: &[String],\n ) -> Result<Option<Vec<String>>> {\n     // Resolve RPATH entries with $ORIGIN expansion\n-    let resolved_rpath = resolve_rpath(current_rpath, elf_path)?;\n-\n-    let needed_libs = get_needed_libs(elf_path)?;\n-    let mut needed_dirs: Vec<String> = Vec::new();\n-\n-    for lib_name in &needed_libs {\n-        let Some(lib_path) = resolve_needed(lib_name, &resolved_rpath, store_dir)? else {\n-            continue;\n-        };\n-\n-        let Some(lib_dir) = lib_path.parent() else {\n-            continue;\n-        };\n-\n-        needed_dirs.push(\n-            lib_dir\n-                .to_str()\n-                .context(\"Library directiory was not UTF-8\")?\n-                .to_owned(),\n-        );\n-    }\n-\n-    Ok(assemble_rpath(current_rpath, &needed_dirs))\n+    Ok(None) /* ~ changed by cargo-mutants ~ */\n }\n \n fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {\n     let mut resolved_paths = Vec::new();\n \n     let origin = elf_path\n         .parent()\n         .ok_or_else(|| anyhow!(\"ELF path has no parent directory\"))?\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "compute_new_rpath",
+      "return_type": "-> Result<Option<Vec<String>>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 195
+        },
+        "start": {
+          "column": 1,
+          "line": 166
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:172:5: replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(None)",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(None)",
+    "span": {
+      "end": {
+        "column": 52,
+        "line": 194
+      },
+      "start": {
+        "column": 5,
+        "line": 172
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec![]))\n@@ -164,39 +164,17 @@\n }\n \n fn compute_new_rpath(\n     store_dir: &Path,\n     elf_path: &Path,\n     current_rpath: &[String],\n ) -> Result<Option<Vec<String>>> {\n     // Resolve RPATH entries with $ORIGIN expansion\n-    let resolved_rpath = resolve_rpath(current_rpath, elf_path)?;\n-\n-    let needed_libs = get_needed_libs(elf_path)?;\n-    let mut needed_dirs: Vec<String> = Vec::new();\n-\n-    for lib_name in &needed_libs {\n-        let Some(lib_path) = resolve_needed(lib_name, &resolved_rpath, store_dir)? else {\n-            continue;\n-        };\n-\n-        let Some(lib_dir) = lib_path.parent() else {\n-            continue;\n-        };\n-\n-        needed_dirs.push(\n-            lib_dir\n-                .to_str()\n-                .context(\"Library directiory was not UTF-8\")?\n-                .to_owned(),\n-        );\n-    }\n-\n-    Ok(assemble_rpath(current_rpath, &needed_dirs))\n+    Ok(Some(vec![])) /* ~ changed by cargo-mutants ~ */\n }\n \n fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {\n     let mut resolved_paths = Vec::new();\n \n     let origin = elf_path\n         .parent()\n         .ok_or_else(|| anyhow!(\"ELF path has no parent directory\"))?\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "compute_new_rpath",
+      "return_type": "-> Result<Option<Vec<String>>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 195
+        },
+        "start": {
+          "column": 1,
+          "line": 166
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:172:5: replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec![]))",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(Some(vec![]))",
+    "span": {
+      "end": {
+        "column": 52,
+        "line": 194
+      },
+      "start": {
+        "column": 5,
+        "line": 172
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec![String::new()]))\n@@ -164,39 +164,17 @@\n }\n \n fn compute_new_rpath(\n     store_dir: &Path,\n     elf_path: &Path,\n     current_rpath: &[String],\n ) -> Result<Option<Vec<String>>> {\n     // Resolve RPATH entries with $ORIGIN expansion\n-    let resolved_rpath = resolve_rpath(current_rpath, elf_path)?;\n-\n-    let needed_libs = get_needed_libs(elf_path)?;\n-    let mut needed_dirs: Vec<String> = Vec::new();\n-\n-    for lib_name in &needed_libs {\n-        let Some(lib_path) = resolve_needed(lib_name, &resolved_rpath, store_dir)? else {\n-            continue;\n-        };\n-\n-        let Some(lib_dir) = lib_path.parent() else {\n-            continue;\n-        };\n-\n-        needed_dirs.push(\n-            lib_dir\n-                .to_str()\n-                .context(\"Library directiory was not UTF-8\")?\n-                .to_owned(),\n-        );\n-    }\n-\n-    Ok(assemble_rpath(current_rpath, &needed_dirs))\n+    Ok(Some(vec![String::new()])) /* ~ changed by cargo-mutants ~ */\n }\n \n fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {\n     let mut resolved_paths = Vec::new();\n \n     let origin = elf_path\n         .parent()\n         .ok_or_else(|| anyhow!(\"ELF path has no parent directory\"))?\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "compute_new_rpath",
+      "return_type": "-> Result<Option<Vec<String>>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 195
+        },
+        "start": {
+          "column": 1,
+          "line": 166
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:172:5: replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec![String::new()]))",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(Some(vec![String::new()]))",
+    "span": {
+      "end": {
+        "column": 52,
+        "line": 194
+      },
+      "start": {
+        "column": 5,
+        "line": 172
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec![\"xyzzy\".into()]))\n@@ -164,39 +164,17 @@\n }\n \n fn compute_new_rpath(\n     store_dir: &Path,\n     elf_path: &Path,\n     current_rpath: &[String],\n ) -> Result<Option<Vec<String>>> {\n     // Resolve RPATH entries with $ORIGIN expansion\n-    let resolved_rpath = resolve_rpath(current_rpath, elf_path)?;\n-\n-    let needed_libs = get_needed_libs(elf_path)?;\n-    let mut needed_dirs: Vec<String> = Vec::new();\n-\n-    for lib_name in &needed_libs {\n-        let Some(lib_path) = resolve_needed(lib_name, &resolved_rpath, store_dir)? else {\n-            continue;\n-        };\n-\n-        let Some(lib_dir) = lib_path.parent() else {\n-            continue;\n-        };\n-\n-        needed_dirs.push(\n-            lib_dir\n-                .to_str()\n-                .context(\"Library directiory was not UTF-8\")?\n-                .to_owned(),\n-        );\n-    }\n-\n-    Ok(assemble_rpath(current_rpath, &needed_dirs))\n+    Ok(Some(vec![\"xyzzy\".into()])) /* ~ changed by cargo-mutants ~ */\n }\n \n fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {\n     let mut resolved_paths = Vec::new();\n \n     let origin = elf_path\n         .parent()\n         .ok_or_else(|| anyhow!(\"ELF path has no parent directory\"))?\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "compute_new_rpath",
+      "return_type": "-> Result<Option<Vec<String>>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 195
+        },
+        "start": {
+          "column": 1,
+          "line": 166
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:172:5: replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec![\"xyzzy\".into()]))",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(Some(vec![\"xyzzy\".into()]))",
+    "span": {
+      "end": {
+        "column": 52,
+        "line": 194
+      },
+      "start": {
+        "column": 5,
+        "line": 172
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace resolve_rpath -> Result<Vec<PathBuf>> with Ok(vec![])\n@@ -190,35 +190,17 @@\n                 .to_owned(),\n         );\n     }\n \n     Ok(assemble_rpath(current_rpath, &needed_dirs))\n }\n \n fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {\n-    let mut resolved_paths = Vec::new();\n-\n-    let origin = elf_path\n-        .parent()\n-        .ok_or_else(|| anyhow!(\"ELF path has no parent directory\"))?\n-        .to_string_lossy();\n-\n-    for entry in rpath {\n-        // An empty entry is the runtime \"current directory\" marker. It is\n-        // preserved in the rebuilt RPATH but it is not a directory we can\n-        // resolve a needed library against here.\n-        if entry.is_empty() {\n-            continue;\n-        }\n-        let expanded = entry.replace(\"$ORIGIN\", &origin);\n-        resolved_paths.push(PathBuf::from(expanded));\n-    }\n-\n-    Ok(resolved_paths)\n+    Ok(vec![]) /* ~ changed by cargo-mutants ~ */\n }\n \n fn get_needed_libs(elf_path: &Path) -> Result<Vec<String>> {\n     let output = Command::new(\"patchelf\")\n         .arg(\"--print-needed\")\n         .arg(elf_path)\n         .output()\n         .map_err(|e| anyhow!(\"Failed to execute patchelf --print-needed: {e}\"))?;\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "resolve_rpath",
+      "return_type": "-> Result<Vec<PathBuf>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 217
+        },
+        "start": {
+          "column": 1,
+          "line": 197
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:198:5: replace resolve_rpath -> Result<Vec<PathBuf>> with Ok(vec![])",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(vec![])",
+    "span": {
+      "end": {
+        "column": 23,
+        "line": 216
+      },
+      "start": {
+        "column": 5,
+        "line": 198
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace resolve_rpath -> Result<Vec<PathBuf>> with Ok(vec![Default::default()])\n@@ -190,35 +190,17 @@\n                 .to_owned(),\n         );\n     }\n \n     Ok(assemble_rpath(current_rpath, &needed_dirs))\n }\n \n fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {\n-    let mut resolved_paths = Vec::new();\n-\n-    let origin = elf_path\n-        .parent()\n-        .ok_or_else(|| anyhow!(\"ELF path has no parent directory\"))?\n-        .to_string_lossy();\n-\n-    for entry in rpath {\n-        // An empty entry is the runtime \"current directory\" marker. It is\n-        // preserved in the rebuilt RPATH but it is not a directory we can\n-        // resolve a needed library against here.\n-        if entry.is_empty() {\n-            continue;\n-        }\n-        let expanded = entry.replace(\"$ORIGIN\", &origin);\n-        resolved_paths.push(PathBuf::from(expanded));\n-    }\n-\n-    Ok(resolved_paths)\n+    Ok(vec![Default::default()]) /* ~ changed by cargo-mutants ~ */\n }\n \n fn get_needed_libs(elf_path: &Path) -> Result<Vec<String>> {\n     let output = Command::new(\"patchelf\")\n         .arg(\"--print-needed\")\n         .arg(elf_path)\n         .output()\n         .map_err(|e| anyhow!(\"Failed to execute patchelf --print-needed: {e}\"))?;\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "resolve_rpath",
+      "return_type": "-> Result<Vec<PathBuf>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 217
+        },
+        "start": {
+          "column": 1,
+          "line": 197
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:198:5: replace resolve_rpath -> Result<Vec<PathBuf>> with Ok(vec![Default::default()])",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(vec![Default::default()])",
+    "span": {
+      "end": {
+        "column": 23,
+        "line": 216
+      },
+      "start": {
+        "column": 5,
+        "line": 198
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace get_needed_libs -> Result<Vec<String>> with Ok(vec![])\n@@ -212,33 +212,17 @@\n         let expanded = entry.replace(\"$ORIGIN\", &origin);\n         resolved_paths.push(PathBuf::from(expanded));\n     }\n \n     Ok(resolved_paths)\n }\n \n fn get_needed_libs(elf_path: &Path) -> Result<Vec<String>> {\n-    let output = Command::new(\"patchelf\")\n-        .arg(\"--print-needed\")\n-        .arg(elf_path)\n-        .output()\n-        .map_err(|e| anyhow!(\"Failed to execute patchelf --print-needed: {e}\"))?;\n-\n-    if !output.status.success() {\n-        let stderr = String::from_utf8_lossy(&output.stderr);\n-        return Err(anyhow!(\"patchelf --print-needed failed: {stderr}\"));\n-    }\n-\n-    let needed_str = String::from_utf8_lossy(&output.stdout);\n-    Ok(needed_str\n-        .lines()\n-        .map(|line| line.trim().to_string())\n-        .filter(|line| !line.is_empty())\n-        .collect())\n+    Ok(vec![]) /* ~ changed by cargo-mutants ~ */\n }\n \n fn resolve_needed(lib_name: &str, rpath: &[PathBuf], store_dir: &Path) -> Result<Option<PathBuf>> {\n     // Search for the library in each rpath directory\n     for search_dir in rpath {\n         let lib_path = search_dir.join(lib_name);\n \n         // If it's already in nix store, return None (don't add to rpath)\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "get_needed_libs",
+      "return_type": "-> Result<Vec<String>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 237
+        },
+        "start": {
+          "column": 1,
+          "line": 219
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:220:5: replace get_needed_libs -> Result<Vec<String>> with Ok(vec![])",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(vec![])",
+    "span": {
+      "end": {
+        "column": 20,
+        "line": 236
+      },
+      "start": {
+        "column": 5,
+        "line": 220
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace get_needed_libs -> Result<Vec<String>> with Ok(vec![String::new()])\n@@ -212,33 +212,17 @@\n         let expanded = entry.replace(\"$ORIGIN\", &origin);\n         resolved_paths.push(PathBuf::from(expanded));\n     }\n \n     Ok(resolved_paths)\n }\n \n fn get_needed_libs(elf_path: &Path) -> Result<Vec<String>> {\n-    let output = Command::new(\"patchelf\")\n-        .arg(\"--print-needed\")\n-        .arg(elf_path)\n-        .output()\n-        .map_err(|e| anyhow!(\"Failed to execute patchelf --print-needed: {e}\"))?;\n-\n-    if !output.status.success() {\n-        let stderr = String::from_utf8_lossy(&output.stderr);\n-        return Err(anyhow!(\"patchelf --print-needed failed: {stderr}\"));\n-    }\n-\n-    let needed_str = String::from_utf8_lossy(&output.stdout);\n-    Ok(needed_str\n-        .lines()\n-        .map(|line| line.trim().to_string())\n-        .filter(|line| !line.is_empty())\n-        .collect())\n+    Ok(vec![String::new()]) /* ~ changed by cargo-mutants ~ */\n }\n \n fn resolve_needed(lib_name: &str, rpath: &[PathBuf], store_dir: &Path) -> Result<Option<PathBuf>> {\n     // Search for the library in each rpath directory\n     for search_dir in rpath {\n         let lib_path = search_dir.join(lib_name);\n \n         // If it's already in nix store, return None (don't add to rpath)\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "get_needed_libs",
+      "return_type": "-> Result<Vec<String>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 237
+        },
+        "start": {
+          "column": 1,
+          "line": 219
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:220:5: replace get_needed_libs -> Result<Vec<String>> with Ok(vec![String::new()])",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(vec![String::new()])",
+    "span": {
+      "end": {
+        "column": 20,
+        "line": 236
+      },
+      "start": {
+        "column": 5,
+        "line": 220
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace get_needed_libs -> Result<Vec<String>> with Ok(vec![\"xyzzy\".into()])\n@@ -212,33 +212,17 @@\n         let expanded = entry.replace(\"$ORIGIN\", &origin);\n         resolved_paths.push(PathBuf::from(expanded));\n     }\n \n     Ok(resolved_paths)\n }\n \n fn get_needed_libs(elf_path: &Path) -> Result<Vec<String>> {\n-    let output = Command::new(\"patchelf\")\n-        .arg(\"--print-needed\")\n-        .arg(elf_path)\n-        .output()\n-        .map_err(|e| anyhow!(\"Failed to execute patchelf --print-needed: {e}\"))?;\n-\n-    if !output.status.success() {\n-        let stderr = String::from_utf8_lossy(&output.stderr);\n-        return Err(anyhow!(\"patchelf --print-needed failed: {stderr}\"));\n-    }\n-\n-    let needed_str = String::from_utf8_lossy(&output.stdout);\n-    Ok(needed_str\n-        .lines()\n-        .map(|line| line.trim().to_string())\n-        .filter(|line| !line.is_empty())\n-        .collect())\n+    Ok(vec![\"xyzzy\".into()]) /* ~ changed by cargo-mutants ~ */\n }\n \n fn resolve_needed(lib_name: &str, rpath: &[PathBuf], store_dir: &Path) -> Result<Option<PathBuf>> {\n     // Search for the library in each rpath directory\n     for search_dir in rpath {\n         let lib_path = search_dir.join(lib_name);\n \n         // If it's already in nix store, return None (don't add to rpath)\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "get_needed_libs",
+      "return_type": "-> Result<Vec<String>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 237
+        },
+        "start": {
+          "column": 1,
+          "line": 219
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:220:5: replace get_needed_libs -> Result<Vec<String>> with Ok(vec![\"xyzzy\".into()])",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(vec![\"xyzzy\".into()])",
+    "span": {
+      "end": {
+        "column": 20,
+        "line": 236
+      },
+      "start": {
+        "column": 5,
+        "line": 220
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ delete ! in get_needed_libs\n@@ -218,17 +218,17 @@\n \n fn get_needed_libs(elf_path: &Path) -> Result<Vec<String>> {\n     let output = Command::new(\"patchelf\")\n         .arg(\"--print-needed\")\n         .arg(elf_path)\n         .output()\n         .map_err(|e| anyhow!(\"Failed to execute patchelf --print-needed: {e}\"))?;\n \n-    if !output.status.success() {\n+    if  /* ~ changed by cargo-mutants ~ */output.status.success() {\n         let stderr = String::from_utf8_lossy(&output.stderr);\n         return Err(anyhow!(\"patchelf --print-needed failed: {stderr}\"));\n     }\n \n     let needed_str = String::from_utf8_lossy(&output.stdout);\n     Ok(needed_str\n         .lines()\n         .map(|line| line.trim().to_string())\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "get_needed_libs",
+      "return_type": "-> Result<Vec<String>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 237
+        },
+        "start": {
+          "column": 1,
+          "line": 219
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:226:8: delete ! in get_needed_libs",
+    "package": "nix-ninja-task",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 9,
+        "line": 226
+      },
+      "start": {
+        "column": 8,
+        "line": 226
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ delete ! in get_needed_libs\n@@ -227,17 +227,17 @@\n         let stderr = String::from_utf8_lossy(&output.stderr);\n         return Err(anyhow!(\"patchelf --print-needed failed: {stderr}\"));\n     }\n \n     let needed_str = String::from_utf8_lossy(&output.stdout);\n     Ok(needed_str\n         .lines()\n         .map(|line| line.trim().to_string())\n-        .filter(|line| !line.is_empty())\n+        .filter(|line|  /* ~ changed by cargo-mutants ~ */line.is_empty())\n         .collect())\n }\n \n fn resolve_needed(lib_name: &str, rpath: &[PathBuf], store_dir: &Path) -> Result<Option<PathBuf>> {\n     // Search for the library in each rpath directory\n     for search_dir in rpath {\n         let lib_path = search_dir.join(lib_name);\n \n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "get_needed_libs",
+      "return_type": "-> Result<Vec<String>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 237
+        },
+        "start": {
+          "column": 1,
+          "line": 219
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:235:24: delete ! in get_needed_libs",
+    "package": "nix-ninja-task",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 25,
+        "line": 235
+      },
+      "start": {
+        "column": 24,
+        "line": 235
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace resolve_needed -> Result<Option<PathBuf>> with Ok(None)\n@@ -233,41 +233,17 @@\n         .lines()\n         .map(|line| line.trim().to_string())\n         .filter(|line| !line.is_empty())\n         .collect())\n }\n \n fn resolve_needed(lib_name: &str, rpath: &[PathBuf], store_dir: &Path) -> Result<Option<PathBuf>> {\n     // Search for the library in each rpath directory\n-    for search_dir in rpath {\n-        let lib_path = search_dir.join(lib_name);\n-\n-        // If it's already in nix store, return None (don't add to rpath)\n-        //\n-        // PRE-EXISTING and untouched by this week's changes, flagged during\n-        // the 2026-08-29 audit so it is on the record rather than rediscovered:\n-        // this returns on the FIRST rpath entry that is store-prefixed,\n-        // without checking the library actually exists there. For an rpath of\n-        // `/nix/store/a/lib:/build/out/lib`, a library that lives only in the\n-        // second entry is skipped. Not fixed here because nothing has been\n-        // observed failing on it and a speculative change to rpath resolution\n-        // is how this file acquired its last two defects.\n-        if lib_path.starts_with(store_dir) {\n-            return Ok(None);\n-        }\n-\n-        if lib_path.exists() {\n-            let canonical_path = fs::canonicalize(&lib_path)\n-                .map_err(|e| anyhow::anyhow!(\"canonicalize({}): {e}\", lib_path.display()))?;\n-            return Ok(Some(canonical_path));\n-        }\n-    }\n-\n-    Err(anyhow!(\"Library {lib_name} not found in RPATH\"))\n+    Ok(None) /* ~ changed by cargo-mutants ~ */\n }\n \n fn apply_rpath(elf_path: &Path, new_paths: &[String]) -> Result<()> {\n     let rpath_str = new_paths.join(\":\");\n     let mut cmd = Command::new(\"patchelf\");\n     cmd.arg(\"--set-rpath\").arg(&rpath_str).arg(elf_path);\n \n     let output = cmd\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "resolve_needed",
+      "return_type": "-> Result<Option<PathBuf>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 266
+        },
+        "start": {
+          "column": 1,
+          "line": 239
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:241:5: replace resolve_needed -> Result<Option<PathBuf>> with Ok(None)",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(None)",
+    "span": {
+      "end": {
+        "column": 58,
+        "line": 265
+      },
+      "start": {
+        "column": 5,
+        "line": 241
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace resolve_needed -> Result<Option<PathBuf>> with Ok(Some(Default::default()))\n@@ -233,41 +233,17 @@\n         .lines()\n         .map(|line| line.trim().to_string())\n         .filter(|line| !line.is_empty())\n         .collect())\n }\n \n fn resolve_needed(lib_name: &str, rpath: &[PathBuf], store_dir: &Path) -> Result<Option<PathBuf>> {\n     // Search for the library in each rpath directory\n-    for search_dir in rpath {\n-        let lib_path = search_dir.join(lib_name);\n-\n-        // If it's already in nix store, return None (don't add to rpath)\n-        //\n-        // PRE-EXISTING and untouched by this week's changes, flagged during\n-        // the 2026-08-29 audit so it is on the record rather than rediscovered:\n-        // this returns on the FIRST rpath entry that is store-prefixed,\n-        // without checking the library actually exists there. For an rpath of\n-        // `/nix/store/a/lib:/build/out/lib`, a library that lives only in the\n-        // second entry is skipped. Not fixed here because nothing has been\n-        // observed failing on it and a speculative change to rpath resolution\n-        // is how this file acquired its last two defects.\n-        if lib_path.starts_with(store_dir) {\n-            return Ok(None);\n-        }\n-\n-        if lib_path.exists() {\n-            let canonical_path = fs::canonicalize(&lib_path)\n-                .map_err(|e| anyhow::anyhow!(\"canonicalize({}): {e}\", lib_path.display()))?;\n-            return Ok(Some(canonical_path));\n-        }\n-    }\n-\n-    Err(anyhow!(\"Library {lib_name} not found in RPATH\"))\n+    Ok(Some(Default::default())) /* ~ changed by cargo-mutants ~ */\n }\n \n fn apply_rpath(elf_path: &Path, new_paths: &[String]) -> Result<()> {\n     let rpath_str = new_paths.join(\":\");\n     let mut cmd = Command::new(\"patchelf\");\n     cmd.arg(\"--set-rpath\").arg(&rpath_str).arg(elf_path);\n \n     let output = cmd\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "resolve_needed",
+      "return_type": "-> Result<Option<PathBuf>>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 266
+        },
+        "start": {
+          "column": 1,
+          "line": 239
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:241:5: replace resolve_needed -> Result<Option<PathBuf>> with Ok(Some(Default::default()))",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(Some(Default::default()))",
+    "span": {
+      "end": {
+        "column": 58,
+        "line": 265
+      },
+      "start": {
+        "column": 5,
+        "line": 241
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ replace apply_rpath -> Result<()> with Ok(())\n@@ -261,30 +261,17 @@\n             return Ok(Some(canonical_path));\n         }\n     }\n \n     Err(anyhow!(\"Library {lib_name} not found in RPATH\"))\n }\n \n fn apply_rpath(elf_path: &Path, new_paths: &[String]) -> Result<()> {\n-    let rpath_str = new_paths.join(\":\");\n-    let mut cmd = Command::new(\"patchelf\");\n-    cmd.arg(\"--set-rpath\").arg(&rpath_str).arg(elf_path);\n-\n-    let output = cmd\n-        .output()\n-        .map_err(|e| anyhow!(\"Failed to execute patchelf: {e}\"))?;\n-\n-    if !output.status.success() {\n-        let stderr = String::from_utf8_lossy(&output.stderr);\n-        return Err(anyhow!(\"patchelf failed: {stderr}\"));\n-    }\n-\n-    Ok(())\n+    Ok(()) /* ~ changed by cargo-mutants ~ */\n }\n \n #[cfg(test)]\n mod tests {\n     use super::{parse_rpath, retained_entries};\n \n     // This file had no tests, which is why f8bb3bd shipped fixing one of the\n     // three spellings of its own bug. These are the three.\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "apply_rpath",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 283
+        },
+        "start": {
+          "column": 1,
+          "line": 268
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:269:5: replace apply_rpath -> Result<()> with Ok(())",
+    "package": "nix-ninja-task",
+    "replacement": "Ok(())",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 282
+      },
+      "start": {
+        "column": 5,
+        "line": 269
+      }
+    }
+  },
+  {
+    "diff": "--- crates/nix-ninja-task/src/patchelf.rs\n+++ delete ! in apply_rpath\n@@ -269,17 +269,17 @@\n     let rpath_str = new_paths.join(\":\");\n     let mut cmd = Command::new(\"patchelf\");\n     cmd.arg(\"--set-rpath\").arg(&rpath_str).arg(elf_path);\n \n     let output = cmd\n         .output()\n         .map_err(|e| anyhow!(\"Failed to execute patchelf: {e}\"))?;\n \n-    if !output.status.success() {\n+    if  /* ~ changed by cargo-mutants ~ */output.status.success() {\n         let stderr = String::from_utf8_lossy(&output.stderr);\n         return Err(anyhow!(\"patchelf failed: {stderr}\"));\n     }\n \n     Ok(())\n }\n \n #[cfg(test)]\n",
+    "file": "crates/nix-ninja-task/src/patchelf.rs",
+    "function": {
+      "function_name": "apply_rpath",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 283
+        },
+        "start": {
+          "column": 1,
+          "line": 268
+        }
+      }
+    },
+    "genre": "UnaryOperator",
+    "name": "crates/nix-ninja-task/src/patchelf.rs:277:8: delete ! in apply_rpath",
+    "package": "nix-ninja-task",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 9,
+        "line": 277
+      },
+      "start": {
+        "column": 8,
+        "line": 277
+      }
+    }
+  }
+]

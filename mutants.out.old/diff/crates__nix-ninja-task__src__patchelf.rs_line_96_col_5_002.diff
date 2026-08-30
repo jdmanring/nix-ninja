@@ -1,0 +1,27 @@
+--- crates/nix-ninja-task/src/patchelf.rs
++++ replace parse_rpath -> Vec<String> with vec!["xyzzy".into()]
+@@ -88,23 +88,17 @@
+ ///
+ /// This function exists to rewrite build-time paths into store paths, so a
+ /// build-directory decision is precisely the thing that must not survive it.
+ /// `f8bb3bd` argued the opposite - that the trailing empty entry was
+ /// "meaningful" and should be re-appended - and that reasoning was wrong in a
+ /// way that put a cwd search into every patched output. The original splitter
+ /// dropped every empty entry, and on the write side it was right to.
+ fn parse_rpath(raw: &str) -> Vec<String> {
+-    if raw.is_empty() {
+-        // "".split(':') yields one empty entry, which would invent an RPATH
+-        // element for a binary that has none.
+-        Vec::new()
+-    } else {
+-        raw.split(':').map(|s| s.to_string()).collect()
+-    }
++    vec!["xyzzy".into()] /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn get_raw_rpath(elf_path: &Path) -> Result<String> {
+     let output = Command::new("patchelf")
+         .arg("--print-rpath")
+         .arg(elf_path)
+         .output()
+         .map_err(|e| anyhow!("Failed to execute patchelf --print-rpath: {e}"))?;

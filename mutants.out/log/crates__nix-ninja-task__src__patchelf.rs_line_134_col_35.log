@@ -1,0 +1,870 @@
+
+*** crates/nix-ninja-task/src/patchelf.rs:134:35: replace && with || in retained_entries
+
+*** mutation diff:
+--- crates/nix-ninja-task/src/patchelf.rs
++++ replace && with || in retained_entries
+@@ -126,17 +126,17 @@
+ /// `$ORIGIN` entries go because the rewrite resolves them to store paths.
+ ///
+ /// Pulled out of compute_new_rpath so the rule is testable: that function
+ /// shells out to patchelf against a real ELF, so nothing asserted on its
+ /// output, which is exactly where the behaviour changed twice this week.
+ fn retained_entries(current_rpath: &[String]) -> Vec<String> {
+     current_rpath
+         .iter()
+-        .filter(|p| !p.is_empty() && !p.contains("$ORIGIN"))
++        .filter(|p| !p.is_empty() || /* ~ changed by cargo-mutants ~ */ !p.contains("$ORIGIN"))
+         .cloned()
+         .collect()
+ }
+ 
+ /// The RPATH a rewritten output should carry, from what it had and the store
+ /// directories its NEEDED libraries resolved to. `None` means nothing was
+ /// added and the binary should be left alone.
+ ///
+
+
+*** /usr/bin/cargo test --no-run --verbose --workspace
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/cargo-mutants-nix-ninja-scmuPO.tmp/vendor-n2/Cargo.toml
+workspace: /tmp/cargo-mutants-nix-ninja-scmuPO.tmp/Cargo.toml
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+       Fresh unicode-ident v1.0.24
+       Fresh cfg-if v1.0.4
+       Fresh memchr v2.8.3
+       Fresh pin-project-lite v0.2.17
+       Fresh typenum v1.20.1
+       Fresh bitflags v2.13.1
+       Fresh unicode-segmentation v1.13.3
+       Fresh itoa v1.0.18
+       Fresh once_cell v1.21.4
+       Fresh cpufeatures v0.3.0
+       Fresh const-oid v0.10.2
+       Fresh shlex v2.0.1
+       Fresh find-msvc-tools v0.1.9
+       Fresh arrayvec v0.7.8
+       Fresh proc-macro2 v1.0.107
+       Fresh hybrid-array v0.4.13
+       Fresh aho-corasick v1.1.4
+       Fresh convert_case v0.10.0
+       Fresh unicode-xid v0.2.6
+       Fresh cc v1.3.0
+       Fresh linux-raw-sys v0.12.1
+       Fresh data-encoding v2.11.0
+       Fresh constant_time_eq v0.4.2
+       Fresh semver v1.0.28
+       Fresh arrayref v0.3.9
+       Fresh tracing-core v0.1.36
+       Fresh autocfg v1.5.1
+       Fresh md5 v0.8.1
+       Fresh quote v1.0.47
+       Fresh libc v0.2.189
+       Fresh serde_core v1.0.229
+       Fresh zmij v1.0.23
+       Fresh block-buffer v0.12.1
+       Fresh crypto-common v0.2.2
+       Fresh rustc_version v0.4.1
+       Fresh utf8parse v0.2.2
+       Fresh is_terminal_polyfill v1.70.2
+       Fresh colorchoice v1.0.5
+       Fresh anstyle-query v1.1.5
+       Fresh anstyle v1.0.14
+       Fresh clap_lex v1.1.0
+       Fresh zeroize v1.9.0
+       Fresh heck v0.5.0
+       Fresh unicode-width v0.2.2
+       Fresh strsim v0.11.1
+       Fresh signature v3.0.0
+       Fresh unicase v2.9.0
+       Fresh lazy_static v1.5.0
+       Fresh smallvec v1.15.2
+       Fresh syn v2.0.119
+       Fresh syn v3.0.3
+       Fresh serde_json v1.0.151
+       Fresh digest v0.11.3
+       Fresh getrandom v0.4.3
+       Fresh rustix v1.1.4
+       Fresh anstyle-parse v1.0.0
+       Fresh anyhow v1.0.104
+       Fresh subtle v2.6.1
+       Fresh ed25519 v3.0.0
+       Fresh log v0.4.33
+       Fresh futures-core v0.3.33
+       Fresh siphasher v1.0.3
+       Fresh futures-sink v0.3.33
+       Fresh bstr v1.13.0
+       Fresh winnow v1.0.4
+       Fresh equivalent v1.0.2
+       Fresh same-file v1.0.6
+       Fresh hashbrown v0.17.1
+       Fresh errno v0.3.14
+       Fresh powerfmt v0.2.0
+       Fresh deranged v0.5.8
+       Fresh serde_derive v1.0.229
+       Fresh thiserror-impl v2.0.19
+       Fresh zerocopy-derive v0.8.55
+       Fresh derive_more-impl v2.1.1
+       Fresh sha2 v0.11.0
+       Fresh blake3 v1.8.5
+       Fresh sha1 v0.11.0
+       Fresh anstream v1.0.0
+       Fresh terminal_size v0.4.4
+       Fresh curve25519-dalek-derive v0.1.1
+       Fresh tracing-attributes v0.1.31
+       Fresh clap_derive v4.6.4
+       Fresh futures-channel v0.3.33
+       Fresh walkdir v2.5.0
+       Fresh futures-macro v0.3.33
+       Fresh toml_parser v1.1.2+spec-1.1.0
+       Fresh indexmap v2.14.0
+       Fresh futures-io v0.3.33
+       Fresh futures-task v0.3.33
+       Fresh toml_datetime v1.1.1+spec-1.1.0
+       Fresh time-core v0.1.9
+       Fresh cfg_aliases v0.2.2
+       Fresh slab v0.4.12
+       Fresh num-conv v0.2.2
+       Fresh serde v1.0.229
+       Fresh thiserror v2.0.19
+       Fresh zerocopy v0.8.55
+       Fresh derive_more v2.1.1
+       Fresh tracing v0.1.44
+       Fresh clap_builder v4.6.2
+       Fresh curve25519-dalek v5.0.0
+       Fresh lexopt v0.3.2
+       Fresh rustc-hash v1.1.0
+       Fresh toml_edit v0.25.13+spec-1.1.0
+       Fresh futures-util v0.3.33
+       Fresh time v0.3.54
+       Fresh tracing-log v0.2.0
+       Fresh tokio-macros v2.7.1
+       Fresh signal-hook-registry v1.4.8
+       Fresh socket2 v0.6.5
+       Fresh sharded-slab v0.1.7
+       Fresh matchers v0.2.0
+       Fresh mio v1.2.2
+       Fresh thread_local v1.1.10
+       Fresh regex-syntax v0.8.11
+       Fresh harmonia-utils-base-encoding v0.0.0-alpha.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh bytes v1.12.1
+       Fresh ed25519-dalek v3.0.0
+       Fresh clap v4.6.4
+       Fresh tracing-serde v0.2.0
+       Fresh nu-ansi-term v0.50.3
+       Fresh memoffset v0.9.1
+       Fresh regex-automata v0.4.16
+       Fresh proc-macro-crate v3.5.0
+       Fresh scopeguard v1.2.0
+       Fresh version_check v0.9.5
+       Fresh harmonia-file-core v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh async-stream-impl v0.3.6
+       Fresh thiserror-impl v1.0.69
+       Fresh harmonia-utils-hash v0.0.0-alpha.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh harmonia-utils-signature v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh tokio v1.53.1
+       Fresh tracing-subscriber v0.3.23
+       Fresh regex v1.13.1
+       Fresh nix v0.31.3
+       Fresh rustversion v1.0.23
+       Fresh num_enum_derive v0.7.6
+       Fresh lock_api v0.4.14
+       Fresh ucd-trie v0.1.7
+       Fresh async-stream v0.3.6
+       Fresh harmonia-protocol-derive v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh getrandom v0.2.17
+       Fresh fnv v1.0.7
+       Fresh harmonia-store-path v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh phf_generator v0.11.3
+       Fresh tokio-util v0.7.19
+       Fresh crossbeam-utils v0.8.22
+       Fresh num_enum v0.7.6
+       Fresh parking_lot_core v0.9.12
+       Fresh parse-zoneinfo v0.3.1
+       Fresh harmonia-utils-io v0.0.0-alpha.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh thiserror v1.0.69
+       Fresh pest v2.8.8
+       Fresh camino v1.2.4
+       Fresh rand_core v0.6.4
+       Fresh ppv-lite86 v0.2.21
+       Fresh futures-executor v0.3.33
+       Fresh globset v0.4.19
+       Fresh phf_shared v0.11.3
+       Fresh is_executable v1.0.6
+       Fresh harmonia-store-content-address v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh phf_codegen v0.11.3
+       Fresh crossbeam-epoch v0.9.20
+       Fresh harmonia-file-nar v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh parking_lot v0.12.5
+       Fresh num-traits v0.2.19
+       Fresh pest_meta v2.8.8
+       Fresh generic-array v0.14.7
+       Fresh shell-words v1.1.1
+       Fresh iana-time-zone v0.1.65
+       Fresh gimli v0.32.3
+       Fresh elf v0.8.0
+       Fresh symlink v0.1.0
+       Fresh adler2 v2.0.1
+       Fresh phf v0.11.3
+       Fresh rand_chacha v0.3.1
+       Fresh owo-colors v4.3.0
+       Fresh futures v0.3.33
+       Fresh tracing-error v0.2.1
+       Fresh divan-macros v0.1.21
+       Fresh regex-lite v0.1.9
+       Fresh harmonia-store-derivation v0.0.0-alpha.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh chrono-tz-build v0.3.0
+       Fresh harmonia-store-path-info v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh crossbeam-deque v0.8.7
+       Fresh prometheus v0.14.0
+       Fresh miniz_oxide v0.8.9
+       Fresh chrono v0.4.45
+       Fresh pest_generator v2.8.8
+       Fresh libm v0.2.16
+       Fresh nix-nar v0.3.1
+       Fresh object v0.37.3
+       Fresh addr2line v0.25.1
+       Fresh bytemuck v1.25.2
+       Fresh condtype v1.3.0
+       Fresh indenter v0.3.4
+       Fresh minimal-lexical v0.2.1
+       Fresh rustc-demangle v0.1.28
+       Fresh deunicode v1.6.2
+       Fresh crypto-common v0.1.7
+       Fresh block-buffer v0.10.4
+       Fresh rand v0.8.7
+       Fresh brownstone v3.0.0
+       Fresh indent_write v2.2.0
+       Fresh harmonia-store-build-result v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh harmonia-store-aterm v0.0.0-alpha.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh ignore v0.4.31
+       Fresh pest_derive v2.8.8
+       Fresh slug v0.1.6
+       Fresh humansize v2.1.3
+       Fresh divan v0.1.21
+       Fresh nom v7.1.3
+       Fresh atomic v0.6.1
+warning: unused variable: `current_rpath`
+   --> crates/nix-ninja-task/src/patchelf.rs:131:21
+    |
+131 | fn retained_entries(current_rpath: &[String]) -> Vec<String> {
+    |                     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_current_rpath`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+       Fresh eyre v0.6.12
+       Fresh color-spantrace v0.3.0
+       Fresh backtrace v0.3.76
+       Fresh joinery v2.1.0
+       Fresh percent-encoding v2.3.2
+       Fresh digest v0.10.7
+       Fresh cpufeatures v0.2.17
+       Fresh glob v0.3.4
+       Fresh either v1.16.0
+       Fresh shlex v1.3.0
+       Fresh env_home v0.1.0
+       Fresh fastrand v2.5.0
+warning: `nix-ninja-task` (lib) generated 1 warning (run `cargo fix --lib -p nix-ninja-task` to apply 1 suggestion)
+warning: `nix-ninja-task` (lib test) generated 1 warning (1 duplicate)
+       Fresh harmonia-protocol v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh globwalk v0.9.1
+       Fresh nom-supreme v0.8.0
+       Fresh color-eyre v0.6.5
+       Fresh uuid v1.24.0
+       Fresh sha2 v0.10.9
+       Fresh which v7.0.3
+       Fresh tempfile v3.27.0
+       Fresh nix-ninja-task v0.1.0 (/tmp/cargo-mutants-nix-ninja-scmuPO.tmp/crates/nix-ninja-task)
+       Fresh deps-infer v0.1.0 (/tmp/cargo-mutants-nix-ninja-scmuPO.tmp/crates/deps-infer)
+       Fresh harmonia-store-remote v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh chrono-tz v0.9.0
+       Fresh n2 v0.1.0 (/tmp/cargo-mutants-nix-ninja-scmuPO.tmp/vendor-n2)
+       Fresh tera v1.20.1
+       Fresh include-graph v1.2.2 (https://github.com/hinshun/igraph?branch=performance-improvements#eb14705f)
+       Fresh nix-builder-rpc-client v0.1.0 (/tmp/cargo-mutants-nix-ninja-scmuPO.tmp/crates/nix-builder-rpc-client)
+       Fresh nix-ninja v0.1.0 (/tmp/cargo-mutants-nix-ninja-scmuPO.tmp/crates/nix-ninja)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.86s
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/deps_infer-cb74eec4daed7309`
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/deps_infer-0415fa32e3b027b2`
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/n2-c300543a3b674b07`
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/n2-e05ccc3aef6bef0f`
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/e2e_test-1f438fc0af20965e`
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/nix_builder_rpc_client-dd1a68edd98e649a`
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/nix_ninja-1aba3d29f653a29c`
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/nix_ninja-dc28fe3dc9e79bfb`
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/include_dir_shadow-6734ec2d05406352`
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/rpath_assembly-231623fe91dab62b`
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/nix_ninja_task-6b65072999e5ebdc`
+  Executable `/home/james/.cache/cargo-target/nix-ninja/debug/deps/nix_ninja_task-5d306986f7cce0e8`
+
+*** result: Success
+
+*** /usr/bin/cargo test --verbose --workspace
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /tmp/cargo-mutants-nix-ninja-scmuPO.tmp/vendor-n2/Cargo.toml
+workspace: /tmp/cargo-mutants-nix-ninja-scmuPO.tmp/Cargo.toml
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+       Fresh unicode-ident v1.0.24
+       Fresh cfg-if v1.0.4
+       Fresh memchr v2.8.3
+       Fresh pin-project-lite v0.2.17
+       Fresh typenum v1.20.1
+       Fresh bitflags v2.13.1
+       Fresh unicode-segmentation v1.13.3
+       Fresh once_cell v1.21.4
+       Fresh itoa v1.0.18
+       Fresh const-oid v0.10.2
+       Fresh cpufeatures v0.3.0
+       Fresh arrayvec v0.7.8
+       Fresh unicode-xid v0.2.6
+       Fresh find-msvc-tools v0.1.9
+       Fresh proc-macro2 v1.0.107
+       Fresh hybrid-array v0.4.13
+       Fresh aho-corasick v1.1.4
+       Fresh convert_case v0.10.0
+       Fresh shlex v2.0.1
+       Fresh linux-raw-sys v0.12.1
+       Fresh data-encoding v2.11.0
+       Fresh semver v1.0.28
+       Fresh arrayref v0.3.9
+       Fresh constant_time_eq v0.4.2
+       Fresh tracing-core v0.1.36
+       Fresh utf8parse v0.2.2
+       Fresh md5 v0.8.1
+       Fresh autocfg v1.5.1
+       Fresh quote v1.0.47
+       Fresh libc v0.2.189
+       Fresh serde_core v1.0.229
+       Fresh zmij v1.0.23
+       Fresh crypto-common v0.2.2
+       Fresh block-buffer v0.12.1
+       Fresh cc v1.3.0
+       Fresh rustc_version v0.4.1
+       Fresh anstyle-parse v1.0.0
+       Fresh anstyle v1.0.14
+       Fresh anstyle-query v1.1.5
+       Fresh colorchoice v1.0.5
+       Fresh is_terminal_polyfill v1.70.2
+       Fresh strsim v0.11.1
+       Fresh clap_lex v1.1.0
+       Fresh heck v0.5.0
+       Fresh signature v3.0.0
+       Fresh subtle v2.6.1
+       Fresh lazy_static v1.5.0
+       Fresh zeroize v1.9.0
+       Fresh unicase v2.9.0
+       Fresh smallvec v1.15.2
+       Fresh syn v2.0.119
+       Fresh syn v3.0.3
+       Fresh serde_json v1.0.151
+       Fresh digest v0.11.3
+       Fresh getrandom v0.4.3
+       Fresh rustix v1.1.4
+       Fresh anyhow v1.0.104
+       Fresh anstream v1.0.0
+       Fresh unicode-width v0.2.2
+       Fresh ed25519 v3.0.0
+       Fresh log v0.4.33
+       Fresh futures-core v0.3.33
+       Fresh siphasher v1.0.3
+       Fresh futures-sink v0.3.33
+       Fresh bstr v1.13.0
+       Fresh winnow v1.0.4
+       Fresh same-file v1.0.6
+       Fresh equivalent v1.0.2
+       Fresh hashbrown v0.17.1
+       Fresh errno v0.3.14
+       Fresh futures-task v0.3.33
+       Fresh powerfmt v0.2.0
+       Fresh serde_derive v1.0.229
+       Fresh thiserror-impl v2.0.19
+       Fresh zerocopy-derive v0.8.55
+       Fresh derive_more-impl v2.1.1
+       Fresh sha2 v0.11.0
+       Fresh sha1 v0.11.0
+       Fresh curve25519-dalek-derive v0.1.1
+       Fresh terminal_size v0.4.4
+       Fresh tracing-attributes v0.1.31
+       Fresh clap_derive v4.6.4
+       Fresh futures-macro v0.3.33
+       Fresh walkdir v2.5.0
+       Fresh toml_parser v1.1.2+spec-1.1.0
+       Fresh futures-channel v0.3.33
+       Fresh indexmap v2.14.0
+       Fresh time-core v0.1.9
+       Fresh slab v0.4.12
+       Fresh toml_datetime v1.1.1+spec-1.1.0
+       Fresh rustc-hash v1.1.0
+       Fresh futures-io v0.3.33
+       Fresh cfg_aliases v0.2.2
+       Fresh deranged v0.5.8
+       Fresh lexopt v0.3.2
+       Fresh serde v1.0.229
+       Fresh thiserror v2.0.19
+       Fresh derive_more v2.1.1
+       Fresh zerocopy v0.8.55
+       Fresh blake3 v1.8.5
+       Fresh curve25519-dalek v5.0.0
+       Fresh clap_builder v4.6.2
+       Fresh tracing v0.1.44
+       Fresh num-conv v0.2.2
+       Fresh futures-util v0.3.33
+       Fresh toml_edit v0.25.13+spec-1.1.0
+       Fresh signal-hook-registry v1.4.8
+       Fresh tracing-log v0.2.0
+       Fresh tokio-macros v2.7.1
+       Fresh mio v1.2.2
+       Fresh socket2 v0.6.5
+       Fresh sharded-slab v0.1.7
+       Fresh matchers v0.2.0
+       Fresh thread_local v1.1.10
+       Fresh regex-syntax v0.8.11
+       Fresh harmonia-utils-base-encoding v0.0.0-alpha.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh bytes v1.12.1
+       Fresh ed25519-dalek v3.0.0
+       Fresh clap v4.6.4
+       Fresh time v0.3.54
+       Fresh tracing-serde v0.2.0
+       Fresh nu-ansi-term v0.50.3
+       Fresh regex-automata v0.4.16
+       Fresh proc-macro-crate v3.5.0
+       Fresh memoffset v0.9.1
+       Fresh version_check v0.9.5
+       Fresh scopeguard v1.2.0
+       Fresh harmonia-file-core v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh thiserror-impl v1.0.69
+       Fresh async-stream-impl v0.3.6
+       Fresh harmonia-utils-hash v0.0.0-alpha.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh harmonia-utils-signature v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh tracing-subscriber v0.3.23
+       Fresh tokio v1.53.1
+       Fresh phf_generator v0.11.3
+       Fresh rustversion v1.0.23
+       Fresh num_enum_derive v0.7.6
+       Fresh nix v0.31.3
+       Fresh lock_api v0.4.14
+       Fresh regex v1.13.1
+       Fresh ucd-trie v0.1.7
+       Fresh async-stream v0.3.6
+       Fresh harmonia-protocol-derive v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh getrandom v0.2.17
+       Fresh harmonia-store-path v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh parking_lot_core v0.9.12
+       Fresh harmonia-utils-io v0.0.0-alpha.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh parse-zoneinfo v0.3.1
+       Fresh phf_codegen v0.11.3
+       Fresh num_enum v0.7.6
+       Fresh tokio-util v0.7.19
+       Fresh crossbeam-utils v0.8.22
+       Fresh thiserror v1.0.69
+       Fresh pest v2.8.8
+       Fresh camino v1.2.4
+       Fresh fnv v1.0.7
+       Fresh rand_core v0.6.4
+       Fresh ppv-lite86 v0.2.21
+       Fresh futures-executor v0.3.33
+       Fresh globset v0.4.19
+       Fresh phf_shared v0.11.3
+       Fresh harmonia-store-content-address v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh chrono-tz-build v0.3.0
+       Fresh harmonia-file-nar v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh crossbeam-epoch v0.9.20
+       Fresh parking_lot v0.12.5
+       Fresh pest_meta v2.8.8
+       Fresh generic-array v0.14.7
+       Fresh num-traits v0.2.19
+       Fresh symlink v0.1.0
+       Fresh iana-time-zone v0.1.65
+       Fresh gimli v0.32.3
+       Fresh shell-words v1.1.1
+       Fresh is_executable v1.0.6
+       Fresh adler2 v2.0.1
+       Fresh elf v0.8.0
+       Fresh phf v0.11.3
+       Fresh rand_chacha v0.3.1
+       Fresh owo-colors v4.3.0
+       Fresh futures v0.3.33
+       Fresh tracing-error v0.2.1
+       Fresh divan-macros v0.1.21
+       Fresh harmonia-store-derivation v0.0.0-alpha.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh harmonia-store-path-info v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh prometheus v0.14.0
+       Fresh crossbeam-deque v0.8.7
+       Fresh libm v0.2.16
+       Fresh nix-nar v0.3.1
+       Fresh object v0.37.3
+       Fresh addr2line v0.25.1
+       Fresh miniz_oxide v0.8.9
+       Fresh pest_generator v2.8.8
+       Fresh chrono v0.4.45
+       Fresh deunicode v1.6.2
+       Fresh bytemuck v1.25.2
+       Fresh regex-lite v0.1.9
+       Fresh minimal-lexical v0.2.1
+       Fresh rustc-demangle v0.1.28
+       Fresh condtype v1.3.0
+       Fresh indenter v0.3.4
+       Fresh color-spantrace v0.3.0
+       Fresh block-buffer v0.10.4
+       Fresh rand v0.8.7
+       Fresh crypto-common v0.1.7
+       Fresh harmonia-store-aterm v0.0.0-alpha.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh harmonia-store-build-result v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh ignore v0.4.31
+       Fresh atomic v0.6.1
+       Fresh backtrace v0.3.76
+       Fresh eyre v0.6.12
+warning: unused variable: `current_rpath`
+   --> crates/nix-ninja-task/src/patchelf.rs:131:21
+    |
+131 | fn retained_entries(current_rpath: &[String]) -> Vec<String> {
+    |                     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_current_rpath`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+       Fresh humansize v2.1.3
+       Fresh pest_derive v2.8.8
+       Fresh slug v0.1.6
+       Fresh divan v0.1.21
+       Fresh nom v7.1.3
+       Fresh brownstone v3.0.0
+       Fresh indent_write v2.2.0
+       Fresh percent-encoding v2.3.2
+       Fresh joinery v2.1.0
+       Fresh digest v0.10.7
+       Fresh env_home v0.1.0
+       Fresh cpufeatures v0.2.17
+       Fresh shlex v1.3.0
+       Fresh either v1.16.0
+       Fresh glob v0.3.4
+       Fresh fastrand v2.5.0
+warning: `nix-ninja-task` (lib) generated 1 warning (run `cargo fix --lib -p nix-ninja-task` to apply 1 suggestion)
+       Fresh harmonia-protocol v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh chrono-tz v0.9.0
+       Fresh globwalk v0.9.1
+       Fresh nom-supreme v0.8.0
+       Fresh uuid v1.24.0
+       Fresh color-eyre v0.6.5
+       Fresh which v7.0.3
+       Fresh sha2 v0.10.9
+       Fresh tempfile v3.27.0
+       Fresh nix-ninja-task v0.1.0 (/tmp/cargo-mutants-nix-ninja-scmuPO.tmp/crates/nix-ninja-task)
+       Fresh deps-infer v0.1.0 (/tmp/cargo-mutants-nix-ninja-scmuPO.tmp/crates/deps-infer)
+warning: `nix-ninja-task` (lib test) generated 1 warning (1 duplicate)
+       Fresh harmonia-store-remote v3.2.0 (https://github.com/nix-community/harmonia.git?branch=main#4ec14354)
+       Fresh tera v1.20.1
+       Fresh n2 v0.1.0 (/tmp/cargo-mutants-nix-ninja-scmuPO.tmp/vendor-n2)
+       Fresh include-graph v1.2.2 (https://github.com/hinshun/igraph?branch=performance-improvements#eb14705f)
+       Fresh nix-builder-rpc-client v0.1.0 (/tmp/cargo-mutants-nix-ninja-scmuPO.tmp/crates/nix-builder-rpc-client)
+       Fresh nix-ninja v0.1.0 (/tmp/cargo-mutants-nix-ninja-scmuPO.tmp/crates/nix-ninja)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running `/home/james/.cache/cargo-target/nix-ninja/debug/deps/deps_infer-cb74eec4daed7309`
+
+running 27 tests
+test c_include_parser::tests::a_missing_header_that_was_never_declared_virtual_still_fails ... ok
+test c_include_parser::tests::lexical_normalize_keeps_symlinks_and_leading_parents ... ok
+test c_include_parser::tests::virtual_path_lookup_matches_scan_semantics ... ok
+test gcc_include_parser::tests::iquote_isystem_idirafter_are_include_dirs ... ok
+test gcc_include_parser::tests::idirafter_sorts_last_and_demotes_its_early_i_twin ... ok
+test gcc_depfile_parser::tests::test_create_deps_command ... ok
+test gcc_include_parser::tests::test_absolute_paths ... ok
+test gcc_include_parser::tests::test_basic_cases ... ok
+test gcc_include_parser::tests::test_invalid_syntax ... ok
+test gcc_include_parser::tests::test_mixed_with_other_options ... ok
+test gcc_include_parser::tests::test_multiple_includes ... ok
+test gcc_include_parser::tests::test_multiple_spaces ... ok
+test gcc_include_parser::tests::test_paths_with_spaces ... ok
+test gcc_include_parser::tests::test_paths_with_special_chars ... ok
+test gcc_include_parser::tests::test_relative_paths ... ok
+test c_include_parser::tests::include_regex_covers_embed_without_over_matching ... ok
+test c_include_parser::tests::a_declared_virtual_header_that_does_not_exist_yet_scans_as_empty ... ok
+test c_include_parser::tests::nasm_percent_include_is_scanned ... ok
+test c_include_parser::tests::non_utf8_line_does_not_end_the_scan ... ok
+test c_include_parser::tests::computed_include_resolving_through_include_dir_keeps_that_head ... ok
+test c_include_parser::tests::computed_include_through_cross_file_define_is_declared ... ok
+test c_include_parser::tests::computed_include_through_same_file_define_is_declared ... ok
+test c_include_parser::tests::directive_with_space_after_hash_still_scans ... ok
+test c_include_parser::tests::directive_cache_hits_across_tus_and_invalidates_on_edit ... ok
+test c_include_parser::tests::function_like_computed_include_reports_the_scan_incomplete ... ok
+test c_include_parser::tests::guarded_default_declares_both_candidate_headers ... ok
+test c_include_parser::tests::symlinked_include_dir_declares_nested_quoted_include_at_both_spellings ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running `/home/james/.cache/cargo-target/nix-ninja/debug/deps/deps_infer-0415fa32e3b027b2`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/home/james/.cache/cargo-target/nix-ninja/debug/deps/n2-c300543a3b674b07`
+
+running 30 tests
+test canon::tests::dot ... ok
+test canon::tests::noop ... ok
+test canon::tests::not_dot ... ok
+test canon::tests::slash ... ok
+test canon::tests::parent ... ok
+test depfile::tests::test_parse_missing_colon ... ok
+test depfile::tests::test_parse_multiline ... ok
+test depfile::tests::test_parse_multiple_targets ... ok
+test depfile::tests::test_parse_simple ... ok
+test depfile::tests::test_parse_space_suffix ... ok
+test depfile::tests::test_parse_spaces_before_colon ... ok
+test depfile::tests::test_parse_windows_dep_path ... ok
+test depfile::tests::test_parse_without_final_newline ... ok
+test graph::tests::remove_dups_explicit ... ok
+test graph::tests::remove_dups_implicit ... ok
+test parse::tests::parse_defaults ... ok
+test parse::tests::parse_dot_in_eval ... ok
+test parse::tests::parse_dot_in_rule ... ok
+test parse::tests::parse_trailing_newline ... ok
+test progress_fancy::tests::progress_bar_rendering ... ok
+test progress_fancy::tests::task_rendering ... ok
+test progress_fancy::tests::task_rendering_with_time ... ok
+test progress_fancy::tests::truncate_utf8 ... ok
+test scanner::tests::scanner ... ok
+test task::tests::find_last ... ok
+test scanner::tests::read_file_with_nul_appends_nul_and_keeps_contents ... ok
+test task::tests::missing_depfile_allowed ... ok
+test task::tests::show_includes ... ok
+test work::tests::build_cycle ... ok
+test graph::stat_mtime_resolution ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running `/home/james/.cache/cargo-target/nix-ninja/debug/deps/n2-e05ccc3aef6bef0f`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/home/james/.cache/cargo-target/nix-ninja/debug/deps/e2e_test-1f438fc0af20965e`
+
+running 41 tests
+test e2e::basic::empty_file ... ok
+test e2e::bindings::bad_rule_variable ... ok
+test e2e::basic::builddir ... ok
+test e2e::basic::missing_command ... ok
+test e2e::basic::basic_build ... ok
+test e2e::basic::phony_depends ... ok
+test e2e::basic::create_subdir ... ok
+test e2e::bindings::build_bindings_arent_recursive ... ok
+test e2e::bindings::empty_variable_binding ... ok
+test e2e::bindings::eval_twice ... ok
+test e2e::bindings::empty_build_variable ... ok
+test e2e::basic::specify_build_file ... ok
+test e2e::basic::utf8_filename ... ok
+test e2e::missing::missing_phony_input ... ok
+test e2e::missing::missing_input ... ok
+test e2e::basic::write_to_input ... ok
+test e2e::bindings::looks_up_values_from_build ... ok
+test e2e::discovered::bad_depfile ... ok
+test e2e::basic::showincludes ... ok
+test e2e::basic::repeated_out ... ok
+test e2e::bindings::deps_evaluate_build_bindings ... ok
+test e2e::basic::explain ... ok
+test e2e::missing::missing_phony ... ok
+test e2e::basic::spam_output ... ok
+test e2e::validations::build_fails_when_validation_fails ... ok
+test e2e::missing::phony_existing_file ... ok
+test e2e::missing::missing_generated ... ok
+test e2e::regen::generate_build_file_failure ... ok
+test e2e::validations::basic_validation ... ok
+test e2e::regen::restat ... ok
+test e2e::validations::validation_inputs_break_cycles ... ok
+test e2e::basic::generate_rsp_file ... ok
+test e2e::regen::shared_regen_input ... ok
+test e2e::regen::generate_build_file ... ok
+test e2e::regen::generate_specified_build_file ... ok
+test e2e::missing::phony_missing_file ... ok
+test e2e::directories::dep_on_current_directory ... ok
+test e2e::discovered::discover_existing_dep ... ok
+test e2e::discovered::escaped_newline_in_depfile ... ok
+test e2e::discovered::multi_output_depfile ... ok
+test e2e::validations::build_starts_before_validation_finishes ... ok
+
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running `/home/james/.cache/cargo-target/nix-ninja/debug/deps/nix_builder_rpc_client-dd1a68edd98e649a`
+
+running 20 tests
+test connect_backoff_tests::backoff_never_shortens ... ok
+test connect_backoff_tests::retries_match_the_backoff_ladder ... ok
+test connect_backoff_tests::total_window_rides_a_daemon_restart ... ok
+test nar_upload_memo_tests::an_unstattable_key_is_not_cacheable ... ok
+test realise_memo_tests::a_demoted_slot_is_sorted_back_into_place ... ok
+test realise_memo_tests::a_duplicate_slot_would_shift_every_later_pairing ... ok
+test realise_memo_tests::a_short_reply_is_refused_not_absorbed - should panic ... ok
+test realise_memo_tests::an_out_of_range_slot_is_dropped_not_indexed ... ok
+test realise_memo_tests::interleaved_hits_and_misses_keep_request_order ... ok
+test realise_memo_tests::the_ordinary_case_is_left_alone ... ok
+test realise_memo_tests::the_two_extremes_are_both_identity ... ok
+test realise_timer_tests::dropping_the_guard_records_a_call ... ok
+test realise_timer_tests::slow_threshold_stays_loud_enough_to_catch_a_stalled_round ... ok
+test transient_error_tests::the_two_named_races_are_transient_and_verdicts_are_not ... ok
+test uploaded_drv_retention_tests::the_matchers_survive_a_reformat_and_fail_without_the_guard ... ok
+test watchdog_policy_tests::allowance_schedule_is_pinned ... ok
+test watchdog_policy_tests::monitored_patterns_appear_in_display_output ... ok
+test uploaded_drv_retention_tests::retention_is_conditional_on_being_inside_a_derivation ... ok
+test nar_streaming_tests::a_payload_larger_than_the_buffer_streams_without_deadlock ... ok
+test nar_upload_memo_tests::a_rewritten_file_changes_its_stamp ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running `/home/james/.cache/cargo-target/nix-ninja/debug/deps/nix_ninja-1aba3d29f653a29c`
+
+running 99 tests
+test build::system_tests::the_override_wins_but_only_outside_a_derivation ... ok
+test build::system_tests::unchanged_on_the_platform_this_tree_is_built_on ... ok
+test dyndep::tests::an_unknown_version_is_refused_not_guessed ... ok
+test dyndep::tests::bindings_are_recovered_from_a_build_statement ... ok
+test dyndep::tests::escaped_spaces_in_paths_survive ... ok
+test dyndep::tests::producer_side_declares_implicit_outputs ... ok
+test cli::tests::resolved_jobs_follows_dash_j ... ok
+test dyndep::tests::an_edge_without_a_binding_contributes_nothing ... ok
+test dyndep::tests::an_implicit_input_does_not_disturb_the_existing_ones ... ok
+test dyndep::tests::the_bare_manual_version_is_also_accepted ... ok
+test dyndep::tests::applying_the_same_entry_twice_is_a_no_op ... ok
+test dyndep::tests::the_cheap_precheck_agrees_with_the_scan ... ok
+test dyndep::tests::a_missing_version_is_refused ... ok
+test dyndep::tests::applying_dyndep_connects_producer_to_consumer ... ok
+test dyndep::tests::a_non_dyndep_rule_is_refused ... ok
+test dyndep::tests::two_edges_claiming_one_module_is_refused ... ok
+test dyndep::tests::consumer_side_declares_implicit_inputs ... ok
+test resolve_cache::tests::persistence_gate_table ... ok
+test local::copy_over_tests::the_copy_is_writable_even_when_the_source_is_not ... ok
+test resolve_cache::tests::stale_driver_stamp_fails_the_header_predicate ... ok
+test cli::tests::resolved_jobs_zero_means_cores_not_infinity ... ok
+test local::copy_over_tests::the_destination_is_a_real_file_not_a_link ... ok
+test task::accepted_depfile_output_tests::a_command_that_writes_no_depfile_is_refused ... ok
+test task::accepted_depfile_output_tests::a_depfile_outside_the_build_dir_is_refused ... ok
+test local::copy_over_tests::an_existing_symlink_is_replaced_rather_than_followed ... ok
+test task::accepted_depfile_output_tests::a_depfile_without_deps_gcc_is_refused ... ok
+test task::accepted_depfile_output_tests::a_gcc_deps_edge_with_a_relative_depfile_is_accepted ... ok
+test task::accepted_depfile_output_tests::an_empty_depfile_path_is_refused ... ok
+test task::accepted_depfile_output_tests::the_depfile_flag_is_honoured_from_the_rspfile ... ok
+test task::collectable_tests::a_task_with_no_accepted_depfile_collects_nothing_either_way ... ok
+test cli::tests::connections_are_capped_independently_of_admission ... ok
+test cli::ignored_flag_tests::dash_l_parses_and_is_not_silently_dropped ... ok
+test task::collectable_tests::local_mode_collects_and_derivation_mode_does_not ... ok
+test task::compile_task_tests::a_compile_still_is_one ... ok
+test task::alias_symlink_tests::a_dangling_soname_alias_is_carried_and_an_escape_is_not ... ok
+test resolve_cache::tests::validated_hit_and_stale_drop ... ok
+test task::compile_task_tests::a_link_with_gcc_deps_is_not_a_compile ... ok
+test task::compile_task_tests::mixed_outputs_are_not_a_compile ... ok
+test task::compile_task_tests::no_outputs_is_not_a_compile ... ok
+test task::compile_task_tests::other_deps_are_never_a_compile ... ok
+test task::create_symlink_undeclared_output_tests::create_symlink_link_is_an_output_with_and_without_cd ... ok
+test task::create_symlink_undeclared_output_tests::preprocessor_fallback_adds_to_the_scan_rather_than_replacing_it ... ok
+test task::generated_not_yet_written_tests::a_declared_virtual_file_that_is_absent_is_skipped ... ok
+test task::generated_not_yet_written_tests::a_declared_virtual_file_that_exists_is_still_uploaded ... ok
+test task::generated_not_yet_written_tests::an_absent_file_nobody_declared_is_not_skipped ... ok
+test task::job_permits_tests::an_oversized_task_still_runs_alone ... ok
+test task::job_permits_tests::budget_tapers_with_memory_instead_of_cliffing ... ok
+test task::job_permits_tests::degenerate_bounds_fall_back_to_the_full_cap ... ok
+test task::job_permits_tests::load_limit_matches_ninja_and_zero_disables ... ok
+test task::job_permits_tests::weight_tracks_input_count_and_stays_inside_the_budget ... ok
+test task::depfile_read_back_tests::fresh_stale_and_empty ... ok
+test task::new_built_file_tests::in_tree_output_keeps_rel_path_equal ... ok
+test task::new_built_file_tests::rel_path_never_climbs ... ok
+test task::job_permits_tests::permit_released_on_panic ... ok
+test task::new_built_file_tests::wl_groups_yield_files_and_skip_output_flags ... ok
+test task::ninja_pool_tests::cmdline_is_lto_last_flag_wins_and_fat_changes_nothing ... ok
+test task::ninja_pool_tests::no_pools_is_an_empty_map ... ok
+test task::ninja_pool_tests::depth_zero_is_unbounded_and_gets_no_semaphore ... ok
+test task::ninja_pool_tests::remove_outer_rpath_strips_the_out_lib_pair ... ok
+test task::normalize_output_tests::allowed_charset_passes_through ... ok
+test task::ninja_pool_tests::outer_rewrite_map_is_same_length_stable_and_reversible ... ok
+test task::normalize_output_tests::at_sign_is_sanitized ... ok
+test task::ninja_pool_tests::task_is_lto_sees_the_wrapper_baseline_and_the_opt_out_after_it ... ok
+test task::normalize_output_tests::empty_falls_back ... ok
+test task::normalize_output_tests::leading_period_is_prefixed ... ok
+test task::normalize_output_tests::lexical_join_pops_parents_against_base ... ok
+test task::normalize_output_tests::slash_still_maps_to_dash ... ok
+test task::normalize_output_tests::spaces_and_unicode_are_sanitized ... ok
+test task::normalize_output_tests::generate_grd_cmdline_files_resolve_against_tool_root ... ok
+test task::normalize_output_tests::grd_scaled_image_resolves_through_context_dir ... ok
+test task::normalized_task_outputs_tests::an_output_that_cannot_be_placed_fails_the_whole_task ... ok
+test task::normalized_task_outputs_tests::no_partial_output_set_is_returned ... ok
+test task::normalized_task_outputs_tests::ordinary_outputs_all_come_back ... ok
+test task::prune_gate_tests::a_zero_numerator_suppresses_the_ratio_instead_of_reporting_it ... ok
+test task::prune_gate_tests::header_shape_covers_the_c_family_and_nothing_else ... ok
+test task::normalize_output_tests::syspath_dirs_read_quoted_segments ... ok
+test task::prune_gate_tests::the_gate_rejects_a_count_placed_after_the_continue ... ok
+test task::python_import_names_tests::ancestor_rewrite_compensates_for_cd_depth ... ok
+test task::rewrite_ancestor_paths_tests::build_dir_itself_strips_to_relative ... ok
+test task::python_import_names_tests::finds_indented_import_in_try_block ... ok
+test task::rewrite_ancestor_paths_tests::deep_ancestor_becomes_up_chain ... ok
+test task::rewrite_ancestor_paths_tests::store_and_system_paths_untouched ... ok
+test task::python_import_names_tests::env_shebang_patched_only_when_exec_and_simple ... ok
+test task::python_import_names_tests::finds_module_in_own_subtree ... ok
+test task::self_rss_tests::reports_a_plausible_resident_size ... ok
+test task::python_import_names_tests::finds_import_and_from_first_segment ... ok
+test task::target_resolution_tests::a_generated_header_under_include_is_not_a_tree ... ok
+test task::target_resolution_tests::absolute_cmdline_args_rebase_into_the_build_tree ... ok
+test task::target_resolution_tests::alias_cycle_terminates ... ok
+test task::target_resolution_tests::concrete_target_resolves_to_itself ... ok
+test task::target_resolution_tests::depfile_only_declared_when_the_command_writes_it ... ok
+test task::target_resolution_tests::lib_shape_table ... ok
+test task::target_resolution_tests::phony_of_phony_resolves_transitively ... ok
+test task::target_resolution_tests::phony_target_resolves_to_the_files_it_aliases ... ok
+test task::target_resolution_tests::unknown_target_resolves_empty ... ok
+test task::create_symlink_undeclared_output_tests::angle_include_resolves_against_dash_i_dot ... ok
+test task::prune_gate_tests::the_numerator_is_counted_inside_the_filters_taken_branch ... ok
+test task::self_rss_tests::in_use_tracks_a_real_allocation ... ok
+test task::job_permits_tests::concurrency_never_exceeds_cap ... ok
+
+test result: ok. 99 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running `/home/james/.cache/cargo-target/nix-ninja/debug/deps/nix_ninja-dc28fe3dc9e79bfb`
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/home/james/.cache/cargo-target/nix-ninja/debug/deps/include_dir_shadow-6734ec2d05406352`
+
+running 1 test
+test a_directory_shadowing_a_header_name_is_skipped ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running `/home/james/.cache/cargo-target/nix-ninja/debug/deps/rpath_assembly-231623fe91dab62b`
+
+running 3 tests
+test a_binary_whose_only_entries_are_dropped_still_gains_what_it_needs ... FAILED
+test an_empty_entry_never_survives_assembly ... ok
+test nothing_new_means_leave_the_binary_alone ... FAILED
+
+failures:
+
+---- a_binary_whose_only_entries_are_dropped_still_gains_what_it_needs stdout ----
+
+thread 'a_binary_whose_only_entries_are_dropped_still_gains_what_it_needs' (26639) panicked at crates/nix-ninja/tests/rpath_assembly.rs:63:5:
+assertion `left == right` failed
+  left: ["xyzzy", "/nix/store/bbbb-zlib/lib"]
+ right: ["/nix/store/bbbb-zlib/lib"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- nothing_new_means_leave_the_binary_alone stdout ----
+
+thread 'nothing_new_means_leave_the_binary_alone' (26641) panicked at crates/nix-ninja/tests/rpath_assembly.rs:51:5:
+assertion failed: assemble_rpath(&current, &needed).is_none()
+
+
+failures:
+    a_binary_whose_only_entries_are_dropped_still_gains_what_it_needs
+    nothing_new_means_leave_the_binary_alone
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p nix-ninja --test rpath_assembly`
+
+*** result: Failure(101)

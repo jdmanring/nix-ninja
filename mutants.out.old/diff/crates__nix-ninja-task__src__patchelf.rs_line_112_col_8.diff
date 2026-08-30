@@ -1,0 +1,21 @@
+--- crates/nix-ninja-task/src/patchelf.rs
++++ delete ! in get_raw_rpath
+@@ -104,17 +104,17 @@
+ 
+ fn get_raw_rpath(elf_path: &Path) -> Result<String> {
+     let output = Command::new("patchelf")
+         .arg("--print-rpath")
+         .arg(elf_path)
+         .output()
+         .map_err(|e| anyhow!("Failed to execute patchelf --print-rpath: {e}"))?;
+ 
+-    if !output.status.success() {
++    if  /* ~ changed by cargo-mutants ~ */output.status.success() {
+         let stderr = String::from_utf8_lossy(&output.stderr);
+         return Err(anyhow!("patchelf --print-rpath failed: {stderr}"));
+     }
+ 
+     Ok(String::from_utf8_lossy(&output.stdout)
+         .trim_end_matches('\n')
+         .to_string())
+ }

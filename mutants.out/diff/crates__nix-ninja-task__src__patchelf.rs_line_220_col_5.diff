@@ -1,0 +1,37 @@
+--- crates/nix-ninja-task/src/patchelf.rs
++++ replace get_needed_libs -> Result<Vec<String>> with Ok(vec![])
+@@ -212,33 +212,17 @@
+         let expanded = entry.replace("$ORIGIN", &origin);
+         resolved_paths.push(PathBuf::from(expanded));
+     }
+ 
+     Ok(resolved_paths)
+ }
+ 
+ fn get_needed_libs(elf_path: &Path) -> Result<Vec<String>> {
+-    let output = Command::new("patchelf")
+-        .arg("--print-needed")
+-        .arg(elf_path)
+-        .output()
+-        .map_err(|e| anyhow!("Failed to execute patchelf --print-needed: {e}"))?;
+-
+-    if !output.status.success() {
+-        let stderr = String::from_utf8_lossy(&output.stderr);
+-        return Err(anyhow!("patchelf --print-needed failed: {stderr}"));
+-    }
+-
+-    let needed_str = String::from_utf8_lossy(&output.stdout);
+-    Ok(needed_str
+-        .lines()
+-        .map(|line| line.trim().to_string())
+-        .filter(|line| !line.is_empty())
+-        .collect())
++    Ok(vec![]) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn resolve_needed(lib_name: &str, rpath: &[PathBuf], store_dir: &Path) -> Result<Option<PathBuf>> {
+     // Search for the library in each rpath directory
+     for search_dir in rpath {
+         let lib_path = search_dir.join(lib_name);
+ 
+         // If it's already in nix store, return None (don't add to rpath)

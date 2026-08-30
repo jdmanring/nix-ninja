@@ -1,0 +1,43 @@
+--- crates/nix-ninja-task/src/patchelf.rs
++++ replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec!["xyzzy".into()]))
+@@ -164,39 +164,17 @@
+ }
+ 
+ fn compute_new_rpath(
+     store_dir: &Path,
+     elf_path: &Path,
+     current_rpath: &[String],
+ ) -> Result<Option<Vec<String>>> {
+     // Resolve RPATH entries with $ORIGIN expansion
+-    let resolved_rpath = resolve_rpath(current_rpath, elf_path)?;
+-
+-    let needed_libs = get_needed_libs(elf_path)?;
+-    let mut needed_dirs: Vec<String> = Vec::new();
+-
+-    for lib_name in &needed_libs {
+-        let Some(lib_path) = resolve_needed(lib_name, &resolved_rpath, store_dir)? else {
+-            continue;
+-        };
+-
+-        let Some(lib_dir) = lib_path.parent() else {
+-            continue;
+-        };
+-
+-        needed_dirs.push(
+-            lib_dir
+-                .to_str()
+-                .context("Library directiory was not UTF-8")?
+-                .to_owned(),
+-        );
+-    }
+-
+-    Ok(assemble_rpath(current_rpath, &needed_dirs))
++    Ok(Some(vec!["xyzzy".into()])) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {
+     let mut resolved_paths = Vec::new();
+ 
+     let origin = elf_path
+         .parent()
+         .ok_or_else(|| anyhow!("ELF path has no parent directory"))?
