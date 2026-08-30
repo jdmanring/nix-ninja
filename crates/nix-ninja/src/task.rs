@@ -2889,28 +2889,33 @@ fn report_progress(rpc_client: &Arc<BuilderRpcClient>, n_tasks: u64) {
     // first end-to-end run for upstream #7 produced a row of zeros that look
     // like measurements and are only rounding.
     //
-    // Additive and opt-in rather than a change of units, because the seconds
-    // line is already being grepped and parsed elsewhere - changing what it
-    // means would break those readers silently, which is the failure this
-    // whole campaign keeps hitting.
-    if std::env::var_os("NIX_NINJA_STATS_JSON").is_some() {
-        println!(
-            "nix-ninja-stats {{\"tasks\":{},\"resolve_ms\":{},\"dyn_ms\":{},\
-             \"dyn_realise_ms\":{},\"dyn_discover_ms\":{},\"dyn_adddrv_ms\":{},\
-             \"dyn_adddrv_calls\":{},\"plain_adddrv_ms\":{},\"plain_adddrv_calls\":{},\
-             \"rss_mib\":{}}}",
-            n_tasks,
-            RESOLVE_MS.load(Ordering::Relaxed),
-            DYN_MS.load(Ordering::Relaxed),
-            DYN_REALISE_MS.load(Ordering::Relaxed),
-            DYN_DISCOVER_MS.load(Ordering::Relaxed),
-            DYN_ADDDRV_MS.load(Ordering::Relaxed),
-            DYN_ADDDRV_N.load(Ordering::Relaxed),
-            DYN_PLAIN_ADDDRV_MS.load(Ordering::Relaxed),
-            DYN_PLAIN_ADDDRV_N.load(Ordering::Relaxed),
-            self_rss_mib(),
-        );
-    }
+    // Additive rather than a change of units, because the seconds line is
+    // already being grepped and parsed elsewhere and redefining what it means
+    // would break those readers silently.
+    //
+    // UNCONDITIONAL, and it was briefly gated on NIX_NINJA_STATS_JSON, which
+    // could not work: this driver runs INSIDE a derivation, and the sandbox
+    // does not carry an environment variable exported by whoever invoked
+    // `nix build`. The first run after adding the gate emitted nothing, which
+    // is the only reason the mistake was caught rather than shipped as a
+    // knob nobody could turn. One line per run is a price worth not making
+    // configurable.
+    println!(
+        "nix-ninja-stats {{\"tasks\":{},\"resolve_ms\":{},\"dyn_ms\":{},\
+         \"dyn_realise_ms\":{},\"dyn_discover_ms\":{},\"dyn_adddrv_ms\":{},\
+         \"dyn_adddrv_calls\":{},\"plain_adddrv_ms\":{},\"plain_adddrv_calls\":{},\
+         \"rss_mib\":{}}}",
+        n_tasks,
+        RESOLVE_MS.load(Ordering::Relaxed),
+        DYN_MS.load(Ordering::Relaxed),
+        DYN_REALISE_MS.load(Ordering::Relaxed),
+        DYN_DISCOVER_MS.load(Ordering::Relaxed),
+        DYN_ADDDRV_MS.load(Ordering::Relaxed),
+        DYN_ADDDRV_N.load(Ordering::Relaxed),
+        DYN_PLAIN_ADDDRV_MS.load(Ordering::Relaxed),
+        DYN_PLAIN_ADDDRV_N.load(Ordering::Relaxed),
+        self_rss_mib(),
+    );
     // Persist resolve-cache entries computed since the last tick;
     // a killed driver loses at most one tick's worth.
     if let Err(e) = crate::resolve_cache::flush() {

@@ -41,9 +41,9 @@ if nix path-info --extra-experimental-features "$FEATURES" "$drv" >/dev/null 2>&
   prebuilt=true
 fi
 
-# Ask the driver for machine-readable counters. The human line reports whole
-# seconds, which rounds every phase of a small build to zero.
-export NIX_NINJA_STATS_JSON=1
+# The driver emits `nix-ninja-stats` unconditionally - it runs inside a
+# derivation, so there is no environment variable this script could set that
+# would reach it.
 start=$(date +%s.%N)
 nix build --extra-experimental-features "$FEATURES" --no-link --print-build-logs \
   ".#${TARGET}" >/dev/null 2>"$OUT.log"
