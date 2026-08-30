@@ -609,6 +609,29 @@ fn build_task_derivation(
                 .insert(SingleDerivedPath::Opaque(cmdline_path.clone()));
             path.push(format!("{}/bin", task.store_dir.display(&cmdline_path)));
         }
+
+        // A `-fuse-ld=<name>` flag makes the compiler exec `ld.<name>` from
+        // PATH at link time, and the PATH assembled just above holds cc,
+        // coreutils, patchelf and the command binary alone. Meson bakes the
+        // flag in from `CC_LD`/`CXX_LD`, so a tree configured in a shell that
+        // selects an alternate linker emits it on every link rule and every
+        // link task then fails to find the linker it was told to use. Resolve
+        // the requested linker out here, where the caller's PATH still holds
+        // it, and carry its store path in as both an input and a PATH entry.
+        // Both spellings are tried because the flag accepts both: `ld.gold`
+        // for the traditional gcc names, the bare name for mold and wild.
+        for name in requested_linkers(cmdline) {
+            let resolved = which_store_path_opt(&task.store_dir, &format!("ld.{name}"))
+                .ok()
+                .flatten()
+                .or_else(|| which_store_path_opt(&task.store_dir, name).ok().flatten());
+            if let Some(sp) = resolved {
+                path.push(format!("{}/bin", task.store_dir.display(&sp)));
+                drv.inputs.insert(SingleDerivedPath::Opaque(sp));
+            }
+            // Unresolved: leave the command as written, so the link fails
+            // with the compiler's own message, which names the linker.
+        }
         drv.env
             .insert(b"PATH"[..].into(), path.join(":").into_bytes().into());
     }
@@ -799,6 +822,20 @@ fn handle_derivation_result(
     }
 }
 
+/// The linker names a command asks for through `-fuse-ld=<name>`.
+///
+/// `bfd` is dropped because it ships beside cc already, and an empty name is
+/// dropped because the flag carries no request. Quotes are stripped: the flag
+/// reaches here as it was written in the build file, which may quote it.
+fn requested_linkers(cmdline: &str) -> impl Iterator<Item = &str> {
+    cmdline.split_whitespace().filter_map(|tok| {
+        let name = tok
+            .trim_matches(|c| c == '"' || c == '\'')
+            .strip_prefix("-fuse-ld=")?;
+        (!name.is_empty() && name != "bfd").then_some(name)
+    })
+}
+
 pub fn which_store_path(store_dir: &StoreDir, binary_name: &str) -> Result<StorePath> {
     which_store_path_opt(store_dir, binary_name)?.ok_or_else(|| {
         anyhow!(
@@ -968,4 +1005,52 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+#[cfg(test)]
+mod fuse_ld_tests {
+    use super::requested_linkers;
+
+    fn names(cmdline: &str) -> Vec<&str> {
+        requested_linkers(cmdline).collect()
+    }
+
+    #[test]
+    fn a_command_with_no_flag_requests_nothing() {
+        assert!(names("g++ -o a.out a.o").is_empty());
+    }
+
+    #[test]
+    fn the_requested_linker_is_the_flag_value() {
+        assert_eq!(names("g++ -fuse-ld=mold -o a.out a.o"), ["mold"]);
+    }
+
+    #[test]
+    fn quotes_are_not_part_of_the_name() {
+        assert_eq!(names("g++ '-fuse-ld=lld' -o a.out"), ["lld"]);
+        assert_eq!(names("g++ \"-fuse-ld=lld\" -o a.out"), ["lld"]);
+    }
+
+    #[test]
+    fn bfd_ships_beside_cc_and_is_not_requested() {
+        assert!(names("g++ -fuse-ld=bfd -o a.out").is_empty());
+    }
+
+    #[test]
+    fn an_empty_value_carries_no_request() {
+        assert!(names("g++ -fuse-ld= -o a.out").is_empty());
+    }
+
+    #[test]
+    fn a_flag_that_merely_contains_the_prefix_is_not_a_request() {
+        assert!(names("g++ -Wl,--no-fuse-ld=mold -o a.out").is_empty());
+    }
+
+    #[test]
+    fn every_requested_linker_is_reported() {
+        assert_eq!(
+            names("g++ -fuse-ld=mold -o a.out && g++ -fuse-ld=lld -o b.out"),
+            ["mold", "lld"]
+        );
+    }
 }
