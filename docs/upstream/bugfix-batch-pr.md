@@ -31,22 +31,55 @@ than saying it in the PR body.
    command not found` before doing any work, having demanded a tool it was
    never going to use. Any target-less graph hits this; hicolor-icon-theme is
    the package that bit us.
-4. **Generated headers materialize through a virtual-path map** (`2f7b8f2`,
-   `dc296f3`). The include scanner reads headers off disk, and a header a
-   generator has not written yet is not there, so the compile task never
-   declared it. Known-generated inputs now map to themselves so resolution
-   succeeds before the file exists; task outputs are excluded from the map,
-   which is what `dc296f3` fixes.
+4. **Generated headers reach a task at THREE points, and the virtual-path map
+   is one of them** (`2f7b8f2`, `dc296f3`, `c45cc88`, `cf75635`). The include
+   scanner reads headers off disk, and a header a generator has not written
+   yet is not there, so the compile task never declared it.
+
+   **This item said "virtual-path map" and stopped there until 2026-08-30,
+   and that description would have sent a PR claiming a fix that does not
+   hold.** A generated file is touched at three separate points and fixing
+   one leaves the next fatal. They are SERIAL - the second is invisible until
+   the first is fixed - which is why one build does not show the size of it:
+
+   1. **resolve** - `canonicalize_cached` must return the path though the file
+      is absent, or the include is never declared. That is the map
+      (`2f7b8f2`), with task outputs excluded from it (`dc296f3`).
+   2. **scan** - the BFS then queues the resolved path and READS it for nested
+      includes. `Failed to read file ...` (`c45cc88`). A file the caller
+      declared virtual now contributes no directives instead of an error.
+   3. **upload** - the declaration reaches `new_opaque_file`, which
+      canonicalizes it to make a store object. `canonicalize ...` (`cf75635`).
+      Skipping it drops nothing, because ninja declares the generated header
+      ORDER-ONLY on the compile edge and `Task::new` reads `ordering_ins()`,
+      so the producing edge already supplies it as a `Built` input.
+
+   Both new fixes are gated on the file being DECLARED virtual, never on the
+   operation failing, and both carry a negative control: a file nobody
+   declared generated still fails loudly, and a declared-virtual file that
+   EXISTS is still read and still uploaded. Swallowing either unconditionally
+   converts a loud failure into a silently under-declared task, which is the
+   failure this crate exists to prevent.
 5. ~~**A trailing colon in `RPATH` survives the round trip** (`f8bb3bd`).~~
    **WITHDRAWN 2026-08-29. It fixes nothing upstream and its premise is
    wrong.** See round 4 below. This PR carries FOUR fixes.
 
 ## What this PR must say about itself, and it is not flattering
 
-**Three of the four have not been verified against the package that named
-them.** hicolor-icon-theme has not been driven through the lazy `cc` path;
-libvmaf and liblapack have not been built with the virtual-path map; no
-package has been linked through the RPATH fix. Each compiles, each has the
+**Two of the four have not been verified against the package that named them,
+and that count improved on 2026-08-30 by driving one.** hicolor-icon-theme has
+still not been driven through the lazy `cc` path, and libvmaf and liblapack
+have still not been built.
+
+Fix 4 now HAS a package behind it, and it is the reason fix 4's description
+above changed. `example-nix` is the first package in this tree carrying a
+generated header on a compile edge - meson writes
+`src/nix/nix.p/unpack-channel.nix.gen.hh` with a CUSTOM_COMMAND and declares it
+order-only on every compile edge in `src/nix`. It failed twice, once per
+unfixed stage, then built: 345 tasks, 446 derivations, 371 s
+(`bench/records/2026-08-30-example-nix.json`). The package that verified the
+class is not the package that named it, which is worth stating plainly rather
+than letting "verified" stand alone. Each compiles, each has the
 reasoning written down, and ONE of the four carries a test: the
 include-directory fix (`4e591a0`), whose regression test was verified failing
 first. The nine tests in `patchelf.rs` cover the withdrawn item and stay in
