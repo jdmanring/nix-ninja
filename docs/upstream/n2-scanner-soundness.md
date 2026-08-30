@@ -50,7 +50,8 @@ for and it is a real ninja input.
 ## What this PR must NOT carry
 
 This fork's `vendor-n2` diverges from its pinned base in five files as of
-2026-08-29:
+2026-08-29. A sixth path, `.cargo-ok`, was a committed cargo vendoring
+artefact and has been removed rather than routed - it belonged in no PR:
 
     Cargo.toml          BOTH: our ${rspfile} liability AND our lint policy
     src/load.rs         the ${rspfile} work - ours, not upstream's problem
@@ -91,10 +92,16 @@ have given third-party code, and it is scaffolding attached to the vendoring
 rather than a standing policy: when item 6 resolves and this tree stops
 vendoring, the block is deleted with it and nothing is left behind.
 
-That is worth telling the nix-ninja maintainer as part of item 6, because it
-is a concrete cost of the vendoring that is easy to miss - it does not appear
-until somebody runs `clippy -D warnings`, and then it looks like the vendored
-crate's fault.
+That is worth telling the nix-ninja maintainer as part of item 6, but not as
+a straight cost, because the ledger runs the other way and the honest version
+is the better story:
+
+`--cap-lints allow` silences `correctness` too. Consuming n2 as a git
+dependency - which is what upstream nix-ninja does - would have hidden
+`uninit_vec` permanently. The vendoring is the only reason anybody saw this
+bug. So the trade is real: vendoring costs a merge liability and 44 lints of
+noise, and it bought a memory-safety fix that the supported consumption path
+structurally cannot surface.
 
 ## Why this one is different from everything else in this directory
 

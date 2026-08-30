@@ -48,10 +48,13 @@ than saying it in the PR body.
 them.** hicolor-icon-theme has not been driven through the lazy `cc` path;
 libvmaf and liblapack have not been built with the virtual-path map; no
 package has been linked through the RPATH fix. Each compiles, each has the
-reasoning written down, and exactly ONE of the five carries a test: the
-include-directory fix, whose regression test was verified failing first
-(counted, not remembered: `git show <commit> | grep -c '^+.*#\[test\]'` is 1
-for `4e591a0` and 0 for the other four). "No symptom
+reasoning written down, and TWO of the five carry tests. The
+include-directory fix (`4e591a0`) has one regression test, verified failing
+first. The RPATH fix now has nine in `patchelf.rs`, a file that had none when
+`f8bb3bd` shipped - which is why `f8bb3bd` repaired one of three spellings of
+its own bug and then introduced a worse one. Recounted against the tip rather
+than restated: this body said ONE for several rounds after it stopped being
+true. "No symptom
 appeared" is the absence of one symptom, not evidence.
 
 Say that in the PR body rather than letting a reviewer find it. The honest
@@ -139,9 +142,10 @@ Round 3 (2026-08-29), after `e285861` landed the repairs round 2 demanded.
   would have been a partial fix presented as a complete one, which is exactly
   the claim this directory exists to stop. Send the two commits together or
   squash them; sending `f8bb3bd` by itself is worse than sending nothing.
-- The test count in the section above is now wrong in our favour and stays
-  wrong until somebody recounts it against the tip. It said one of five
-  carries a test. Two do.
+- The test count in the section above HAS BEEN RECOUNTED and corrected to two.
+  It said one for several rounds after it stopped being true, and a previous
+  round of this audit identified it as false and left it standing, which is a
+  worse failure than not noticing.
 
 Still owed, and none of it fixed by `e285861`:
 
@@ -155,7 +159,10 @@ Status: NOT SENDABLE, and the reason has narrowed twice. Round 1 said missing
 repros; round 2 said fix 5 was defective; round 3 says fix 5 is repaired and
 tested at the parser but unexercised by any link, and the repros are still
 absent. The honest gate now is a single small package built at
-`e2858615d5f74d5a631cef6308a184a03114896e` - which ArtNix is running for its
-own reasons - reporting no RPATH regression. That is one build away rather
+a current tip, reporting no RPATH regression. That gate has since been partly
+met: `example-hello` and `example-dynamic-deps` both build and link here, and
+`nix-ninja-task: Fixed RPATH for hello` appears in the log. No claim is made
+about another tree's activity; when ArtNix's build produces a result it will
+be recorded in that repo's own notes. That is one build away rather
 than one code change away. It remains independent of every other blocker in
 this directory.

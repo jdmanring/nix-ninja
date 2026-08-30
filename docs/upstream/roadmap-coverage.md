@@ -309,13 +309,19 @@ issues open on the forge, read the same day.
 
 DEVELOPED - code exists and was located, not recalled:
 
+Cited by SYMBOL, not by line. The first version of this table gave line
+numbers and three of five were wrong by about a hundred lines - in a section
+whose stated premise is that the code was located rather than remembered. Line
+numbers in a document rot on the next edit to the file; a symbol name does
+not. Where a line is genuinely useful it is given as of a named commit.
+
 | # | Where it lives |
 |---|---|
-| 52 | `task.rs:2795-2806`, and the comment names the issue: `-fuse-ld=` is stripped from the cmdline and the linker resolved into the task's PATH |
+| 52 | `task.rs`, the block introduced by the comment `UPSTREAM #52` - `-fuse-ld=` is stripped from the cmdline and the linker resolved into the task's PATH (`strip_prefix("-fuse-ld=")`) |
 | 20 | `modules/flake/pkgs/mkCMakePackage` and `modules/flake/examples/cmake-hello`, neither of which exists in `upstream/main` |
-| 5 | `build.rs:125-139` distinguishes a phony from a real output when resolving requested targets |
-| 18 | `nix-builder-rpc-client/src/lib.rs:566` and `:1494` stream NARs through `tokio::io::duplex` rather than materialising them |
-| 17 | `task.rs:5888` `depfile_read_back`, the freshness-guarded parse. Step one of the issue, not all of it |
+| 5 | `build.rs`, the target-resolution loop: a header-only CMake project emits `build all: phony`, and only a non-phony target resolves to a real output |
+| 18 | `nix-builder-rpc-client/src/lib.rs`, `add_to_store_nar`'s streaming path via `tokio::io::duplex`. NOTE: the second `duplex` call in that file is inside `a_payload_larger_than_the_buffer_streams_without_deadlock`, a unit test, and the first version of this table cited it as an implementation site |
+| 17 | `task.rs`, `fn depfile_read_back`, the freshness-guarded parse. Step one of the issue, not all of it |
 
 ANSWERED, and there is nothing for us to develop:
 
@@ -354,8 +360,8 @@ The sweep above was written to be uncomfortable and then acted on. What moved:
 
 | # | Was | Now |
 |---|---|---|
-| 4 | nothing | `crates/nix-ninja/benches/generate.rs`, divan, no new dependency. Numbers recorded in the commit: graph load linear at 563 µs/1k and 7.80 ms/10k edges, include scan ~30 µs per TU |
-| 41 | nothing | Answered by measurement rather than opinion. mmap beats the read 1.7x (10.9 µs against 18.9 µs) and the read is 0.26% of the graph load it feeds, so it buys ~0.1% and costs a SIGBUS fallback for page-multiple files |
+| 4 | nothing | `crates/nix-ninja/benches/generate.rs`, divan, no new dependency. Graph load 563 µs at 1k edges and 7.80 ms at 10k - 10x the edges for 13.9x the time, so SUPERLINEAR by about 39%, and an earlier version of this row called it linear, which the numbers contradict. Include scan ~30 µs per TU |
+| 41 | nothing | Answered by measurement, and the FIRST measurement was wrong in the direction that flattered the conclusion. The mmap bench touched two bytes while the read bench moved 400 KB, so 10.9 µs was open+mmap+munmap, not a read. With both XOR-ing every byte: read 21.89 µs, mmap 25.65 µs - mmap is SLOWER. The recommendation is unchanged and better supported: slower, and it still needs a SIGBUS fallback for page-multiple files |
 | 7 | nothing | `bench/e2e.sh` runs one example end to end and records wall clock plus the driver's own counters. Validated on `example-hello` |
 | 14 | nothing | The hardcoded `"x86_64-linux"` in `build.rs` is gone, host-derived with `NIX_NINJA_SYSTEM` overriding. The rest of #14 is hardware, not code |
 | 6 | nothing | Prepared with evidence: snix's daemon implements three store operations against the thirteen this driver needs, none of them a build |
