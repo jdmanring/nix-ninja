@@ -42,16 +42,21 @@
   upstream.
 - [ ] `inputs.nix` cannot build against a nixpkgs carrying both boost/context
   patches
-  - `packaging/dependencies.nix` in the `nix` input overrides `boost.patches`,
-    which REPLACES the list nixpkgs supplies. nixpkgs at the `nixos-26.05` pin
-    supplies two fetched boostorg/context patches whose order is required, and
-    the override drops them.
+  - `packaging/dependencies.nix` in the `nix` input passes `patches` to
+    `pkgs.boost.override`. That argument is PREPENDED to the list nixpkgs
+    builds, not substituted for it: `generic.nix:168` reads `patches = patches
+    ++ ...`. nixpkgs' two fetched boostorg/context patches survive, one
+    position later, and the second's hunk at `fiber_fcontext.hpp:87` no longer
+    applies.
+  - So the remedy is to pass NO `patches` argument, not to pass the right
+    ordered list. nixpkgs already orders them correctly; the override only has
+    to stop displacing them.
   - Reaches us at `modules/flake/overlays.nix:96` and `:100`, which build
     `inputs.nix.packages.<sys>.nix`, and at the NixOS test in
     `modules/nixos/tests/nix-build.nix:87`.
-  - Mechanism read off the pinned sources on 2026-08-29, NOT reproduced by a
-    build here. ArtNix hit the failure itself and worked around it by filtering
-    `patches` out of the `override` in its own package set.
+  - Read off the pinned sources on 2026-08-29 and NOT reproduced by a build
+    here. ArtNix has the failing build and the two drvPaths either side of the
+    fix; this tree has only the mechanism. Those are different claims.
   - It is nix's bug rather than nixpkgs'. If it survives a bump it belongs
     upstream at NixOS/nix, not in `docs/upstream/`, which is for
     pdtpartners/nix-ninja.
