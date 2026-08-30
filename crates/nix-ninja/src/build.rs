@@ -15,6 +15,10 @@ pub struct BuildConfig {
     pub build_dir: PathBuf,
     pub store_dir: StoreDir,
     pub is_output_derivation: bool,
+    /// Ninja's `-j`. 0 means the core count.
+    pub jobs: usize,
+    /// Ninja's `-l`. 0.0 leaves it disabled.
+    pub load_limit: f64,
 }
 
 pub fn build(
@@ -35,6 +39,8 @@ pub fn build(
             build_dir: config.build_dir,
             store_dir: config.store_dir,
             is_output_derivation: config.is_output_derivation,
+            jobs: config.jobs,
+            load_limit: config.load_limit,
         },
     )?;
     runner.read_build_dir(&mut loader.graph.files)?;

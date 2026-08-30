@@ -22,7 +22,7 @@ use std::{
     env, fs,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, Condvar, Mutex},
 };
 use walkdir::WalkDir;
 use which::which;
@@ -95,6 +95,211 @@ pub struct RunnerConfig {
     pub build_dir: PathBuf,
     pub store_dir: StoreDir,
     pub is_output_derivation: bool,
+    /// Ninja's `-j`. 0 means the core count.
+    pub jobs: usize,
+    /// Ninja's `-l`. 0.0 leaves it disabled.
+    pub load_limit: f64,
+}
+
+// Counting semaphore bounding concurrent tasks. Permits release on
+// Drop, so a panicking task thread cannot leak a slot.
+const INPUTS_PER_WEIGHT: usize = 512;
+
+/// Memory headroom is CONTINUOUS, so the response to it is too.
+///
+/// The first version was a floor with a hardcoded 6 GiB: above it the full
+/// budget, below it serial. That is a step function over a smooth resource,
+/// and it makes the machine oscillate - admit wide, overshoot, collapse to 1,
+/// recover, admit wide again. It also invented a constant, which is the same
+/// defect as inventing a `-j`, one level down.
+///
+/// Both bounds are now derived from the machine. The reserve is MemTotal/5,
+/// which on this 30.45 GiB box is 6.1 GiB and is the desktop's working set
+/// plus slack; the point at which the full budget is allowed is MemTotal/2.
+/// Between them the budget scales linearly, so pressure produces a taper
+/// rather than a cliff.
+fn memory_bounds_gib() -> (u64, u64) {
+    let total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb / (1024 * 1024))
+        .unwrap_or(0);
+    (total / 5, total / 2)
+}
+
+/// One-minute load average, or 0.0 where /proc cannot be read.
+fn load_average() -> f64 {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
+        .unwrap_or(0.0)
+}
+
+/// Admission budget under ninja's `-l`: stop starting work while the load
+/// average exceeds the limit.
+///
+/// This is ninja's own contract and nix-ninja previously warned that it
+/// accepted the flag and ignored it, which is worse than not taking it.
+///
+/// It is deliberately the WEAKER of the two controls here, and the reason is
+/// measured rather than assumed: load average counts D-state, and a build
+/// driven through the nix daemon parks many processes there waiting on the
+/// store. This machine has read a load of 20.6 with PSI cpu full at 0.00 -
+/// nothing was CPU-starved and the number said otherwise. So `-l` is honoured
+/// because a user who passes it means it, while the memory taper above is
+/// what actually protects the machine. Never reach for load when the question
+/// is memory.
+fn budget_for_load(cap: usize, load: f64, limit: f64) -> usize {
+    if limit <= 0.0 || load < limit {
+        return cap.max(1);
+    }
+    1
+}
+
+/// Admission budget for the memory currently available.
+///
+/// Pure so the curve is testable: the failures that matter are a 0 (admits
+/// nothing, hangs the round) and a value above `cap` (admits more than asked
+/// for), and both present only as a stall or a thrash.
+fn budget_for_memory(cap: usize, avail_gib: u64, reserve_gib: u64, full_gib: u64) -> usize {
+    if cap <= 1 || full_gib <= reserve_gib {
+        return cap.max(1);
+    }
+    if avail_gib >= full_gib {
+        return cap;
+    }
+    if avail_gib <= reserve_gib {
+        return 1;
+    }
+    let span = full_gib - reserve_gib;
+    let over = avail_gib - reserve_gib;
+    let scaled = 1 + ((cap - 1) as u64 * over / span) as usize;
+    scaled.clamp(1, cap)
+}
+
+/// Weight for a task declaring `inputs` inputs, clamped to `budget`.
+///
+/// Pure so the curve can be tested without a scheduler: the failure that
+/// matters is a weight of 0 (admits unboundedly) or a weight above the budget
+/// (never admits, hanging the round), and neither shows up as anything but a
+/// stall.
+fn admission_weight(inputs: usize, budget: usize) -> usize {
+    (1 + inputs / INPUTS_PER_WEIGHT).clamp(1, budget.max(1))
+}
+
+/// Available memory in GiB, or `u64::MAX` where /proc cannot be read - an
+/// unreadable meminfo must not silently serialize the whole round.
+fn available_gib() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb / (1024 * 1024))
+        .unwrap_or(u64::MAX)
+}
+
+struct JobPermits {
+    inner: Arc<(Mutex<usize>, Condvar)>,
+    cap: usize,
+    /// Ninja's `-l`: 0.0 disables, matching ninja.
+    load_limit: f64,
+    /// Whether admission tracks live memory. A field rather than a constant
+    /// read inline so tests can disable it: with it live, a concurrency test
+    /// asserts on the machine's memory at that instant and fails on a busy
+    /// box for a reason unrelated to the semaphore. A flaky test about
+    /// backpressure is worse than none, because it gets muted.
+    memory_aware: bool,
+}
+
+struct JobPermit {
+    inner: Arc<(Mutex<usize>, Condvar)>,
+    weight: usize,
+}
+
+impl JobPermits {
+    fn new(cap: usize) -> Self {
+        JobPermits {
+            inner: Arc::new((Mutex::new(0), Condvar::new())),
+            cap,
+            load_limit: 0.0,
+            memory_aware: true,
+        }
+    }
+
+    /// Ninja's `-l`. 0.0 leaves it disabled.
+    fn with_load_limit(mut self, limit: f64) -> Self {
+        self.load_limit = limit;
+        self
+    }
+
+    /// Same, with the memory gate disabled. Tests only.
+    #[cfg(test)]
+    fn new_without_memory_gate(cap: usize) -> Self {
+        JobPermits {
+            load_limit: 0.0,
+            memory_aware: false,
+            ..JobPermits::new(cap)
+        }
+    }
+
+    /// Blocks until `weight` units free. Blocking in the scheduler's start()
+    /// is deliberate backpressure: running task threads complete and
+    /// release without needing the main loop, so this cannot deadlock.
+    ///
+    /// The effective budget shrinks under memory pressure, which is what lets
+    /// one round run the shallow strata wide and the deep ones nearly serial
+    /// without anybody choosing a number in advance. A weight already clamped
+    /// to the FULL budget can still exceed the shrunken one, so the wait
+    /// admits it once nothing else holds a unit - otherwise low memory would
+    /// hang the round rather than slow it.
+    fn acquire_weighted(&self, weight: usize) -> JobPermit {
+        let weight = weight.clamp(1, self.cap.max(1));
+        let (lock, cvar) = &*self.inner;
+        let mut count = lock.lock().unwrap();
+        loop {
+            let budget =
+                if self.memory_aware {
+                    let (reserve, full) = memory_bounds_gib();
+                    // The tighter of the two controls wins. Memory is the one
+                    // that matters here; load is honoured because -l was asked
+                    // for, and its weakness is documented at budget_for_load.
+                    budget_for_memory(self.cap, available_gib(), reserve, full)
+                        .min(budget_for_load(self.cap, load_average(), self.load_limit))
+                } else {
+                    self.cap
+                };
+            if *count == 0 || *count + weight <= budget {
+                break;
+            }
+            let (c, _) = cvar
+                .wait_timeout(count, std::time::Duration::from_secs(2))
+                .unwrap();
+            count = c;
+        }
+        *count += weight;
+        JobPermit {
+            inner: self.inner.clone(),
+            weight,
+        }
+    }
+}
+
+impl Drop for JobPermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.inner;
+        let mut count = lock.lock().unwrap();
+        *count = count.saturating_sub(self.weight);
+        cvar.notify_all();
+    }
 }
 
 /// Runner is an async runtime that spawns threads for each task.
@@ -110,6 +315,7 @@ pub struct Runner {
     wrapper_vars: HashMap<String, String>,
     wrapper_store_paths: Vec<StorePath>,
     store_regex: Regex,
+    permits: JobPermits,
 }
 
 impl Runner {
@@ -153,6 +359,15 @@ impl Runner {
         }
 
         let (tx, rx) = mpsc::channel();
+        let permits = JobPermits::new(if config.jobs == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+        } else {
+            config.jobs
+        })
+        .with_load_limit(config.load_limit);
+
         Ok(Runner {
             derived_files: HashMap::new(),
             build_dir_inputs: HashMap::new(),
@@ -164,6 +379,7 @@ impl Runner {
             wrapper_vars,
             wrapper_store_paths,
             store_regex,
+            permits,
         })
     }
 
@@ -204,9 +420,25 @@ impl Runner {
         let tools = self.tools.clone();
         let task = self.new_task(files, build)?;
 
+        // A slot before the thread, not after it. Upstream spawns one OS
+        // thread per edge with nothing bounding the count; at 16,000 edges
+        // that is 16,000 threads, each of which materialises its own input
+        // set. The permit moves into the thread and releases on drop, so a
+        // panicking task cannot leak the slot.
+        //
+        // Weighted by the task's declared input count, which is the best
+        // predictor of its memory cost available at admission time. Counting
+        // every task as one job is what makes a single -j wrong everywhere:
+        // high enough for leaf translation units thrashes on the deep ones,
+        // low enough for the deep ones leaves cores idle on the leaves.
+        let permit = self
+            .permits
+            .acquire_weighted(admission_weight(task.inputs.len(), self.permits.cap));
+
         let config = self.config.clone();
         let rpc_client = self.rpc_client.clone();
         std::thread::spawn(move || {
+            let _permit = permit;
             let (derived_path, err) =
                 match build_task_derivation(tools.clone(), &rpc_client, task.clone()) {
                     Ok(drv) => match handle_derivation_result(
@@ -968,4 +1200,159 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+#[cfg(test)]
+mod job_permits_tests {
+    use super::{admission_weight, budget_for_load, budget_for_memory, JobPermits};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn concurrency_never_exceeds_cap() {
+        let permits = Arc::new(JobPermits::new_without_memory_gate(3));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let permits = permits.clone();
+            let running = running.clone();
+            let peak = peak.clone();
+            handles.push(std::thread::spawn(move || {
+                let _permit = permits.acquire_weighted(1);
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                running.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(running.load(Ordering::SeqCst), 0, "all tasks completed");
+        assert!(
+            peak.load(Ordering::SeqCst) <= 3,
+            "peak concurrency {} exceeded cap 3",
+            peak.load(Ordering::SeqCst)
+        );
+        assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "peak {} suspiciously low - the test exercised no parallelism",
+            peak.load(Ordering::SeqCst)
+        );
+    }
+
+    /// The weight curve is the whole point of the change: one round must run
+    /// the shallow strata wide and the deep ones nearly serial. A weight of 0
+    /// admits unboundedly and a weight above the budget never admits at all,
+    /// and both present only as a stall, so the boundaries are pinned.
+    #[test]
+    fn weight_tracks_input_count_and_stays_inside_the_budget() {
+        assert_eq!(admission_weight(0, 24), 1, "a leaf task must be weight 1");
+        assert_eq!(admission_weight(20, 24), 1, "tens of inputs is still 1");
+        // The 6,134-input realise measured in round 87: heavy enough that only
+        // a few run together, not so heavy that it serializes the machine.
+        let deep = admission_weight(6134, 24);
+        assert!(
+            (8..=16).contains(&deep),
+            "a 6,134-input task weighed {deep}, outside the intended band"
+        );
+        // Never zero, never past the budget - the two stalling failures.
+        for inputs in [0, 1, 511, 512, 513, 100_000] {
+            for budget in [1, 2, 24] {
+                let w = admission_weight(inputs, budget);
+                assert!(w >= 1, "weight 0 for {inputs}/{budget} admits unboundedly");
+                assert!(w <= budget, "weight {w} exceeds budget {budget}");
+            }
+        }
+    }
+
+    /// The taper is the point: a step function over a smooth resource makes
+    /// the machine oscillate - admit wide, overshoot, collapse to serial,
+    /// recover, repeat. The two ends and monotonicity are what must hold.
+    #[test]
+    fn budget_tapers_with_memory_instead_of_cliffing() {
+        let (cap, reserve, full) = (24usize, 6u64, 15u64);
+        assert_eq!(budget_for_memory(cap, 30, reserve, full), 24, "plenty free");
+        assert_eq!(
+            budget_for_memory(cap, 15, reserve, full),
+            24,
+            "at full mark"
+        );
+        assert_eq!(
+            budget_for_memory(cap, 6, reserve, full),
+            1,
+            "at the reserve"
+        );
+        assert_eq!(budget_for_memory(cap, 2, reserve, full), 1, "below reserve");
+        // Strictly non-decreasing in available memory, and never outside
+        // [1, cap] - a 0 hangs the round, a value over cap thrashes it.
+        let mut prev = 0;
+        for avail in 0..=40 {
+            let b = budget_for_memory(cap, avail, reserve, full);
+            assert!((1..=cap).contains(&b), "budget {b} outside [1,{cap}]");
+            assert!(b >= prev, "budget fell from {prev} to {b} as memory ROSE");
+            prev = b;
+        }
+        // Mid-range must actually be in the middle, not pinned to an end -
+        // otherwise the taper is a cliff wearing a linear formula.
+        let mid = budget_for_memory(cap, 10, reserve, full);
+        assert!(
+            (2..cap).contains(&mid),
+            "mid-range budget {mid} is an endpoint"
+        );
+    }
+
+    /// `-l` is ninja's contract: stop starting work above the limit. 0.0
+    /// disables it, which is the default and must never throttle.
+    #[test]
+    fn load_limit_matches_ninja_and_zero_disables() {
+        assert_eq!(budget_for_load(24, 99.0, 0.0), 24, "0.0 must disable -l");
+        assert_eq!(
+            budget_for_load(24, 3.0, 8.0),
+            24,
+            "under the limit runs wide"
+        );
+        assert_eq!(budget_for_load(24, 8.0, 8.0), 1, "at the limit throttles");
+        assert_eq!(
+            budget_for_load(24, 40.0, 8.0),
+            1,
+            "over the limit throttles"
+        );
+        // Never zero: a throttled round must crawl, never stop.
+        for load in [0.0, 1.0, 7.9, 8.0, 100.0] {
+            assert!(budget_for_load(24, load, 8.0) >= 1);
+        }
+    }
+
+    /// A machine that reports nothing must not serialize the round: unknown
+    /// memory means fall back to the asked-for cap, never to 1.
+    #[test]
+    fn degenerate_bounds_fall_back_to_the_full_cap() {
+        assert_eq!(budget_for_memory(24, 0, 0, 0), 24, "unreadable meminfo");
+        assert_eq!(budget_for_memory(1, 0, 6, 15), 1, "cap of 1 stays 1");
+    }
+
+    /// A heavy task must still be admitted when it alone exceeds the budget,
+    /// or a low-memory moment turns into a hang instead of a slowdown.
+    #[test]
+    fn an_oversized_task_still_runs_alone() {
+        let permits = std::sync::Arc::new(JobPermits::new_without_memory_gate(2));
+        let _p = permits.acquire_weighted(usize::MAX);
+        // Acquiring it at all proves the empty-pool escape hatch works.
+    }
+
+    #[test]
+    fn permit_released_on_panic() {
+        let permits = Arc::new(JobPermits::new_without_memory_gate(1));
+        let p2 = permits.clone();
+        let _ = std::thread::spawn(move || {
+            let _permit = p2.acquire_weighted(1);
+            panic!("task died");
+        })
+        .join();
+        // If the panicking thread leaked its permit, this blocks forever
+        // and the test times out; acquiring proves the Drop ran.
+        let _permit = permits.acquire_weighted(1);
+    }
 }

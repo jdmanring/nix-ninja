@@ -33,7 +33,7 @@ pub struct Cli {
     #[arg(short = 't')]
     pub tool: Option<String>,
 
-    /// Run N jobs in parallel (0 means infinity)
+    /// Run N jobs in parallel (0 means the core count)
     #[arg(short = 'j', default_value = "0", hide = true)]
     pub jobs: usize,
 
@@ -132,6 +132,8 @@ fn build(cli: &Cli, build_dir: &Path, rpc_client: &Arc<BuilderRpcClient>) -> Res
         build_dir: build_dir.to_path_buf(),
         store_dir: cli.store_dir.clone(),
         is_output_derivation: cli.is_output_derivation,
+        jobs: cli.jobs,
+        load_limit: cli.load_average,
     };
 
     build::build(
