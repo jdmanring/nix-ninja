@@ -66,14 +66,23 @@ fn fix_rpath(store_dir: &Path, elf_path: &Path) -> Result<()> {
 
 /// Split a raw RPATH on ':', PRESERVING empty entries.
 ///
-/// An empty entry means "the current directory" and it is meaningful: the
-/// build already decided to keep it, and dropping it hands back a shorter
-/// search path than we were given. The old splitter filtered every empty
-/// entry out, and f8bb3bd compensated by re-appending one when the raw string
-/// ended in a colon - which repairs `a:b:` and silently keeps losing the
-/// element in `:a:b` and `a::b`. Preserving them here fixes all three
-/// spellings in one place, and lets the rebuild in compute_new_rpath put each
-/// one back where it was rather than at the end.
+/// Faithful on the READ side so callers can see what the binary actually
+/// carries. `compute_new_rpath` then drops empties when it rebuilds, and that
+/// asymmetry is the whole point.
+///
+/// An empty element in `DT_RPATH`/`DT_RUNPATH` means the current directory,
+/// exactly as it does in `PATH`. In a build tree that is a decision the build
+/// made about its own layout. In a STORE OUTPUT it is a search of whatever
+/// directory the user happens to be standing in when they run the binary,
+/// ahead of the store paths we just resolved - nondeterministic, and a route
+/// to loading a library nobody intended.
+///
+/// This function exists to rewrite build-time paths into store paths, so a
+/// build-directory decision is precisely the thing that must not survive it.
+/// `f8bb3bd` argued the opposite - that the trailing empty entry was
+/// "meaningful" and should be re-appended - and that reasoning was wrong in a
+/// way that put a cwd search into every patched output. The original splitter
+/// dropped every empty entry, and on the write side it was right to.
 fn parse_rpath(raw: &str) -> Vec<String> {
     if raw.is_empty() {
         // "".split(':') yields one empty entry, which would invent an RPATH
@@ -101,6 +110,23 @@ fn get_raw_rpath(elf_path: &Path) -> Result<String> {
         .to_string())
 }
 
+/// The entries of an existing RPATH that survive into the rewritten one.
+///
+/// Empty entries go, because an empty element means the current directory and
+/// this function's output is written into a store binary - see parse_rpath.
+/// `$ORIGIN` entries go because the rewrite resolves them to store paths.
+///
+/// Pulled out of compute_new_rpath so the rule is testable: that function
+/// shells out to patchelf against a real ELF, so nothing asserted on its
+/// output, which is exactly where the behaviour changed twice this week.
+fn retained_entries(current_rpath: &[String]) -> Vec<String> {
+    current_rpath
+        .iter()
+        .filter(|p| !p.is_empty() && !p.contains("$ORIGIN"))
+        .cloned()
+        .collect()
+}
+
 fn compute_new_rpath(
     store_dir: &Path,
     elf_path: &Path,
@@ -110,16 +136,8 @@ fn compute_new_rpath(
     let resolved_rpath = resolve_rpath(current_rpath, elf_path)?;
 
     // Get needed libraries and collect directories that need to be added to RPATH
-    let mut new_rpath = Vec::new();
     let mut path_added = false;
-
-    // Keep existing non-$ORIGIN paths, empty entries included and in place.
-    for path in current_rpath {
-        if path.contains("$ORIGIN") {
-            continue;
-        }
-        new_rpath.push(path.clone());
-    }
+    let mut new_rpath = retained_entries(current_rpath);
 
     let needed_libs = get_needed_libs(elf_path)?;
 
@@ -230,7 +248,7 @@ fn apply_rpath(elf_path: &Path, new_paths: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rpath;
+    use super::{parse_rpath, retained_entries};
 
     // This file had no tests, which is why f8bb3bd shipped fixing one of the
     // three spellings of its own bug. These are the three.
@@ -258,6 +276,31 @@ mod tests {
     #[test]
     fn a_lone_colon_is_two_empty_entries() {
         assert_eq!(parse_rpath(":"), vec!["", ""]);
+    }
+
+    // The WRITE side. parse_rpath keeps empty entries so a caller can see
+    // them; these assert they never reach a patched binary.
+
+    #[test]
+    fn an_empty_entry_never_survives_into_a_store_binary() {
+        // ":/a" means "search the current directory, then /a". Preserving
+        // that in a store output is a cwd search in somebody else's process.
+        let parsed = parse_rpath(":/a:/b");
+        assert_eq!(parsed, vec!["", "/a", "/b"], "read side stays faithful");
+        assert_eq!(retained_entries(&parsed), vec!["/a", "/b"]);
+    }
+
+    #[test]
+    fn trailing_and_interior_empties_go_too() {
+        assert_eq!(retained_entries(&parse_rpath("/a:/b:")), vec!["/a", "/b"]);
+        assert_eq!(retained_entries(&parse_rpath("/a::/b")), vec!["/a", "/b"]);
+        assert!(retained_entries(&parse_rpath(":")).is_empty());
+    }
+
+    #[test]
+    fn origin_entries_are_dropped_because_the_rewrite_resolves_them() {
+        let parsed = parse_rpath("$ORIGIN/../lib:/nix/store/a/lib");
+        assert_eq!(retained_entries(&parsed), vec!["/nix/store/a/lib"]);
     }
 
     #[test]

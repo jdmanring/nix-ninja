@@ -10,6 +10,8 @@ out/
 # n2's build database, written wherever nix-ninja runs. Committed by
 # accident in d0e7960 while running the #4 benchmarks.
 .n2_db
+# cargo vendoring marker, committed with the vendored n2 tree
+.cargo-ok
 
 # Aider
 .aider*

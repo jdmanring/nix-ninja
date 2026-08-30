@@ -62,13 +62,14 @@ crlf = []
 # and complexity lints in code we did not write, which made `nix flake check`
 # permanently red and buried anything real underneath.
 #
-# Style and complexity are allowed here; correctness, suspicious and perf are
-# NOT, because those are the categories that catch a defect rather than a
-# preference. That distinction is load-bearing rather than tidy: with `all`
-# allowed, the `clippy::uninit_vec` in `read_file_with_nul` - a genuine
-# undefined-behaviour bug, since `set_len` on reserved-but-uninitialised
-# memory handed uninit bytes to safe code - would have been silenced instead
-# of found and fixed.
+# Style, complexity, perf and suspicious are allowed here. `correctness` is
+# NOT, and it is the only one enforced - an earlier version of this comment
+# claimed perf and suspicious were too, while the table below allowed them.
+#
+# `correctness` is where `clippy::uninit_vec` lives, and that lint found real
+# undefined behaviour in `read_file_with_nul`: `set_len` on
+# reserved-but-uninitialised memory handed uninit bytes to safe code. Allowing
+# `all` would have silenced it.
 [lints.clippy]
 style = { level = "allow", priority = -1 }
 complexity = { level = "allow", priority = -1 }

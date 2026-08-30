@@ -107,17 +107,27 @@ fn page_size() -> usize {
 /// mmap a file and hand back a slice INCLUDING the zero byte past EOF.
 /// Returns None when the length is a page multiple, which is the case that
 /// has no free NUL and must fall back to a read.
-unsafe fn mmap_with_nul(path: &Path) -> Option<(*mut libc::c_void, usize, usize)> {
+unsafe fn mmap_with_nul(path: &Path) -> Result<(*mut libc::c_void, usize, usize), &'static str> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     let fd = libc::open(c.as_ptr(), libc::O_RDONLY);
     if fd < 0 {
-        return None;
+        return Err("open failed");
     }
-    let len = fs::metadata(path).unwrap().len() as usize;
+    // metadata() on the PATH would open a second time and leak nothing, but
+    // it also races the open; and a failure here used to be reported to the
+    // caller as "page multiple", which sent the reader to regenerate a
+    // fixture that was fine. Three causes, three messages.
+    let len = match fs::metadata(path) {
+        Ok(m) => m.len() as usize,
+        Err(_) => {
+            libc::close(fd);
+            return Err("stat failed");
+        }
+    };
     if len.is_multiple_of(page_size()) {
         libc::close(fd);
-        return None; // no free NUL past EOF
+        return Err("length is a page multiple: no free NUL past EOF");
     }
     let map_len = len + 1;
     let p = libc::mmap(
@@ -130,9 +140,9 @@ unsafe fn mmap_with_nul(path: &Path) -> Option<(*mut libc::c_void, usize, usize)
     );
     libc::close(fd);
     if p == libc::MAP_FAILED {
-        return None;
+        return Err("mmap failed");
     }
-    Some((p, len, map_len))
+    Ok((p, len, map_len))
 }
 
 #[divan::bench]
@@ -144,7 +154,13 @@ fn read_10k_ninja_to_buffer_with_nul() {
     let mut f = fs::File::open(&p).unwrap();
     std::io::Read::read_to_end(&mut f, &mut bytes).unwrap();
     bytes.push(0);
-    divan::black_box(&bytes);
+    // Same reduction as the mmap bench, so the two differ only in how the
+    // bytes arrive.
+    let mut acc = 0u8;
+    for b in bytes[..bytes.len() - 1].iter() {
+        acc ^= *b;
+    }
+    divan::black_box(acc);
 }
 
 #[divan::bench]
@@ -152,13 +168,22 @@ fn mmap_10k_ninja_with_nul_past_eof() {
     let p = fixture().join("build-10000.ninja");
     unsafe {
         match mmap_with_nul(&p) {
-            Some((ptr, len, map_len)) => {
+            Ok((ptr, len, map_len)) => {
                 let s = std::slice::from_raw_parts(ptr as *const u8, len + 1);
                 assert_eq!(s[len], 0, "byte past EOF must be the free NUL");
-                divan::black_box(s[0]);
+                // TOUCH EVERY BYTE. The first version of this bench read
+                // s[0] and s[len] and nothing else, so it faulted in two
+                // pages and timed open+mmap+munmap while the read bench it
+                // was compared against moved 400 KB. The comparison was
+                // meaningless and its number reached a document.
+                let mut acc = 0u8;
+                for b in s[..len].iter() {
+                    acc ^= *b;
+                }
+                divan::black_box(acc);
                 libc::munmap(ptr, map_len);
             }
-            None => panic!("fixture is a page multiple; regenerate it"),
+            Err(why) => panic!("mmap_with_nul: {why}"),
         }
     }
 }

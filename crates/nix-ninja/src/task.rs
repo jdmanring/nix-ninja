@@ -2893,6 +2893,12 @@ fn report_progress(rpc_client: &Arc<BuilderRpcClient>, n_tasks: u64) {
     // already being grepped and parsed elsewhere and redefining what it means
     // would break those readers silently.
     //
+    // STDERR, not stdout. `nix-ninja -t drv` mimics `nix derivation show` and
+    // prints a JSON object on stdout (cli.rs), so a stats line on stdout put
+    // a non-JSON line ahead of it and broke `nix-ninja -t drv | jq`. It costs
+    // the benchmark nothing: nix folds a derivation's fd 1 and fd 2 into the
+    // same build log, which is where bench/e2e.sh reads it from.
+    //
     // UNCONDITIONAL, and it was briefly gated on NIX_NINJA_STATS_JSON, which
     // could not work: this driver runs INSIDE a derivation, and the sandbox
     // does not carry an environment variable exported by whoever invoked
@@ -2900,7 +2906,7 @@ fn report_progress(rpc_client: &Arc<BuilderRpcClient>, n_tasks: u64) {
     // is the only reason the mistake was caught rather than shipped as a
     // knob nobody could turn. One line per run is a price worth not making
     // configurable.
-    println!(
+    eprintln!(
         "nix-ninja-stats {{\"tasks\":{},\"resolve_ms\":{},\"dyn_ms\":{},\
          \"dyn_realise_ms\":{},\"dyn_discover_ms\":{},\"dyn_adddrv_ms\":{},\
          \"dyn_adddrv_calls\":{},\"plain_adddrv_ms\":{},\"plain_adddrv_calls\":{},\

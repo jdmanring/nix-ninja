@@ -176,6 +176,22 @@ pub fn read_file_with_nul(path: &Path) -> std::io::Result<Vec<u8>> {
     // `size` bytes, so a file that grew between the metadata call and the read
     // was silently truncated; read_to_end takes whatever is there.
     file.read_to_end(&mut bytes)?;
+    // read_exact used to catch a file that SHRANK between the metadata call
+    // and the read - it returned UnexpectedEof and the load failed loudly.
+    // read_to_end returns the short content and Ok, and a truncated
+    // build.ninja usually still parses, as a smaller valid graph: fewer
+    // targets built and no error anywhere. Keeping the check keeps the loud
+    // failure while the grow case stays fixed.
+    if bytes.len() < size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "{}: shrank during read ({size} bytes at stat, {} read)",
+                path.display(),
+                bytes.len()
+            ),
+        ));
+    }
     bytes.push(0);
     Ok(bytes)
 }
@@ -186,8 +202,10 @@ mod tests {
 
     #[test]
     fn read_file_with_nul_appends_nul_and_keeps_contents() {
-        let dir = std::env::temp_dir().join(format!("n2-scanner-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // tempfile is already a dev-dependency and tests/e2e/mod.rs already
+        // uses it; hand-rolling a temp dir here would be reinventing it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path();
         let path = dir.join("input.ninja");
         std::fs::write(&path, b"rule cc\n  command = cc\n").unwrap();
 
@@ -201,7 +219,10 @@ mod tests {
         std::fs::write(&empty, b"").unwrap();
         assert_eq!(read_file_with_nul(&empty).unwrap(), vec![0u8]);
 
-        std::fs::remove_dir_all(&dir).ok();
+        // The single-allocation property this function exists for, measured
+        // rather than asserted in prose: capacity is still exactly size + 1.
+        let again = read_file_with_nul(&path).unwrap();
+        assert_eq!(again.capacity(), again.len());
     }
 
     #[test]

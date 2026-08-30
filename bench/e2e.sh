@@ -45,9 +45,17 @@ fi
 
 # Was the target already built? Read BEFORE building, or the answer is
 # always yes.
-prebuilt=false
-if nix path-info --extra-experimental-features "$FEATURES" "$drv" >/dev/null 2>&1; then
+# Three-valued on purpose. Any path-info failure - daemon down, feature
+# rejected, malformed path - used to be recorded as `false`, which is the
+# direction that reads as "more work was done" and is exactly the wrong way
+# for an unknown to fail.
+prebuilt=unknown
+pi_err=$(nix path-info --extra-experimental-features "$FEATURES" "$drv" 2>&1 >/dev/null)
+pi_rc=$?
+if [ "$pi_rc" -eq 0 ]; then
   prebuilt=true
+elif printf '%s' "$pi_err" | grep -qi 'does not exist\|is not valid\|no such'; then
+  prebuilt=false
 fi
 
 # The driver emits `nix-ninja-stats` unconditionally - it runs inside a
@@ -55,7 +63,7 @@ fi
 # would reach it.
 start=$(date +%s.%N)
 nix build --extra-experimental-features "$FEATURES" --no-link --print-build-logs \
-  ".#${TARGET}" >/dev/null 2>"$OUT.log"
+  ".#${TARGET}" >"$OUT.log" 2>&1
 rc=$?
 end=$(date +%s.%N)
 wall=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.3f", b-a}')
@@ -64,8 +72,24 @@ wall=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.3f", b-a}')
 # take the last, which is the completed one.
 # How much was actually built, as opposed to substituted or already present.
 # `grep -c` prints 0 and exits 1, so take the count and discard the status.
-built=$(grep -c "^building '" "$OUT.log" 2>/dev/null) || true
-built=${built:-0}
+# null, not 0, when the log is missing or unreadable: "nothing was built" and
+# "the count could not be taken" are different facts and 0 asserts the first.
+# The anchor is checked against real logs - nix does not prefix these lines.
+if [ -r "$OUT.log" ]; then
+  built=$(grep -c "^building '" "$OUT.log" 2>/dev/null) || true
+  built=${built:-0}
+else
+  built=null
+fi
+
+# A FAILED BUILD MUST NOT LOOK LIKE A RESULT. wall_seconds and
+# derivations_built are the fields a comparison reads, and a run that died in
+# four seconds has both. Divert the record so no later sweep of *.json can
+# average a fast failure into a fast success.
+if [ "$rc" -ne 0 ]; then
+  OUT="$OUT.failed"
+  echo "build failed (rc=$rc); record written to $OUT" >&2
+fi
 
 resolved=$(grep -h 'nix-ninja: resolved' "$OUT.log" 2>/dev/null | tail -1)
 stats=$(grep -ho 'nix-ninja-stats {.*}' "$OUT.log" 2>/dev/null | tail -1)
@@ -80,8 +104,8 @@ rec = {
     "target": target,
     "wall_seconds": float(wall),
     "exit_code": int(rc),
-    "target_prebuilt": prebuilt == "true",
-    "derivations_built": int(built),
+    "target_prebuilt": {"true": True, "false": False}.get(prebuilt),
+    "derivations_built": None if built == "null" else int(built),
     "drv": drv,
     "driver_line": resolved or None,
 }
@@ -110,7 +134,16 @@ if resolved:
         m = re.search(pat, resolved)
         if m:
             rec[key] = int(m.group(1))
-json.dump(rec, open(out, "w"), indent=2, sort_keys=True)
+with open(out, "w") as fh:
+    json.dump(rec, fh, indent=2, sort_keys=True)
 print(json.dumps(rec, indent=2, sort_keys=True))
 PY
+# The python above writes the record. If IT failed, the record does not
+# exist and the caller must not read our exit status as "record written".
+py_rc=$?
+if [ "$py_rc" -ne 0 ]; then
+  echo "failed to write record to $OUT (python rc=$py_rc)" >&2
+  exit 3
+fi
+
 exit $rc

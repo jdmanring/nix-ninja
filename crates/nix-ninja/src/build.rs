@@ -32,17 +32,29 @@ pub struct BuildConfig {
 /// `docs/todo.md` for what remains, which is mostly testing this on real
 /// hardware.
 ///
-/// `NIX_NINJA_SYSTEM` overrides it, because cross and remote-builder setups
-/// legitimately want a platform that is not the host's, and because it gives
-/// anyone reproducing #14 a lever that needs no aarch64 machine.
+/// `NIX_NINJA_SYSTEM` overrides it, for cross and remote-builder setups that
+/// legitimately want a platform that is not the host's.
+///
+/// Where that override IS and IS NOT reachable, because the first draft of
+/// this comment claimed more than it had: it works for a bare `nix-ninja`
+/// invocation, which is local mode. It does NOT reach the driver running
+/// inside a derivation - the sandbox does not carry the invoker's
+/// environment, and neither `mkMesonPackage` nor `mkCMakePackage` plumbs it
+/// through. Reproducing #14's emission path under the packaged helpers needs
+/// those helpers to pass it, which they do not yet.
 ///
 /// Deliberately NOT a general Rust-triple-to-nix-system mapping: those two
 /// namings agree for linux and disagree for darwin (`macos` versus `darwin`),
 /// and this tree is linux-only today. A wrong guess for a platform nobody has
 /// tested is worse than an error saying so.
 fn host_nix_system() -> String {
+    // Filtered on emptiness: `NIX_NINJA_SYSTEM=` is Ok(""), and an empty
+    // string here becomes an empty `drv.platform` in every emitted
+    // derivation.
     if let Ok(s) = std::env::var("NIX_NINJA_SYSTEM") {
-        return s;
+        if !s.is_empty() {
+            return s;
+        }
     }
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
@@ -583,17 +595,31 @@ mod system_tests {
     /// gets stamped into `drv.platform` on the machine everything was built
     /// on. `host_nix_system()` replaced a literal, and a replacement for a
     /// literal is only free if it returns the same string.
+    // Both tests mutate ONE process-wide variable, and cargo runs them as
+    // threads in one process. Without this lock they interleave and the
+    // platform guard reads "aarch64-linux" and fails - intermittently, which
+    // is the worst outcome for a test whose entire job is to fail loudly if
+    // the emitted platform ever moves. Under nextest each test gets its own
+    // process and it passes, so `nix flake check` would stay green while
+    // `cargo test` flaked. c_include_parser's SCAN_TEST_LOCK does the same.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn unchanged_on_the_platform_this_tree_is_built_on() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("NIX_NINJA_SYSTEM");
         assert_eq!(host_nix_system(), "x86_64-linux");
     }
 
     #[test]
-    fn the_override_wins_so_14_is_reproducible_without_the_hardware() {
+    fn the_override_wins_but_only_outside_a_derivation() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("NIX_NINJA_SYSTEM", "aarch64-linux");
         assert_eq!(host_nix_system(), "aarch64-linux");
+        // Set but empty must not become an empty drv.platform.
+        std::env::set_var("NIX_NINJA_SYSTEM", "");
+        assert_ne!(host_nix_system(), "");
         std::env::remove_var("NIX_NINJA_SYSTEM");
     }
 }
