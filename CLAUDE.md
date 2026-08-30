@@ -152,6 +152,77 @@ as done while never having been deployed at all.
   warm cache. Compiling to confirm something a `drvPath` already answered is
   not real work.
 
+## How the pieces fit
+
+Two binaries, and the split between them is the same split as the cost model
+above.
+
+- **`crates/nix-ninja`** is the DRIVER. It parses `build.ninja` through
+  `vendor-n2` (a vendored fork of evmar's n2, consumed as a library), and
+  `task.rs` turns every edge into a derivation, which is why that file is what
+  the emission test is really about. The build goes through
+  `nix-builder-rpc-client`, not a `nix build` subprocess; `NIX_NINJA_DRV`
+  (`cli.rs`, `is_output_derivation`) only decides what happens to the result:
+  submit the one output derivation back to the daemon when running inside a
+  derivation, or symlink the built paths into the build directory
+  (`local.rs`). `dyndep.rs` and `resolve_cache.rs` handle ninja's dyndep and
+  the resolution memo.
+- **`nix-ninja -t dynamic-task`** (`subtool/dynamic_task.rs`) is the second
+  half, and it is not something you invoke: `task.rs` emits derivations whose
+  builder IS this subtool, so each task re-reads its own drv inside the
+  sandbox, discovers dependencies, and submits the updated derivation. That
+  is where per-TU dynamic dependencies actually happen.
+- **`crates/nix-ninja-task`** is the BUILDER of every emitted derivation. It
+  runs inside each per-TU derivation, materialises inputs, runs the command,
+  and patches rpaths (`patchelf.rs`) because shared libraries built by sibling
+  dynamic derivations are not on any normal search path.
+- **`crates/deps-infer`** scans C/C++ sources for includes so a compile task
+  can declare its real inputs. Failure classes 3 and 4 in the list above both
+  live here in substance: it reads headers off disk, and generated headers are
+  not there yet.
+- **`crates/nix-builder-rpc-client`** speaks `builder-rpc-v0` to the daemon,
+  which is how a derivation adds derivations to the store and submits its own
+  output. This is the crate the daemon precondition below is about.
+
+Packages enter through `modules/flake/pkgs/mkMesonPackage` and `mkCMakePackage`:
+they set `NINJA=nix-ninja`, `NIX_NINJA_DRV=true`, ask for the
+`builder-rpc-v0` system feature, and expose the real result as
+`passthru.target = builtins.outputOf ninjaDrv.outPath <target>`. That is why
+`packages` holds only the two binaries while every `example-*` lives under
+`legacyPackages`, gated on `builtins ? outputOf`. ArtNix consumes the same two
+helpers, so an edit to either is emission-side.
+
+`modules/flake/examples/` is the emission-side test bed the cost model asks
+you to use: `example-hello` for the smallest possible emission diff,
+`example-header` and `example-dynamic-deps` for dependency inference,
+`example-nix` for a real build.
+
+## Commands
+
+    cargo check -p nix-ninja          # seconds against the warm cache
+    cargo check -p nix-ninja-task
+    cargo test -p nix-ninja           # 80 unit tests, all inline
+    cargo test -p nix-ninja --test include_dir_shadow   # one test FILE
+    cargo test -p deps-infer c_include_parser::         # one module's tests
+    nix flake check                   # clippy -D warnings, rustfmt, taplo,
+                                      # cargo-audit, cargo-deny, nextest
+    nix develop                       # meson, taplo, just, agg, gnumake
+
+The devShell ships `just`, but there is no justfile in the tree.
+
+**Before `cargo test`, read the fileset test above.** Tests under
+`crates/deps-infer`, `crates/nix-ninja-task` or `vendor-n2` are inside the
+task binary's allowlist and re-key it; the same test reaching the same `pub`
+function from `crates/nix-ninja` is free. This is not hypothetical, it is the
+2026-08-24 incident.
+
+Driving a single example end to end needs the experimental features on the
+invocation, not a machine-wide edit:
+
+    nix build --extra-experimental-features \
+      'nix-command flakes dynamic-derivations ca-derivations recursive-nix' \
+      .#example-hello
+
 ## Preconditions on the workstation
 
 - The daemon must implement `builder-rpc-v0`, which the dynamic task requires
@@ -173,6 +244,8 @@ as done while never having been deployed at all.
 | the daemon wedge: incident and failed reproduction | `docs/daemon-wedge.md` |
 | what is staged for upstream, and its plan | `docs/upstream/` |
 | incidents, per date | `docs/incidents/` |
+| ArtNix's thirteen opt-outs, in six families | `docs/opt-out-triage.md` |
+| dynamic derivations, from the beginning | `docs/dynamic-derivations.md` |
 | what is next | `docs/todo.md` |
 | commit and prose conventions | `docs/conventions.md` |
 
