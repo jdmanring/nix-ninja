@@ -85,6 +85,47 @@ Round 1 (2026-08-29), adversarial read of this draft against ground rule 3:
   distribution build of hundreds of packages. Building minimal repros for 3
   and 5 would strengthen the PR and has not been done.
 
-Status: NOT SENDABLE. One round, and the missing repros above are the thing
-that would change that. It is otherwise independent of every other blocker in
-this directory.
+Round 2 (2026-08-29), begun as an attempt to write the missing repro for fix
+5 and turned into a read of the fix itself. Three findings, none of which the
+first round looked for, because round 1 audited the DRAFT and not the CODE it
+describes:
+
+- **Blocking: `f8bb3bd` runs `patchelf --print-rpath` twice per ELF file.**
+  `fix_rpath` calls `get_raw_rpath` at `patchelf.rs:54`, and the
+  `compute_new_rpath` it then calls reaches `get_rpath` at `:82`, which spawns
+  the same subprocess against the same file. The two differ only in `.trim()`
+  versus `.trim_end_matches('\n')`. This file runs over every output of every
+  task derivation, so the duplicate is a per-output cost across the whole
+  distribution, and a maintainer reading the diff will see it before we point
+  at anything else in the PR. The repair is to read the raw string once and
+  pass it down.
+- **Blocking, and the same defect class the fix was written for:
+  `get_rpath` drops EVERY empty entry, not only the trailing one.**
+  `:143` filters on `!p.is_empty()`, so a leading colon and a doubled interior
+  colon lose their empty element exactly as the trailing one did.
+  `f8bb3bd` restores one position and leaves the others, which means the
+  commit message's claim about being "faithful about a property it was never
+  asked to change" is true of one spelling and false of two.
+- **`crates/nix-ninja-task/src/patchelf.rs` contains zero tests**, which is
+  why both of the above survived. The count in the section above is right and
+  now reads differently: the one test in this batch is not merely the only
+  test, it is in a different crate from the fix that most needs one.
+
+The repro this round set out to write is also priced now, and it is not free.
+Every route to testing the RPATH logic touches `crates/nix-ninja-task`, which
+is inside `nix-ninja-task`'s fileset allowlist, so it re-keys the task binary
+and every banked per-TU output with it. `compute_new_rpath` and `get_rpath`
+are both private, so the trick that made the 2026-08-24 regression test free
+- reach the same `pub` function from `crates/nix-ninja` - is not available
+without an edit that itself re-keys.
+
+That is not an argument for skipping the test. It is an argument for the rule
+at the top of `CLAUDE.md`: the two repairs above and the test that would have
+caught them are one batch, landed together, paying the re-key once. Landing
+the test alone would pay it and still ship the duplicate subprocess.
+
+Status: NOT SENDABLE, and the reason has changed. Round 1 said the blocker was
+missing repros; round 2 says fix 5 has two defects of its own and the batch
+needs a re-keying change before it is honest to send. Fixes 1 through 4 are
+untouched by this. It remains independent of every other blocker in this
+directory.
