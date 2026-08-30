@@ -1,0 +1,7 @@
+Timer precision: 10 ns
+generate                              fastest       │ slowest       │ median        │ mean          │ samples │ iters
+├─ include_scan_64_tus_shared_header  1.69 ms       │ 4.074 ms      │ 1.797 ms      │ 1.828 ms      │ 100     │ 100
+├─ mmap_10k_ninja_with_nul_past_eof   24.7 µs       │ 68.53 µs      │ 24.92 µs      │ 26.03 µs      │ 100     │ 100
+├─ ninja_graph_load_1k                493.4 µs      │ 891.6 µs      │ 507.4 µs      │ 515.2 µs      │ 100     │ 100
+├─ ninja_graph_load_10k               5.194 ms      │ 7.63 ms       │ 6.533 ms      │ 6.5 ms        │ 100     │ 100
+╰─ read_10k_ninja_to_buffer_with_nul  22.81 µs      │ 33.92 µs      │ 23.46 µs      │ 23.95 µs      │ 100     │ 100

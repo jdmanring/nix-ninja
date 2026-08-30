@@ -26,33 +26,34 @@
   - Left undone deliberately, both cosmetic: `DerivedFile` has no `name`
     field, and the symlink logic is a free function rather than a method on
     `DerivedFile`. Neither changes behaviour and the issue asks for neither.
-  - This entry stayed unchecked long after the work landed and misled the
-    2026-08-30 milestone sweep into reporting #5 as partial.
-- [x] Depfile support (upstream #17) - all three parts, 2026-08-30
-  - [x] If depfile defined, add that as an additional output (dd73947, gated
-    on `deps = gcc`: a declared output the command does not produce fails the
-    task, and `depfile` alone is not a promise that anything writes one)
-  - [x] Create virtual target of all depfiles to install locally into builddir
-    (c60480c). Built as direct materialization rather than a virtual phony
-    target: the driver records each accepted depfile output and local mode
-    symlinks them in after the targets. A phony would buy a name for the set
-    and nothing else, since nothing requests it from a command line - worth
-    saying to the maintainer, whose spelling this bullet is.
-  - [x] Read depfile to skip dep_infer if depfile exists (50fad25) - guarded
-    on freshness against every source, failing toward the scan
-  - The read half was written first and could not fire until collection
-    existed: local mode materializes only the requested targets, so no
-    per-object depfile ever reached the build directory. Two thirds of this
-    item read as done for a week while the pipeline it forms was open.
-  - STILL OWED, and it is the newest part that is owed: collection runs in
-    LOCAL mode and every example drives DERIVATION mode, so no build has
-    executed it. It is not unreachable - `connect_from_env` talks to the
-    daemon socket and decides `in_drv` from `NIX_BUILD_TOP` alone, so
-    `nix-ninja <target>` run by hand in a configured build directory against
-    a `builder-rpc-v0` daemon exercises it, and a second run in the same
-    directory is what proves the skip. That is a test nobody has written.
+- [ ] Depfile support (upstream #17) - three parts built, not yet exercised
+  - [x] If depfile defined, add that as an additional output. Gated on
+    `deps = gcc` rather than on `depfile` alone: a declared output the command
+    does not produce fails the task, and `depfile` on its own is a path ninja
+    would read IF one appeared, not a statement that anything writes it.
+  - [x] Install the collected depfiles into the build directory. Built as
+    direct materialization rather than a virtual phony target: the driver
+    records each accepted depfile output and local mode copies them in after
+    the requested targets. They are COPIED, not symlinked - a symlink into the
+    store carries mtime 1, which the freshness guard below reads as older than
+    every source, so a symlinked depfile disables the read-back entirely.
+  - [x] Read the depfile to skip inference when one exists. Guarded on
+    freshness against the TU sources AND against every header the depfile
+    names, since it is the headers it speaks for: editing a header to add an
+    include does not touch the .c file, and checking only the sources lets a
+    stale depfile under-declare silently. Fails toward the scan.
+  - Unchecked at the top because none of it has been exercised end to end.
+    The collection runs in LOCAL mode and the examples all drive derivation
+    mode, so no build has executed it. Running `nix-ninja <target>` by hand in
+    a configured build directory against a `builder-rpc-v0` daemon exercises
+    it, and a second run in the same directory is what proves the skip.
 - [ ] mkMesonPackage do configure caching
-  - Separate out configure and build into two derivations
+  - [x] Separate out configure and build into two derivations, behind an
+    opt-in `useConfigureCache`. Opting out leaves the emitted derivation
+    byte-identical. Measured caveat: a source edit still re-runs configure,
+    because `src` is an input of the configure derivation, so the split as
+    described does not cache across the common case. Narrowing the configure
+    derivation's source is what would make it pay.
   - Put source into one output path
   - Put build_dir_inputs into one output path
 - [ ] Writing derivation caching for local mode
