@@ -18,4 +18,4 @@
 19	the driver itself	SEVERAL offers	-	-	unseparated	crates/nix-ninja/src/task.rs;crates/nix-ninja/src/build.rs;crates/nix-ninja/src/cli.rs;crates/nix-ninja/src/local.rs;crates/nix-ninja/src/lib.rs;crates/nix-ninja/src/subtool/dynamic_task.rs;crates/nix-ninja/Cargo.toml
 20	packaging glue	SEVERAL offers	-	-	unseparated	modules/flake/overlays.nix;modules/flake/packages.nix
 21	vendored n2 fork	consumed as a library	-	n2-scanner-soundness.md	carried	vendor-n2/
-22	local-only, never sent	-	-	-	local-only	docs/;.graphifyignore;Cargo.lock;README.md;modules/flake/examples/hello/;.gitignore;CLAUDE.md
+22	local-only, never sent	-	-	-	local-only	docs/;.graphifyignore;Cargo.lock;README.md;modules/flake/examples/hello/;.gitignore;CLAUDE.md;scripts/upstream-ledger.py
