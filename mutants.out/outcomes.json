@@ -8,7 +8,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.701930257,
+          "duration": 5.564004097,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -20,139 +20,13 @@
         },
         {
           "phase": "Test",
-          "duration": 0.100839611,
+          "duration": 0.102260396,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
             "test",
             "--verbose",
             "--package=nix-ninja-task@0.1.0"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:21:19: replace += with *= in fix_rpaths",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "fix_rpaths",
-            "return_type": "-> Result<()>",
-            "span": {
-              "start": {
-                "line": 9,
-                "column": 1
-              },
-              "end": {
-                "line": 32,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 21,
-              "column": 19
-            },
-            "end": {
-              "line": 21,
-              "column": 21
-            }
-          },
-          "replacement": "*=",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_21_col_19_001.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_21_col_19_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 3.759762641,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.702643244,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:24:14: replace > with == in fix_rpaths",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "fix_rpaths",
-            "return_type": "-> Result<()>",
-            "span": {
-              "start": {
-                "line": 9,
-                "column": 1
-              },
-              "end": {
-                "line": 32,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 24,
-              "column": 14
-            },
-            "end": {
-              "line": 24,
-              "column": 15
-            }
-          },
-          "replacement": "==",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_24_col_14.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_24_col_14.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 3.808469971,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.701935767,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
           ]
         }
       ]
@@ -197,7 +71,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 3.810031249,
+          "duration": 27.106209253,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -209,196 +83,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.751707603,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:21:19: replace += with -= in fix_rpaths",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "fix_rpaths",
-            "return_type": "-> Result<()>",
-            "span": {
-              "start": {
-                "line": 9,
-                "column": 1
-              },
-              "end": {
-                "line": 32,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 21,
-              "column": 19
-            },
-            "end": {
-              "line": 21,
-              "column": 21
-            }
-          },
-          "replacement": "-=",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_21_col_19.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_21_col_19.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 3.809704386,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.802407729,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:24:14: replace > with >= in fix_rpaths",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "fix_rpaths",
-            "return_type": "-> Result<()>",
-            "span": {
-              "start": {
-                "line": 9,
-                "column": 1
-              },
-              "end": {
-                "line": 32,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 24,
-              "column": 14
-            },
-            "end": {
-              "line": 24,
-              "column": 15
-            }
-          },
-          "replacement": ">=",
-          "genre": "BinaryOperator"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_24_col_14_002.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_24_col_14_002.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.851714663,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 2.957464458,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:45:5: replace is_elf_dynamic -> Result<bool> with Ok(true)",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "is_elf_dynamic",
-            "return_type": "-> Result<bool>",
-            "span": {
-              "start": {
-                "line": 36,
-                "column": 1
-              },
-              "end": {
-                "line": 61,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 45,
-              "column": 5
-            },
-            "end": {
-              "line": 60,
-              "column": 6
-            }
-          },
-          "replacement": "Ok(true)",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_45_col_5.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_45_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 0.852264735,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 2.9578547889999998,
+          "duration": 0.860271783,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -449,7 +134,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 0.903952774,
+          "duration": 2.113103558,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -461,7 +146,322 @@
         },
         {
           "phase": "Test",
-          "duration": 3.00569955,
+          "duration": 0.653775525,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:24:14: replace > with == in fix_rpaths",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "fix_rpaths",
+            "return_type": "-> Result<()>",
+            "span": {
+              "start": {
+                "line": 9,
+                "column": 1
+              },
+              "end": {
+                "line": 32,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 24,
+              "column": 14
+            },
+            "end": {
+              "line": 24,
+              "column": 15
+            }
+          },
+          "replacement": "==",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_24_col_14.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_24_col_14.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 30.347714005,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.652063724,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:21:19: replace += with *= in fix_rpaths",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "fix_rpaths",
+            "return_type": "-> Result<()>",
+            "span": {
+              "start": {
+                "line": 9,
+                "column": 1
+              },
+              "end": {
+                "line": 32,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 21,
+              "column": 19
+            },
+            "end": {
+              "line": 21,
+              "column": 21
+            }
+          },
+          "replacement": "*=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_21_col_19_001.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_21_col_19_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 30.327749228,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.702185055,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:21:19: replace += with -= in fix_rpaths",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "fix_rpaths",
+            "return_type": "-> Result<()>",
+            "span": {
+              "start": {
+                "line": 9,
+                "column": 1
+              },
+              "end": {
+                "line": 32,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 21,
+              "column": 19
+            },
+            "end": {
+              "line": 21,
+              "column": 21
+            }
+          },
+          "replacement": "-=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_21_col_19.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_21_col_19.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 31.554687155,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.651627476,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:24:14: replace > with >= in fix_rpaths",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "fix_rpaths",
+            "return_type": "-> Result<()>",
+            "span": {
+              "start": {
+                "line": 9,
+                "column": 1
+              },
+              "end": {
+                "line": 32,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 24,
+              "column": 14
+            },
+            "end": {
+              "line": 24,
+              "column": 15
+            }
+          },
+          "replacement": ">=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_24_col_14_002.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_24_col_14_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.902928973,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.654036144,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:45:5: replace is_elf_dynamic -> Result<bool> with Ok(true)",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "is_elf_dynamic",
+            "return_type": "-> Result<bool>",
+            "span": {
+              "start": {
+                "line": 36,
+                "column": 1
+              },
+              "end": {
+                "line": 61,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 45,
+              "column": 5
+            },
+            "end": {
+              "line": 60,
+              "column": 6
+            }
+          },
+          "replacement": "Ok(true)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_45_col_5.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_45_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.4042835679999999,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.652652058,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -512,7 +512,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 3.206477703,
+          "duration": 1.455356954,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -524,7 +524,70 @@
         },
         {
           "phase": "Test",
-          "duration": 0.602354246,
+          "duration": 0.652517255,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:58:9: delete match arm elf::abi::ET_EXEC | elf::abi::ET_DYN in is_elf_dynamic",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "is_elf_dynamic",
+            "return_type": "-> Result<bool>",
+            "span": {
+              "start": {
+                "line": 36,
+                "column": 1
+              },
+              "end": {
+                "line": 61,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 58,
+              "column": 9
+            },
+            "end": {
+              "line": 58,
+              "column": 58
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_58_col_9.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_58_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 0.855181114,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.7038993,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -569,13 +632,13 @@
           "genre": "FnValue"
         }
       },
-      "summary": "CaughtMutant",
+      "summary": "MissedMutant",
       "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_69_col_5.log",
       "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_69_col_5.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.55618407,
+          "duration": 2.058957188,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -587,7 +650,70 @@
         },
         {
           "phase": "Test",
-          "duration": 0.552233095,
+          "duration": 0.654164004,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:96:5: replace parse_rpath -> Vec<String> with vec![String::new()]",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "parse_rpath",
+            "return_type": "-> Vec<String>",
+            "span": {
+              "start": {
+                "line": 76,
+                "column": 1
+              },
+              "end": {
+                "line": 103,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 96,
+              "column": 5
+            },
+            "end": {
+              "line": 102,
+              "column": 6
+            }
+          },
+          "replacement": "vec![String::new()]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_96_col_5_001.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_96_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.6060173629999999,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.453281916,
           "process_status": {
             "Failure": 101
           },
@@ -640,7 +766,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.555418203,
+          "duration": 1.655999864,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -652,139 +778,9 @@
         },
         {
           "phase": "Test",
-          "duration": 0.703265532,
+          "duration": 0.501724598,
           "process_status": {
-            "Failure": 1
-          },
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:58:9: delete match arm elf::abi::ET_EXEC | elf::abi::ET_DYN in is_elf_dynamic",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "is_elf_dynamic",
-            "return_type": "-> Result<bool>",
-            "span": {
-              "start": {
-                "line": 36,
-                "column": 1
-              },
-              "end": {
-                "line": 61,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 58,
-              "column": 9
-            },
-            "end": {
-              "line": 58,
-              "column": 58
-            }
-          },
-          "replacement": "",
-          "genre": "MatchArm"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_58_col_9.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_58_col_9.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 2.606114121,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.704484107,
-          "process_status": {
-            "Failure": 1
-          },
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:96:5: replace parse_rpath -> Vec<String> with vec![String::new()]",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "parse_rpath",
-            "return_type": "-> Vec<String>",
-            "span": {
-              "start": {
-                "line": 76,
-                "column": 1
-              },
-              "end": {
-                "line": 103,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 96,
-              "column": 5
-            },
-            "end": {
-              "line": 102,
-              "column": 6
-            }
-          },
-          "replacement": "vec![String::new()]",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_96_col_5_001.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_96_col_5_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 2.555368139,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.703401035,
-          "process_status": {
-            "Failure": 1
+            "Failure": 101
           },
           "argv": [
             "/usr/bin/cargo",
@@ -829,13 +825,13 @@
           "genre": "FnValue"
         }
       },
-      "summary": "MissedMutant",
+      "summary": "CaughtMutant",
       "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_96_col_5_002.log",
       "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_96_col_5_002.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.555030636,
+          "duration": 1.205778709,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -847,7 +843,200 @@
         },
         {
           "phase": "Test",
-          "duration": 3.106141857,
+          "duration": 0.401243148,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:112:8: delete ! in get_raw_rpath",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "get_raw_rpath",
+            "return_type": "-> Result<String>",
+            "span": {
+              "start": {
+                "line": 105,
+                "column": 1
+              },
+              "end": {
+                "line": 120,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 112,
+              "column": 8
+            },
+            "end": {
+              "line": 112,
+              "column": 9
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_112_col_8.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_112_col_8.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.204186161,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.653629241,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:132:5: replace retained_entries -> Vec<String> with vec![]",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "retained_entries",
+            "return_type": "-> Vec<String>",
+            "span": {
+              "start": {
+                "line": 122,
+                "column": 1
+              },
+              "end": {
+                "line": 137,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 132,
+              "column": 5
+            },
+            "end": {
+              "line": 136,
+              "column": 19
+            }
+          },
+          "replacement": "vec![]",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_132_col_5.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_132_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.513806567,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.401373974,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:106:5: replace get_raw_rpath -> Result<String> with Ok(\"xyzzy\".into())",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "get_raw_rpath",
+            "return_type": "-> Result<String>",
+            "span": {
+              "start": {
+                "line": 105,
+                "column": 1
+              },
+              "end": {
+                "line": 120,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 106,
+              "column": 5
+            },
+            "end": {
+              "line": 119,
+              "column": 22
+            }
+          },
+          "replacement": "Ok(\"xyzzy\".into())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_106_col_5_001.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_106_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.7562465729999999,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.601664973,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -898,7 +1087,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.958981928,
+          "duration": 2.05811092,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -910,7 +1099,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.701965844,
+          "duration": 0.651519102,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -924,135 +1113,7 @@
     {
       "scenario": {
         "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:106:5: replace get_raw_rpath -> Result<String> with Ok(\"xyzzy\".into())",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "get_raw_rpath",
-            "return_type": "-> Result<String>",
-            "span": {
-              "start": {
-                "line": 105,
-                "column": 1
-              },
-              "end": {
-                "line": 120,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 106,
-              "column": 5
-            },
-            "end": {
-              "line": 119,
-              "column": 22
-            }
-          },
-          "replacement": "Ok(\"xyzzy\".into())",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_106_col_5_001.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_106_col_5_001.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.958897258,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.702059059,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:112:8: delete ! in get_raw_rpath",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "get_raw_rpath",
-            "return_type": "-> Result<String>",
-            "span": {
-              "start": {
-                "line": 105,
-                "column": 1
-              },
-              "end": {
-                "line": 120,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 112,
-              "column": 8
-            },
-            "end": {
-              "line": 112,
-              "column": 9
-            }
-          },
-          "replacement": "",
-          "genre": "UnaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_112_col_8.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_112_col_8.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.9584653880000005,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.653098796,
-          "process_status": {
-            "Failure": 1
-          },
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:132:5: replace retained_entries -> Vec<String> with vec![]",
+          "name": "crates/nix-ninja-task/src/patchelf.rs:132:5: replace retained_entries -> Vec<String> with vec![\"xyzzy\".into()]",
           "package": "nix-ninja-task",
           "file": "crates/nix-ninja-task/src/patchelf.rs",
           "function": {
@@ -1079,17 +1140,17 @@
               "column": 19
             }
           },
-          "replacement": "vec![]",
+          "replacement": "vec![\"xyzzy\".into()]",
           "genre": "FnValue"
         }
       },
       "summary": "CaughtMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_132_col_5.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_132_col_5.diff",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_132_col_5_002.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_132_col_5_002.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.605259949,
+          "duration": 1.003973791,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -1101,7 +1162,7 @@
         },
         {
           "phase": "Test",
-          "duration": 2.754015565,
+          "duration": 0.451756104,
           "process_status": {
             "Failure": 101
           },
@@ -1154,7 +1215,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.9086279600000005,
+          "duration": 1.405890702,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -1166,72 +1227,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.501476462,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:132:5: replace retained_entries -> Vec<String> with vec![\"xyzzy\".into()]",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "retained_entries",
-            "return_type": "-> Vec<String>",
-            "span": {
-              "start": {
-                "line": 122,
-                "column": 1
-              },
-              "end": {
-                "line": 137,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 132,
-              "column": 5
-            },
-            "end": {
-              "line": 136,
-              "column": 19
-            }
-          },
-          "replacement": "vec![\"xyzzy\".into()]",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_132_col_5_002.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_132_col_5_002.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.908592543,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.50162398,
+          "duration": 0.401475394,
           "process_status": {
             "Failure": 101
           },
@@ -1284,7 +1280,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.909115825,
+          "duration": 1.404379067,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -1296,7 +1292,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.553000664,
+          "duration": 0.401628711,
           "process_status": {
             "Failure": 101
           },
@@ -1349,7 +1345,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.555420497,
+          "duration": 1.411521995,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -1361,72 +1357,7 @@
         },
         {
           "phase": "Test",
-          "duration": 2.604772145,
-          "process_status": {
-            "Failure": 101
-          },
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:134:38: delete ! in retained_entries",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "retained_entries",
-            "return_type": "-> Vec<String>",
-            "span": {
-              "start": {
-                "line": 122,
-                "column": 1
-              },
-              "end": {
-                "line": 137,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 134,
-              "column": 38
-            },
-            "end": {
-              "line": 134,
-              "column": 39
-            }
-          },
-          "replacement": "",
-          "genre": "UnaryOperator"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_134_col_38.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_134_col_38.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.607676305,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.452480933,
+          "duration": 0.402078506,
           "process_status": {
             "Failure": 101
           },
@@ -1479,7 +1410,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.657640181,
+          "duration": 1.257761151,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -1491,7 +1422,72 @@
         },
         {
           "phase": "Test",
-          "duration": 0.452560943,
+          "duration": 0.452278865,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:134:38: delete ! in retained_entries",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "retained_entries",
+            "return_type": "-> Vec<String>",
+            "span": {
+              "start": {
+                "line": 122,
+                "column": 1
+              },
+              "end": {
+                "line": 137,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 134,
+              "column": 38
+            },
+            "end": {
+              "line": 134,
+              "column": 39
+            }
+          },
+          "replacement": "",
+          "genre": "UnaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_134_col_38.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_134_col_38.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.45490715,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.453037478,
           "process_status": {
             "Failure": 101
           },
@@ -1544,7 +1540,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.606694033,
+          "duration": 1.35615242,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -1556,7 +1552,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.451883072,
+          "duration": 0.15130618,
           "process_status": {
             "Failure": 101
           },
@@ -1609,7 +1605,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.405796652,
+          "duration": 1.4055163099999999,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -1621,7 +1617,7 @@
         },
         {
           "phase": "Test",
-          "duration": 2.654610104,
+          "duration": 0.401796005,
           "process_status": {
             "Failure": 101
           },
@@ -1674,7 +1670,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.561522014,
+          "duration": 0.904135026,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -1686,7 +1682,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.451535561,
+          "duration": 0.454079342,
           "process_status": {
             "Failure": 101
           },
@@ -1739,7 +1735,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.608677352,
+          "duration": 1.00724714,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -1751,7 +1747,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.501764182,
+          "duration": 0.453269823,
           "process_status": {
             "Failure": 101
           },
@@ -1798,13 +1794,13 @@
           "genre": "FnValue"
         }
       },
-      "summary": "CaughtMutant",
+      "summary": "MissedMutant",
       "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_172_col_5.log",
       "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_172_col_5.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.607776423,
+          "duration": 2.167778991,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -1816,10 +1812,8 @@
         },
         {
           "phase": "Test",
-          "duration": 0.502062812,
-          "process_status": {
-            "Failure": 101
-          },
+          "duration": 0.653977804,
+          "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
             "test",
@@ -1869,7 +1863,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.50514135,
+          "duration": 2.108353739,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -1881,73 +1875,8 @@
         },
         {
           "phase": "Test",
-          "duration": 2.955238182,
+          "duration": 0.652713653,
           "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:172:5: replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec![String::new()]))",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "compute_new_rpath",
-            "return_type": "-> Result<Option<Vec<String>>>",
-            "span": {
-              "start": {
-                "line": 166,
-                "column": 1
-              },
-              "end": {
-                "line": 195,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 172,
-              "column": 5
-            },
-            "end": {
-              "line": 194,
-              "column": 52
-            }
-          },
-          "replacement": "Ok(Some(vec![String::new()]))",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "CaughtMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_172_col_5_002.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_172_col_5_002.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.808133767,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.702324547,
-          "process_status": {
-            "Failure": 1
-          },
           "argv": [
             "/usr/bin/cargo",
             "test",
@@ -1997,7 +1926,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.761111839,
+          "duration": 2.109018816,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2009,7 +1938,70 @@
         },
         {
           "phase": "Test",
-          "duration": 0.702868487,
+          "duration": 0.70197459,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:172:5: replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec![String::new()]))",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "compute_new_rpath",
+            "return_type": "-> Result<Option<Vec<String>>>",
+            "span": {
+              "start": {
+                "line": 166,
+                "column": 1
+              },
+              "end": {
+                "line": 195,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 172,
+              "column": 5
+            },
+            "end": {
+              "line": 194,
+              "column": 52
+            }
+          },
+          "replacement": "Ok(Some(vec![String::new()]))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_172_col_5_002.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_172_col_5_002.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.156975196,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.701614445,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2060,7 +2052,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.710242054,
+          "duration": 1.9556920359999999,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2072,9 +2064,9 @@
         },
         {
           "phase": "Test",
-          "duration": 0.703151788,
+          "duration": 0.202990783,
           "process_status": {
-            "Failure": 1
+            "Failure": 101
           },
           "argv": [
             "/usr/bin/cargo",
@@ -2125,7 +2117,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.5554304759999997,
+          "duration": 1.9589012860000001,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2137,7 +2129,7 @@
         },
         {
           "phase": "Test",
-          "duration": 2.956600998,
+          "duration": 0.652804734,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2182,13 +2174,13 @@
           "genre": "FnValue"
         }
       },
-      "summary": "MissedMutant",
+      "summary": "CaughtMutant",
       "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_220_col_5.log",
       "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_220_col_5.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.806507436,
+          "duration": 2.110288829,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2200,8 +2192,10 @@
         },
         {
           "phase": "Test",
-          "duration": 0.702804697,
-          "process_status": "Success",
+          "duration": 0.150971311,
+          "process_status": {
+            "Failure": 101
+          },
           "argv": [
             "/usr/bin/cargo",
             "test",
@@ -2251,7 +2245,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.80864754,
+          "duration": 2.161783776,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2263,9 +2257,9 @@
         },
         {
           "phase": "Test",
-          "duration": 0.701706768,
+          "duration": 0.151050651,
           "process_status": {
-            "Failure": 1
+            "Failure": 101
           },
           "argv": [
             "/usr/bin/cargo",
@@ -2310,13 +2304,13 @@
           "genre": "FnValue"
         }
       },
-      "summary": "CaughtMutant",
+      "summary": "MissedMutant",
       "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_220_col_5_002.log",
       "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_220_col_5_002.diff",
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.807530885,
+          "duration": 1.805387004,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2328,10 +2322,8 @@
         },
         {
           "phase": "Test",
-          "duration": 0.70218239,
-          "process_status": {
-            "Failure": 1
-          },
+          "duration": 0.704888556,
+          "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
             "test",
@@ -2381,7 +2373,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.555174055,
+          "duration": 1.808753459,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2393,70 +2385,7 @@
         },
         {
           "phase": "Test",
-          "duration": 2.955259592,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--verbose",
-            "--workspace"
-          ]
-        }
-      ]
-    },
-    {
-      "scenario": {
-        "Mutant": {
-          "name": "crates/nix-ninja-task/src/patchelf.rs:241:5: replace resolve_needed -> Result<Option<PathBuf>> with Ok(None)",
-          "package": "nix-ninja-task",
-          "file": "crates/nix-ninja-task/src/patchelf.rs",
-          "function": {
-            "function_name": "resolve_needed",
-            "return_type": "-> Result<Option<PathBuf>>",
-            "span": {
-              "start": {
-                "line": 239,
-                "column": 1
-              },
-              "end": {
-                "line": 266,
-                "column": 2
-              }
-            }
-          },
-          "span": {
-            "start": {
-              "line": 241,
-              "column": 5
-            },
-            "end": {
-              "line": 265,
-              "column": 58
-            }
-          },
-          "replacement": "Ok(None)",
-          "genre": "FnValue"
-        }
-      },
-      "summary": "MissedMutant",
-      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_241_col_5.log",
-      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_241_col_5.diff",
-      "phase_results": [
-        {
-          "phase": "Build",
-          "duration": 4.75998221,
-          "process_status": "Success",
-          "argv": [
-            "/usr/bin/cargo",
-            "test",
-            "--no-run",
-            "--verbose",
-            "--workspace"
-          ]
-        },
-        {
-          "phase": "Test",
-          "duration": 0.651770124,
+          "duration": 0.654853647,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2507,7 +2436,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.809293511,
+          "duration": 1.655638766,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2519,7 +2448,70 @@
         },
         {
           "phase": "Test",
-          "duration": 0.652593448,
+          "duration": 0.656069718,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--verbose",
+            "--workspace"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "crates/nix-ninja-task/src/patchelf.rs:241:5: replace resolve_needed -> Result<Option<PathBuf>> with Ok(None)",
+          "package": "nix-ninja-task",
+          "file": "crates/nix-ninja-task/src/patchelf.rs",
+          "function": {
+            "function_name": "resolve_needed",
+            "return_type": "-> Result<Option<PathBuf>>",
+            "span": {
+              "start": {
+                "line": 239,
+                "column": 1
+              },
+              "end": {
+                "line": 266,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 241,
+              "column": 5
+            },
+            "end": {
+              "line": 265,
+              "column": 58
+            }
+          },
+          "replacement": "Ok(None)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/crates__nix-ninja-task__src__patchelf.rs_line_241_col_5.log",
+      "diff_path": "diff/crates__nix-ninja-task__src__patchelf.rs_line_241_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 1.808680592,
+          "process_status": "Success",
+          "argv": [
+            "/usr/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--workspace"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 0.652262207,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2570,7 +2562,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 4.808862774,
+          "duration": 1.704137384,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2582,7 +2574,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.701549714,
+          "duration": 0.652920952,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2633,7 +2625,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.556946049,
+          "duration": 1.104408352,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2645,7 +2637,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.653042089,
+          "duration": 0.601777715,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2696,7 +2688,7 @@
       "phase_results": [
         {
           "phase": "Build",
-          "duration": 2.50977405,
+          "duration": 0.903189322,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2708,7 +2700,7 @@
         },
         {
           "phase": "Test",
-          "duration": 0.652389275,
+          "duration": 0.602140114,
           "process_status": "Success",
           "argv": [
             "/usr/bin/cargo",
@@ -2721,12 +2713,12 @@
     }
   ],
   "total_mutants": 42,
-  "missed": 21,
-  "caught": 21,
+  "missed": 25,
+  "caught": 17,
   "timeout": 0,
   "unviable": 0,
   "success": 0,
-  "start_time": "2026-08-30T15:52:08.855671517Z",
-  "end_time": "2026-08-30T15:53:02.109150602Z",
+  "start_time": "2026-08-30T16:23:22.596520851Z",
+  "end_time": "2026-08-30T16:24:19.438069088Z",
   "cargo_mutants_version": "27.1.0"
 }

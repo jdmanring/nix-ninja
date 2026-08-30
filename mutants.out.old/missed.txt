@@ -1,15 +1,16 @@
-crates/nix-ninja-task/src/patchelf.rs:21:19: replace += with -= in fix_rpaths
 crates/nix-ninja-task/src/patchelf.rs:15:5: replace fix_rpaths -> Result<()> with Ok(())
 crates/nix-ninja-task/src/patchelf.rs:21:19: replace += with *= in fix_rpaths
-crates/nix-ninja-task/src/patchelf.rs:24:14: replace > with == in fix_rpaths
+crates/nix-ninja-task/src/patchelf.rs:21:19: replace += with -= in fix_rpaths
 crates/nix-ninja-task/src/patchelf.rs:24:14: replace > with < in fix_rpaths
+crates/nix-ninja-task/src/patchelf.rs:24:14: replace > with == in fix_rpaths
 crates/nix-ninja-task/src/patchelf.rs:24:14: replace > with >= in fix_rpaths
-crates/nix-ninja-task/src/patchelf.rs:45:5: replace is_elf_dynamic -> Result<bool> with Ok(false)
 crates/nix-ninja-task/src/patchelf.rs:45:5: replace is_elf_dynamic -> Result<bool> with Ok(true)
-crates/nix-ninja-task/src/patchelf.rs:96:5: replace parse_rpath -> Vec<String> with vec!["xyzzy".into()]
-crates/nix-ninja-task/src/patchelf.rs:106:5: replace get_raw_rpath -> Result<String> with Ok(String::new())
-crates/nix-ninja-task/src/patchelf.rs:106:5: replace get_raw_rpath -> Result<String> with Ok("xyzzy".into())
+crates/nix-ninja-task/src/patchelf.rs:45:5: replace is_elf_dynamic -> Result<bool> with Ok(false)
+crates/nix-ninja-task/src/patchelf.rs:69:5: replace fix_rpath -> Result<()> with Ok(())
 crates/nix-ninja-task/src/patchelf.rs:112:8: delete ! in get_raw_rpath
+crates/nix-ninja-task/src/patchelf.rs:106:5: replace get_raw_rpath -> Result<String> with Ok("xyzzy".into())
+crates/nix-ninja-task/src/patchelf.rs:106:5: replace get_raw_rpath -> Result<String> with Ok(String::new())
+crates/nix-ninja-task/src/patchelf.rs:172:5: replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(None)
 crates/nix-ninja-task/src/patchelf.rs:172:5: replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec![]))
 crates/nix-ninja-task/src/patchelf.rs:172:5: replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec![String::new()]))
 crates/nix-ninja-task/src/patchelf.rs:172:5: replace compute_new_rpath -> Result<Option<Vec<String>>> with Ok(Some(vec!["xyzzy".into()]))
@@ -21,6 +22,6 @@ crates/nix-ninja-task/src/patchelf.rs:220:5: replace get_needed_libs -> Result<V
 crates/nix-ninja-task/src/patchelf.rs:226:8: delete ! in get_needed_libs
 crates/nix-ninja-task/src/patchelf.rs:235:24: delete ! in get_needed_libs
 crates/nix-ninja-task/src/patchelf.rs:241:5: replace resolve_needed -> Result<Option<PathBuf>> with Ok(None)
-crates/nix-ninja-task/src/patchelf.rs:241:5: replace resolve_needed -> Result<Option<PathBuf>> with Ok(Some(Default::default()))
 crates/nix-ninja-task/src/patchelf.rs:269:5: replace apply_rpath -> Result<()> with Ok(())
+crates/nix-ninja-task/src/patchelf.rs:241:5: replace resolve_needed -> Result<Option<PathBuf>> with Ok(Some(Default::default()))
 crates/nix-ninja-task/src/patchelf.rs:277:8: delete ! in apply_rpath
