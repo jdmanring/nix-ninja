@@ -13,10 +13,18 @@
 #
 # Usage:  bench/e2e.sh example-hello [outfile.json]
 #
-# It does NOT clean the store first. Timing a build whose outputs are already
-# banked measures substitution, not compilation, so the record says which it
-# was rather than pretending: `prebuilt` is true when the target was already
-# realised, and a prebuilt run is not comparable with a cold one.
+# It does NOT clean the store first, so a record is only comparable with
+# another record built the same way. Two fields say how much work actually
+# happened, and BOTH are needed:
+#
+#   target_prebuilt   the target itself was already realised
+#   derivations_built how many derivations the run actually built
+#
+# target_prebuilt alone is not enough and saying so cost a wrong reading here:
+# two runs of example-hello both reported it false - the target had re-keyed
+# each time, so it genuinely was not built - while taking 312 s and 18.6 s,
+# because the first built nix's whole closure and the second reused it. False
+# does not mean cold.
 set -uo pipefail
 
 TARGET="${1:?usage: bench/e2e.sh <example-name> [outfile]}"
@@ -35,7 +43,8 @@ if [ -z "$drv" ]; then
   exit 2
 fi
 
-# Was it already built? Read BEFORE building, or the answer is always yes.
+# Was the target already built? Read BEFORE building, or the answer is
+# always yes.
 prebuilt=false
 if nix path-info --extra-experimental-features "$FEATURES" "$drv" >/dev/null 2>&1; then
   prebuilt=true
@@ -53,19 +62,26 @@ wall=$(awk -v a="$start" -v b="$end" 'BEGIN{printf "%.3f", b-a}')
 
 # The driver's own accounting, from the build log. One line per driver run;
 # take the last, which is the completed one.
+# How much was actually built, as opposed to substituted or already present.
+# `grep -c` prints 0 and exits 1, so take the count and discard the status.
+built=$(grep -c "^building '" "$OUT.log" 2>/dev/null) || true
+built=${built:-0}
+
 resolved=$(grep -h 'nix-ninja: resolved' "$OUT.log" 2>/dev/null | tail -1)
 stats=$(grep -ho 'nix-ninja-stats {.*}' "$OUT.log" 2>/dev/null | tail -1)
 stats="${stats#nix-ninja-stats }"
 
-python3 - "$OUT" "$TARGET" "$wall" "$rc" "$prebuilt" "$drv" "$resolved" "$stats" <<'PY'
+python3 - "$OUT" "$TARGET" "$wall" "$rc" "$prebuilt" "$drv" "$resolved" "$stats" "$built" <<'PY'
 import json, sys, re
 out, target, wall, rc, prebuilt, drv, resolved = sys.argv[1:8]
 stats = sys.argv[8] if len(sys.argv) > 8 else ""
+built = sys.argv[9] if len(sys.argv) > 9 else "0"
 rec = {
     "target": target,
     "wall_seconds": float(wall),
     "exit_code": int(rc),
-    "prebuilt": prebuilt == "true",
+    "target_prebuilt": prebuilt == "true",
+    "derivations_built": int(built),
     "drv": drv,
     "driver_line": resolved or None,
 }
