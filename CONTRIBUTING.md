@@ -75,6 +75,38 @@ examples (e.g. when iterating on `nix build .#example-nix`) all in one build.
 If there's a good UX way of iterating on `nix-ninja` in a tmp store and without
 modifying your main nix, please contribute!
 
+### Iterating without touching your system nix
+
+`contrib/devstore.sh` runs a daemon on a throwaway store as your own user, so
+you can iterate without making a patched nix your system daemon. The daemon
+comes from this repository's own `nix` flake input - the version already
+pinned here, rather than one the script picked - built or substituted once
+like any other input.
+
+Builds in this store are UNSANDBOXED - it has no build users group and runs as
+you - so the host filesystem is visible to them. That is fine for iteration
+and wrong for anything anyone else will consume; do not push results from it.
+
+```
+contrib/devstore.sh selftest        # prove the store works
+contrib/devstore.sh run -- cargo test
+contrib/devstore.sh stop
+```
+
+Two settings are required and both fail by appearing to blame the client:
+
+- `trusted-users` must name you in the DAEMON's config. Without it the daemon
+  discards client settings and reports `experimental Nix feature
+  'ca-derivations' is disabled`, which reads as the client missing a feature
+  it actually has.
+- `--extra-experimental-features` must be on the DAEMON's own argv. It does
+  not read them from the `experimental-features` line of the config file it
+  was pointed at, and the error is the same one as above.
+
+The selftest also checks that the daemon advertises `builder-rpc-v0`, which
+every dynamic task requires. A daemon without it otherwise fails much later
+with a message that does not name the cause.
+
 ## Implementation notes
 
 - See [todo] for remaining work.
