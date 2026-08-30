@@ -124,8 +124,38 @@ at the top of `CLAUDE.md`: the two repairs above and the test that would have
 caught them are one batch, landed together, paying the re-key once. Landing
 the test alone would pay it and still ship the duplicate subprocess.
 
-Status: NOT SENDABLE, and the reason has changed. Round 1 said the blocker was
-missing repros; round 2 says fix 5 has two defects of its own and the batch
-needs a re-keying change before it is honest to send. Fixes 1 through 4 are
-untouched by this. It remains independent of every other blocker in this
-directory.
+Round 3 (2026-08-29), after `e285861` landed the repairs round 2 demanded.
+
+- Both blocking findings are fixed. `fix_rpath` reads the RPATH once instead
+  of twice, and `parse_rpath` preserves empty entries in place so all three
+  spellings survive rather than the trailing one alone.
+- `patchelf.rs` now carries six tests where it carried none, and they were
+  verified failing first: reverting `parse_rpath` to the old filter fails four
+  of the six, including the trailing case that `f8bb3bd` claimed to fix, and
+  leaves the two controls passing.
+- **This changes what fix 5 IS, and the PR body has to say so.** It is no
+  longer "preserve a trailing colon"; it is "stop dropping empty RPATH
+  entries", of which the trailing colon was one spelling. `f8bb3bd` alone
+  would have been a partial fix presented as a complete one, which is exactly
+  the claim this directory exists to stop. Send the two commits together or
+  squash them; sending `f8bb3bd` by itself is worse than sending nothing.
+- The test count in the section above is now wrong in our favour and stays
+  wrong until somebody recounts it against the tip. It said one of five
+  carries a test. Two do.
+
+Still owed, and none of it fixed by `e285861`:
+
+- The minimal repros for fixes 3 and 5 do not exist. The six new tests cover
+  the RPATH PARSER; nothing has linked a binary through the change, and the
+  lazy-`cc` fix has still never been driven by a package with zero compile
+  targets.
+- Fixes 1, 2 and 4 are untouched by all of this.
+
+Status: NOT SENDABLE, and the reason has narrowed twice. Round 1 said missing
+repros; round 2 said fix 5 was defective; round 3 says fix 5 is repaired and
+tested at the parser but unexercised by any link, and the repros are still
+absent. The honest gate now is a single small package built at
+`e2858615d5f74d5a631cef6308a184a03114896e` - which ArtNix is running for its
+own reasons - reporting no RPATH regression. That is one build away rather
+than one code change away. It remains independent of every other blocker in
+this directory.
