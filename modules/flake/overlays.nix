@@ -137,6 +137,16 @@
         target = "hello";
       };
 
+      # A header produced during the build and declared order-only on the
+      # compile edge, so it does not exist when the driver scans. libvmaf's
+      # vcs_version.h and cmake's FortranCInterface VerifyFortran.h are this
+      # shape.
+      example-generated-header = self.mkMesonPackage {
+        name = "example-generated-header";
+        src = ./examples/generated-header;
+        target = "main";
+      };
+
       example-header = self.mkMesonPackage {
         name = "example-header";
         src = ./examples/header;

@@ -6,5 +6,6 @@
     nixosTests.nix-build-shared-lib = import ./tests/nix-build-shared-lib.nix;
     nixosTests.nix-build-run-script = import ./tests/nix-build-run-script.nix;
     nixosTests.nix-build-dynamic-deps = import ./tests/nix-build-dynamic-deps.nix;
+    nixosTests.nix-build-generated-header = import ./tests/nix-build-generated-header.nix;
   };
 }
