@@ -16,11 +16,18 @@
     by meson that just don't use $in and $out in practice.
   - Only fool proof way is to source symlink in, and copy outputs into
     content-addressed output placeholders after
-- [ ] Phony target support
-  - DerivedFile has name: Option<String> again
-  - Move symlinking logic to method under DerivedFile
-  - If symlink source is directory, walk dir and symlink to dest as prefix
-  - Virtual targets e.g. if user inputs list of targets
+- [x] Phony target support (upstream #5)
+  - Resolution: `resolve_target_in` follows phony aliases transitively to
+    concrete outputs, five tests including chains and empty phonies.
+  - Materialisation: `derived_file.rs::link_tree` walks a tree file by file,
+    keeping directories REAL so a separately declared output can still land
+    in them. Three tests added 2026-08-30, verified failing first.
+  - Multiple CLI targets: supported, adopted from upstream PR 43.
+  - Left undone deliberately, both cosmetic: `DerivedFile` has no `name`
+    field, and the symlink logic is a free function rather than a method on
+    `DerivedFile`. Neither changes behaviour and the issue asks for neither.
+  - This entry stayed unchecked long after the work landed and misled the
+    2026-08-30 milestone sweep into reporting #5 as partial.
 - [ ] Depfile support
   - If depfile defined, add that as an additional output
   - Create virtual target of all depfiles to install locally into builddir

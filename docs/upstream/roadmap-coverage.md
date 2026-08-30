@@ -411,11 +411,18 @@ how close the fork is to a release the maintainer has already scoped.
 | # | state |
 |---|---|
 | 20 | **Complete.** `mkCMakePackage` and `example-cmake-hello`; the issue asks to "expand to other ninja-outputting build systems and add a CMake example" and both exist, neither upstream |
-| 5 | **PARTIAL, and the fifth sweep called it developed, which was wrong.** The issue has THREE parts: phony as a buildEnv-equivalent derivation input, local-mode materialisation that walks a phony's contents and symlinks each file back, and multiple CLI targets via a virtual phony. We have the first and the third. The second is absent - `local.rs` contains no `is_dir` and never walks a directory - and `docs/todo.md:19` carries upstream's OWN unchecked "Phony target support" entry listing exactly the missing pieces, including "if symlink source is directory, walk dir and symlink to dest as prefix" |
+| 5 | **Complete, and this row was wrong TWICE before it was right.** The issue has three parts: phony as a buildEnv-equivalent derivation input, local-mode materialisation that walks a phony's contents and symlinks each file back, and multiple CLI targets via a virtual phony. The fifth sweep called it developed without checking the parts. The first version of THIS row called it partial because `local.rs` has no `is_dir` - the walk is `derived_file.rs::link_tree`, called from `create_symlinks`, which `local.rs` calls. Wrong file. `resolve_target_in` follows phony aliases transitively to concrete outputs and has five tests; `link_tree` walks a tree file by file, keeping directories real so a declared output can still land in them, and had NONE until 2026-08-30 |
 
-So the honest headline is that this fork is **one partially-done issue away from
-upstream's 0.1.0 milestone**, and the missing piece is described in the tree's
-own todo file in upstream's words.
+So the honest headline is that **every open issue on upstream's 0.1.0
+milestone has working code in this fork**, and the last of it now has tests on
+both halves. What 0.1.0 lacks is not implementation; it is that none of this
+has been offered to the maintainer.
+
+`docs/todo.md:19` still carried an unchecked "Phony target support" entry with
+sub-bullets naming work that had already landed, which is what made this row
+read as partial. An unchecked box outlives the work it describes unless
+somebody checks it, and this one misled a sweep whose whole purpose was to
+avoid exactly that.
 
 ### 0.2.0 - three of five
 

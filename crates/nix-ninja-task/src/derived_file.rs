@@ -278,3 +278,105 @@ pub fn create_symlinks(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod link_tree_tests {
+    use super::link_tree;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// UPSTREAM #5's second half is this function.
+    ///
+    /// The issue asks that, in local mode, a phony target's contents be
+    /// walked and each file symlinked back into the build directory "to have
+    /// the same side-effect and make it available to the user". Resolution -
+    /// following phony aliases to concrete outputs - has five tests in
+    /// task.rs. The materialisation had none, so the half that actually
+    /// touches the user's build directory was the untested one.
+    ///
+    /// No `tempfile` here on purpose: `nix-ninja-task` has no
+    /// dev-dependencies, and adding one writes a line into `Cargo.lock`,
+    /// which is inside this crate's own fileset allowlist. A future bump of
+    /// a test-only dependency would then re-key every banked per-TU output.
+    /// See the DEFER on divan in `crates/nix-ninja/Cargo.toml`.
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "nn-link-tree-{}-{tag}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            Tmp(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_tree_is_linked_file_by_file_and_its_directories_stay_real() {
+        let tmp = Tmp::new("shape");
+        let src = tmp.path().join("store-out");
+        fs::create_dir_all(src.join("include/qt")).unwrap();
+        fs::write(src.join("include/qt/QObject"), b"header").unwrap();
+        fs::write(src.join("top.h"), b"top").unwrap();
+
+        let dst = tmp.path().join("build");
+        link_tree(&src, &dst).unwrap();
+
+        // Files arrive as symlinks pointing INTO the source tree.
+        assert!(dst.join("top.h").is_symlink());
+        assert_eq!(fs::read_link(dst.join("top.h")).unwrap(), src.join("top.h"));
+        assert_eq!(fs::read(dst.join("include/qt/QObject")).unwrap(), b"header");
+
+        // Directories are REAL directories, not symlinks. This is the whole
+        // reason the tree is walked rather than linked whole: a symlinked
+        // directory is read-only store, so a later declared output has
+        // nowhere to land and any task writing into it dies EACCES.
+        assert!(dst.join("include").is_dir());
+        assert!(!dst.join("include").is_symlink());
+        assert!(!dst.join("include/qt").is_symlink());
+    }
+
+    #[test]
+    fn an_existing_file_is_left_alone_because_the_declared_output_wins() {
+        let tmp = Tmp::new("firstwins");
+        let src = tmp.path().join("store-out");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("shared.h"), b"from the tree").unwrap();
+
+        let dst = tmp.path().join("build");
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("shared.h"), b"declared output").unwrap();
+
+        link_tree(&src, &dst).unwrap();
+
+        // create_symlinks sorts directory inputs LAST so the individually
+        // declared file is already in place; the tree must then fill only
+        // what is missing rather than overwrite it.
+        assert_eq!(fs::read(dst.join("shared.h")).unwrap(), b"declared output");
+        assert!(!dst.join("shared.h").is_symlink());
+    }
+
+    #[test]
+    fn the_destination_is_created_when_it_does_not_exist() {
+        let tmp = Tmp::new("mkdir");
+        let src = tmp.path().join("store-out");
+        fs::create_dir_all(src.join("a/b")).unwrap();
+        fs::write(src.join("a/b/c.txt"), b"deep").unwrap();
+
+        let dst = tmp.path().join("does/not/exist/yet");
+        link_tree(&src, &dst).unwrap();
+        assert_eq!(fs::read(dst.join("a/b/c.txt")).unwrap(), b"deep");
+    }
+}
