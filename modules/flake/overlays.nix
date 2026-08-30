@@ -137,6 +137,17 @@
         target = "hello";
       };
 
+      # #16's subject. Same sources as example-hello, configured through the
+      # cached configure derivation instead of `meson setup` inside the ninja
+      # derivation, so the two are directly comparable and the option has a
+      # package behind it rather than an argument.
+      example-hello-cached-configure = self.mkMesonPackage {
+        name = "example-hello-cached-configure";
+        src = ./examples/hello;
+        target = "hello";
+        useConfigureCache = true;
+      };
+
       example-header = self.mkMesonPackage {
         name = "example-header";
         src = ./examples/header;
