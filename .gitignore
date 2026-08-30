@@ -26,6 +26,7 @@ __pycache__/
 # in a tracked path with a ledger entry naming its destination.
 /local/
 
-# Symlinks into the fork-only area; the files live in local/.
+# Fork-only, and they live at the root because that is where their tooling
+# looks for them. Untracked, so they never reach upstream.
 /CLAUDE.md
 /.graphifyignore
