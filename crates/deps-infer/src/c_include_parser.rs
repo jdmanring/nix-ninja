@@ -209,7 +209,18 @@ where
     }
 
     // If cache-miss, then look it up ourselves.
-    let result = if path.as_ref().exists() {
+    //
+    // A DIRECTORY IS NOT A HEADER, AND `exists()` SAYS YES TO ONE. gcc skips
+    // a directory found on the include path and keeps searching; this
+    // returned it as the resolved include, the BFS queued it, and the scan's
+    // `fs::read` died:
+    //     Failed to read file .../webrtc/rtc_base/memory: Is a directory
+    // webrtc-audio-processing 1.3 and 2.1, every compile edge in the graph:
+    // `#include <memory>` against an include dir holding a `memory/`
+    // subdirectory. Refusing here, at the single resolution point, lets the
+    // search fall through to the next include dir exactly as the compiler
+    // does.
+    let result = if path.as_ref().is_file() {
         Some(canonicalize(&path)?)
     } else {
         None
