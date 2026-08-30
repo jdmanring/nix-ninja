@@ -1,0 +1,31 @@
+{
+  "derivations_built": 446,
+  "driver_line": "example-nix.drv> nix-ninja: resolved 345 tasks, 0 s total resolve time (worklist 0 s, cmdline 0 s, py 0 s, grd 0 s), dyn 4 s (realise 0 s, discover 0 s, update 0 s/0 calls, adddrv 0 s/0 calls, plain adddrv 0 s/246 calls, sandbox adddrv 1 s/99 calls), realise 0/0 sent, nar 1157/35569 sent, scan 1174/86792 parsed, rss 79 MiB, heap 23 MiB live / 78 MiB retained",
+  "drv": "/170scg4ilzv2igkyaac4ixgapkgpiz78vnx4bc823bmyvs8483gh",
+  "dyn_discover_s": 0,
+  "dyn_realise_s": 0,
+  "dyn_s": 4,
+  "exit_code": 0,
+  "plain_adddrv_calls": 246,
+  "plain_adddrv_s": 0,
+  "resolve_s": 0,
+  "rss_mib": 79,
+  "stats_ms": {
+    "dyn_adddrv_calls": 0,
+    "dyn_adddrv_ms": 0,
+    "dyn_discover_ms": 0,
+    "dyn_ms": 4037,
+    "dyn_realise_ms": 0,
+    "plain_adddrv_calls": 246,
+    "plain_adddrv_ms": 719,
+    "resolve_ms": 897,
+    "rss_mib": 79,
+    "sandbox_adddrv_calls": 99,
+    "sandbox_adddrv_ms": 1283,
+    "tasks": 345
+  },
+  "target": "example-nix",
+  "target_prebuilt": false,
+  "tasks": 345,
+  "wall_seconds": 371.045
+}

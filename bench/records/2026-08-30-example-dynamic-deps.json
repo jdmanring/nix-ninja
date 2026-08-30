@@ -1,0 +1,29 @@
+{
+  "derivations_built": 6,
+  "driver_line": "example-dynamic-deps.drv> nix-ninja: resolved 4 tasks, 0 s total resolve time (worklist 0 s, cmdline 0 s, py 0 s, grd 0 s), dyn 0 s (realise 0 s, discover 0 s, update 0 s/0 calls, adddrv 0 s/0 calls, plain adddrv 0 s/3 calls), realise 0/0 sent, nar 6/6 sent, scan 1/2 parsed, rss 8 MiB, heap 0 MiB live / 4 MiB retained",
+  "drv": "/0rir505p1k44d3d1cabwi1y9k9h6mjfdfi2c9sgz7pfi2rp47ilh",
+  "dyn_discover_s": 0,
+  "dyn_realise_s": 0,
+  "dyn_s": 0,
+  "exit_code": 0,
+  "plain_adddrv_calls": 3,
+  "plain_adddrv_s": 0,
+  "resolve_s": 0,
+  "rss_mib": 8,
+  "stats_ms": {
+    "dyn_adddrv_calls": 0,
+    "dyn_adddrv_ms": 0,
+    "dyn_discover_ms": 0,
+    "dyn_ms": 53,
+    "dyn_realise_ms": 0,
+    "plain_adddrv_calls": 3,
+    "plain_adddrv_ms": 37,
+    "resolve_ms": 10,
+    "rss_mib": 8,
+    "tasks": 4
+  },
+  "target": "example-dynamic-deps",
+  "target_prebuilt": false,
+  "tasks": 4,
+  "wall_seconds": 8.915
+}
