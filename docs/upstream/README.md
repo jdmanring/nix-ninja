@@ -41,6 +41,7 @@ hand before the next one makes sense.
 | 10 | ninja `dyndep` support | a QUESTION first, then maybe a PR | not drafted, and it needs James's decision before it is |
 | 11 | UB in n2's `read_file_with_nul` | PR on **`evmar/n2`** | drafted 2026-08-29, `n2-scanner-soundness.md`; best odds in this directory |
 | 12 | boost patch collision from nix's own override | issue/PR on **NixOS/nix** | drafted 2026-08-29, `nix-boost-patch-collision.md`; reproduced by build here |
+| 13 | `mkMesonPackage` configure caching (their #16) | PR on nix-ninja | drafted 2026-08-30, `configure-caching-16.md`; built, verified on a package, and MEASURED not to pay as the issue frames it. Branch `pr/configure-caching` |
 
 **9 AND 10 WERE ADDED 2026-08-29, and 10 is a question rather than an offer.**
 Everything between 2026-08-26 and 2026-08-29 was unmapped until then: this
@@ -225,6 +226,40 @@ that differ. The count of files in a vendored copy says nothing about the
 divergence, and quoting it as though it did is what turned a forty-line patch
 into an unsendable pile.
 
+## Every file in this directory, because five of them were not indexed here
+
+A file nobody links is a file the next sweep does not read, and this directory
+has already recorded that defect once about a table row. On 2026-08-30 five of
+fifteen documents here were referenced nowhere in this README, three of them
+written that day. Fixed by listing all of them, and the list is the contract:
+**anything added here gets a line, in the same commit.**
+
+Offers, each drafted as something that goes somewhere:
+
+    nix-daemon-wedge-issue.md    item 1, an issue on NixOS/nix
+    issue-replies.md             items 3 and 5, comments into their #7/#4/#17
+    pr3-multiple-targets.md      item 4, a PR
+    devstore-pr.md               item 7, a PR, gated on their #26
+    pr26-reply.md                item 0, a comment - send first
+    bugfix-batch-pr.md           item 9, four fixes in their crates
+    n2-scanner-soundness.md      item 11, a PR on evmar/n2
+    nix-boost-patch-collision.md item 12, an issue/PR on NixOS/nix
+    configure-caching-16.md      item 13, #16: the split, and the measurement
+                                 that says it does not pay as designed
+
+Working documents, which are OURS and go nowhere:
+
+    roadmap-coverage.md          their todo.md and milestones, against this fork
+    their-branches.md            their branches and PRs, and which were unread
+    pr37-libclang.md             their open libclang draft, read and answered
+    branching.md                 how a staged item becomes a PR branch
+    pr-plan.md                   the plan the offers are sequenced by
+    rung3-granularity-issue.md   a granularity argument, undrafted
+    rustc-shim-design.md         a design note, not an offer
+
+None of the working documents may be quoted outward without rereading. They
+discuss the maintainer and they date fast.
+
 ## Their roadmap, separately indexed
 
 The table above is indexed by our pull requests, which cannot answer "what of
@@ -403,6 +438,43 @@ first six rounds audited DRAFTS against THIS TREE. Every finding above came
 from reading something else - the target branch, the upstream patch file, the
 benchmark's own code. **A draft can only be checked against the thing it
 claims about.**
+
+### Round 8, 2026-08-30: took round 7's lesson to the forge, and it held
+
+Round 7 said a draft can only be checked against the thing it claims about.
+Applying that to the DESTINATION rather than to a draft produced four findings,
+and none of them was reachable from inside this tree:
+
+- **PRs had never been enumerated.** Issues were listed by hand more than once;
+  the pull requests never were, so this directory referenced three of seven
+  open PRs and knew nothing of #37, #42, #30 or #8. The largest staged item
+  would have arrived without acknowledging the maintainer's own open draft on
+  the same subject.
+- **A fix credited to a branch had actually landed.** The first version of
+  `their-branches.md` said the #24 tolerance was left unmerged and we
+  rediscovered it. `upstream/main:task.rs:607` has it. What this fork adds
+  sits on top and is a refinement, which is a smaller and true claim.
+- **An accusation was made before checking.** That same first version said
+  `devstore-pr.md` had missed the prior attempt. It had not: round 2 found
+  PR #26, documented it, and reordered the plan around it. Seeing a branch and
+  not mapping it to a PR the directory already knew is the same failure shape
+  as not reading the destination, pointed inward.
+- **A batch item described one third of a fix as the whole of it.** Item 4
+  said "generated headers materialize through a virtual-path map". Driving
+  `example-nix` showed the map is stage one of three, and the other two
+  stages are each fatal on their own. A PR sent on the old text would have
+  claimed a fix that does not hold.
+
+**Status of everything written on 2026-08-30: UNAUDITED.** `configure-caching-16.md`,
+`pr37-libclang.md`, `their-branches.md`, `branching.md` and the rewritten item 4
+of `bugfix-batch-pr.md` have had no independent adversarial read. Two of them
+were written, found wrong, and corrected within the same hour by one more
+command each, which is evidence about the drafting rather than about the
+subject. They are not ready by this directory's own rule.
+
+The lesson round 8 leaves for round 9: **check before you accuse.** Two of the
+four findings above are this round's own errors, both produced by writing up a
+conclusion from one observation when a second command would have settled it.
 
 ## The prose gate, which lives in the other tree and so never ran here
 
