@@ -244,17 +244,14 @@ pub fn run() -> Result<()> {
         let depfiles = task::take_collected_depfiles();
         if !depfiles.is_empty() {
             let n = depfiles.len();
-            match local::symlink_derived_files(
-                &rpc_client,
-                &cli.store_dir,
-                &build_dir,
-                &depfiles,
-            ) {
-                Ok(()) => eprintln!(
-                    "nix-ninja: collected {n} depfile(s) into the build directory;                      a rebuild reads them instead of scanning"
+            match local::copy_derived_files(&rpc_client, &cli.store_dir, &build_dir, &depfiles) {
+                Ok(copied) => eprintln!(
+                    "nix-ninja: collected {copied}/{n} depfile(s) into the build \
+                     directory; a rebuild reads them instead of scanning"
                 ),
                 Err(e) => eprintln!(
-                    "nix-ninja: could not collect {n} depfile(s) ({e}); the next run                      scans as before"
+                    "nix-ninja: could not collect {n} depfile(s) ({e}); the next \
+                     run scans as before"
                 ),
             }
         }

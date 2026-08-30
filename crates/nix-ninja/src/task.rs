@@ -846,7 +846,14 @@ impl Runner {
                 // consumers as a build product and feed undeclared_outputs
                 // a path it never reasoned about. It is a side channel for
                 // the collector alone.
-                if let Some(dpath) = accepted_depfile_output(&task) {
+                // ONLY IN LOCAL MODE, because only local mode materializes
+                // them. Inside a derivation the collector has no consumer:
+                // `cli.rs` drains this in the else-branch, so on the
+                // NIX_NINJA_DRV path every push was a normalize_output plus a
+                // store_rel_path per task for a value nothing would read.
+                if let Some(dpath) =
+                    accepted_depfile_output(&task).filter(|_| !config.is_output_derivation)
+                {
                     COLLECTED_DEPFILES
                         .lock()
                         .unwrap()
@@ -5908,6 +5915,54 @@ mod depfile_read_back_tests {
             &[PathBuf::from("a.c")]
         )
         .is_none());
+        // A HEADER newer than the depfile is stale too, and checking only
+        // the TUs missed it: editing a header to add an include does not
+        // touch the .c file. This is the D2 regression.
+        //
+        // The fixture has to put the depfile BETWEEN the source and the
+        // header in time, or the sources loop returns None first and this
+        // asserts nothing - which is exactly what the first version of this
+        // test did.
+        let t0 = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let t1 = std::time::SystemTime::now() - std::time::Duration::from_secs(30);
+        let t2 = std::time::SystemTime::now();
+        std::fs::write(&dep, "a.o: a.c \\\n hdr/one.h\n").unwrap();
+        let hdr_dir = d.join("hdr");
+        std::fs::create_dir_all(&hdr_dir).unwrap();
+        let hdr = hdr_dir.join("one.h");
+        std::fs::write(&hdr, "// h\n").unwrap();
+        let set = |f: &std::path::Path, t: std::time::SystemTime| {
+            std::fs::File::open(f)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(t))
+                .unwrap();
+        };
+        set(&src, t0);
+        set(&dep, t1);
+        set(&hdr, t0);
+        // Source older, header older: the depfile's answer stands.
+        assert!(
+            depfile_read_back(
+                &d,
+                Some(PathBuf::from("a.o.d").as_path()),
+                &[PathBuf::from("a.c")]
+            )
+            .is_some(),
+            "with everything older than the depfile the read-back must fire"
+        );
+        // Only the HEADER moves, and the source is untouched.
+        set(&hdr, t2);
+        assert!(
+            depfile_read_back(
+                &d,
+                Some(PathBuf::from("a.o.d").as_path()),
+                &[PathBuf::from("a.c")]
+            )
+            .is_none(),
+            "a header newer than the depfile must fall back to the scan"
+        );
+        std::fs::remove_file(&hdr).unwrap();
+
         // Empty depfile is no answer, not an empty answer.
         std::fs::write(&dep, "").unwrap();
         assert!(depfile_read_back(&d, Some(PathBuf::from("a.o.d").as_path()), &[]).is_none());
@@ -6133,18 +6188,19 @@ fn depfile_read_back(
     } else {
         build_dir.join(d)
     };
-    let dep_m = std::fs::metadata(&d).ok()?.modified().ok()?;
-    for srcf in sources {
-        let p = if srcf.is_absolute() {
-            srcf.clone()
-        } else {
-            build_dir.join(srcf)
-        };
-        let m = std::fs::metadata(&p).ok()?.modified().ok()?;
-        if m > dep_m {
-            return None;
-        }
+    // A SYMLINK INTO THE STORE IS ALWAYS STALE BY THIS TEST, which is why
+    // this guard silently disabled the whole feature for a day. Store files
+    // carry mtime 1 by construction, `fs::metadata` follows the symlink, and
+    // every real source is newer than the epoch - so a collected depfile
+    // materialized as a symlink took the `m > dep_m` branch every time and
+    // the scan ran anyway. `local.rs` now COPIES depfiles rather than
+    // symlinking them, and this refuses a store path outright rather than
+    // pretending to compare against one.
+    if d.canonicalize().is_ok_and(|c| c.starts_with("/nix/store/")) {
+        return None;
     }
+    let dep_m = std::fs::metadata(&d).ok()?.modified().ok()?;
+
     let buf = n2::scanner::read_file_with_nul(&d).ok()?;
     let mut sc = n2::scanner::Scanner::new(&buf);
     let parsed = n2::depfile::parse(&mut sc).ok()?;
@@ -6157,10 +6213,55 @@ fn depfile_read_back(
     // An empty parse is no answer, not an empty answer: fall back to the
     // scan rather than declaring a TU with zero includes.
     if out.is_empty() {
-        None
-    } else {
-        Some(out)
+        return None;
     }
+
+    // FRESHNESS IS ABOUT WHAT THE DEPFILE SPEAKS FOR, WHICH IS THE HEADERS.
+    // This used to compare only against `sources` - the TU files - and the
+    // headers are exactly what it claims to know. Editing a header to add an
+    // `#include` does not touch the .c file, so a stale depfile passed the
+    // guard and the new header was never declared: a silent under-declaration
+    // and a wrong artifact, which is the one failure mode this module exists
+    // to prevent. Check the TUs AND every path the depfile names.
+    // The TUs are strict: one that cannot be stat'd means this is not a
+    // build directory we understand, and the scan should run.
+    for srcf in sources {
+        let p = if srcf.is_absolute() {
+            srcf.clone()
+        } else {
+            build_dir.join(srcf)
+        };
+        let m = std::fs::metadata(&p).ok()?.modified().ok()?;
+        if m > dep_m {
+            return None;
+        }
+    }
+    // The HEADERS are checked leniently, and the asymmetry is deliberate.
+    // Strictness here re-creates the inert-feature bug in a new place: a
+    // depfile names paths as the compiler spelled them, and one that does not
+    // resolve from `build_dir` would make every read-back fail and every run
+    // re-scan. A path we cannot stat is one whose freshness we cannot judge,
+    // not evidence of staleness - and if it is genuinely gone, declaring it
+    // makes the upload fail LOUDLY, which is the direction this pipeline
+    // wants. A header that does resolve and is newer than the depfile is the
+    // real case, and it is the one this loop exists for: editing a header to
+    // add an include does not touch the .c file, so checking only the TUs
+    // let a stale depfile under-declare silently.
+    for hdr in &out {
+        let p = if hdr.is_absolute() {
+            hdr.clone()
+        } else {
+            build_dir.join(hdr)
+        };
+        let Ok(m) = std::fs::metadata(&p).and_then(|md| md.modified()) else {
+            continue;
+        };
+        if m > dep_m {
+            return None;
+        }
+    }
+
+    Some(out)
 }
 
 /// Union of the textual scan and the preprocessor's depfile, scan order

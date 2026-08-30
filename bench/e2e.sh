@@ -34,8 +34,8 @@ FEATURES='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
 # These examples evaluate to a STRING, not a derivation: each is
 # `builtins.outputOf ninjaDrv.outPath <target>`, which is the whole point of
 # the dynamic-derivation design. So there is no `.drvPath` to read, and the
-# attribute is addressed bare - `.#example-hello` - exactly as the README and
-# CLAUDE.md say to build it.
+# attribute is addressed bare - `.#example-hello` - exactly as the README says
+# to build it.
 drv=$(nix eval --raw --extra-experimental-features "$FEATURES" \
         ".#${TARGET}" 2>/dev/null)
 if [ -z "$drv" ]; then

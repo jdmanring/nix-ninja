@@ -498,7 +498,13 @@ fn is_declared_virtual(path: &Path, virtual_paths: Option<&HashMap<PathBuf, Path
     let Some(vp) = virtual_paths else {
         return false;
     };
-    vp.contains_key(path) || vp.values().any(|v| v == path)
+    // KEY LOOKUP ONLY. The caller builds this map as build_path -> build_path
+    // and `canonicalize_cached` returns the VALUE for a key hit, so the path
+    // the BFS queues is literally a key here. A `values().any()` fallback
+    // looked defensive and was an O(V) scan over the same map whose pairwise
+    // scanning was once measured at 25% of driver CPU - see
+    // canonicalize_cached. Defensive code on a hot map is not free.
+    vp.contains_key(path)
 }
 
 pub fn extract_includes(

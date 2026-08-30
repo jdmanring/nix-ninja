@@ -109,3 +109,65 @@ pub fn symlink_derived_files(
 
     Ok(())
 }
+
+/// UPSTREAM #17: materialize collected depfiles as COPIES, not symlinks.
+///
+/// `symlink_derived_files` is right for build products - a symlink into the
+/// store costs nothing and the store path is the identity. It is WRONG for a
+/// depfile, and getting that wrong made the whole read-back inert for a day:
+/// nix gives every store file mtime 1, `fs::metadata` follows the symlink, so
+/// `depfile_read_back`'s freshness guard saw a file older than every source
+/// and fell back to the scan on every run. The collection ran, printed its
+/// count, and bought nothing.
+///
+/// A copy lands with the current mtime, which is what makes the guard mean
+/// what it says. Best effort per file: a depfile that fails to copy costs a
+/// scan next run, which is the behavior that has always been in force.
+pub fn copy_derived_files(
+    rpc_client: &BuilderRpcClient,
+    store_dir: &StoreDir,
+    prefix: &Path,
+    derived_files: &[DerivedFile],
+) -> Result<usize> {
+    let derived_paths: Vec<_> = derived_files
+        .iter()
+        .map(|df| df.derived_path.clone())
+        .collect();
+    let store_paths = rpc_client.build_paths(store_dir, &derived_paths)?;
+
+    let mut copied = 0usize;
+    for (df, store_path) in derived_files.iter().zip(store_paths.iter()) {
+        let mut src = store_path.to_absolute_path(store_dir);
+        if let Some(rel) = &df.rel_path {
+            src = src.join(rel);
+        }
+        if !src.is_file() {
+            continue;
+        }
+        let dest = prefix.join(&df.build_path);
+        if let Some(parent) = dest.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        // Replace whatever is there: a previous run may have left a symlink
+        // into the store at this path, and copying onto a symlink would
+        // write THROUGH it into a read-only store file.
+        if dest.is_symlink() || dest.exists() {
+            let _ = std::fs::remove_file(&dest);
+        }
+        if std::fs::copy(&src, &dest).is_err() {
+            continue;
+        }
+        // Store files are read-only; the copy inherits that and a later run
+        // could not replace it in place.
+        if let Ok(md) = std::fs::metadata(&dest) {
+            let mut perms = md.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(&dest, perms);
+        }
+        copied += 1;
+    }
+    Ok(copied)
+}

@@ -10,7 +10,7 @@
 //! It lives in `crates/nix-ninja` rather than beside its subject in
 //! `crates/deps-infer` on purpose: deps-infer is inside
 //! `nix-ninja-task`'s `src` allowlist, so a test file there re-keys the
-//! task binary and every banked per-TU output. See CLAUDE.md.
+//! task binary and every output a consumer has already built against it.
 
 use deps_infer::c_include_parser::extract_includes;
 use std::path::PathBuf;
