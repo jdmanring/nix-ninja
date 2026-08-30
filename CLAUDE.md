@@ -62,6 +62,12 @@ emits.** Two independent tests, and passing the first is not enough:
    `nix-ninja-task` from `2ai4n9fh` to `da3j2y88` on 2026-08-24, spending every
    banked output to buy coverage that never runs inside a build. Moved to
    `crates/nix-ninja`, reaching the same `pub` function, the hash returned.
+   Read that last sentence with the paragraph above it: `nix-ninja-task`'s hash
+   returned. `nix-ninja`'s did not, and it is the builder of every dynamic task,
+   so the move bought back the plain task derivations and not the dynamic ones.
+   For a package with no generated sources that is the whole bank; for a
+   codegen-heavy one it is not. There is no location in this tree where a test
+   is free of both binaries.
 
 2. **The emission test, which the fileset test cannot see.** A driver-only edit
    is free ONLY if it does not change what the driver EMITS. Anything touching
