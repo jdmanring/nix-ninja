@@ -881,7 +881,12 @@ impl Runner {
                 // `cli.rs` drains this in the else-branch, so on the
                 // NIX_NINJA_DRV path every push was a normalize_output plus a
                 // store_rel_path per task for a value nothing would read.
-                if let Some(dpath) = collectable_depfile_output(&task, config.is_output_derivation)
+                // Only in local mode: `cli.rs` drains the collector in its
+                // else-branch, so inside a derivation every push would be a
+                // normalize_output and a store_rel_path per task for a value
+                // nothing will read.
+                if let Some(dpath) =
+                    accepted_depfile_output(&task).filter(|_| !config.is_output_derivation)
                 {
                     COLLECTED_DEPFILES
                         .lock()
@@ -5451,51 +5456,6 @@ fn accepted_depfile_output_of(
     }
 }
 
-/// Which depfile, if any, this run should COLLECT - the accepted output,
-/// minus the case where nothing will drain it.
-///
-/// Split out because the `is_output_derivation` half had no test: inside a
-/// derivation `cli.rs` never calls `take_collected_depfiles`, so every push
-/// there was a `normalize_output` plus a `store_rel_path` per task for a
-/// value nothing would read.
-fn collectable_depfile_output(task: &Task, is_output_derivation: bool) -> Option<PathBuf> {
-    collectable(accepted_depfile_output(task), is_output_derivation)
-}
-
-/// The decision alone, over values rather than a `Task`, so it can be tested.
-fn collectable(accepted: Option<PathBuf>, is_output_derivation: bool) -> Option<PathBuf> {
-    if is_output_derivation {
-        None
-    } else {
-        accepted
-    }
-}
-
-#[cfg(test)]
-mod collectable_tests {
-    use super::collectable;
-    use std::path::PathBuf;
-
-    #[test]
-    fn local_mode_collects_and_derivation_mode_does_not() {
-        let d = Some(PathBuf::from("a.o.d"));
-        assert_eq!(collectable(d.clone(), false), d, "local mode drains these");
-        assert_eq!(
-            collectable(d, true),
-            None,
-            "inside a derivation nothing drains the collector, so pushing is \
-             a normalize_output and a store_rel_path per task for a value \
-             nothing reads"
-        );
-    }
-
-    #[test]
-    fn a_task_with_no_accepted_depfile_collects_nothing_either_way() {
-        assert_eq!(collectable(None, false), None);
-        assert_eq!(collectable(None, true), None);
-    }
-}
-
 /// UPSTREAM #17, THE COLLECTION HALF. Every depfile a task emitted, as a
 /// derived path that can be realized after the run.
 ///
@@ -6642,16 +6602,13 @@ fn generated_not_yet_written(
     include: &Path,
     virtual_declared: Option<&HashMap<PathBuf, PathBuf>>,
 ) -> bool {
-    let Some(vp) = virtual_declared else {
-        return false;
-    };
-    // KEY LOOKUP ONLY, to agree with `is_declared_virtual` in deps-infer.
-    // That one dropped its `values()` fallback for cost; this one kept it, so
-    // the two predicates disagreed for any non-identity map. The map is built
-    // identity today (build_path -> build_path), which is why no test could
-    // tell them apart - a divergence that goes live the first time a real
-    // mapping is introduced.
-    if !vp.contains_key(include) {
+    // ONE PREDICATE, SHARED WITH THE SCANNER, not a second copy of it. This
+    // was hand-written twice in two crates and the copies diverged within a
+    // day: the scanner's dropped a `values()` fallback for cost and this one
+    // kept it, so they disagreed for any non-identity map. No test could tell
+    // them apart, because the map is built identity today - which is exactly
+    // how a duplicated predicate rots unnoticed.
+    if !c_include_parser::is_declared_virtual(include, virtual_declared) {
         return false;
     }
     let abs = if include.is_absolute() {

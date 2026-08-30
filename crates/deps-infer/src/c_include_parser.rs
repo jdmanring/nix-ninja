@@ -494,7 +494,7 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
 /// assuming the identity mapping, which is the caller's choice and not this
 /// module's contract. Linear over the values only on a read failure, which
 /// is rare by construction.
-fn is_declared_virtual(path: &Path, virtual_paths: Option<&HashMap<PathBuf, PathBuf>>) -> bool {
+pub fn is_declared_virtual(path: &Path, virtual_paths: Option<&HashMap<PathBuf, PathBuf>>) -> bool {
     let Some(vp) = virtual_paths else {
         return false;
     };
