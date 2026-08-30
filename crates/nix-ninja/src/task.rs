@@ -704,7 +704,7 @@ impl Runner {
         // (measured, round 58: 22 min without a daemon connection). The
         // counter names the slow task and prices resolution per task; it
         // is always on because its cost is two atomics per task.
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::Ordering;
         let t0 = std::time::Instant::now();
         let task = self.new_task(files, build)?;
         let resolve_ms = t0.elapsed().as_millis() as u64;

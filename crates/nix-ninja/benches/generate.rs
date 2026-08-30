@@ -115,7 +115,7 @@ unsafe fn mmap_with_nul(path: &Path) -> Option<(*mut libc::c_void, usize, usize)
         return None;
     }
     let len = fs::metadata(path).unwrap().len() as usize;
-    if len % page_size() == 0 {
+    if len.is_multiple_of(page_size()) {
         libc::close(fd);
         return None; // no free NUL past EOF
     }
