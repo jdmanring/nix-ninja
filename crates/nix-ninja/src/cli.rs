@@ -88,6 +88,23 @@ pub fn run() -> Result<()> {
         submit_outer_output(&cli.store_dir, &derived_file, &rpc_client)?;
     } else {
         local::symlink_derived_files(&rpc_client, &cli.store_dir, &build_dir, &[derived_file])?;
+
+        // UPSTREAM #17: materialise the depfiles the run collected. Best
+        // effort - a depfile that fails to appear costs a scan on the next
+        // run, which is the behaviour that has always been in force, and
+        // failing the build here would turn that into a build failure.
+        let depfiles = crate::task::take_collected_depfiles();
+        if !depfiles.is_empty() {
+            let n = depfiles.len();
+            match local::copy_derived_files(&rpc_client, &cli.store_dir, &build_dir, &depfiles) {
+                Ok(copied) => eprintln!(
+                    "nix-ninja: collected {copied}/{n} depfile(s) into the build directory"
+                ),
+                Err(e) => eprintln!(
+                    "nix-ninja: could not collect {n} depfile(s) ({e}); the next run scans as before"
+                ),
+            }
+        }
     }
     Ok(())
 }

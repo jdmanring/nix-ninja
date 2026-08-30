@@ -17,6 +17,7 @@ use nix_ninja_task::derived_file::DerivedFile;
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
+use std::sync::{LazyLock, Mutex};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
@@ -67,6 +68,9 @@ struct Task {
     cmdline: Option<String>,
     desc: Option<String>,
     deps: Option<String>,
+    /// The edge's `depfile`, carried so the task can declare it as an output
+    /// and the run can collect it. Upstream #17.
+    depfile: Option<String>,
 
     files: HashMap<FileId, File>,
     inputs: Vec<DerivedFile>,
@@ -216,7 +220,22 @@ impl Runner {
                         drv.clone(),
                         &config,
                     ) {
-                        Ok(final_derived_path) => (Some(final_derived_path), None),
+                        Ok(final_derived_path) => {
+                            // UPSTREAM #17, the collection half. Only in
+                            // local mode: inside a derivation nothing drains
+                            // this, so every push would cost a name
+                            // normalisation per task for a value no one
+                            // reads.
+                            if let Some(dpath) = accepted_depfile_output(&task)
+                                .filter(|_| !config.is_output_derivation)
+                            {
+                                COLLECTED_DEPFILES.lock().unwrap().push(new_built_file(
+                                    final_derived_path.clone(),
+                                    dpath,
+                                ));
+                            }
+                            (Some(final_derived_path), None)
+                        }
                         Err(err) => (None, Some(err.context(format!("Failed to handle derivation result for task (derivation: {})\nDerivation JSON:\n{}", drv.name, serde_json::to_string_pretty(&drv).unwrap_or_else(|_| "Failed to serialize derivation".to_string()))))),
                     },
                     Err(err) => (None, Some(err.context("Failed to build task derivation for task".to_string()))),
@@ -424,6 +443,7 @@ impl Runner {
             cmdline,
             desc: build.desc.clone(),
             deps: build.deps.clone(),
+            depfile: build.depfile.clone(),
             files: build_files,
             inputs,
             outputs,
@@ -558,9 +578,17 @@ fn build_task_derivation(
         inputs.join(" ").into_bytes().into(),
     );
 
+    // UPSTREAM #17: declare the edge's depfile as an output too, so the
+    // build writes it somewhere the run can collect it from. Only when the
+    // command actually generates one - see `accepted_depfile_output`.
+    let mut task_outputs = task.outputs.clone();
+    if let Some(dpath) = accepted_depfile_output(&task) {
+        task_outputs.push(dpath);
+    }
+
     // Add all ninja build outputs.
     let mut outputs: Vec<String> = Vec::new();
-    for output_path in &task.outputs {
+    for output_path in &task_outputs {
         // Declare a content addressed output.
         let normalized_name = normalize_output(&output_path.to_string_lossy());
         drv.outputs.insert(
@@ -903,6 +931,115 @@ fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> Deriv
     }
 }
 
+///
+/// Takes the four fields rather than a `&Task`, for the reason
+/// `is_compile_edge` does: a Task needs a whole ninja graph to construct,
+/// and a gate nobody can unit-test is a gate that drifts.
+fn accepted_depfile_output(task: &Task) -> Option<PathBuf> {
+    accepted_depfile_output_of(
+        task.depfile.as_deref(),
+        task.deps.as_deref(),
+        task.cmdline.as_deref(),
+        // The rspfile spelling is deliberately NOT read here. An edge that
+        // hides its `-MD` inside an rspfile is refused, which costs a scan
+        // rather than producing a wrong answer, and reading it would pull in
+        // plumbing this change does not otherwise need.
+        None,
+    )
+}
+
+fn accepted_depfile_output_of(
+    depfile: Option<&str>,
+    deps: Option<&str>,
+    cmdline: Option<&str>,
+    rspfile_content: Option<&str>,
+) -> Option<PathBuf> {
+    let (Some(d), Some("gcc")) = (depfile, deps) else {
+        return None;
+    };
+    if d.is_empty() || !command_writes_depfile(cmdline, rspfile_content) {
+        return None;
+    }
+    let p = PathBuf::from(d);
+    // An absolute or escaping depfile path is not ours to copy: the task's
+    // outputs are build-dir-relative by construction, and a path outside
+    // that tree would be silently rebased. Skip it and leave the task
+    // exactly as it was.
+    if p.is_absolute() || p.starts_with("..") {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// UPSTREAM #17, THE COLLECTION HALF. Every depfile a task emitted, as a
+/// derived path that can be realized after the run.
+///
+/// The read-back half already existed and could never fire on a fresh
+/// build directory, which is why this looked finished and was not: the
+/// depfile is a content-addressed OUTPUT of the task derivation, and local
+/// mode materializes only the requested TARGETS (`cli.rs`), so no
+/// per-object depfile ever reached the build directory for a later run to
+/// read. Collect them here, materialize them in local mode, and
+/// `depfile_read_back` does the skipping it was always written to do.
+static COLLECTED_DEPFILES: LazyLock<Mutex<Vec<DerivedFile>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Drains the collected depfile outputs. Drained rather than cloned: the
+/// caller materializes them once at the end of a run, and leaving them
+/// behind would make a second call in the same process re-realize paths it
+/// already wrote.
+pub fn take_collected_depfiles() -> Vec<DerivedFile> {
+    std::mem::take(&mut *COLLECTED_DEPFILES.lock().unwrap())
+}
+
+/// Whether a compile command will actually WRITE a depfile. CMake's LTO
+/// capability probe (`_CMakeLTOTest-CXX`) generates an edge declaring
+/// `deps = gcc` and a depfile while its command carries no -MD/-MF, so
+/// gcc never writes the file and a task that declared it as an output
+/// dies collecting it (`canonicalize(...o.d): No such file`). The edge
+/// declaration is a promise about the RULE; the command is the truth.
+/// -MMD implies -MD's writing behaviour; -MF names the file explicitly
+/// (spaced or fused). The rspfile is part of the command line.
+/// Does this command actually WRITE a dependency file?
+///
+/// `-MF` DOES NOT ANSWER THAT, and treating it as though it did cost a real
+/// package. `-MF` names where a depfile would go; `-MQ` and `-MT` set the
+/// target inside it. Only a dependency-GENERATION flag makes one appear.
+///
+/// gcc does not merely skip the depfile in that case, it REFUSES the compile:
+/// `cc1: error: to generate dependencies you must specify either '-M' or
+/// '-MM'`. So no gcc command line reaching this function can have a bare
+/// `-MF` and still be a command that runs.
+///
+/// nasm is the case that reached a build. meson's nasm rule is `deps = gcc`
+/// with `-MQ ... -MF ...` and no generation flag, and nasm accepts that,
+/// exits 0, and writes nothing. #17 then declared the depfile a
+/// content-addressed output and the task failed collecting an output the
+/// command never produces: `canonicalize(...cpuid.obj.ndep): No such file or
+/// directory`. Measured 2026-08-30 driving libvmaf, the package that named
+/// failure class 3. This is the exact hazard the gate exists to prevent, and
+/// it was in the gate.
+fn command_writes_depfile(cmdline: Option<&str>, rsp: Option<&str>) -> bool {
+    let writes = |s: &str| {
+        s.split_whitespace().any(|t| {
+            // Generation flags. `-M`/`-MM` write to stdout unless redirected
+            // by `-MF`, and both are dependency modes, so both count.
+            t == "-M"
+                || t == "-MM"
+                || t == "-MD"
+                || t == "-MMD"
+                || t == "-MG"
+                // The LINKER spelling: CMake 3.27+ link edges write their
+                // depfile via `-Wl,--dependency-file=...` (capstone's LTO
+                // link died writing link.d into a directory only the
+                // declared-output path used to create).
+                || t.contains("--dependency-file")
+        })
+    };
+    cmdline.is_some_and(writes) || rsp.is_some_and(writes)
+}
+
 // Derivation outputs cannot have `/` in them as its suffixed to the derivation
 // store path.
 fn normalize_output(output: &str) -> String {
@@ -968,4 +1105,106 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+#[cfg(test)]
+mod accepted_depfile_output_tests {
+    use super::accepted_depfile_output_of;
+    use std::path::PathBuf;
+
+    const CC: &str = "cc -MD -MF foo.o.d -c foo.c -o foo.o";
+
+    #[test]
+    fn a_gcc_deps_edge_with_a_relative_depfile_is_accepted() {
+        assert_eq!(
+            accepted_depfile_output_of(Some("foo.o.d"), Some("gcc"), Some(CC), None),
+            Some(PathBuf::from("foo.o.d"))
+        );
+    }
+
+    /// THE GATE THAT COSTS A BUILD IF IT WIDENS. A declared output the
+    /// command does not produce fails the task, and `depfile` without
+    /// `deps = gcc` is a path ninja would read IF one appeared - not a
+    /// promise that anything writes it. meson's nasm rule is the real
+    /// case: `depfile =` and no `deps`.
+    #[test]
+    fn a_depfile_without_deps_gcc_is_refused() {
+        assert_eq!(
+            accepted_depfile_output_of(Some("foo.o.d"), None, Some(CC), None),
+            None
+        );
+    }
+
+    /// And a command that declares no depfile flag writes nothing, however
+    /// the rule is spelled.
+    #[test]
+    fn a_command_that_writes_no_depfile_is_refused() {
+        assert_eq!(
+            accepted_depfile_output_of(Some("foo.o.d"), Some("gcc"), Some("cc -c foo.c"), None),
+            None
+        );
+    }
+
+    /// An absolute or escaping path would be silently rebased into the
+    /// build dir, so it is left alone entirely.
+    #[test]
+    fn a_depfile_outside_the_build_dir_is_refused() {
+        for d in ["/tmp/foo.o.d", "../foo.o.d"] {
+            assert_eq!(
+                accepted_depfile_output_of(Some(d), Some("gcc"), Some(CC), None),
+                None,
+                "{d} must not be adopted as an output"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_depfile_path_is_refused() {
+        assert_eq!(
+            accepted_depfile_output_of(Some(""), Some("gcc"), Some(CC), None),
+            None
+        );
+    }
+
+    /// THE libvmaf REGRESSION. meson's nasm rule is `deps = gcc` with
+    /// `-MQ <target> -MF <path>` and NO generation flag. nasm writes nothing,
+    /// exits 0, and declaring the depfile an output fails the task on an
+    /// output the command never produces. `-MF` names a destination; it does
+    /// not ask for a depfile.
+    #[test]
+    fn nasm_naming_a_depfile_without_asking_for_one_is_refused() {
+        let nasm = "nasm -f elf64 -I ../src/ -MQ src/cpuid.obj \
+                    -MF src/cpuid.obj.ndep ../src/x86/cpuid.asm -o src/cpuid.obj";
+        assert_eq!(
+            accepted_depfile_output_of(Some("src/cpuid.obj.ndep"), Some("gcc"), Some(nasm), None),
+            None,
+            "-MF alone must not be read as a promise that anything writes it"
+        );
+    }
+
+    /// And the same command WITH a generation flag is accepted, so the fix
+    /// narrows the gate rather than closing it.
+    #[test]
+    fn the_same_command_with_a_generation_flag_is_accepted() {
+        let nasm =
+            "nasm -f elf64 -MD -MQ src/cpuid.obj -MF src/cpuid.obj.ndep ../src/x86/cpuid.asm";
+        assert_eq!(
+            accepted_depfile_output_of(Some("src/cpuid.obj.ndep"), Some("gcc"), Some(nasm), None),
+            Some(PathBuf::from("src/cpuid.obj.ndep"))
+        );
+    }
+
+    /// The flag can live in the rspfile rather than the command line.
+    #[test]
+    fn the_depfile_flag_is_honoured_from_the_rspfile() {
+        assert_eq!(
+            accepted_depfile_output_of(
+                Some("foo.o.d"),
+                Some("gcc"),
+                Some("cc @foo.rsp"),
+                Some("-MD -MF foo.o.d -c foo.c")
+            ),
+            Some(PathBuf::from("foo.o.d"))
+        );
+    }
 }

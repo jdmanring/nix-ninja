@@ -63,3 +63,153 @@ pub fn symlink_derived_files(
 
     Ok(())
 }
+
+/// UPSTREAM #17: materialize collected depfiles as COPIES, not symlinks.
+///
+/// `symlink_derived_files` is right for build products - a symlink into the
+/// store costs nothing and the store path is the identity. It is WRONG for a
+/// depfile, and getting that wrong made the whole read-back inert for a day:
+/// nix gives every store file mtime 1, `fs::metadata` follows the symlink, so
+/// `depfile_read_back`'s freshness guard saw a file older than every source
+/// and fell back to the scan on every run. The collection ran, printed its
+/// count, and bought nothing.
+///
+/// A copy lands with the current mtime, which is what makes the guard mean
+/// what it says. Best effort per file: a depfile that fails to copy costs a
+/// scan next run, which is the behavior that has always been in force.
+pub fn copy_derived_files(
+    rpc_client: &BuilderRpcClient,
+    store_dir: &StoreDir,
+    prefix: &Path,
+    derived_files: &[DerivedFile],
+) -> Result<usize> {
+    let derived_paths: Vec<_> = derived_files
+        .iter()
+        .map(|df| df.derived_path.clone())
+        .collect();
+    let store_paths = rpc_client.build_paths(store_dir, &derived_paths)?;
+
+    let mut copied = 0usize;
+    for (df, store_path) in derived_files.iter().zip(store_paths.iter()) {
+        let mut src = store_path.to_absolute_path(store_dir);
+        if let Some(rel) = &df.rel_path {
+            src = src.join(rel);
+        }
+        if !src.is_file() {
+            continue;
+        }
+        let dest = prefix.join(&df.build_path);
+        if let Some(parent) = dest.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        if copy_over(&src, &dest).is_err() {
+            continue;
+        }
+        copied += 1;
+    }
+    Ok(copied)
+}
+
+/// Copy `src` over `dest`, replacing whatever is there, and leave the result
+/// WRITABLE and a REGULAR FILE.
+///
+/// Both properties are the point and neither is incidental:
+///
+/// - a previous run leaves a SYMLINK into the store at this path, and
+///   `fs::copy` onto a symlink writes THROUGH it, into a read-only store
+///   file. Remove first.
+/// - store files are read-only and a copy inherits the mode, so without the
+///   permission fix the next run cannot replace it in place.
+/// - the result must not itself be a symlink, because the whole reason
+///   depfiles are copied is that `fs::metadata` follows a symlink into the
+///   store and reads mtime 1, which the freshness guard treats as older than
+///   every source. That made the feature inert for a day.
+fn copy_over(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if dest.is_symlink() || dest.exists() {
+        let _ = std::fs::remove_file(dest);
+    }
+    std::fs::copy(src, dest)?;
+    if let Ok(md) = std::fs::metadata(dest) {
+        let mut perms = md.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(dest, perms);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod copy_over_tests {
+    use super::copy_over;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "nn-copyover-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// THE REGRESSION. Reverting to a symlink is what made the depfile
+    /// read-back inert: a symlinked destination reads its TARGET's mtime.
+    #[test]
+    fn the_destination_is_a_real_file_not_a_link() {
+        let d = tmp("real");
+        let src = d.join("src.d");
+        std::fs::write(&src, b"a.o: a.c\n").unwrap();
+        let dest = d.join("out.d");
+        copy_over(&src, &dest).unwrap();
+        assert!(
+            !dest.is_symlink(),
+            "a symlink here reads the target's mtime"
+        );
+        assert!(dest.is_file());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a.o: a.c\n");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A previous run's symlink into a read-only store must be REPLACED, not
+    /// written through - writing through it fails, or worse, succeeds against
+    /// something that is not ours.
+    #[test]
+    fn an_existing_symlink_is_replaced_rather_than_followed() {
+        let d = tmp("link");
+        let victim = d.join("victim");
+        std::fs::write(&victim, b"DO NOT TOUCH").unwrap();
+        let dest = d.join("out.d");
+        std::os::unix::fs::symlink(&victim, &dest).unwrap();
+
+        let src = d.join("src.d");
+        std::fs::write(&src, b"new").unwrap();
+        copy_over(&src, &dest).unwrap();
+
+        assert!(!dest.is_symlink());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"DO NOT TOUCH",
+            "the symlink target must be untouched"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A copy of a read-only source must be replaceable next run.
+    #[test]
+    fn the_copy_is_writable_even_when_the_source_is_not() {
+        let d = tmp("perm");
+        let src = d.join("src.d");
+        std::fs::write(&src, b"x").unwrap();
+        let mut p = std::fs::metadata(&src).unwrap().permissions();
+        p.set_readonly(true);
+        std::fs::set_permissions(&src, p).unwrap();
+
+        let dest = d.join("out.d");
+        copy_over(&src, &dest).unwrap();
+        assert!(!std::fs::metadata(&dest).unwrap().permissions().readonly());
+        std::fs::remove_dir_all(&d).ok();
+    }
+}
