@@ -3174,8 +3174,9 @@ fn handle_derivation_result(
         // ONLY ARM THAT RAN. The four sub-timers above all sit inside the
         // dynamic arm, while the DynDiscoveryTimer guard at the top of this
         // function spans BOTH, so every task taking this branch landed in
-        // `dyn` with nothing to account for it. ArtNix read dyn growing
-        // 0.084 s/task on 2026-08-29 with realise, discover, update and
+        // `dyn` with nothing to account for it. Measured on a full
+        // distribution build: dyn grew 0.084 s/task with realise, discover,
+        // update and
         // adddrv all zero and `realise 0/0 sent` on every line, which is this
         // arm running 4000 times with one untimed daemon round trip in it.
         //

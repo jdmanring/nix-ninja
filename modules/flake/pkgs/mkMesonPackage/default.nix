@@ -22,7 +22,7 @@ let
   # cached across builds instead of re-run inside every ninja derivation.
   #
   # OPT-IN, and deliberately so. Every derivation this driver emits is
-  # keyed on what the driver emits, and ArtNix banks hundreds of thousands
+  # keyed on what the driver emits, and a consumer can bank hundreds of thousands
   # of per-TU outputs against those keys. Making this the default flips
   # the configure phase for every consumer at once, on a change no package
   # has been driven through yet - so it ships switchable, gets verified on

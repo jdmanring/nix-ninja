@@ -70,7 +70,7 @@
   - `bench/e2e.sh` (upstream #7). Runs one target end to end and records wall
     clock plus the driver's own counters as JSON. Its subjects so far are
     `example-hello` and `example-dynamic-deps`; the NixOS/Nix-scale number is
-    expected from ArtNix's full build rather than from a dedicated run here.
+    expected from a full distribution build rather than a dedicated run here.
 - [ ] `inputs.nix` cannot build against a nixpkgs carrying both boost/context
   patches
   - `packaging/dependencies.nix` in the `nix` input passes `patches` to
@@ -119,7 +119,7 @@
     `rpc_client.add_drv_to_store(...)` per task, a daemon round trip, with no
     timer around it. The dynamic branch times exactly this call at `:3039`
     and the ordinary branch does not.
-  - This accounts for the reading ArtNix took from artnix-{server,kde,xfce}.log
+  - This accounts for the reading taken from three full distribution builds
     on 2026-08-29: `dyn` growing linearly at 0.084 s/task with realise,
     discover, update and adddrv all reading zero and `realise 0/0 sent` on
     every line. 84 ms is a daemon round trip. It is corroborated by `nar` and
@@ -142,7 +142,7 @@
     names two candidate fixes with different shapes - a memo and a batch - and
     this campaign has twice tuned the wrong one by picking before measuring.
 - [ ] The driver retains ~74 KiB per task and never releases it
-  - Measured by ArtNix on xfce, same logs: rss 118 MiB at 1000 tasks rising
+  - Measured on the largest of those builds, same logs: rss 118 MiB at 1000 tasks rising
     monotonically to 339 MiB at 4000, heap 318 MiB live against 404 MiB
     retained at the final line. Slope 0.074 MiB/task, clean and linear, and it
     continues after `nar` and `scan` have stopped moving.

@@ -107,7 +107,7 @@ pub fn build(
         },
     )?;
     // THE BUILD-DIR WALK IS OFF FOR A ONE-EDGE COMPILE. The compiler drop-in
-    // (ArtNix scripts/nn-cc-shim.sh) starts one driver per `cc -c` under
+    // (a `cc` shim) starts one driver per `cc -c` under
     // make's own -j, and every file in the tree registered as an opaque
     // input, per driver, is both the cost that dominates a small compile and
     // a race: libtool's transient `x.loT` vanished between the walk listing

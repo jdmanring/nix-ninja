@@ -22,7 +22,7 @@
     # DEFER(upstream nix drops the `patches` argument, or nixpkgs stops
     # carrying 5883212): delete `nixpkgs-for-nix` and restore
     # `inputs.nixpkgs.follows = "nixpkgs"`. Staged as item 12 in
-    # `local/upstream/`. Checked 2026-08-29: NixOS/nix master still has it.
+    # staged separately for NixOS/nix. Checked 2026-08-29: master still has it.
     nixpkgs-for-nix.url = "github:NixOS/nixpkgs/6c9e167faa53a09769013922b0c1fc8087f4b7b2";
     nix = {
       url = "github:NixOS/nix";

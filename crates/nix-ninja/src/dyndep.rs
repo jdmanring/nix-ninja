@@ -377,8 +377,7 @@ mod tests {
     // `share/cmake-4.3/Modules/FortranCInterface`, the probe that blocked
     // liblapack. That reference build succeeds (52/52), so these are the
     // bytes a working dyndep implementation has to agree with.
-    // The originals are kept in ArtNix at
-    // `docs/research/dyndep-ground-truth/`; they are inlined here because
+    // They are inlined rather than read from disk because
     // the flake's `src` fileset globs only `**/*.rs`, so a fixture read
     // from disk would pass under `cargo test` and vanish in the flake
     // build - the failure mode `modules/flake/overlays.nix` already warns
