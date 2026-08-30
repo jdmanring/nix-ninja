@@ -12,7 +12,8 @@ files another machine can substitute, and editing one `.cpp` rebuilds one TU.
 This tree is **James Manring's fork of `pdtpartners/nix-ninja`**, and it is
 developed **for upstream** - the goal is contribution, not permanent
 divergence. It is the only place nix-ninja work happens. The consumer is
-ArtNix (`~/Projects/ArtNix`), a distribution that builds every package on one
+ArtNix (`~/Projects/artnix`, lowercase - the capitalised spelling appeared
+here for weeks and every command using it fails), a distribution that builds every package on one
 workstation, which is why per-TU resumability is load-bearing rather than a
 nicety.
 
@@ -82,7 +83,7 @@ emits.** Two independent tests, and passing the first is not enough:
 **Verify by `drvPath`, never by reasoning about what the edit affects:**
 
     nix eval --impure --max-jobs 0 --raw --expr \
-      '(builtins.getFlake "/home/james/Projects/ArtNix").inputs.nix-ninja \
+      '(builtins.getFlake "/home/james/Projects/artnix").inputs.nix-ninja \
        .packages.x86_64-linux.nix-ninja-task.drvPath'
 
 Take it either side of the change. For the emission side, drive
@@ -233,7 +234,21 @@ you to use: `example-hello` for the smallest possible emission diff,
     cargo test -p nix-ninja --test include_dir_shadow   # one test FILE
     cargo test -p deps-infer c_include_parser::         # one module's tests
     nix flake check                   # clippy -D warnings, rustfmt, taplo,
-                                      # cargo-audit, cargo-deny, nextest
+                                      # cargo-audit, cargo-deny, nextest,
+                                      # plus six NixOS VM tests. GREEN as of
+                                      # 2026-08-29; it had been red on a
+                                      # boost collision that blocked every
+                                      # example, not just the VM tests.
+    cargo clippy --all-targets -- --deny warnings   # WHAT THE GATE APPLIES.
+                                      # `cargo check` and a bare `cargo
+                                      # clippy` are both quieter than this,
+                                      # and the flake pins a NEWER toolchain
+                                      # through fenix, so a local pass is not
+                                      # evidence about the gate. Verified
+                                      # green off the wrong command twice on
+                                      # 2026-08-29.
+    ./bench/e2e.sh example-hello      # one build end to end -> a JSON record
+    cargo bench -p nix-ninja          # derivation-generation benchmarks
     nix develop                       # meson, taplo, just, agg, gnumake
 
 The devShell ships `just`, but there is no justfile in the tree.
@@ -276,6 +291,7 @@ invocation, not a machine-wide edit:
 | ArtNix's thirteen opt-outs, in six families | `docs/opt-out-triage.md` |
 | dynamic derivations, from the beginning | `docs/dynamic-derivations.md` |
 | what is next | `docs/todo.md` |
+| the benchmarks, and what they do NOT cover | `bench/e2e.sh` and `crates/nix-ninja/benches/generate.rs`, both with their scope in the file header |
 | commit and prose conventions | `docs/conventions.md` |
 
 ArtNix's own record of this work, including the 2026-08-29 recovery and the

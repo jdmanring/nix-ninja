@@ -104,8 +104,13 @@
   - The in-code comment at `:3040` already names the fix class for the dynamic
     copy of this call - "a memo or a batch, not depsets". The same fix applies
     to the ordinary one, which is the one that runs on every task.
-  - The timer LANDED in `e285861`: `DYN_PLAIN_ADDDRV_MS/N` around `:3049`,
-    printed as `plain adddrv N s/N calls`. No run has produced a number from
+  - The timers LANDED. There turned out to be THREE `add_drv_to_store` call
+    sites in `handle_derivation_result` and only one was counted: the ordinary
+    arm (`DYN_PLAIN_ADDDRV_*`, `e285861`) and the in-sandbox dynamic arm
+    (`DYN_SANDBOX_ADDDRV_*`), added after `example-dynamic-deps` reported
+    `dyn 53 ms` against `plain adddrv 37 ms` and left 16 ms unaccounted. The
+    third, on the local-discovery arm, already had `DYN_ADDDRV_*`.
+    Printed as `plain adddrv N s/N calls, sandbox adddrv N s/N calls`. No run has produced a number from
     it yet, so the 0.084 s/task figure is still an elimination rather than a
     measurement, and this entry stays open until a build prints one.
   - Do NOT fix the call before reading that number. The comment at `:3040`
