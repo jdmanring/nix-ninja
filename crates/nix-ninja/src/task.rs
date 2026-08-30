@@ -705,8 +705,6 @@ impl Runner {
         // counter names the slow task and prices resolution per task; it
         // is always on because its cost is two atomics per task.
         use std::sync::atomic::{AtomicU64, Ordering};
-        static TASKS: AtomicU64 = AtomicU64::new(0);
-        static RESOLVE_MS: AtomicU64 = AtomicU64::new(0);
         let t0 = std::time::Instant::now();
         let task = self.new_task(files, build)?;
         let resolve_ms = t0.elapsed().as_millis() as u64;
@@ -723,105 +721,7 @@ impl Runner {
             );
         }
         if n_tasks.is_multiple_of(500) {
-            // Persist resolve-cache entries computed since the last tick;
-            // a killed driver loses at most one tick's worth.
-            if let Err(e) = crate::resolve_cache::flush() {
-                eprintln!("nix-ninja: resolve cache flush failed: {e}");
-            }
-            if let Err(e) =
-                crate::resolve_cache::save_nar_stamps(&self.rpc_client.nar_stamps_snapshot())
-            {
-                eprintln!("nix-ninja: nar stamp save failed: {e}");
-            }
-            // Each stats() call is a fresh pair of atomic loads, so calling
-            // one twice in an argument list samples two different instants
-            // while other threads advance the counters - which can print a
-            // sent count above its own total, or parsed above reached. Read
-            // each family ONCE into a tuple. Reported by the specification
-            // session against scan_stats; realise and nar had it too, and
-            // that is why all three are read here rather than the one that
-            // was noticed.
-            // realise_stats is (ASKED, SENT) - the first element is ALREADY
-            // the total, unlike the other two, which are (hits, count) and
-            // need summing. The original argument list encoded that
-            // difference positionally and it is easy to lose in a rename.
-            let (rl_asked, rl_sent) = nix_builder_rpc_client::realise_stats();
-            let (nar_hits, nar_sent) = nix_builder_rpc_client::nar_upload_stats();
-            // parsed / reached: misses are files actually read, the sum is
-            // every time a TU needed one. The gap is the sharing.
-            let (scan_hit, scan_miss) = deps_infer::c_include_parser::scan_stats();
-            // Same tear as the three families above, and it bites HARDER here
-            // because the pair is read as a RATIO: a ms total from one instant
-            // over a call count from another prints a per-call cost that was
-            // never true. Written separately once in this same session, an hour
-            // after fixing the identical defect - the class does not announce
-            // itself on the way back in.
-            //
-            // AND THIS IS A TUPLE SYNTACTICALLY, NOT AN ATOMIC READ. The two
-            // loads are still two instants; what the binding buys is a window
-            // of nanoseconds instead of one spanning a whole format call, which
-            // is enough for a figure a person reads and is NOT enough for one
-            // code consumes. If a per-call number ever feeds a threshold or a
-            // regression gate, pack ms and n into a single AtomicU64 (32/32
-            // covers these magnitudes) or take a Mutex on the slow path. Said
-            // here because "read as a pair" reads like atomicity and is not.
-            // Raised by the specification session, addendum 734.
-            let (upd_ms, upd_n) = (
-                DYN_UPDATE_MS.load(Ordering::Relaxed),
-                DYN_UPDATE_N.load(Ordering::Relaxed),
-            );
-            let (add_ms, add_n) = (
-                DYN_ADDDRV_MS.load(Ordering::Relaxed),
-                DYN_ADDDRV_N.load(Ordering::Relaxed),
-            );
-            // Appended rather than given a fixed `{}` in the format string,
-            // so a platform without mallinfo2 prints a shorter line instead
-            // of two zeros that read as a measurement.
-            let (declared, kept) = (
-                DECLARED_HEADERS.load(Ordering::Relaxed),
-                USED_HEADERS.load(Ordering::Relaxed),
-            );
-            // Printed as a pair with its denominator: "N prunable" alone is
-            // unreadable without knowing how many were considered, and this
-            // number exists to be compared against the cost of acting on it.
-            let prune = prune_line(declared, kept);
-            let heap = match self_heap_mib() {
-                Some((live, retained)) => {
-                    format!(", heap {live} MiB live / {retained} MiB retained")
-                }
-                None => String::new(),
-            };
-            eprintln!(
-                "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
-                 (worklist {} s, cmdline {} s, py {} s, grd {} s), \
-                 dyn {} s (realise {} s, discover {} s, update {} s/{} calls, adddrv {} s/{} calls, \
-                 plain adddrv {} s/{} calls), \
-                 realise {}/{} sent, nar {}/{} sent, scan {}/{} parsed, \
-                 rss {} MiB{}{}",
-                RESOLVE_MS.load(Ordering::Relaxed) / 1000,
-                NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
-                NT_CMDLINE_MS.load(Ordering::Relaxed) / 1000,
-                NT_PY_MS.load(Ordering::Relaxed) / 1000,
-                NT_GRD_MS.load(Ordering::Relaxed) / 1000,
-                DYN_MS.load(Ordering::Relaxed) / 1000,
-                DYN_REALISE_MS.load(Ordering::Relaxed) / 1000,
-                DYN_DISCOVER_MS.load(Ordering::Relaxed) / 1000,
-                upd_ms / 1000,
-                upd_n,
-                add_ms / 1000,
-                add_n,
-                DYN_PLAIN_ADDDRV_MS.load(Ordering::Relaxed) / 1000,
-                DYN_PLAIN_ADDDRV_N.load(Ordering::Relaxed),
-                rl_sent,
-                rl_asked,
-                nar_sent,
-                nar_hits + nar_sent,
-                scan_miss,
-                scan_hit + scan_miss,
-                self_rss_mib(),
-                heap,
-                prune,
-            );
+            report_progress(&self.rpc_client, n_tasks);
         }
 
         // Stamp-tool edges also record the task's RESOLVED inputs (the
@@ -2954,6 +2854,131 @@ fn build_dynamic_task_derivation(
 
 /// Handles the result of build_task_derivation, deciding whether to wrap with
 /// a dynamic task derivation or use the derivation directly.
+/// Print the driver's phase accounting, and persist the resolve cache.
+///
+/// Called every 500 tasks AND once when the run finishes. It used to be only
+/// the former, which meant two things nobody had said out loud: a build with
+/// fewer than 500 tasks printed NO accounting at all - which is every example
+/// in this tree - and a build of 15,499 tasks reported its numbers as of task
+/// 15,000 and never its totals. Every figure this project has argued about
+/// came from a mid-run tick.
+/// The same report, once, when the run finishes.
+///
+/// Without this the numbers for any build under 500 tasks were never printed
+/// at all, and a longer build's final totals were never printed either - the
+/// last tick landed at the last multiple of 500 and the remainder went
+/// unreported. Both matter for upstream #4 and #7, which ask for benchmarks
+/// and cannot have them from a driver that does not report its own totals.
+pub fn report_progress_final(rpc_client: &Arc<BuilderRpcClient>) {
+    let n = TASKS.load(std::sync::atomic::Ordering::Relaxed);
+    // Nothing resolved means nothing to report; printing zeros would put a
+    // row of measurements into a log where no measuring happened.
+    if n > 0 {
+        report_progress(rpc_client, n);
+    }
+}
+
+fn report_progress(rpc_client: &Arc<BuilderRpcClient>, n_tasks: u64) {
+    use std::sync::atomic::Ordering;
+    // Persist resolve-cache entries computed since the last tick;
+    // a killed driver loses at most one tick's worth.
+    if let Err(e) = crate::resolve_cache::flush() {
+        eprintln!("nix-ninja: resolve cache flush failed: {e}");
+    }
+    if let Err(e) = crate::resolve_cache::save_nar_stamps(&rpc_client.nar_stamps_snapshot()) {
+        eprintln!("nix-ninja: nar stamp save failed: {e}");
+    }
+    // Each stats() call is a fresh pair of atomic loads, so calling
+    // one twice in an argument list samples two different instants
+    // while other threads advance the counters - which can print a
+    // sent count above its own total, or parsed above reached. Read
+    // each family ONCE into a tuple. Reported by the specification
+    // session against scan_stats; realise and nar had it too, and
+    // that is why all three are read here rather than the one that
+    // was noticed.
+    // realise_stats is (ASKED, SENT) - the first element is ALREADY
+    // the total, unlike the other two, which are (hits, count) and
+    // need summing. The original argument list encoded that
+    // difference positionally and it is easy to lose in a rename.
+    let (rl_asked, rl_sent) = nix_builder_rpc_client::realise_stats();
+    let (nar_hits, nar_sent) = nix_builder_rpc_client::nar_upload_stats();
+    // parsed / reached: misses are files actually read, the sum is
+    // every time a TU needed one. The gap is the sharing.
+    let (scan_hit, scan_miss) = deps_infer::c_include_parser::scan_stats();
+    // Same tear as the three families above, and it bites HARDER here
+    // because the pair is read as a RATIO: a ms total from one instant
+    // over a call count from another prints a per-call cost that was
+    // never true. Written separately once in this same session, an hour
+    // after fixing the identical defect - the class does not announce
+    // itself on the way back in.
+    //
+    // AND THIS IS A TUPLE SYNTACTICALLY, NOT AN ATOMIC READ. The two
+    // loads are still two instants; what the binding buys is a window
+    // of nanoseconds instead of one spanning a whole format call, which
+    // is enough for a figure a person reads and is NOT enough for one
+    // code consumes. If a per-call number ever feeds a threshold or a
+    // regression gate, pack ms and n into a single AtomicU64 (32/32
+    // covers these magnitudes) or take a Mutex on the slow path. Said
+    // here because "read as a pair" reads like atomicity and is not.
+    // Raised by the specification session, addendum 734.
+    let (upd_ms, upd_n) = (
+        DYN_UPDATE_MS.load(Ordering::Relaxed),
+        DYN_UPDATE_N.load(Ordering::Relaxed),
+    );
+    let (add_ms, add_n) = (
+        DYN_ADDDRV_MS.load(Ordering::Relaxed),
+        DYN_ADDDRV_N.load(Ordering::Relaxed),
+    );
+    // Appended rather than given a fixed `{}` in the format string,
+    // so a platform without mallinfo2 prints a shorter line instead
+    // of two zeros that read as a measurement.
+    let (declared, kept) = (
+        DECLARED_HEADERS.load(Ordering::Relaxed),
+        USED_HEADERS.load(Ordering::Relaxed),
+    );
+    // Printed as a pair with its denominator: "N prunable" alone is
+    // unreadable without knowing how many were considered, and this
+    // number exists to be compared against the cost of acting on it.
+    let prune = prune_line(declared, kept);
+    let heap = match self_heap_mib() {
+        Some((live, retained)) => {
+            format!(", heap {live} MiB live / {retained} MiB retained")
+        }
+        None => String::new(),
+    };
+    eprintln!(
+        "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
+             (worklist {} s, cmdline {} s, py {} s, grd {} s), \
+             dyn {} s (realise {} s, discover {} s, update {} s/{} calls, adddrv {} s/{} calls, \
+             plain adddrv {} s/{} calls), \
+             realise {}/{} sent, nar {}/{} sent, scan {}/{} parsed, \
+             rss {} MiB{}{}",
+        RESOLVE_MS.load(Ordering::Relaxed) / 1000,
+        NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
+        NT_CMDLINE_MS.load(Ordering::Relaxed) / 1000,
+        NT_PY_MS.load(Ordering::Relaxed) / 1000,
+        NT_GRD_MS.load(Ordering::Relaxed) / 1000,
+        DYN_MS.load(Ordering::Relaxed) / 1000,
+        DYN_REALISE_MS.load(Ordering::Relaxed) / 1000,
+        DYN_DISCOVER_MS.load(Ordering::Relaxed) / 1000,
+        upd_ms / 1000,
+        upd_n,
+        add_ms / 1000,
+        add_n,
+        DYN_PLAIN_ADDDRV_MS.load(Ordering::Relaxed) / 1000,
+        DYN_PLAIN_ADDDRV_N.load(Ordering::Relaxed),
+        rl_sent,
+        rl_asked,
+        nar_sent,
+        nar_hits + nar_sent,
+        scan_miss,
+        scan_hit + scan_miss,
+        self_rss_mib(),
+        heap,
+        prune,
+    );
+}
+
 fn handle_derivation_result(
     tools: Tools,
     rpc_client: &Arc<BuilderRpcClient>,
@@ -4592,6 +4617,12 @@ fn header_like(p: &Path) -> bool {
 }
 
 /// dyn's two expensive halves, separated because they have different fixes.
+// Hoisted with RESOLVE_MS, same reason: the end-of-run report needs the
+// task count and it is no longer read only from inside the loop.
+static TASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Hoisted from inside the resolve loop so report_progress can read it: the
+// summary is now printed at the end of a run as well as every 500 tasks.
+static RESOLVE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_UPDATE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 // CALL COUNTS, not just totals, and the reason is a question the totals
 // cannot answer. Both calls fire once per DYNAMIC task rather than once per

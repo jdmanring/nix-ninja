@@ -153,6 +153,12 @@ pub fn build(
         eprintln!("nix-ninja: end-of-run cache flush failed: {e}");
     }
 
+    // The run's own totals, printed once. See report_progress_final: until
+    // now the accounting appeared only on 500-task boundaries, so short
+    // builds reported nothing and long ones reported everything except
+    // their last few hundred tasks.
+    task::report_progress_final(rpc_client);
+
     // Deduplicated by build_path, because two targets legitimately share
     // outputs - ask for a phony and one of the files it aliases and the file
     // arrives twice - and a duplicate here becomes a duplicate symlink
