@@ -366,8 +366,15 @@ Three things the work turned up that were not on anybody's list:
 - **The driver never printed its own totals.** The summary is gated on
   `n_tasks.is_multiple_of(500)`, so a build under 500 tasks printed no
   accounting at all - every example here - and a longer one reported its last
-  tick rather than its result. Every number this campaign has argued over was
-  a mid-run reading. Fixed with `report_progress_final`.
+  tick rather than its result. Fixed with `report_progress_final`.
+  **This invalidates TOTALS, not slopes, and the first draft of this entry
+  overstated it as "every number".** ArtNix made the distinction and it is
+  right: a reading at task 1000 and another at task 4000 are both real, so the
+  0.084 s/task and 74 KiB/task slopes between them stand as measured. What
+  the modulus breaks is any figure presented as a run's result - xfce's
+  372 s `dyn` is a LOWER BOUND with an unmeasured tail, not a total. The two
+  claims have different consequences for what has to be re-taken, which is
+  why the difference is worth the sentence.
 - **The summary reports whole seconds**, so the first end-to-end run returned
   a row of zeros that look like measurements and are rounding.
   `NIX_NINJA_STATS_JSON=1` now emits the same counters in milliseconds,
