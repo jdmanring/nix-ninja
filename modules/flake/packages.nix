@@ -23,6 +23,7 @@
     legacyPackages = lib.optionalAttrs (builtins ? outputOf) {
       example-hello = pkgs.example-hello.target;
       example-hello-cached-configure = pkgs.example-hello-cached-configure.target;
+      example-generated-header = pkgs.example-generated-header.target;
       example-header = pkgs.example-header.target;
       example-multi-source = pkgs.example-multi-source.target;
       example-shared-lib = pkgs.example-shared-lib.target;

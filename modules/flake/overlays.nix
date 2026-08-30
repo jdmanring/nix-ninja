@@ -157,6 +157,17 @@
         useConfigureCache = true;
       };
 
+      # The generated-header class: a header produced during the build and
+      # declared order-only on the compile edge, so it does not exist when
+      # the driver scans. libvmaf's vcs_version.h and liblapack's
+      # VerifyFortran.h are this shape, and nix itself failed three separate
+      # ways on it before it built.
+      example-generated-header = self.mkMesonPackage {
+        name = "example-generated-header";
+        src = ./examples/generated-header;
+        target = "main";
+      };
+
       example-header = self.mkMesonPackage {
         name = "example-header";
         src = ./examples/header;
