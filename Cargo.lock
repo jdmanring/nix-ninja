@@ -842,8 +842,8 @@ dependencies = [
 
 [[package]]
 name = "harmonia-file-core"
-version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+version = "3.2.0"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "serde",
  "serde_json",
@@ -852,8 +852,8 @@ dependencies = [
 
 [[package]]
 name = "harmonia-file-nar"
-version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+version = "3.2.0"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "bstr",
  "bytes",
@@ -876,8 +876,8 @@ dependencies = [
 
 [[package]]
 name = "harmonia-protocol"
-version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+version = "3.2.0"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "async-stream",
  "bstr",
@@ -910,18 +910,18 @@ dependencies = [
 
 [[package]]
 name = "harmonia-protocol-derive"
-version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+version = "3.2.0"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "harmonia-store-aterm"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "bytes",
  "harmonia-store-content-address",
@@ -936,8 +936,8 @@ dependencies = [
 
 [[package]]
 name = "harmonia-store-build-result"
-version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+version = "3.2.0"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "harmonia-store-derivation",
  "num_enum",
@@ -947,8 +947,8 @@ dependencies = [
 
 [[package]]
 name = "harmonia-store-content-address"
-version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+version = "3.2.0"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "derive_more",
  "harmonia-store-path",
@@ -960,7 +960,7 @@ dependencies = [
 [[package]]
 name = "harmonia-store-derivation"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "bytes",
  "data-encoding",
@@ -978,8 +978,8 @@ dependencies = [
 
 [[package]]
 name = "harmonia-store-path"
-version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+version = "3.2.0"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "derive_more",
  "harmonia-utils-base-encoding",
@@ -991,8 +991,8 @@ dependencies = [
 
 [[package]]
 name = "harmonia-store-path-info"
-version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+version = "3.2.0"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "harmonia-store-content-address",
  "harmonia-store-path",
@@ -1003,8 +1003,8 @@ dependencies = [
 
 [[package]]
 name = "harmonia-store-remote"
-version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+version = "3.2.0"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "async-stream",
  "futures-core",
@@ -1024,7 +1024,7 @@ dependencies = [
 [[package]]
 name = "harmonia-utils-base-encoding"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -1034,7 +1034,7 @@ dependencies = [
 [[package]]
 name = "harmonia-utils-hash"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -1046,16 +1046,16 @@ dependencies = [
  "sha1",
  "sha2 0.11.0",
  "thiserror 2.0.19",
- "tokio",
 ]
 
 [[package]]
 name = "harmonia-utils-io"
 version = "0.0.0-alpha.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "bytes",
  "futures-util",
+ "harmonia-utils-hash",
  "libc",
  "nix",
  "pin-project-lite",
@@ -1064,8 +1064,8 @@ dependencies = [
 
 [[package]]
 name = "harmonia-utils-signature"
-version = "3.1.0"
-source = "git+https://github.com/nix-community/harmonia.git?branch=main#b7c7777f422ff42ce637f6b2f356c2dbac2d3db4"
+version = "3.2.0"
+source = "git+https://github.com/nix-community/harmonia.git?branch=main#4ec14354eb77650607c529364256174e0b731323"
 dependencies = [
  "data-encoding",
  "ed25519-dalek",
@@ -2490,7 +2490,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

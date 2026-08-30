@@ -17,7 +17,7 @@ use harmonia_protocol::daemon_wire::types2::{BuildMode, BuildResultInner};
 use harmonia_protocol::store_path::StoreDir;
 use harmonia_protocol::types::{DaemonError, DaemonErrorKind, DaemonStore};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
-use harmonia_store_derivation::derivation::Derivation;
+use harmonia_store_derivation::derivation::{Derivation, DerivationInputs};
 use harmonia_store_derivation::derived_path::{
     DerivedPath, OutputName, OutputSpec, SingleDerivedPath,
 };
@@ -356,7 +356,14 @@ impl BuilderRpcClient {
     // Serialise a derivation and add it to the store.
     // Should be preferred to `add_to_store_text` for derivations,
     pub fn add_drv_to_store(&self, store_dir: &StoreDir, drv: &Derivation) -> Result<StorePath> {
-        let bytes = aterm::print_derivation_aterm(store_dir, drv);
+        // harmonia 4ec1435 split a derivation's inputs into the "full"
+        // representation, DerivationInputs { srcs, drvs }, and the ATerm
+        // printer now takes that rather than the flat BTreeSet we hold.
+        // map_inputs is harmonia's own conversion point and the From impl
+        // beside it does the splitting, so this is a shape change at the
+        // boundary and not a semantic one.
+        let full = drv.clone().map_inputs(|i| DerivationInputs::from(&i));
+        let bytes = aterm::print_derivation_aterm(store_dir, &full);
         let refs: StorePathSet = drv.inputs.iter().map(|p| p.root_path().clone()).collect();
         let name = format!("{}.drv", drv.name);
         let info = self.runtime.block_on(async {
