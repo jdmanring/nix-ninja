@@ -107,7 +107,7 @@ impl TestSpace {
     /// Persist the temp dir locally and abort the test.  Debugging helper.
     #[allow(dead_code)]
     pub fn eject(self) -> ! {
-        panic!("ejected at {:?}", self.dir.into_path());
+        panic!("ejected at {:?}", self.dir.keep());
     }
 }
 

@@ -56,3 +56,30 @@ harness = false
 default = []
 jemalloc = ["jemallocator"]
 crlf = []
+
+# n2 is VENDORED UPSTREAM (evmar's n2, via the hinshun fork), and the
+# workspace's `clippy -- --deny warnings` was being applied to it: 44 style
+# and complexity lints in code we did not write, which made `nix flake check`
+# permanently red and buried anything real underneath.
+#
+# Style and complexity are allowed here; correctness, suspicious and perf are
+# NOT, because those are the categories that catch a defect rather than a
+# preference. That distinction is load-bearing rather than tidy: with `all`
+# allowed, the `clippy::uninit_vec` in `read_file_with_nul` - a genuine
+# undefined-behaviour bug, since `set_len` on reserved-but-uninitialised
+# memory handed uninit bytes to safe code - would have been silenced instead
+# of found and fixed.
+[lints.clippy]
+style = { level = "allow", priority = -1 }
+complexity = { level = "allow", priority = -1 }
+perf = { level = "allow", priority = -1 }
+suspicious = { level = "allow", priority = -1 }
+
+# `correctness` is deliberately absent from that list and must stay absent.
+# It is the category holding `uninit_vec`, the undefined behaviour actually
+# found in this crate, so it is the one earning its keep.
+[lints.rust]
+dead_code = "allow"
+# rustc lints, not clippy ones, so [lints.clippy] above does not reach them.
+mismatched_lifetime_syntaxes = "allow"
+

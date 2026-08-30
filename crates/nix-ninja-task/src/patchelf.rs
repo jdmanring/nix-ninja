@@ -8,7 +8,8 @@ use std::process::Command;
 
 pub fn fix_rpaths(store_dir: &Path, outputs: &[DerivedFile]) -> Result<()> {
     for output in outputs {
-        let canonical_path = fs::canonicalize(&output.build_path).map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", output.build_path.display()))?;
+        let canonical_path = fs::canonicalize(&output.build_path)
+            .map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", output.build_path.display()))?;
         if is_elf_dynamic(&canonical_path)? {
             fix_rpath(store_dir, &canonical_path)?;
             println!(
@@ -95,7 +96,9 @@ fn get_raw_rpath(elf_path: &Path) -> Result<String> {
         return Err(anyhow!("patchelf --print-rpath failed: {stderr}"));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim_end_matches('\n').to_string())
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches('\n')
+        .to_string())
 }
 
 fn compute_new_rpath(
@@ -199,7 +202,8 @@ fn resolve_needed(lib_name: &str, rpath: &[PathBuf], store_dir: &Path) -> Result
         }
 
         if lib_path.exists() {
-            let canonical_path = fs::canonicalize(&lib_path).map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", lib_path.display()))?;
+            let canonical_path = fs::canonicalize(&lib_path)
+                .map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", lib_path.display()))?;
             return Ok(Some(canonical_path));
         }
     }

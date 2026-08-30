@@ -128,8 +128,7 @@ fn bfs_parse_includes(
                     .map(|p| (dir.clone(), p))
                     .or_else(|| {
                         include_dirs.iter().find_map(|i| {
-                            try_resolve(i, &tail, virtual_paths.as_ref())
-                                .map(|p| (i.clone(), p))
+                            try_resolve(i, &tail, virtual_paths.as_ref()).map(|p| (i.clone(), p))
                         })
                     });
                 if let Some((head, p)) = hit {
@@ -209,17 +208,14 @@ where
         let virtual_paths = virtual_paths.clone();
 
         handles.push(std::thread::spawn(move || {
-            let includes = match extract_includes(
-                &path,
-                &spelled,
-                &includes,
-                virtual_paths.as_ref().as_ref(),
-            ) {
-                Ok(value) => value,
-                Err(e) => {
-                    return Err(e);
-                }
-            };
+            let includes =
+                match extract_includes(&path, &spelled, &includes, virtual_paths.as_ref().as_ref())
+                {
+                    Ok(value) => value,
+                    Err(e) => {
+                        return Err(e);
+                    }
+                };
 
             let (path_defines, macro_uses, computed_unresolvable) = match scan_directives(&path) {
                 // The scan is memoized, so this re-read is a cache hit.
@@ -260,9 +256,8 @@ where
 // eight input classes this fork already fixes, arriving through a directive
 // nobody has hit yet. Cheaper to carry the upstream spelling now than to
 // rediscover it as a ninth class from a resolved-derivation error.
-static INCLUDE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r##"^\s*#\s*(?:include|embed)\s*(["<])([^">]*)[">]"##).unwrap()
-});
+static INCLUDE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r##"^\s*#\s*(?:include|embed)\s*(["<])([^">]*)[">]"##).unwrap());
 
 /// nasm/yasm spell an include `%include "name"` - always quoted, resolved
 /// through the includer's directory and then -I dirs, same as a quoted C
@@ -270,9 +265,8 @@ static INCLUDE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// zero includes and their x86inc.asm-style helpers were never uploaded:
 /// libvmaf's cpuid.asm died `unable to open include file` with the file
 /// sitting in the source tree (tenth class, 2026-08-23).
-static NASM_INCLUDE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*%\s*include\s+"([^"]*)""#).unwrap()
-});
+static NASM_INCLUDE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*%\s*include\s+"([^"]*)""#).unwrap());
 
 /// One `#include`/`#embed` directive as written, before resolution.
 /// `quoted` is true for `"name"`, false for `<name>`.
@@ -330,8 +324,7 @@ pub struct ScanResult {
     pub computed_unresolvable: Vec<String>,
 }
 
-type DirectiveCache =
-    Arc<RwLock<rustc_hash::FxHashMap<PathBuf, (u64, u128, Arc<ScanResult>)>>>;
+type DirectiveCache = Arc<RwLock<rustc_hash::FxHashMap<PathBuf, (u64, u128, Arc<ScanResult>)>>>;
 static DIRECTIVE_CACHE: LazyLock<DirectiveCache> = LazyLock::new(Default::default);
 
 pub static SCAN_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -364,7 +357,11 @@ fn file_key(path: &Path) -> Option<(u64, u128)> {
 fn directive_rest<'a>(line: &'a str, kw: &str) -> Option<&'a str> {
     let s = line.trim_start().strip_prefix('#')?.trim_start();
     let rest = s.strip_prefix(kw)?;
-    if rest.starts_with(char::is_whitespace) { Some(rest.trim_start()) } else { None }
+    if rest.starts_with(char::is_whitespace) {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
 }
 
 /// Parse a file's include directives, memoized across translation units.
@@ -400,14 +397,14 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
     for raw in data.split(|&b| b == b'\n') {
         let line = String::from_utf8_lossy(raw);
         let line = line.as_ref();
-        if let Some(captures) = INCLUDE_REGEX.captures(&line) {
+        if let Some(captures) = INCLUDE_REGEX.captures(line) {
             directives.push(Directive {
                 quoted: captures.get(1).unwrap().as_str() == "\"",
                 name: PathBuf::from(captures.get(2).unwrap().as_str()),
             });
             continue;
         }
-        if let Some(captures) = NASM_INCLUDE_REGEX.captures(&line) {
+        if let Some(captures) = NASM_INCLUDE_REGEX.captures(line) {
             directives.push(Directive {
                 quoted: true,
                 name: PathBuf::from(captures.get(1).unwrap().as_str()),
@@ -423,17 +420,21 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
         // resolved - the general case is the preprocessor, which is not
         // this parser's job; an unresolved computed include still fails
         // loudly in the task, never silently.
-        if let Some(rest) = directive_rest(&line, "define") {
+        if let Some(rest) = directive_rest(line, "define") {
             let mut it = rest.splitn(2, char::is_whitespace);
             if let (Some(name), Some(val)) = (it.next(), it.next()) {
                 let val = val.trim();
-                if val.len() > 2 && val.starts_with('"') && val.ends_with('"') && !name.contains('(') {
+                if val.len() > 2
+                    && val.starts_with('"')
+                    && val.ends_with('"')
+                    && !name.contains('(')
+                {
                     macro_paths.insert(name.to_string(), val[1..val.len() - 1].to_string());
                 }
             }
             continue;
         }
-        if let Some(rest) = directive_rest(&line, "include") {
+        if let Some(rest) = directive_rest(line, "include") {
             let token = rest.trim();
             if let Some(path) = macro_paths.get(token) {
                 directives.push(Directive {
@@ -488,7 +489,7 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
 /// Includes are generally of the form `#include <name>` or `#include "name"`.
 /// Also, C23 `#embed` resolves quoted names the same way.
 pub fn extract_includes(
-    path: &PathBuf,
+    path: &Path,
     spelled: &Path,
     include_dirs: &[PathBuf],
     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
@@ -676,8 +677,7 @@ mod tests {
             "#include <stdio.h>\n#include \"plain.h\"\n",
         )
         .unwrap();
-        let (got2, incomplete2) =
-            bfs_parse_includes(vec![d.join("plain.c")], &[], None).unwrap();
+        let (got2, incomplete2) = bfs_parse_includes(vec![d.join("plain.c")], &[], None).unwrap();
         assert!(
             !incomplete2,
             "an ordinary source must NOT trigger the preprocessor fallback: {got2:?}"
@@ -693,23 +693,28 @@ mod tests {
         let _g = SCAN_TEST_LOCK.lock().unwrap();
         let d = std::env::temp_dir().join(format!("nnxf{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("config.h"),
-            "#define SM_FILE \"sm_impl.h\"\n").unwrap();
-        std::fs::write(d.join("body.h"),
-            "#include SM_FILE\n").unwrap();
+        std::fs::write(d.join("config.h"), "#define SM_FILE \"sm_impl.h\"\n").unwrap();
+        std::fs::write(d.join("body.h"), "#include SM_FILE\n").unwrap();
         std::fs::write(d.join("sm_impl.h"), "\n").unwrap();
-        std::fs::write(d.join("main.c"),
-            "#include \"config.h\"\n#include \"body.h\"\n").unwrap();
-        let got = bfs_parse_includes(
-            vec![d.join("main.c")], &[], None).unwrap().0;
-        assert!(got.iter().any(|p| p.ends_with("sm_impl.h")),
-            "cross-file computed include not declared: {:?}", got);
+        std::fs::write(
+            d.join("main.c"),
+            "#include \"config.h\"\n#include \"body.h\"\n",
+        )
+        .unwrap();
+        let got = bfs_parse_includes(vec![d.join("main.c")], &[], None)
+            .unwrap()
+            .0;
+        assert!(
+            got.iter().any(|p| p.ends_with("sm_impl.h")),
+            "cross-file computed include not declared: {:?}",
+            got
+        );
         // The negative control: a use whose macro is never defined stays
         // undeclared rather than inventing a path.
-        std::fs::write(d.join("main2.c"),
-            "#include NEVER_DEFINED\n").unwrap();
-        let got2 = bfs_parse_includes(
-            vec![d.join("main2.c")], &[], None).unwrap().0;
+        std::fs::write(d.join("main2.c"), "#include NEVER_DEFINED\n").unwrap();
+        let got2 = bfs_parse_includes(vec![d.join("main2.c")], &[], None)
+            .unwrap()
+            .0;
         assert_eq!(got2.len(), 1, "only the source itself: {:?}", got2);
     }
 
@@ -725,18 +730,33 @@ mod tests {
         let d = std::env::temp_dir().join(format!("nn-gd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("root.c"),
-            "#define CM_FILE \"root_cm.ch\"\n#include \"body.ch\"\n").unwrap();
-        std::fs::write(d.join("body.ch"),
-            "#if !defined(CM_FILE)\n#  define CM_FILE \"body_cm.ch\"\n#endif\n#  include CM_FILE\n").unwrap();
+        std::fs::write(
+            d.join("root.c"),
+            "#define CM_FILE \"root_cm.ch\"\n#include \"body.ch\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("body.ch"),
+            "#if !defined(CM_FILE)\n#  define CM_FILE \"body_cm.ch\"\n#endif\n#  include CM_FILE\n",
+        )
+        .unwrap();
         std::fs::write(d.join("root_cm.ch"), "\n").unwrap();
         std::fs::write(d.join("body_cm.ch"), "\n").unwrap();
-        let got = bfs_parse_includes(vec![d.join("root.c")], &[], None).unwrap().0;
-        let names: Vec<String> = got.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        assert!(names.iter().any(|n| n.ends_with("root_cm.ch")),
-            "root override missing: {names:?}");
-        assert!(names.iter().any(|n| n.ends_with("body_cm.ch")),
-            "guarded default missing: {names:?}");
+        let got = bfs_parse_includes(vec![d.join("root.c")], &[], None)
+            .unwrap()
+            .0;
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with("root_cm.ch")),
+            "root override missing: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("body_cm.ch")),
+            "guarded default missing: {names:?}"
+        );
     }
 
     #[test]
@@ -750,14 +770,26 @@ mod tests {
         std::fs::create_dir_all(d.join("contrib")).unwrap();
         std::fs::create_dir_all(d.join("mips")).unwrap();
         std::fs::write(d.join("contrib/x.c"), "\n").unwrap();
-        std::fs::write(d.join("mips/init.c"),
-            "#define F \"contrib/x.c\"\n#include F\n").unwrap();
-        let got = bfs_parse_includes(
-            vec![d.join("mips/init.c")], &[d.clone()], None).unwrap().0;
-        let names: Vec<String> = got.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        assert!(names.iter().any(|n| n.ends_with("contrib/x.c")), "{names:?}");
-        assert!(!names.iter().any(|n| n.contains("mips/contrib")),
-            "fabricated spelling declared: {names:?}");
+        std::fs::write(
+            d.join("mips/init.c"),
+            "#define F \"contrib/x.c\"\n#include F\n",
+        )
+        .unwrap();
+        let got = bfs_parse_includes(vec![d.join("mips/init.c")], std::slice::from_ref(&d), None)
+            .unwrap()
+            .0;
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with("contrib/x.c")),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("mips/contrib")),
+            "fabricated spelling declared: {names:?}"
+        );
     }
 
     #[test]
@@ -768,7 +800,13 @@ mod tests {
         std::fs::write(&src, b"; x86 helpers\n%include \"ext/x86/x86inc.asm\"\n%include\t\"config.asm\"\ncglobal cpu_cpuid\n").unwrap();
         let scan = scan_directives(&src).unwrap();
         let names: Vec<_> = scan.directives.iter().map(|d| d.name.clone()).collect();
-        assert_eq!(names, vec![PathBuf::from("ext/x86/x86inc.asm"), PathBuf::from("config.asm")]);
+        assert_eq!(
+            names,
+            vec![
+                PathBuf::from("ext/x86/x86inc.asm"),
+                PathBuf::from("config.asm")
+            ]
+        );
         assert!(scan.directives.iter().all(|d| d.quoted));
     }
 
@@ -787,7 +825,10 @@ mod tests {
         std::fs::write(&src, body).unwrap();
         let scan = scan_directives(&src).unwrap();
         let names: Vec<_> = scan.directives.iter().map(|d| d.name.clone()).collect();
-        assert_eq!(names, vec![PathBuf::from("config.h"), PathBuf::from("lbp.h")]);
+        assert_eq!(
+            names,
+            vec![PathBuf::from("config.h"), PathBuf::from("lbp.h")]
+        );
         assert!(!scan.directives[0].quoted);
         assert!(scan.directives[1].quoted);
     }
@@ -802,7 +843,11 @@ mod tests {
         let f = std::env::temp_dir().join(format!("nn-sp-test-{}.c", std::process::id()));
         std::fs::write(&f, "#  define SM_INC \"sm2_impl.h\"\n#  include SM_INC\n").unwrap();
         let dirs = super::scan_directives(&f).unwrap();
-        let names: Vec<String> = dirs.directives.iter().map(|d| d.name.to_string_lossy().into_owned()).collect();
+        let names: Vec<String> = dirs
+            .directives
+            .iter()
+            .map(|d| d.name.to_string_lossy().into_owned())
+            .collect();
         assert!(names.contains(&"sm2_impl.h".to_string()), "{names:?}");
         // `#definexyz` must not parse as a define.
         assert!(super::directive_rest("#definexyz A \"b.h\"", "define").is_none());
@@ -822,13 +867,22 @@ mod tests {
         for sub in ["pr/include/obsolete", "dist/include/nspr/obsolete", "lib"] {
             std::fs::create_dir_all(d.join(sub)).unwrap();
         }
-        std::fs::write(d.join("pr/include/prtypes.h"),
-            "#include \"obsolete/protypes.h\"\n").unwrap();
+        std::fs::write(
+            d.join("pr/include/prtypes.h"),
+            "#include \"obsolete/protypes.h\"\n",
+        )
+        .unwrap();
         std::fs::write(d.join("pr/include/obsolete/protypes.h"), "\n").unwrap();
-        std::os::unix::fs::symlink("../../../pr/include/prtypes.h",
-            d.join("dist/include/nspr/prtypes.h")).unwrap();
-        std::os::unix::fs::symlink("../../../../pr/include/obsolete/protypes.h",
-            d.join("dist/include/nspr/obsolete/protypes.h")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../pr/include/prtypes.h",
+            d.join("dist/include/nspr/prtypes.h"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../../../../pr/include/obsolete/protypes.h",
+            d.join("dist/include/nspr/obsolete/protypes.h"),
+        )
+        .unwrap();
         std::fs::write(d.join("lib/strlen.c"), "#include \"prtypes.h\"\n").unwrap();
         // Relative paths, as the real cmdline spells them
         // (-I../../../dist/include/nspr from lib/libc/src): the spelled
@@ -843,10 +897,14 @@ mod tests {
         );
         std::env::set_current_dir(prev).unwrap();
         let got = got.unwrap().0;
-        let names: Vec<String> =
-            got.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert!(
-            names.iter().any(|n| n.contains("dist/include/nspr/obsolete/protypes.h")),
+            names
+                .iter()
+                .any(|n| n.contains("dist/include/nspr/obsolete/protypes.h")),
             "nested quoted include missing its spelled location: {names:?}"
         );
     }
@@ -857,8 +915,15 @@ mod tests {
         let f = std::env::temp_dir().join(format!("nn-ci-test-{}.c", std::process::id()));
         std::fs::write(&f, "#define SIMD_HEADER \"simd-support/simd-sse2.h\"\n#include SIMD_HEADER\n#include <math.h>\n#define FN(x) \"not-a-path\"\n#include UNKNOWN_MACRO\n").unwrap();
         let dirs = super::scan_directives(&f).unwrap();
-        let names: Vec<String> = dirs.directives.iter().map(|d| d.name.to_string_lossy().into_owned()).collect();
-        assert!(names.contains(&"simd-support/simd-sse2.h".to_string()), "{names:?}");
+        let names: Vec<String> = dirs
+            .directives
+            .iter()
+            .map(|d| d.name.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"simd-support/simd-sse2.h".to_string()),
+            "{names:?}"
+        );
         assert!(names.contains(&"math.h".to_string()));
         assert!(!names.iter().any(|n| n.contains("not-a-path")));
         assert_eq!(names.len(), 2);
@@ -868,10 +933,18 @@ mod tests {
     fn lexical_normalize_keeps_symlinks_and_leading_parents() {
         use super::lexical_normalize;
         use std::path::PathBuf;
-        assert_eq!(lexical_normalize(&PathBuf::from("../../include/./alsa/sound/x.h")),
-                   PathBuf::from("../../include/alsa/sound/x.h"));
-        assert_eq!(lexical_normalize(&PathBuf::from("a/b/../c.h")), PathBuf::from("a/c.h"));
-        assert_eq!(lexical_normalize(&PathBuf::from("../a/../../c.h")), PathBuf::from("../../c.h"));
+        assert_eq!(
+            lexical_normalize(&PathBuf::from("../../include/./alsa/sound/x.h")),
+            PathBuf::from("../../include/alsa/sound/x.h")
+        );
+        assert_eq!(
+            lexical_normalize(&PathBuf::from("a/b/../c.h")),
+            PathBuf::from("a/c.h")
+        );
+        assert_eq!(
+            lexical_normalize(&PathBuf::from("../a/../../c.h")),
+            PathBuf::from("../../c.h")
+        );
     }
 
     use super::*;
@@ -970,7 +1043,11 @@ mod tests {
             .write_all(b"#include \"a.h\"\n#include <b.h>\n")
             .unwrap();
         let edited = scan_directives(&h).unwrap();
-        assert_eq!(edited.directives.len(), 2, "edit was NOT seen - cache is pinning stale deps");
+        assert_eq!(
+            edited.directives.len(),
+            2,
+            "edit was NOT seen - cache is pinning stale deps"
+        );
         assert!(!edited.directives[1].quoted, "angle-bracket form preserved");
         assert_eq!(scan_stats().1 - after.1, 1, "the edit cost one re-parse");
 

@@ -152,10 +152,8 @@ pub fn parse_dyndep(bytes: &[u8]) -> Result<HashMap<String, DyndepEntry>> {
         // here; its methods are public, so calling through inference works
         // and needs no edit to the vendored tree.
         let out = build.outs[0].evaluate(&[]);
-        let implicit_outs: Vec<String> =
-            build.outs[1..].iter().map(|s| s.evaluate(&[])).collect();
-        let implicit_ins: Vec<String> =
-            build.ins.iter().map(|s| s.evaluate(&[])).collect();
+        let implicit_outs: Vec<String> = build.outs[1..].iter().map(|s| s.evaluate(&[])).collect();
+        let implicit_ins: Vec<String> = build.ins.iter().map(|s| s.evaluate(&[])).collect();
         let restat = build
             .vars
             .get("restat")
@@ -188,6 +186,11 @@ pub fn parse_dyndep(bytes: &[u8]) -> Result<HashMap<String, DyndepEntry>> {
 /// graph can be joined on. Returns an empty map for the overwhelmingly
 /// common case of a project with no dyndep at all, and the caller is
 /// expected to skip the whole second pass then - see `mentions_dyndep`.
+// Called by scan_bindings_from_file's tests rather than by the file-reading
+// wrapper itself, which is what dead_code is reporting. It is the byte-slice
+// half of the pair and the only one the tests can drive without a file, so it
+// stays.
+#[allow(dead_code)]
 pub fn scan_bindings(bytes: &[u8]) -> Result<HashMap<String, String>> {
     let buf = with_nul(bytes);
     let mut parser = Parser::new(&buf);
@@ -218,7 +221,10 @@ pub fn scan_bindings(bytes: &[u8]) -> Result<HashMap<String, String>> {
             );
         }
         if build.explicit_outs == 0 {
-            bail!("line {}: edge with a dyndep binding has no output", build.line);
+            bail!(
+                "line {}: edge with a dyndep binding has no output",
+                build.line
+            );
         }
         let key = build.outs[0].evaluate(&[]);
         out.insert(key, path);
@@ -254,15 +260,17 @@ pub fn scan_bindings_from_file(root: &Path) -> Result<HashMap<String, String>> {
         // because the root of a GN build mentions neither and every real
         // build statement is in a subninja. A file that pulls in others
         // still has to be parsed even when it has no dyndep of its own.
-        let mentions_include =
-            find_bytes(&bytes, b"include") || find_bytes(&bytes, b"subninja");
+        let mentions_include = find_bytes(&bytes, b"include") || find_bytes(&bytes, b"subninja");
         if !mentions_dyndep(&bytes) && !mentions_include {
             continue;
         }
 
         let buf = with_nul(&bytes);
         let mut parser = Parser::new(&buf);
-        while let Some(stmt) = parser.read().map_err(|e| anyhow!("{}: {e:?}", path.display()))? {
+        while let Some(stmt) = parser
+            .read()
+            .map_err(|e| anyhow!("{}: {e:?}", path.display()))?
+        {
             match stmt {
                 Statement::Build(build) => {
                     let Some(binding) = build.vars.get("dyndep") else {
@@ -353,9 +361,7 @@ pub fn apply_entry(graph: &mut Graph, bid: BuildId, entry: &DyndepEntry) -> Resu
         match graph.files.by_id[fid].input {
             None => graph.files.by_id[fid].input = Some(bid),
             Some(prev) if prev == bid => {}
-            Some(_) => bail!(
-                "dyndep names {name:?} as an output of two different edges"
-            ),
+            Some(_) => bail!("dyndep names {name:?} as an output of two different edges"),
         }
     }
 

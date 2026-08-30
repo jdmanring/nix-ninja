@@ -178,7 +178,7 @@ fn resolved_jobs(cli: &Cli) -> usize {
 const MAX_DAEMON_CONNECTIONS: usize = 6;
 
 fn resolved_connections(cli: &Cli) -> usize {
-    resolved_jobs(cli).min(MAX_DAEMON_CONNECTIONS).max(1)
+    resolved_jobs(cli).clamp(1, MAX_DAEMON_CONNECTIONS)
 }
 
 pub fn run() -> Result<()> {
@@ -203,7 +203,9 @@ pub fn run() -> Result<()> {
         return subtool(&build_dir, &cli.store_dir, &tool, cli.targets.clone());
     }
 
-    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(resolved_connections(&cli)))?);
+    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
+        resolved_connections(&cli),
+    ))?);
     let derived_files = build(&cli, &build_dir, &rpc_client)?;
     if cli.is_output_derivation {
         // One output derivation, by construction: $out is a single path, so
@@ -258,7 +260,11 @@ fn submit_outer_output(
     Ok(())
 }
 
-fn build(cli: &Cli, build_dir: &Path, rpc_client: &Arc<BuilderRpcClient>) -> Result<Vec<DerivedFile>> {
+fn build(
+    cli: &Cli,
+    build_dir: &Path,
+    rpc_client: &Arc<BuilderRpcClient>,
+) -> Result<Vec<DerivedFile>> {
     let config = BuildConfig {
         build_dir: build_dir.to_path_buf(),
         store_dir: cli.store_dir.clone(),
@@ -303,7 +309,9 @@ fn subtool(
         }
         "drv" => {
             let cli = Cli::parse();
-            let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(resolved_connections(&cli)))?);
+            let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
+                resolved_connections(&cli),
+            ))?);
             let derived_files = build(&cli, build_dir, &rpc_client)?;
             // `drv` prints ONE derivation. Same reasoning as above: refusing
             // is the only honest answer to several targets here.
@@ -441,4 +449,3 @@ mod ignored_flag_tests {
         assert_eq!(Cli::parse_from(["nix-ninja"]).load_average, 0.0);
     }
 }
-

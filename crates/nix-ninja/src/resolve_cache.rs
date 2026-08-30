@@ -463,7 +463,10 @@ mod tests {
         );
         fs::write(bd.join(NAR_FILE), "wrong-header\njunk\n").unwrap();
         assert!(load_nar_stamps().is_empty());
-        assert!(!bd.join(NAR_FILE).exists(), "bad header must discard the file");
+        assert!(
+            !bd.join(NAR_FILE).exists(),
+            "bad header must discard the file"
+        );
         fs::remove_dir_all(&bd).unwrap();
     }
 

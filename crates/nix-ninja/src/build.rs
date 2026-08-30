@@ -3,15 +3,15 @@ use crate::local;
 use crate::task;
 use anyhow::bail;
 use anyhow::{anyhow, Result};
+use harmonia_store_derivation::derived_path::SingleDerivedPath;
 use harmonia_store_path::StoreDir;
 use n2::densemap::DenseMap;
 use n2::graph::{Build, BuildId, FileId, Graph};
 use n2::{canon, load, scanner};
 use nix_builder_rpc_client::BuilderRpcClient;
 use nix_ninja_task::derived_file::DerivedFile;
-use harmonia_store_derivation::derived_path::SingleDerivedPath;
-use std::collections::{HashSet, VecDeque};
 use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

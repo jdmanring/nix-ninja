@@ -155,8 +155,8 @@ pub struct RunnerConfig {
     pub load_limit: f64,
 }
 
-/// Counting semaphore bounding concurrent tasks. Permits release on
-/// Drop, so a panicking task thread cannot leak a slot.
+// Counting semaphore bounding concurrent tasks. Permits release on
+// Drop, so a panicking task thread cannot leak a slot.
 
 /// Build one semaphore per bounded ninja pool.
 ///
@@ -427,8 +427,8 @@ pub struct Runner {
     /// that executes a just-built tool, and the loader then dies anyway:
     /// DT_NEEDED names the SONAME, which exists only as the alias.
     /// read_build_dir cannot upload them as opaque files either - at
-    /// scan time the target may not be built yet, so canonicalize fails
-    /// - and a store-level symlink object would dangle, because task
+    /// scan time the target may not be built yet, so canonicalize fails -
+    /// and a store-level symlink object would dangle, because task
     /// materialization symlinks build paths AT the store object, making
     /// a relative target resolve against /nix/store. So the link TEXT
     /// rides NIX_NINJA_ALIASES and nix-ninja-task recreates the symlink
@@ -575,14 +575,17 @@ impl Runner {
             // whole driver on a temp file (libtool's `.loT`, alsa-lib).
             let entry = match entry {
                 Ok(e) => e,
-                Err(e) if e.io_error().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => continue,
+                Err(e)
+                    if e.io_error()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue
+                }
                 Err(e) => return Err(e.into()),
             };
             if entry.file_type().is_symlink() {
                 let path = entry.into_path();
-                if let Some(pair) =
-                    alias_symlink_entry(&self.config.build_dir, &path)
-                {
+                if let Some(pair) = alias_symlink_entry(&self.config.build_dir, &path) {
                     self.alias_symlinks.push(pair);
                 }
                 continue;
@@ -592,11 +595,17 @@ impl Runner {
             }
 
             let path = entry.into_path();
-            let derived_file = match new_opaque_file(&self.rpc_client, &self.config.build_dir, path.clone()) {
-                Ok(d) => d,
-                Err(e) if e.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => continue,
-                Err(e) => return Err(e),
-            };
+            let derived_file =
+                match new_opaque_file(&self.rpc_client, &self.config.build_dir, path.clone()) {
+                    Ok(d) => d,
+                    Err(e)
+                        if e.downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        continue
+                    }
+                    Err(e) => return Err(e),
+                };
             let fid = self.add_derived_file(files, derived_file.clone());
             self.build_dir_inputs.insert(fid, derived_file);
         }
@@ -713,7 +722,7 @@ impl Runner {
                     .unwrap_or("?")
             );
         }
-        if n_tasks % 500 == 0 {
+        if n_tasks.is_multiple_of(500) {
             // Persist resolve-cache entries computed since the last tick;
             // a killed driver loses at most one tick's worth.
             if let Err(e) = crate::resolve_cache::flush() {
@@ -1041,11 +1050,8 @@ impl Runner {
                 // new id; the DerivedFile keeps its relative build_path,
                 // which is the one the sandbox layout is built from.
                 let abs_fid = if path_str.starts_with("../") {
-                    let mut abs = format!(
-                        "{}/{}",
-                        self.config.build_dir.to_string_lossy(),
-                        path_str
-                    );
+                    let mut abs =
+                        format!("{}/{}", self.config.build_dir.to_string_lossy(), path_str);
                     canon::canonicalize_path(&mut abs);
                     files.lookup(&abs)
                 } else {
@@ -1152,7 +1158,10 @@ impl Runner {
         // which drives fftw's per-TU compiles through this same path.
         let is_gcc_task = is_compile_task(
             build.deps.as_deref(),
-            build.outs().iter().map(|fid| files.by_id[*fid].name.as_str()),
+            build
+                .outs()
+                .iter()
+                .map(|fid| files.by_id[*fid].name.as_str()),
         );
         let mut worklist: Vec<(FileId, bool)> =
             build.ordering_ins().iter().map(|f| (*f, false)).collect();
@@ -1831,7 +1840,11 @@ impl Runner {
         BLANKET_REPORTED.call_once(|| {
             eprintln!(
                 "nix-ninja: implicit-input blanket {}: build_dir_inputs={} limit={}",
-                if self.build_dir_inputs.len() <= implicit_limit { "ON" } else { "OFF" },
+                if self.build_dir_inputs.len() <= implicit_limit {
+                    "ON"
+                } else {
+                    "OFF"
+                },
                 self.build_dir_inputs.len(),
                 implicit_limit,
             );
@@ -1907,7 +1920,9 @@ impl Runner {
         // because the linker WRITES those.
         if let Some(cmdline) = &cmdline {
             for tok in cmdline.split_whitespace() {
-                let Some(group) = tok.strip_prefix("-Wl,") else { continue };
+                let Some(group) = tok.strip_prefix("-Wl,") else {
+                    continue;
+                };
                 for cand in wl_file_candidates(group) {
                     let p = Path::new(cand);
                     if !p.is_file() {
@@ -2165,9 +2180,17 @@ fn build_task_derivation(
     // Propagate wrapper environment variables to the task. They were
     // placeholdered at task creation; an LTO task gets them restored,
     // the exact inverse map, because its output cannot be restored.
-    let env_restore = if lto_raw { outer_restore_map() } else { Vec::new() };
+    let env_restore = if lto_raw {
+        outer_restore_map()
+    } else {
+        Vec::new()
+    };
     for (key, value) in &task.wrapper_vars {
-        let value = &if lto_raw { rewrite_str(value, &env_restore) } else { value.clone() };
+        let value = &if lto_raw {
+            rewrite_str(value, &env_restore)
+        } else {
+            value.clone()
+        };
         let final_value = if key.starts_with("NIX_CFLAGS_COMPILE") {
             // Also add a deterministic random seed based on the task's
             // cmdline for reproducible builds.
@@ -2283,8 +2306,7 @@ fn build_task_derivation(
     // gate can only over-declare, which is the pipeline's safe polarity.
     let mut discovered_inputs: Vec<DerivedFile> = Vec::new();
     {
-        let wants_discovery =
-            task.deps.as_deref() == Some("gcc") || task.depfile.is_some();
+        let wants_discovery = task.deps.as_deref() == Some("gcc") || task.depfile.is_some();
         if wants_discovery {
             // Only opaque inputs are processed by gcc
             let files: Vec<PathBuf> = task
@@ -2351,7 +2373,10 @@ fn build_task_derivation(
         let mut by_bp: HashMap<PathBuf, Vec<DerivedFile>> = HashMap::new();
         for i in task.inputs.iter().chain(discovered_inputs.iter()) {
             if matches!(i.derived_path, SingleDerivedPath::Opaque(_)) {
-                by_bp.entry(i.build_path.clone()).or_default().push(i.clone());
+                by_bp
+                    .entry(i.build_path.clone())
+                    .or_default()
+                    .push(i.clone());
             }
         }
         for (bp, group) in by_bp {
@@ -2390,7 +2415,9 @@ fn build_task_derivation(
                     continue;
                 }
                 let abs = task.build_dir.join(&i.build_path);
-                let Ok(canonical) = fs::canonicalize(&abs) else { continue };
+                let Ok(canonical) = fs::canonicalize(&abs) else {
+                    continue;
+                };
                 if !rewritten.contains(&canonical) {
                     continue;
                 }
@@ -2492,7 +2519,11 @@ fn build_task_derivation(
     // the bytes were not (qsvgutils.cpp.o re-ran on an edit to
     // qsvgrenderer.cpp, measured 2026-08-23). The build path is stable.
     let mut inputs: Vec<String> = input_set.into_iter().collect();
-    inputs.sort_by(|a, b| encoded_build_path(a).cmp(encoded_build_path(b)).then(a.cmp(b)));
+    inputs.sort_by(|a, b| {
+        encoded_build_path(a)
+            .cmp(encoded_build_path(b))
+            .then(a.cmp(b))
+    });
 
     drv.env.insert(
         b"NIX_NINJA_INPUTS"[..].into(),
@@ -2665,7 +2696,9 @@ fn build_task_derivation(
         );
         drv.env.insert(
             b"NIX_NINJA_RSPFILE_CONTENT"[..].into(),
-            rewrite_str(rsp_content, &outer_rewrite_map()).into_bytes().into(),
+            rewrite_str(rsp_content, &outer_rewrite_map())
+                .into_bytes()
+                .into(),
         );
         pass_as_file.push_str(" NIX_NINJA_RSPFILE_CONTENT");
     }
@@ -2770,7 +2803,9 @@ fn build_task_derivation(
         // spellings are tried because the flag takes both: `ld.gold` for
         // gcc's traditional names, the bare name for mold and wild.
         for tok in cmdline.split_whitespace() {
-            let Some(name) = tok.strip_prefix("-fuse-ld=") else { continue };
+            let Some(name) = tok.strip_prefix("-fuse-ld=") else {
+                continue;
+            };
             let name = name.trim_matches(|c| c == '"' || c == '\'');
             if name.is_empty() || name == "bfd" {
                 continue; // bfd is binutils' own, already beside gcc
@@ -2835,7 +2870,11 @@ fn build_dynamic_task_derivation(
         .map(|input| input.to_encoded(store_dir))
         .collect();
     // Same ordering rule as build_task_derivation, same reason.
-    inputs.sort_by(|a, b| encoded_build_path(a).cmp(encoded_build_path(b)).then(a.cmp(b)));
+    inputs.sort_by(|a, b| {
+        encoded_build_path(a)
+            .cmp(encoded_build_path(b))
+            .then(a.cmp(b))
+    });
     drv.env.insert(
         b"NIX_NINJA_INPUTS"[..].into(),
         inputs.join(" ").into_bytes().into(),
@@ -3223,7 +3262,10 @@ pub fn rewrite_bytes(data: &[u8], map: &[(String, String)]) -> Option<Vec<u8>> {
 
 /// The reverse map: placeholder -> real.
 pub fn outer_restore_map() -> Vec<(String, String)> {
-    outer_rewrite_map().into_iter().map(|(r, p)| (p, r)).collect()
+    outer_rewrite_map()
+        .into_iter()
+        .map(|(r, p)| (p, r))
+        .collect()
 }
 
 /// The outer derivation's output paths, from the `outputs` env var the
@@ -3297,7 +3339,10 @@ fn new_opaque_files(
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("upload thread panicked"))))
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow!("upload thread panicked")))
+                })
                 .collect()
         });
         for r in results {
@@ -3364,7 +3409,10 @@ fn new_opaque_file(
                     "nn-outer-{}-{}-{}",
                     std::process::id(),
                     TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                    canonical_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                    canonical_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
                 ));
                 fs::write(&tmp, rewritten)?;
                 if let Ok(md) = fs::metadata(&canonical_path) {
@@ -3372,7 +3420,10 @@ fn new_opaque_file(
                 }
                 // Remembered, so an LTO task can ask for the raw form
                 // (lto_task_keeps_real_outer_paths).
-                rewritten_uploads().lock().unwrap().insert(canonical_path.clone());
+                rewritten_uploads()
+                    .lock()
+                    .unwrap()
+                    .insert(canonical_path.clone());
                 Some(tmp)
             }
             None => None,
@@ -3397,7 +3448,8 @@ fn new_opaque_file(
 /// therefore uploaded with the placeholder substituted. An LTO task must
 /// not read those (see lto_task_keeps_real_outer_paths).
 fn rewritten_uploads() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
-    static SET: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    static SET: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
     SET.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
 }
 
@@ -3456,6 +3508,12 @@ fn new_opaque_file_raw(
 /// the outer output path moves, which is the honest cost - only tasks
 /// that actually read an outer path pay it, and a wrong artifact is not
 /// a cache hit.
+// Exercised by this module's tests and named by the comments at :2166 and
+// :2408 that explain why LTO tasks are handled the way they are. dead_code
+// fires because the non-test callers went away when that handling moved, not
+// because the predicate stopped being the documented one - deleting it would
+// delete the tests that pin the behaviour those comments describe.
+#[allow(dead_code)]
 fn cmdline_is_lto(cmdline: &str) -> bool {
     scan_lto_flags(cmdline, false)
 }
@@ -3484,7 +3542,9 @@ fn scan_lto_flags(flags: &str, start: bool) -> bool {
 /// which the wrapper appends AFTER the command line - so a package's
 /// -fno-lto opt-out delivered that way wins, exactly as it does for gcc.
 fn task_is_lto(cmdline: &str, wrapper_vars: &HashMap<String, String>) -> bool {
-    let assume = std::env::var("NIX_NINJA_ASSUME_LTO").map(|v| v == "1").unwrap_or(false);
+    let assume = std::env::var("NIX_NINJA_ASSUME_LTO")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let after_cmdline = scan_lto_flags(cmdline, assume);
     match wrapper_vars.get("NIX_CFLAGS_COMPILE") {
         Some(extra) => scan_lto_flags(extra, after_cmdline),
@@ -3721,7 +3781,11 @@ fn common_include_root(outputs: &[PathBuf]) -> Option<PathBuf> {
     // file, which is redundant and correct - the same argument that lets
     // this be structural rather than gated on the command.
     let named = outputs.iter().filter(|o| o.starts_with(&root)).count();
-    if named >= 1 { Some(root) } else { None }
+    if named >= 1 {
+        Some(root)
+    } else {
+        None
+    }
 }
 
 /// `<dir>/<T>_autogen` when every declared output sits directly under one
@@ -3739,7 +3803,10 @@ fn autogen_include_root(outputs: &[PathBuf]) -> Option<PathBuf> {
         // `canonicalize(.../<T>.dir/<T>_autogen/include): No such file`.
         let Some(parent) = o.parent() else { continue };
         let file = o.file_name().map(|f| f.to_string_lossy().into_owned());
-        if !matches!(file.as_deref(), Some("mocs_compilation.cpp") | Some("timestamp")) {
+        if !matches!(
+            file.as_deref(),
+            Some("mocs_compilation.cpp") | Some("timestamp")
+        ) {
             continue;
         }
         if !parent
@@ -3803,7 +3870,11 @@ fn undeclared_trees(outputs: &[PathBuf]) -> Vec<PathBuf> {
 /// ("file INSTALL cannot find .../lib/libQt6Svg.prl", 2026-08-23). The
 /// meta file is configure-time content in the build dir, so it is readable
 /// at planning. One function for both the planning and the result paths.
-fn undeclared_outputs(declared: &[PathBuf], cmdline: Option<&str>, build_dir: &Path) -> Vec<PathBuf> {
+fn undeclared_outputs(
+    declared: &[PathBuf],
+    cmdline: Option<&str>,
+    build_dir: &Path,
+) -> Vec<PathBuf> {
     let mut v = undeclared_trees(declared);
     if let Some(c) = cmdline {
         if c.contains("QtFinishPrlFile.cmake") {
@@ -3905,10 +3976,7 @@ fn is_tree_path(p: &Path) -> bool {
 /// and whose link path and target both survive the `link=target`
 /// space-separated encoding. Everything else is skipped, and skipping is
 /// the safe direction: the pre-fix behavior for every symlink.
-fn alias_symlink_entry(
-    build_dir: &Path,
-    link_abs: &Path,
-) -> Option<(String, String)> {
+fn alias_symlink_entry(build_dir: &Path, link_abs: &Path) -> Option<(String, String)> {
     let target = std::fs::read_link(link_abs).ok()?;
     if target.is_absolute() {
         return None;
@@ -4183,10 +4251,8 @@ fn upload_python_closure_uncached(
                 out.push(new_opaque_file(rpc_client, build_dir, p)?);
             } else if p.is_dir() && p.file_name().is_some_and(|n| n == "node_modules") {
                 upload_dir(&p, 8192, out)?;
-            } else if p.is_dir() && p.join("__init__.py").is_file() {
-                if upload_dir(&p, 512, out)? {
-                    queue.push(p);
-                }
+            } else if p.is_dir() && p.join("__init__.py").is_file() && upload_dir(&p, 512, out)? {
+                queue.push(p);
             }
         }
         // Imports this directory's files make that nothing here satisfies.
@@ -4371,13 +4437,16 @@ fn grd_reference_candidates(grd: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Source files a generate_grd.py invocation names on its cmdline:
-/// `--input-files f1 f2 ...` relative to `--input-files-base-dir base`,
-/// where base is relative to the repo root. The root is derived from the
-/// tool's own path token (it always ends `ui/webui/resources/tools/`
-/// `generate_grd.py`), so the function is tree-layout-independent.
-/// Existence-filtered: a name that resolves nowhere is a manifest entry
-/// for a GENERATED file, which the edge's declared inputs already carry.
+// Source files a generate_grd.py invocation names on its cmdline:
+// `--input-files f1 f2 ...` relative to `--input-files-base-dir base`,
+// where base is relative to the repo root. The root is derived from the
+// tool's own path token (it always ends `ui/webui/resources/tools/`
+// `generate_grd.py`), so the function is tree-layout-independent.
+// Existence-filtered: a name that resolves nowhere is a manifest entry
+// for a GENERATED file, which the edge's declared inputs already carry.
+// (These lines sit AFTER the function they describe, so they are comments
+// rather than doc comments - as `///` they documented the statics below.)
+//
 // Section buckets for new_task's serial-resolution cost, printed by the
 // heartbeat in start(): worklist expansion, cmdline scan (incl. the
 // implicit-inputs blanket), the py sibling post-pass, and the grd pass.
@@ -4942,10 +5011,7 @@ fn python_import_names_uncached(pkg: &Path) -> Result<Vec<String>> {
             } else {
                 continue;
             };
-            let first = rest
-                .split(|c: char| c == ' ' || c == '.' || c == ',')
-                .next()
-                .unwrap_or("");
+            let first = rest.split([' ', '.', ',']).next().unwrap_or("");
             if !first.is_empty() && first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 names.insert(first.to_string());
             }
@@ -4969,9 +5035,12 @@ fn walk_dir_capped(
     // Store dedup makes repeat uploads cheap; this makes them free, and
     // makes the NEGATIVE result free too, which is the half that
     // mattered.
-    static WALK_MEMO: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<(PathBuf, usize), Option<Vec<DerivedFile>>>>,
-    > = std::sync::OnceLock::new();
+    // Keyed by (directory, cap) because the cap changes which entries a walk
+    // is allowed to return, so a hit under one cap is not a hit under another.
+    // None is a REMEMBERED NEGATIVE - the half that mattered, per the comment
+    // above - not an absent entry.
+    type WalkMemo = std::sync::Mutex<HashMap<(PathBuf, usize), Option<Vec<DerivedFile>>>>;
+    static WALK_MEMO: std::sync::OnceLock<WalkMemo> = std::sync::OnceLock::new();
     let memo = WALK_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let key = (dir.to_path_buf(), cap);
     if let Some(hit) = memo.lock().unwrap().get(&key) {
@@ -5130,26 +5199,32 @@ mod compile_task_tests {
     // edge does not declare.
     #[test]
     fn a_link_with_gcc_deps_is_not_a_compile() {
-        assert!(!is_compile_task(Some("gcc"), ["libz-ng.so.2.3.3"].into_iter()));
+        assert!(!is_compile_task(
+            Some("gcc"),
+            ["libz-ng.so.2.3.3"].into_iter()
+        ));
         assert!(!is_compile_task(Some("gcc"), ["libcapstone.a"].into_iter()));
         assert!(!is_compile_task(Some("gcc"), ["zlib-ng-test"].into_iter()));
     }
 
     #[test]
     fn a_compile_still_is_one() {
-        assert!(is_compile_task(Some("gcc"), ["CMakeFiles/z.dir/deflate.c.o"].into_iter()));
-        assert!(is_compile_task(Some("gcc"), [".libs/hf_64.lo"].into_iter()));
         assert!(is_compile_task(
             Some("gcc"),
-            ["a.o", "b.obj"].into_iter()
+            ["CMakeFiles/z.dir/deflate.c.o"].into_iter()
         ));
+        assert!(is_compile_task(Some("gcc"), [".libs/hf_64.lo"].into_iter()));
+        assert!(is_compile_task(Some("gcc"), ["a.o", "b.obj"].into_iter()));
     }
 
     // A mixed edge is not a compile: one non-object output is enough,
     // because the rules this gates are all about a TU's closure.
     #[test]
     fn mixed_outputs_are_not_a_compile() {
-        assert!(!is_compile_task(Some("gcc"), ["a.o", "libz.so"].into_iter()));
+        assert!(!is_compile_task(
+            Some("gcc"),
+            ["a.o", "libz.so"].into_iter()
+        ));
     }
 
     // No outputs cannot be a compile, and the old expression would have
@@ -5446,10 +5521,7 @@ mod python_import_names_tests {
             None
         );
         assert_eq!(
-            common_include_root(&[
-                PB::from("include/QtSvg/a.h"),
-                PB::from("include/QtGui/b.h"),
-            ]),
+            common_include_root(&[PB::from("include/QtSvg/a.h"), PB::from("include/QtGui/b.h"),]),
             None
         );
         // ONE include output IS enough - syncqt's own edge declares exactly
@@ -5580,19 +5652,28 @@ mod depfile_read_back_tests {
         let dep = d.join("a.o.d");
         std::fs::write(&dep, "a.o: a.c \\\n hdr/one.h\n").unwrap();
         // Fresh depfile (written after the source): its answer is used.
-        let got = depfile_read_back(&d, Some(PathBuf::from("a.o.d").as_path()),
-                                    &[PathBuf::from("a.c")]).unwrap();
+        let got = depfile_read_back(
+            &d,
+            Some(PathBuf::from("a.o.d").as_path()),
+            &[PathBuf::from("a.c")],
+        )
+        .unwrap();
         assert_eq!(got, vec![PathBuf::from("a.c"), PathBuf::from("hdr/one.h")]);
         // Source newer than the depfile: no answer, fall back to the scan.
         let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
-        std::fs::File::open(&src).unwrap().set_times(
-            std::fs::FileTimes::new().set_modified(newer)).unwrap();
-        assert!(depfile_read_back(&d, Some(PathBuf::from("a.o.d").as_path()),
-                                  &[PathBuf::from("a.c")]).is_none());
+        std::fs::File::open(&src)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(newer))
+            .unwrap();
+        assert!(depfile_read_back(
+            &d,
+            Some(PathBuf::from("a.o.d").as_path()),
+            &[PathBuf::from("a.c")]
+        )
+        .is_none());
         // Empty depfile is no answer, not an empty answer.
         std::fs::write(&dep, "").unwrap();
-        assert!(depfile_read_back(&d, Some(PathBuf::from("a.o.d").as_path()),
-                                  &[]).is_none());
+        assert!(depfile_read_back(&d, Some(PathBuf::from("a.o.d").as_path()), &[]).is_none());
         // No depfile declared: the scan is the only source.
         assert!(depfile_read_back(&d, None, &[]).is_none());
     }
@@ -5800,6 +5881,7 @@ mod normalize_output_tests {
 /// Returns (discovered_deps, discovered_store_paths) where:
 /// - discovered_deps: DerivedFiles that need to be encoded and added to NIX_NINJA_INPUTS
 /// - discovered_store_paths: Store paths that only need to be added as input sources
+///
 /// The freshness-guarded depfile parse behind upstream #17. Returns None -
 /// meaning "run the scan" - unless the depfile exists and is at least as
 /// new as every source file offered, and parses cleanly.
@@ -5809,10 +5891,18 @@ fn depfile_read_back(
     sources: &[PathBuf],
 ) -> Option<Vec<PathBuf>> {
     let d = depfile?;
-    let d = if d.is_absolute() { d.to_path_buf() } else { build_dir.join(d) };
+    let d = if d.is_absolute() {
+        d.to_path_buf()
+    } else {
+        build_dir.join(d)
+    };
     let dep_m = std::fs::metadata(&d).ok()?.modified().ok()?;
     for srcf in sources {
-        let p = if srcf.is_absolute() { srcf.clone() } else { build_dir.join(srcf) };
+        let p = if srcf.is_absolute() {
+            srcf.clone()
+        } else {
+            build_dir.join(srcf)
+        };
         let m = std::fs::metadata(&p).ok()?.modified().ok()?;
         if m > dep_m {
             return None;
@@ -5829,15 +5919,16 @@ fn depfile_read_back(
     }
     // An empty parse is no answer, not an empty answer: fall back to the
     // scan rather than declaring a TU with zero includes.
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Union of the textual scan and the preprocessor's depfile, scan order
 /// first, deduped. See the call site for why neither alone is sufficient.
-fn merge_scan_and_preprocessor(
-    scanned: Vec<PathBuf>,
-    preprocessed: Vec<PathBuf>,
-) -> Vec<PathBuf> {
+fn merge_scan_and_preprocessor(scanned: Vec<PathBuf>, preprocessed: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut seen: HashSet<PathBuf> = scanned.iter().cloned().collect();
     let mut out = scanned;
     for p in preprocessed {
@@ -6061,11 +6152,10 @@ fn absolute_file_candidate(arg: &str) -> Option<&str> {
 /// ours to upload.
 fn same_project_tree(base: &Path, target: &Path) -> bool {
     let first = |p: &Path| {
-        p.components()
-            .find_map(|c| match c {
-                std::path::Component::Normal(n) => Some(n.to_owned()),
-                _ => None,
-            })
+        p.components().find_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_owned()),
+            _ => None,
+        })
     };
     match (first(base), first(target)) {
         (Some(a), Some(b)) => a == b,
@@ -6182,7 +6272,10 @@ mod target_resolution_tests {
     fn depfile_only_declared_when_the_command_writes_it() {
         use super::command_writes_depfile as w;
         // CMake LTO probe: depfile declared, command writes none.
-        assert!(!w(Some("g++ -g -flto=auto -fPIC -o foo.o -c foo.cpp"), None));
+        assert!(!w(
+            Some("g++ -g -flto=auto -fPIC -o foo.o -c foo.cpp"),
+            None
+        ));
         // Ordinary CMake/meson compile lines.
         assert!(w(Some("gcc -MD -MT a.o -MF a.o.d -o a.o -c a.c"), None));
         assert!(w(Some("gcc -MMD -o a.o -c a.c"), None));
@@ -6488,9 +6581,17 @@ mod ninja_pool_tests {
     fn cmdline_is_lto_last_flag_wins_and_fat_changes_nothing() {
         assert!(super::cmdline_is_lto("gcc -O3 -flto=8 -c a.c -o a.o"));
         assert!(super::cmdline_is_lto("gcc -flto -c a.c"));
-        assert!(super::cmdline_is_lto("gcc -flto=auto -ffat-lto-objects -c a.c"));
-        assert!(!super::cmdline_is_lto("gcc -flto=8 -fno-lto -c a.c"), "later -fno-lto wins");
-        assert!(super::cmdline_is_lto("gcc -fno-lto -flto -c a.c"), "later -flto wins");
+        assert!(super::cmdline_is_lto(
+            "gcc -flto=auto -ffat-lto-objects -c a.c"
+        ));
+        assert!(
+            !super::cmdline_is_lto("gcc -flto=8 -fno-lto -c a.c"),
+            "later -fno-lto wins"
+        );
+        assert!(
+            super::cmdline_is_lto("gcc -fno-lto -flto -c a.c"),
+            "later -flto wins"
+        );
         assert!(!super::cmdline_is_lto("gcc -O3 -c a.c -o a.o"));
         // the placeholder-restore hazard is about IR, not the word: a
         // path containing 'flto' is not a flag
@@ -6525,8 +6626,14 @@ mod ninja_pool_tests {
     fn outer_rewrite_map_is_same_length_stable_and_reversible() {
         let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("outputs", "out dev");
-        std::env::set_var("out", "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-1.2.16.1");
-        std::env::set_var("dev", "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-alsa-lib-1.2.16.1-dev");
+        std::env::set_var(
+            "out",
+            "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-1.2.16.1",
+        );
+        std::env::set_var(
+            "dev",
+            "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-alsa-lib-1.2.16.1-dev",
+        );
         let m = super::outer_rewrite_map();
         assert_eq!(m.len(), 2);
         for (real, fake) in &m {
@@ -6536,7 +6643,10 @@ mod ninja_pool_tests {
         }
         // Stable under a different $out hash: the placeholder depends on the
         // output NAME only.
-        std::env::set_var("out", "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-alsa-lib-1.2.16.1");
+        std::env::set_var(
+            "out",
+            "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-alsa-lib-1.2.16.1",
+        );
         assert_eq!(super::outer_rewrite_map()[0].1, m[0].1);
         let data = format!("#define DIR \"{}/share\"\0bin", m[0].0);
         let fwd = super::rewrite_bytes(data.as_bytes(), &m).expect("rewritten");
@@ -6550,10 +6660,19 @@ mod ninja_pool_tests {
     fn remove_outer_rpath_strips_the_out_lib_pair() {
         let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("outputs", "out dev");
-        std::env::set_var("out", "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-cc-dropin-1.2.16.1");
-        std::env::set_var("dev", "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-alsa-lib-cc-dropin-1.2.16.1-dev");
+        std::env::set_var(
+            "out",
+            "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-cc-dropin-1.2.16.1",
+        );
+        std::env::set_var(
+            "dev",
+            "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-alsa-lib-cc-dropin-1.2.16.1-dev",
+        );
         let v = "-rpath /nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-cc-dropin-1.2.16.1/lib  -L/nix/store/klkb81wkzlz3bpfv6brnh3gwcapy5b4w-boost-1.89.0/lib";
-        assert_eq!(super::remove_outer_rpath(v), "-L/nix/store/klkb81wkzlz3bpfv6brnh3gwcapy5b4w-boost-1.89.0/lib");
+        assert_eq!(
+            super::remove_outer_rpath(v),
+            "-L/nix/store/klkb81wkzlz3bpfv6brnh3gwcapy5b4w-boost-1.89.0/lib"
+        );
     }
 
     use super::pool_permits_from_depths;
@@ -6599,10 +6718,7 @@ mod alias_symlink_tests {
     // the target's content.
     #[test]
     fn a_dangling_soname_alias_is_carried_and_an_escape_is_not() {
-        let d = std::env::temp_dir().join(format!(
-            "nn-alias-test-{}",
-            std::process::id()
-        ));
+        let d = std::env::temp_dir().join(format!("nn-alias-test-{}", std::process::id()));
         let orc = d.join("orc");
         std::fs::create_dir_all(&orc).unwrap();
 
@@ -6707,7 +6823,9 @@ mod create_symlink_undeclared_output_tests {
             "the preprocessor's computed include was dropped: {got:?}"
         );
         assert_eq!(
-            got.iter().filter(|p| *p == &PathBuf::from("quotearg.c")).count(),
+            got.iter()
+                .filter(|p| *p == &PathBuf::from("quotearg.c"))
+                .count(),
             1,
             "the overlap was declared twice: {got:?}"
         );
@@ -6746,30 +6864,45 @@ mod create_symlink_undeclared_output_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("wchar.h"), b"#ifndef GEN_WCHAR\n#define GEN_WCHAR\nstatic void mbszero(void*p){(void)p;}\n#endif\n").unwrap();
         std::fs::write(dir.join("config.h"), b"#define PACKAGE \"m4\"\n").unwrap();
-        std::fs::write(dir.join("quotearg.h"), b"#ifndef QA_H\n#define QA_H\n#endif\n").unwrap();
+        std::fs::write(
+            dir.join("quotearg.h"),
+            b"#ifndef QA_H\n#define QA_H\n#endif\n",
+        )
+        .unwrap();
         let src = dir.join("quotearg.c");
-        std::fs::write(&src, b"#include <config.h>\n#include \"quotearg.h\"\n#include <wchar.h>\n").unwrap();
+        std::fs::write(
+            &src,
+            b"#include <config.h>\n#include \"quotearg.h\"\n#include <wchar.h>\n",
+        )
+        .unwrap();
 
         // `-I.` is resolved against the process working directory, which is
         // what the compile itself does, so the test stands where the
         // compiler would.
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
-        let got = deps_infer::c_include_parser::retrieve_c_includes("gcc -I. -g -O2 -c -o q.o quotearg.c", vec![PathBuf::from("quotearg.c")], None);
+        let got = deps_infer::c_include_parser::retrieve_c_includes(
+            "gcc -I. -g -O2 -c -o q.o quotearg.c",
+            vec![PathBuf::from("quotearg.c")],
+            None,
+        );
         std::env::set_current_dir(prev).unwrap();
         let got = got.unwrap();
         let names: Vec<String> = got
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .collect();
-        assert!(names.iter().any(|n| n == "wchar.h"),
-            "the generated wchar.h reached only through -I. was not collected: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "wchar.h"),
+            "the generated wchar.h reached only through -I. was not collected: {names:?}"
+        );
         // The quoted include is the POSITIVE CONTROL. Without it a walk that
         // collected nothing at all would fail the assertion above for a
         // reason that has nothing to do with angle includes.
-        assert!(names.iter().any(|n| n == "quotearg.h"),
+        assert!(
+            names.iter().any(|n| n == "quotearg.h"),
             "the quoted include was not collected either, so this says nothing \
-             about angle includes: {names:?}");
+             about angle includes: {names:?}"
+        );
     }
-
 }

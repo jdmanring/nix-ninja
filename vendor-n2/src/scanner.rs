@@ -168,10 +168,14 @@ pub fn read_file_with_nul(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut file = std::fs::File::open(path)?;
     let size = file.metadata()?.len() as usize;
     let mut bytes = Vec::with_capacity(size + 1);
-    unsafe {
-        bytes.set_len(size);
-    }
-    file.read_exact(&mut bytes[..size])?;
+    // read_to_end fills the spare capacity we just reserved, so this keeps the
+    // single-allocation property the comment above is about while leaving the
+    // buffer initialised. The previous version reserved and then set_len'd,
+    // which handed uninitialised bytes to safe code - clippy::uninit_vec, and
+    // undefined behaviour rather than a lint's opinion. It also read exactly
+    // `size` bytes, so a file that grew between the metadata call and the read
+    // was silently truncated; read_to_end takes whatever is there.
+    file.read_to_end(&mut bytes)?;
     bytes.push(0);
     Ok(bytes)
 }
@@ -179,6 +183,26 @@ pub fn read_file_with_nul(path: &Path) -> std::io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_file_with_nul_appends_nul_and_keeps_contents() {
+        let dir = std::env::temp_dir().join(format!("n2-scanner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input.ninja");
+        std::fs::write(&path, b"rule cc\n  command = cc\n").unwrap();
+
+        let bytes = read_file_with_nul(&path).unwrap();
+        assert_eq!(bytes.last(), Some(&0u8), "scanner requires a trailing nul");
+        assert_eq!(&bytes[..bytes.len() - 1], b"rule cc\n  command = cc\n");
+
+        // An empty file is the case the old set_len path was least obviously
+        // correct for, and it is a real ninja input.
+        let empty = dir.join("empty.ninja");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(read_file_with_nul(&empty).unwrap(), vec![0u8]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn scanner() {

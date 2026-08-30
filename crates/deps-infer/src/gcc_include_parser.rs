@@ -113,10 +113,7 @@ mod tests {
         // s6-linux-init's real shape: generated headers reachable only
         // through -iquote. Attached and separate forms both count.
         assert_eq!(
-            parse_include_dirs(
-                "gcc -iquote src/include-local -Isrc/include -c x.c"
-            )
-            .unwrap(),
+            parse_include_dirs("gcc -iquote src/include-local -Isrc/include -c x.c").unwrap(),
             paths(&["src/include-local", "src/include"])
         );
         assert_eq!(

@@ -111,7 +111,10 @@ mod watchdog_policy_tests {
             last_allowance_s: 4800,
         };
         let line = e.to_string();
-        assert!(line.contains("DaemonStalled"), "monitor grep would miss: {line}");
+        assert!(
+            line.contains("DaemonStalled"),
+            "monitor grep would miss: {line}"
+        );
         assert!(line.contains("daemon-side wedge"));
     }
 
@@ -177,15 +180,15 @@ pub struct BuilderRpcClient {
     nar_uploads: Mutex<HashMap<PathBuf, (u64, u128, StorePath)>>,
 }
 
-/// Wall-clock attribution for the realise RPC.
-///
-/// The driver timed four sub-phases of task RESOLUTION and nothing at all
-/// around the daemon round trip, so a round that spent 85% of its wall clock
-/// inside one `build_paths` reported 129 s of "total resolve time" and looked
-/// idle. Three rounds were then tuned against memory, which was never the
-/// bound. A Drop guard rather than a timed block because this function has
-/// several early returns and an untimed one would understate the very case
-/// worth catching.
+// Wall-clock attribution for the realise RPC.
+//
+// The driver timed four sub-phases of task RESOLUTION and nothing at all
+// around the daemon round trip, so a round that spent 85% of its wall clock
+// inside one `build_paths` reported 129 s of "total resolve time" and looked
+// idle. Three rounds were then tuned against memory, which was never the
+// bound. A Drop guard rather than a timed block because this function has
+// several early returns and an untimed one would understate the very case
+// worth catching.
 
 /// `(asked, sent)` realise paths so far: what callers requested, and what
 /// actually reached the daemon. Reported by the driver's progress tick,
@@ -243,7 +246,7 @@ fn merge_hits_and_misses<T>(
         built.len(),
         miss_slots.len(),
     );
-    for (slot, value) in miss_slots.into_iter().zip(built.into_iter()) {
+    for (slot, value) in miss_slots.into_iter().zip(built) {
         slots[slot] = Some(value);
     }
     slots
@@ -264,6 +267,15 @@ static BUILD_PATHS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// A single realise slower than this names itself immediately, with the path
 /// count, rather than waiting for a total nobody reads mid-round.
 const SLOW_REALISE_MS: u64 = 30_000;
+// The band this threshold has to sit in, checked when the crate COMPILES
+// rather than when a test runs. It was written as a #[test] full of literal
+// comparisons against the constant, which clippy reads as an assertion with a
+// constant value and is right to: nothing in it could fail at run time, so it
+// read as a behavioural test while being a compile-time fact. A round that
+// spends minutes in one realise must trip it; a healthy sub-second realise
+// must not.
+const _: () = assert!(SLOW_REALISE_MS < 735_000);
+const _: () = assert!(SLOW_REALISE_MS > 800);
 
 struct RealiseTimer {
     started: std::time::Instant,
@@ -304,7 +316,11 @@ impl BuilderRpcClient {
         // and has no purpose outside a nix derivation.
         let in_drv = std::env::var_os("NIX_BUILD_TOP").is_some();
 
-        Self::connect_unix_sized(&path, in_drv, pool_max.unwrap_or(PoolConfig::default().max_size))
+        Self::connect_unix_sized(
+            &path,
+            in_drv,
+            pool_max.unwrap_or(PoolConfig::default().max_size),
+        )
     }
 
     pub fn connect_unix(path: &Path, in_drv: bool) -> Result<Self> {
@@ -410,45 +426,47 @@ impl BuilderRpcClient {
     /// Derivations have different reference scanning logic, implemented in the
     /// `add_drv_to_store` function
     pub fn add_to_store_text(&self, name: &str, bytes: &[u8]) -> Result<StorePath> {
-        let info = self.runtime.block_on(async {
-            let mut guard = self.pool.acquire().await?;
-            let source = BufReader::new(Cursor::new(bytes));
-            if self.in_drv {
-                guard
-                    .execute(|client| {
-                        client.add_to_store_scanning(
-                            name,
-                            ContentAddressMethodAlgorithm::Text,
-                            source,
-                        )
-                    })
-                    .await
-            } else {
-                // Unfortunately outside of a derivation we do not have a good
-                // idea of possible paths for which we can scan.
-                // A trivial "scan for all paths" implementation would include nonexistent paths
-                // from documentation and fail on important projects, e.g. nix.
-                // An empty reference set is identical to the fallback `nix store add` case
-                // and preferable to no running outside a derivation at all.
-                let refs = Default::default();
-                guard
-                    .execute(|client| {
-                        client.add_ca_to_store(
-                            name,
-                            ContentAddressMethodAlgorithm::Text,
-                            &refs,
-                            false,
-                            source,
-                        )
-                    })
-                    .await
-            }
-        })
-        .map_err(|e| Error::AddToStore {
-            name: name.to_string(),
-            detail: format!("text, {} bytes", bytes.len()),
-            source: Box::new(Error::from(e)),
-        })?;
+        let info = self
+            .runtime
+            .block_on(async {
+                let mut guard = self.pool.acquire().await?;
+                let source = BufReader::new(Cursor::new(bytes));
+                if self.in_drv {
+                    guard
+                        .execute(|client| {
+                            client.add_to_store_scanning(
+                                name,
+                                ContentAddressMethodAlgorithm::Text,
+                                source,
+                            )
+                        })
+                        .await
+                } else {
+                    // Unfortunately outside of a derivation we do not have a good
+                    // idea of possible paths for which we can scan.
+                    // A trivial "scan for all paths" implementation would include nonexistent paths
+                    // from documentation and fail on important projects, e.g. nix.
+                    // An empty reference set is identical to the fallback `nix store add` case
+                    // and preferable to no running outside a derivation at all.
+                    let refs = Default::default();
+                    guard
+                        .execute(|client| {
+                            client.add_ca_to_store(
+                                name,
+                                ContentAddressMethodAlgorithm::Text,
+                                &refs,
+                                false,
+                                source,
+                            )
+                        })
+                        .await
+                }
+            })
+            .map_err(|e| Error::AddToStore {
+                name: name.to_string(),
+                detail: format!("text, {} bytes", bytes.len()),
+                source: Box::new(Error::from(e)),
+            })?;
         Ok(info.path)
     }
 
@@ -540,72 +558,74 @@ impl BuilderRpcClient {
     /// it. Safe against retries because there are none: `execute` is FnOnce
     /// and poisons its connection on error, and no caller retries this.
     pub fn add_to_store_nar(&self, name: &str, path: &Path) -> Result<StorePath> {
-        let info = self.runtime.block_on(async {
-            // Bounded pipe: the producer blocks when it is full rather than
-            // growing, which is the whole point.
-            let (writer, reader) = tokio::io::duplex(NAR_STREAM_BUF);
-            let owned = path.to_path_buf();
-            let producer = tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut encoder =
-                    nix_nar::Encoder::new(&owned).map_err(|e| Error::Nar(e.to_string()))?;
-                let mut bridge = tokio_util::io::SyncIoBridge::new(writer);
-                std::io::copy(&mut encoder, &mut bridge)?;
-                // Without the shutdown the reader never sees EOF and the
-                // daemon waits forever on a NAR that has already been sent.
-                std::io::Write::flush(&mut bridge)?;
-                bridge.shutdown()?;
-                Ok(())
-            });
-            let mut guard = self.pool.acquire().await?;
-            let source = BufReader::new(reader);
-            let out = if self.in_drv {
-                guard
-                    .execute(|client| {
-                        client.add_to_store_scanning(
-                            name,
-                            ContentAddressMethodAlgorithm::NixArchive(
-                                harmonia_utils_hash::Algorithm::SHA256,
-                            ),
-                            source,
-                        )
-                    })
-                    .await
-            } else {
-                // Suboptimal fallback, see add_to_store_text
-                let refs = Default::default();
-                guard
-                    .execute(|client| {
-                        client.add_ca_to_store(
-                            name,
-                            ContentAddressMethodAlgorithm::NixArchive(
-                                harmonia_utils_hash::Algorithm::SHA256,
-                            ),
-                            &refs,
-                            false,
-                            source,
-                        )
-                    })
-                    .await
-            };
-            // Join AFTER the RPC: the daemon drains the pipe, so joining
-            // first deadlocks on any NAR larger than the buffer. A producer
-            // error must not be swallowed - an encoder that failed mid-tree
-            // otherwise looks like a short but valid NAR.
-            match producer.await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(e),
-                Err(join) => return Err(Error::Nar(format!("nar encoder panicked: {join}"))),
-            }
-            // The early returns above fix this block's error type, so the
-            // RPC's own error needs converting rather than being handed back
-            // raw the way it was before the join existed.
-            out.map_err(Error::from)
-        })
-        .map_err(|e| Error::AddToStore {
-            name: name.to_string(),
-            detail: format!("nar of {}", path.display()),
-            source: Box::new(e),
-        })?;
+        let info = self
+            .runtime
+            .block_on(async {
+                // Bounded pipe: the producer blocks when it is full rather than
+                // growing, which is the whole point.
+                let (writer, reader) = tokio::io::duplex(NAR_STREAM_BUF);
+                let owned = path.to_path_buf();
+                let producer = tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut encoder =
+                        nix_nar::Encoder::new(&owned).map_err(|e| Error::Nar(e.to_string()))?;
+                    let mut bridge = tokio_util::io::SyncIoBridge::new(writer);
+                    std::io::copy(&mut encoder, &mut bridge)?;
+                    // Without the shutdown the reader never sees EOF and the
+                    // daemon waits forever on a NAR that has already been sent.
+                    std::io::Write::flush(&mut bridge)?;
+                    bridge.shutdown()?;
+                    Ok(())
+                });
+                let mut guard = self.pool.acquire().await?;
+                let source = BufReader::new(reader);
+                let out = if self.in_drv {
+                    guard
+                        .execute(|client| {
+                            client.add_to_store_scanning(
+                                name,
+                                ContentAddressMethodAlgorithm::NixArchive(
+                                    harmonia_utils_hash::Algorithm::SHA256,
+                                ),
+                                source,
+                            )
+                        })
+                        .await
+                } else {
+                    // Suboptimal fallback, see add_to_store_text
+                    let refs = Default::default();
+                    guard
+                        .execute(|client| {
+                            client.add_ca_to_store(
+                                name,
+                                ContentAddressMethodAlgorithm::NixArchive(
+                                    harmonia_utils_hash::Algorithm::SHA256,
+                                ),
+                                &refs,
+                                false,
+                                source,
+                            )
+                        })
+                        .await
+                };
+                // Join AFTER the RPC: the daemon drains the pipe, so joining
+                // first deadlocks on any NAR larger than the buffer. A producer
+                // error must not be swallowed - an encoder that failed mid-tree
+                // otherwise looks like a short but valid NAR.
+                match producer.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(join) => return Err(Error::Nar(format!("nar encoder panicked: {join}"))),
+                }
+                // The early returns above fix this block's error type, so the
+                // RPC's own error needs converting rather than being handed back
+                // raw the way it was before the join existed.
+                out.map_err(Error::from)
+            })
+            .map_err(|e| Error::AddToStore {
+                name: name.to_string(),
+                detail: format!("nar of {}", path.display()),
+                source: Box::new(e),
+            })?;
         Ok(info.path)
     }
 
@@ -650,7 +670,10 @@ impl BuilderRpcClient {
         //   is what made the cost scale with the input set rather than with
         //   the store. First confirmation still happens before any caller
         //   receives the path.
-        let keys: Vec<String> = paths.iter().map(|p| store_dir.display(p).to_string()).collect();
+        let keys: Vec<String> = paths
+            .iter()
+            .map(|p| store_dir.display(p).to_string())
+            .collect();
 
         let mut out: Vec<Option<StorePath>> = Vec::with_capacity(paths.len());
         let mut misses: Vec<SingleDerivedPath> = Vec::new();
@@ -759,8 +782,8 @@ impl BuilderRpcClient {
             match p {
                 SingleDerivedPath::Opaque(path) => {
                     let key = path.to_string();
-                    if !drv_index.contains_key(&key) {
-                        drv_index.insert(key, merged.len());
+                    if let std::collections::hash_map::Entry::Vacant(e) = drv_index.entry(key) {
+                        e.insert(merged.len());
                         merged.push(DerivedPath::Opaque(path.clone()));
                     }
                 }
@@ -768,10 +791,12 @@ impl BuilderRpcClient {
                     let key = format!("drv:{}", store_dir.display(drv_path.as_ref()));
                     match drv_index.get(&key) {
                         Some(&i) => {
-                            if let DerivedPath::Built { outputs, .. } = &mut merged[i] {
-                                if let OutputSpec::Named(set) = outputs {
-                                    set.insert(output.clone());
-                                }
+                            if let DerivedPath::Built {
+                                outputs: OutputSpec::Named(set),
+                                ..
+                            } = &mut merged[i]
+                            {
+                                set.insert(output.clone());
                             }
                         }
                         None => {
@@ -803,10 +828,10 @@ impl BuilderRpcClient {
         let merged: Vec<DerivedPath> = merged
             .into_iter()
             .flat_map(|p| match p {
-                DerivedPath::Built { drv_path, outputs: OutputSpec::Named(set) }
-                    if set.iter().map(|o| o.as_ref().len() + 1).sum::<usize>()
-                        > MAX_SPEC_CHARS =>
-                {
+                DerivedPath::Built {
+                    drv_path,
+                    outputs: OutputSpec::Named(set),
+                } if set.iter().map(|o| o.as_ref().len() + 1).sum::<usize>() > MAX_SPEC_CHARS => {
                     let mut chunks: Vec<DerivedPath> = Vec::new();
                     let mut cur: Vec<_> = Vec::new();
                     let mut cur_len = 0usize;
@@ -899,7 +924,12 @@ impl BuilderRpcClient {
                 let retrying = stall_attempts + connect_failures > 0;
                 let allowance_s = stall_allowance_s(stall_attempts);
                 let mut _gate = if retrying {
-                    Some(RETRY_GATE.acquire().await.expect("retry gate is never closed"))
+                    Some(
+                        RETRY_GATE
+                            .acquire()
+                            .await
+                            .expect("retry gate is never closed"),
+                    )
                 } else {
                     None
                 };
@@ -1092,7 +1122,7 @@ impl BuilderRpcClient {
                         // no-op; failures still surface below.
                         match by_key.get(&key) {
                             Some(result) if result.success().is_none() => {
-                                return Err(Error::BuildFailed {
+                                Err(Error::BuildFailed {
                                     path: display,
                                     error_msg: match &result.inner {
                                         BuildResultInner::Failure(f) => {
@@ -1100,8 +1130,7 @@ impl BuilderRpcClient {
                                         }
                                         _ => String::new(),
                                     },
-                                }
-                                .into());
+                                })
                             }
                             _ => Ok(path.clone()),
                         }
@@ -1117,8 +1146,7 @@ impl BuilderRpcClient {
                                         }
                                         _ => String::new(),
                                     },
-                                }
-                                .into());
+                                });
                             }
                         }
                         out_pool.get(output).cloned().ok_or_else(|| {
@@ -1195,6 +1223,18 @@ pub fn nar_upload_stats() -> (u64, u64) {
 /// in one go, small enough that a directory upload cannot be a memory event.
 /// Peak per upload is this, not the tree.
 const NAR_STREAM_BUF: usize = 256 * 1024;
+// The buffer is a pipe size, not a tuning knob, but a zero or absurd value
+// silently changes it into one - duplex(0) blocks forever. Compile-time for
+// the same reason as SLOW_REALISE_MS above: this is a fact about the
+// constant, and a #[test] asserting it can never fail.
+const _: () = assert!(
+    NAR_STREAM_BUF >= 64 * 1024,
+    "too small to move a header in one go"
+);
+const _: () = assert!(
+    NAR_STREAM_BUF <= 4 * 1024 * 1024,
+    "large enough to be a memory event again"
+);
 
 #[cfg(test)]
 mod connect_backoff_tests {
@@ -1214,9 +1254,15 @@ mod connect_backoff_tests {
     #[test]
     fn total_window_rides_a_daemon_restart() {
         let total: u64 = CONNECT_BACKOFF_S.iter().sum();
-        assert!(total >= 120, "connect window {total}s is too short for a restart");
+        assert!(
+            total >= 120,
+            "connect window {total}s is too short for a restart"
+        );
         // and bounded, so a genuinely dead daemon does not burn a night
-        assert!(total <= 600, "connect window {total}s waits too long on a dead daemon");
+        assert!(
+            total <= 600,
+            "connect window {total}s waits too long on a dead daemon"
+        );
     }
 
     /// Monotonic: each wait at least as long as the one before it. A ladder
@@ -1255,10 +1301,6 @@ mod realise_timer_tests {
     #[test]
     fn slow_threshold_stays_loud_enough_to_catch_a_stalled_round() {
         assert_eq!(SLOW_REALISE_MS, 30_000);
-        // A round that spends minutes in one realise must trip it; a healthy
-        // sub-second realise must not.
-        assert!(735_000 >= SLOW_REALISE_MS);
-        assert!(800 < SLOW_REALISE_MS);
     }
 }
 
@@ -1467,14 +1509,6 @@ mod nar_streaming_tests {
 
         assert_eq!(got, expected, "streamed byte count must match the source");
     }
-
-    /// The buffer is a pipe size, not a tuning knob, but a zero or absurd
-    /// value silently changes it into one - duplex(0) blocks forever.
-    #[test]
-    fn the_stream_buffer_is_sane() {
-        assert!(NAR_STREAM_BUF >= 64 * 1024, "too small to move a header in one go");
-        assert!(NAR_STREAM_BUF <= 4 * 1024 * 1024, "large enough to be a memory event again");
-    }
 }
 
 #[cfg(test)]
@@ -1505,17 +1539,26 @@ mod nar_upload_memo_tests {
             )
         };
 
-        std::fs::File::create(&f).unwrap().write_all(b"#define A 1\n").unwrap();
+        std::fs::File::create(&f)
+            .unwrap()
+            .write_all(b"#define A 1\n")
+            .unwrap();
         let before = stamp(&f);
 
         // Same length, different content: the size half alone would call this
         // unchanged, which is exactly the case a regenerated header hits.
         std::thread::sleep(std::time::Duration::from_millis(10));
-        std::fs::File::create(&f).unwrap().write_all(b"#define A 2\n").unwrap();
+        std::fs::File::create(&f)
+            .unwrap()
+            .write_all(b"#define A 2\n")
+            .unwrap();
         let after = stamp(&f);
 
         assert_eq!(before.0, after.0, "test is only meaningful at equal size");
-        assert_ne!(before, after, "equal-size rewrite must still change the stamp");
+        assert_ne!(
+            before, after,
+            "equal-size rewrite must still change the stamp"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1582,7 +1625,9 @@ mod transient_error_tests {
         assert!(!transient_daemon_error(
             "cannot build '/nix/store/x.drv' in recursive Nix because path is unknown"
         ));
-        assert!(!transient_daemon_error("missing system features: builder-rpc-v0"));
+        assert!(!transient_daemon_error(
+            "missing system features: builder-rpc-v0"
+        ));
         // A File exists OUTSIDE the cgroup path is a real collision.
         assert!(!transient_daemon_error(
             "copying '/build/out' to '/nix/store/x': File exists"

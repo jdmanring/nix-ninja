@@ -349,7 +349,10 @@ fn main() -> Result<()> {
         );
         fs::write(&rsp, &content)
             .map_err(|e| anyhow::anyhow!("writing rspfile {rsp_path}: {e}"))?;
-        println!("nix-ninja-task: wrote rspfile {rsp_path} ({} bytes)", content.len());
+        println!(
+            "nix-ninja-task: wrote rspfile {rsp_path} ({} bytes)",
+            content.len()
+        );
         // THE ARGUMENT LIST syncqt RAN WITH, verbatim. Every syncqt
         // failure so far has been "exit 0, wrong files", with the cause
         // in the rspfile and nothing in the log saying what it held.
@@ -383,10 +386,15 @@ fn main() -> Result<()> {
                     if let Some(inc) = it.next() {
                         let staging = Path::new(inc).join(".syncqt_staging");
                         if staging.symlink_metadata().is_ok() {
-                            fs::remove_dir_all(&staging).or_else(|_| fs::remove_file(&staging)).map_err(|e| {
-                                anyhow::anyhow!("removing inherited {}: {e}", staging.display())
-                            })?;
-                            println!("nix-ninja-task: syncqt: removed inherited {}", staging.display());
+                            fs::remove_dir_all(&staging)
+                                .or_else(|_| fs::remove_file(&staging))
+                                .map_err(|e| {
+                                    anyhow::anyhow!("removing inherited {}: {e}", staging.display())
+                                })?;
+                            println!(
+                                "nix-ninja-task: syncqt: removed inherited {}",
+                                staging.display()
+                            );
                         }
                     }
                     break;
@@ -416,16 +424,28 @@ fn main() -> Result<()> {
                 .unwrap_or(usize::MAX);
             println!(
                 "nix-ninja-task: probe {probe}: {}",
-                if n == usize::MAX { "absent".to_string() } else { format!("{n} entries") }
+                if n == usize::MAX {
+                    "absent".to_string()
+                } else {
+                    format!("{n} entries")
+                }
             );
         }
         for probe in ["../src/svg", "src/svg"] {
             let n = fs::read_dir(probe)
-                .map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "h")).count())
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "h"))
+                        .count()
+                })
                 .unwrap_or(usize::MAX);
             println!(
                 "nix-ninja-task: probe {probe}: {}",
-                if n == usize::MAX { "absent".to_string() } else { format!("{n} header(s)") }
+                if n == usize::MAX {
+                    "absent".to_string()
+                } else {
+                    format!("{n} header(s)")
+                }
             );
         }
     }
@@ -559,8 +579,7 @@ fn producer_alias_symlinks(store_dir: &StoreDir, outputs: &[DerivedFile]) {
             .parent()
             .unwrap_or_else(|| Path::new(""))
             .to_path_buf();
-        for (link_name, target) in
-            alias_closure(&build_rel_dir, &name.to_string_lossy(), &aliases)
+        for (link_name, target) in alias_closure(&build_rel_dir, &name.to_string_lossy(), &aliases)
         {
             let link_abs = out_dir.join(&link_name);
             if link_abs.exists() || link_abs.is_symlink() {
@@ -621,7 +640,9 @@ fn alias_closure(
     loop {
         let mut advanced = false;
         for (adir, link, target) in aliases {
-            if adir == dir && present.iter().any(|p| p == target) && !present.iter().any(|p| p == link)
+            if adir == dir
+                && present.iter().any(|p| p == target)
+                && !present.iter().any(|p| p == link)
             {
                 present.push(link.clone());
                 created.push((link.clone(), target.clone()));
@@ -653,7 +674,10 @@ mod producer_alias_tests {
         assert_eq!(
             got,
             vec![
-                ("liborc-0.4.so.0".to_string(), "liborc-0.4.so.0.42.0".to_string()),
+                (
+                    "liborc-0.4.so.0".to_string(),
+                    "liborc-0.4.so.0.42.0".to_string()
+                ),
                 ("liborc-0.4.so".to_string(), "liborc-0.4.so.0".to_string()),
             ]
         );
@@ -719,8 +743,8 @@ fn create_output_dirs(outputs: &Vec<DerivedFile>) -> Result<()> {
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)
         .map_err(|e| anyhow::anyhow!("create_dir_all({}): {e}", dst.display()))?;
-    for entry in fs::read_dir(src)
-        .map_err(|e| anyhow::anyhow!("read_dir({}): {e}", src.display()))?
+    for entry in
+        fs::read_dir(src).map_err(|e| anyhow::anyhow!("read_dir({}): {e}", src.display()))?
     {
         let entry = entry?;
         let from = entry.path();
@@ -757,9 +781,9 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         if md.is_dir() {
             copy_tree(&from, &to)?;
         } else {
-            fs::copy(&from, &to)
-                .map_err(|e| anyhow::anyhow!("copy({} -> {}): {e}",
-                    from.display(), to.display()))?;
+            fs::copy(&from, &to).map_err(|e| {
+                anyhow::anyhow!("copy({} -> {}): {e}", from.display(), to.display())
+            })?;
             // fs::copy carries the source mode, and a generated header is
             // often 0444. A later task that has to overwrite it dies EACCES,
             // which is the same defect the duplicate-output fix already met.
@@ -849,7 +873,9 @@ fn dereference_rsp_headers(content: &str) -> Result<usize> {
             continue;
         }
         let p = Path::new(tok);
-        let Ok(md) = fs::symlink_metadata(p) else { continue };
+        let Ok(md) = fs::symlink_metadata(p) else {
+            continue;
+        };
         if !md.file_type().is_symlink() {
             continue;
         }
@@ -861,8 +887,13 @@ fn dereference_rsp_headers(content: &str) -> Result<usize> {
         let perms = fs::metadata(&target)?.permissions();
         fs::remove_file(p)
             .map_err(|e| anyhow::anyhow!("remove_file({}) for syncqt header: {e}", p.display()))?;
-        fs::copy(&target, p)
-            .map_err(|e| anyhow::anyhow!("copy({} -> {}) for syncqt header: {e}", target.display(), p.display()))?;
+        fs::copy(&target, p).map_err(|e| {
+            anyhow::anyhow!(
+                "copy({} -> {}) for syncqt header: {e}",
+                target.display(),
+                p.display()
+            )
+        })?;
         fs::set_permissions(p, perms)?;
         n += 1;
     }
@@ -1004,9 +1035,8 @@ fn cd_prologue_dir(cmdline: &str) -> Option<&str> {
 fn ensure_cd_target(cmdline: &str) -> Result<()> {
     if let Some(dir) = cd_prologue_dir(cmdline) {
         if !Path::new(dir).is_dir() {
-            fs::create_dir_all(dir).map_err(|e| {
-                anyhow::anyhow!("create_dir_all({dir}) for a cd prologue: {e}")
-            })?;
+            fs::create_dir_all(dir)
+                .map_err(|e| anyhow::anyhow!("create_dir_all({dir}) for a cd prologue: {e}"))?;
         }
     }
     Ok(())
@@ -1115,8 +1145,7 @@ fn rewrite_autogen_info(cmdline: &str, build_dir: &Path) -> Result<()> {
             .replace(HOLD, actual_b.as_str());
         // The materialised input is a read-only store symlink; replace it.
         let _ = fs::remove_file(&path);
-        fs::write(&path, &out)
-            .map_err(|e| anyhow::anyhow!("rewriting {}: {e}", path.display()))?;
+        fs::write(&path, &out).map_err(|e| anyhow::anyhow!("rewriting {}: {e}", path.display()))?;
         println!(
             "nix-ninja-task: rewrote autogen plan {} ({} bytes)",
             path.display(),
@@ -1202,8 +1231,14 @@ mod autogen_rewrite_tests {
   "CMAKE_BINARY_DIR" : "/build/src/build",
   "HEADERS" : [ [ "/build/src/build/include/QtSvg/x.h", "Mu", null ] ]
 }"#;
-        assert_eq!(json_string_value(text, "CMAKE_BINARY_DIR"), Some("/build/src/build"));
-        assert_eq!(json_string_value(text, "CMAKE_SOURCE_DIR"), Some("/build/src"));
+        assert_eq!(
+            json_string_value(text, "CMAKE_BINARY_DIR"),
+            Some("/build/src/build")
+        );
+        assert_eq!(
+            json_string_value(text, "CMAKE_SOURCE_DIR"),
+            Some("/build/src")
+        );
         // NEGATIVE CONTROL: an absent key must return None, because the
         // caller leaves the file untouched on None and half-rewriting it
         // would be worse than not rewriting it at all.
@@ -1211,10 +1246,7 @@ mod autogen_rewrite_tests {
 
         // The source dir keeps its relationship to the binary dir.
         assert_eq!(pathdiff_lexical("/build/src", "/build/src/build"), "..");
-        assert_eq!(
-            lexical_normalize("/a/b/src/build/.."),
-            "/a/b/src"
-        );
+        assert_eq!(lexical_normalize("/a/b/src/build/.."), "/a/b/src");
         // And a sibling layout, which is the other shape cmake produces.
         assert_eq!(pathdiff_lexical("/w/src", "/w/build"), "../src");
     }
@@ -1296,7 +1328,9 @@ fn dotdot_prefixes(cmdline: &str, build_top: Option<&str>) -> Vec<std::path::Pat
             .trim_start_matches("-iquote")
             .trim_start_matches("-isystem")
             .trim_start_matches("-idirafter");
-        let Some(dotdot) = t.find("/..") else { continue };
+        let Some(dotdot) = t.find("/..") else {
+            continue;
+        };
         let prefix = &t[..dotdot];
         if prefix.is_empty() || prefix.contains('=') {
             continue;
@@ -1322,10 +1356,7 @@ mod dotdot_prefix_tests {
         // The measured case: cmake spells the include dir through a
         // directory no input materializes.
         assert_eq!(
-            dotdot_prefixes(
-                "gcc -I/build/source/build/cmake/../../lib -c x.c",
-                None
-            ),
+            dotdot_prefixes("gcc -I/build/source/build/cmake/../../lib -c x.c", None),
             vec![PathBuf::from("/build/source/build/cmake")]
         );
         // Relative form counts too.

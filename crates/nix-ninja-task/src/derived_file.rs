@@ -108,8 +108,12 @@ impl fmt::Display for DerivedFile {
 /// way. Existing entries are left alone rather than replaced: a declared
 /// output already materialised at that path is the same file this would link.
 fn link_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    fs::create_dir_all(dst)
-        .map_err(|e| anyhow!("create_dir_all({}) for a directory input: {e}", dst.display()))?;
+    fs::create_dir_all(dst).map_err(|e| {
+        anyhow!(
+            "create_dir_all({}) for a directory input: {e}",
+            dst.display()
+        )
+    })?;
     for entry in fs::read_dir(src)
         .map_err(|e| anyhow!("read_dir({}) for a directory input: {e}", src.display()))?
     {
@@ -123,9 +127,8 @@ fn link_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
         if md.is_dir() {
             link_tree(&from, &to)?;
         } else if !to.exists() && !to.is_symlink() {
-            std::os::unix::fs::symlink(&from, &to).map_err(|e| {
-                anyhow!("symlink({} -> {}): {e}", from.display(), to.display())
-            })?;
+            std::os::unix::fs::symlink(&from, &to)
+                .map_err(|e| anyhow!("symlink({} -> {}): {e}", from.display(), to.display()))?;
         }
     }
     Ok(())
@@ -157,8 +160,11 @@ pub fn create_symlinks(
         // path in the error - a bare EACCES here cost a diagnosis cycle.
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
-                anyhow::anyhow!("create_dir_all({}) for input {}: {e}",
-                    parent.display(), input.build_path.display())
+                anyhow::anyhow!(
+                    "create_dir_all({}) for input {}: {e}",
+                    parent.display(),
+                    input.build_path.display()
+                )
             })?;
         }
 
@@ -175,7 +181,8 @@ pub fn create_symlinks(
         // per-file links inside overwrite on their own. `remove_file` on
         // it is EISDIR (materialize-all, qtsvg, 2026-08-23).
         if overwrite && dest_path.exists() && !source_path.is_dir() {
-            fs::remove_file(&dest_path).map_err(|e| anyhow::anyhow!("remove_file({}): {e}", dest_path.display()))?;
+            fs::remove_file(&dest_path)
+                .map_err(|e| anyhow::anyhow!("remove_file({}): {e}", dest_path.display()))?;
         }
 
         // TWO INPUTS CAN NAME ONE DESTINATION, and when they name the same
@@ -254,13 +261,8 @@ pub fn create_symlinks(
                 .components()
                 .any(|c| c.as_os_str() == "node_modules")
         {
-            fs::copy(&source_path, &dest_path).map_err(|e| {
-                anyhow!(
-                    "copy({:?} -> {}): {e}",
-                    source_path,
-                    dest_path.display()
-                )
-            })?;
+            fs::copy(&source_path, &dest_path)
+                .map_err(|e| anyhow!("copy({:?} -> {}): {e}", source_path, dest_path.display()))?;
             continue;
         }
 
