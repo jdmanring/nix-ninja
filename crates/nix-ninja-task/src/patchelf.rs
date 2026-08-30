@@ -7,15 +7,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn fix_rpaths(store_dir: &Path, outputs: &[DerivedFile]) -> Result<()> {
+    // ONE LINE PER TASK, not per output. This printed a line for every ELF
+    // it touched, and a task whose output is a tree (Qt's syncqt, cmake
+    // custom targets) has hundreds - so the log of a link-heavy target was
+    // mostly this message. The count is the part worth reading: it says how
+    // many of the task's outputs were dynamic ELF at all.
+    let mut fixed = 0usize;
     for output in outputs {
-        let canonical_path = fs::canonicalize(&output.build_path)?;
+        let canonical_path = fs::canonicalize(&output.build_path)
+            .map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", output.build_path.display()))?;
         if is_elf_dynamic(&canonical_path)? {
             fix_rpath(store_dir, &canonical_path)?;
-            println!(
-                "nix-ninja-task: Fixed RPATH for {}",
-                output.build_path.display()
-            );
+            fixed += 1;
         }
+    }
+    if fixed > 0 {
+        println!(
+            "nix-ninja-task: fixed RPATH on {fixed} of {} output(s)",
+            outputs.len()
+        );
     }
 
     Ok(())
@@ -24,7 +34,18 @@ pub fn fix_rpaths(store_dir: &Path, outputs: &[DerivedFile]) -> Result<()> {
 // Check if this is an executable or shared library that can have RPATH.
 // Skip object files (.o) or non-ELF files.
 fn is_elf_dynamic(path: &Path) -> Result<bool> {
-    let data = fs::read(path)?;
+    // A DIRECTORY OUTPUT IS NOT AN ELF AND READING ONE IS AN ERROR, not a
+    // false. Since the driver can declare a whole tree as an output - the
+    // syncqt include directory, whose contents ninja never names - this is
+    // reached with a directory, and `fs::read` returns EISDIR:
+    //     Error: read(.../include/QtSvg): Is a directory
+    // which fails the task rather than skipping the entry. Nothing inside an
+    // include tree carries an RPATH; a directory output that does would need
+    // a walk here, and there is no such output today.
+    if path.is_dir() {
+        return Ok(false);
+    }
+    let data = fs::read(path).map_err(|e| anyhow::anyhow!("read({}): {e}", path.display()))?;
 
     let elf = match ElfBytes::<AnyEndian>::minimal_parse(&data) {
         Ok(elf) => elf,
@@ -40,58 +61,48 @@ fn is_elf_dynamic(path: &Path) -> Result<bool> {
 }
 
 fn fix_rpath(store_dir: &Path, elf_path: &Path) -> Result<()> {
-    if let Some(new_rpath) = compute_new_rpath(store_dir, elf_path)? {
+    // One `patchelf --print-rpath` per file. This used to be two: fix_rpath
+    // read the raw string to spot a trailing colon and compute_new_rpath read
+    // it again through a near-identical helper. This function runs over every
+    // output of every task derivation, so the second one was a subprocess per
+    // output across a whole distribution.
+    let current_rpath = parse_rpath(&get_raw_rpath(elf_path)?);
+    if let Some(new_rpath) = compute_new_rpath(store_dir, elf_path, &current_rpath)? {
         apply_rpath(elf_path, &new_rpath)?;
     }
     Ok(())
 }
 
-fn compute_new_rpath(store_dir: &Path, elf_path: &Path) -> Result<Option<Vec<String>>> {
-    // Resolve RPATH entries with $ORIGIN expansion
-    let current_rpath = get_rpath(elf_path)?;
-    let resolved_rpath = resolve_rpath(&current_rpath, elf_path)?;
-
-    // Get needed libraries and collect directories that need to be added to RPATH
-    let mut new_rpath = Vec::new();
-    let mut path_added = false;
-
-    // Keep existing non-$ORIGIN paths
-    for path in &current_rpath {
-        if path.contains("$ORIGIN") {
-            continue;
-        }
-        new_rpath.push(path.clone());
-    }
-
-    let needed_libs = get_needed_libs(elf_path)?;
-
-    for lib_name in &needed_libs {
-        let Some(lib_path) = resolve_needed(lib_name, &resolved_rpath, store_dir)? else {
-            continue;
-        };
-
-        let Some(lib_dir) = lib_path.parent() else {
-            continue;
-        };
-
-        let lib_str = lib_dir
-            .to_str()
-            .context("Library directiory was not UTF-8")?
-            .to_owned();
-        if !new_rpath.contains(&lib_str) {
-            new_rpath.push(lib_str);
-            path_added = true;
-        }
-    }
-
-    if !path_added {
-        Ok(None)
+/// Split a raw RPATH on ':', PRESERVING empty entries.
+///
+/// Faithful on the READ side so callers can see what the binary actually
+/// carries. `compute_new_rpath` then drops empties when it rebuilds, and that
+/// asymmetry is the whole point.
+///
+/// An empty element in `DT_RPATH`/`DT_RUNPATH` means the current directory,
+/// exactly as it does in `PATH`. In a build tree that is a decision the build
+/// made about its own layout. In a STORE OUTPUT it is a search of whatever
+/// directory the user happens to be standing in when they run the binary,
+/// ahead of the store paths we just resolved - nondeterministic, and a route
+/// to loading a library nobody intended.
+///
+/// This function exists to rewrite build-time paths into store paths, so a
+/// build-directory decision is precisely the thing that must not survive it.
+/// `f8bb3bd` argued the opposite - that the trailing empty entry was
+/// "meaningful" and should be re-appended - and that reasoning was wrong in a
+/// way that put a cwd search into every patched output. The original splitter
+/// dropped every empty entry, and on the write side it was right to.
+fn parse_rpath(raw: &str) -> Vec<String> {
+    if raw.is_empty() {
+        // "".split(':') yields one empty entry, which would invent an RPATH
+        // element for a binary that has none.
+        Vec::new()
     } else {
-        Ok(Some(new_rpath))
+        raw.split(':').map(|s| s.to_string()).collect()
     }
 }
 
-fn get_rpath(elf_path: &Path) -> Result<Vec<String>> {
+fn get_raw_rpath(elf_path: &Path) -> Result<String> {
     let output = Command::new("patchelf")
         .arg("--print-rpath")
         .arg(elf_path)
@@ -103,17 +114,84 @@ fn get_rpath(elf_path: &Path) -> Result<Vec<String>> {
         return Err(anyhow!("patchelf --print-rpath failed: {stderr}"));
     }
 
-    let rpath_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches('\n')
+        .to_string())
+}
 
-    if rpath_str.is_empty() {
-        Ok(Vec::new())
-    } else {
-        Ok(rpath_str
-            .split(':')
-            .filter(|p| !p.is_empty())
-            .map(|p| p.to_string())
-            .collect())
+/// The entries of an existing RPATH that survive into the rewritten one.
+///
+/// Empty entries go, because an empty element means the current directory and
+/// this function's output is written into a store binary - see parse_rpath.
+/// `$ORIGIN` entries go because the rewrite resolves them to store paths.
+///
+/// Pulled out of compute_new_rpath so the rule is testable: that function
+/// shells out to patchelf against a real ELF, so nothing asserted on its
+/// output, which is exactly where the behaviour changed twice this week.
+fn retained_entries(current_rpath: &[String]) -> Vec<String> {
+    current_rpath
+        .iter()
+        .filter(|p| !p.is_empty() && !p.contains("$ORIGIN"))
+        .cloned()
+        .collect()
+}
+
+/// The RPATH a rewritten output should carry, from what it had and the store
+/// directories its NEEDED libraries resolved to. `None` means nothing was
+/// added and the binary should be left alone.
+///
+/// PURE, AND SEPARATE FROM THE ELF READING, so the retention rule can be
+/// pinned where it is actually applied. Nine tests covered `retained_entries`
+/// in isolation and NOTHING covered the fact that this function calls it: a
+/// mutation replacing the call with `current_rpath.to_vec()` left the whole
+/// suite green while restoring the defect `f8bb3bd` fixed - an empty RPATH
+/// element, which the loader reads as the CURRENT DIRECTORY, written into a
+/// store output. The build succeeds and the artifact is wrong.
+pub fn assemble_rpath(current_rpath: &[String], needed_dirs: &[String]) -> Option<Vec<String>> {
+    let mut new_rpath = retained_entries(current_rpath);
+    let mut path_added = false;
+    for lib_str in needed_dirs {
+        if !new_rpath.contains(lib_str) {
+            new_rpath.push(lib_str.clone());
+            path_added = true;
+        }
     }
+    if path_added {
+        Some(new_rpath)
+    } else {
+        None
+    }
+}
+
+fn compute_new_rpath(
+    store_dir: &Path,
+    elf_path: &Path,
+    current_rpath: &[String],
+) -> Result<Option<Vec<String>>> {
+    // Resolve RPATH entries with $ORIGIN expansion
+    let resolved_rpath = resolve_rpath(current_rpath, elf_path)?;
+
+    let needed_libs = get_needed_libs(elf_path)?;
+    let mut needed_dirs: Vec<String> = Vec::new();
+
+    for lib_name in &needed_libs {
+        let Some(lib_path) = resolve_needed(lib_name, &resolved_rpath, store_dir)? else {
+            continue;
+        };
+
+        let Some(lib_dir) = lib_path.parent() else {
+            continue;
+        };
+
+        needed_dirs.push(
+            lib_dir
+                .to_str()
+                .context("Library directiory was not UTF-8")?
+                .to_owned(),
+        );
+    }
+
+    Ok(assemble_rpath(current_rpath, &needed_dirs))
 }
 
 fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {
@@ -125,6 +203,12 @@ fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {
         .to_string_lossy();
 
     for entry in rpath {
+        // An empty entry is the runtime "current directory" marker. It is
+        // preserved in the rebuilt RPATH but it is not a directory we can
+        // resolve a needed library against here.
+        if entry.is_empty() {
+            continue;
+        }
         let expanded = entry.replace("$ORIGIN", &origin);
         resolved_paths.push(PathBuf::from(expanded));
     }
@@ -158,12 +242,22 @@ fn resolve_needed(lib_name: &str, rpath: &[PathBuf], store_dir: &Path) -> Result
         let lib_path = search_dir.join(lib_name);
 
         // If it's already in nix store, return None (don't add to rpath)
+        //
+        // PRE-EXISTING and untouched by this week's changes, flagged during
+        // the 2026-08-29 audit so it is on the record rather than rediscovered:
+        // this returns on the FIRST rpath entry that is store-prefixed,
+        // without checking the library actually exists there. For an rpath of
+        // `/nix/store/a/lib:/build/out/lib`, a library that lives only in the
+        // second entry is skipped. Not fixed here because nothing has been
+        // observed failing on it and a speculative change to rpath resolution
+        // is how this file acquired its last two defects.
         if lib_path.starts_with(store_dir) {
             return Ok(None);
         }
 
         if lib_path.exists() {
-            let canonical_path = fs::canonicalize(&lib_path)?;
+            let canonical_path = fs::canonicalize(&lib_path)
+                .map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", lib_path.display()))?;
             return Ok(Some(canonical_path));
         }
     }
@@ -186,4 +280,70 @@ fn apply_rpath(elf_path: &Path, new_paths: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_rpath, retained_entries};
+
+    // This file had no tests, which is why f8bb3bd shipped fixing one of the
+    // three spellings of its own bug. These are the three.
+
+    #[test]
+    fn trailing_empty_entry_survives() {
+        assert_eq!(parse_rpath("/a:/b:"), vec!["/a", "/b", ""]);
+    }
+
+    #[test]
+    fn leading_empty_entry_survives() {
+        assert_eq!(parse_rpath(":/a:/b"), vec!["", "/a", "/b"]);
+    }
+
+    #[test]
+    fn interior_empty_entry_survives_in_place() {
+        assert_eq!(parse_rpath("/a::/b"), vec!["/a", "", "/b"]);
+    }
+
+    #[test]
+    fn no_rpath_is_no_entries_not_one_empty_entry() {
+        assert!(parse_rpath("").is_empty());
+    }
+
+    #[test]
+    fn a_lone_colon_is_two_empty_entries() {
+        assert_eq!(parse_rpath(":"), vec!["", ""]);
+    }
+
+    // The WRITE side. parse_rpath keeps empty entries so a caller can see
+    // them; these assert they never reach a patched binary.
+
+    #[test]
+    fn an_empty_entry_never_survives_into_a_store_binary() {
+        // ":/a" means "search the current directory, then /a". Preserving
+        // that in a store output is a cwd search in somebody else's process.
+        let parsed = parse_rpath(":/a:/b");
+        assert_eq!(parsed, vec!["", "/a", "/b"], "read side stays faithful");
+        assert_eq!(retained_entries(&parsed), vec!["/a", "/b"]);
+    }
+
+    #[test]
+    fn trailing_and_interior_empties_go_too() {
+        assert_eq!(retained_entries(&parse_rpath("/a:/b:")), vec!["/a", "/b"]);
+        assert_eq!(retained_entries(&parse_rpath("/a::/b")), vec!["/a", "/b"]);
+        assert!(retained_entries(&parse_rpath(":")).is_empty());
+    }
+
+    #[test]
+    fn origin_entries_are_dropped_because_the_rewrite_resolves_them() {
+        let parsed = parse_rpath("$ORIGIN/../lib:/nix/store/a/lib");
+        assert_eq!(retained_entries(&parsed), vec!["/nix/store/a/lib"]);
+    }
+
+    #[test]
+    fn ordinary_rpath_is_unchanged() {
+        assert_eq!(
+            parse_rpath("/nix/store/a/lib:/nix/store/b/lib"),
+            vec!["/nix/store/a/lib", "/nix/store/b/lib"]
+        );
+    }
 }
