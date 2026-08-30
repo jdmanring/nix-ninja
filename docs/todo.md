@@ -64,7 +64,15 @@
   - `subtool/dynamic_task.rs:78` calls `copy_dir_all($src, source_dir)` in
     stage 1, and `copy_dir_all` at `:201` does `fs::copy` per regular file: a
     byte-for-byte recursive copy of the entire source, inside every per-TU
-    dynamic task. Cost is source size times TU count.
+    dynamic task.
+  - The multiplier is NOT the TU count, and an earlier draft of this entry
+    said it was. `handle_derivation_result:2931` builds a dynamic task only
+    when `deps == "gcc"` AND the task has at least one `SingleDerivedPath::
+    Built` input, so a TU compiled from a file that is already in `$src` never
+    reaches this path. The cost is source size times the number of TUs
+    consuming a GENERATED input, which concentrates it on codegen-heavy
+    packages and is why qtwebengine is the shape of the failure and alsa-lib
+    is not.
   - It is there so the include scanner can resolve paths, and scanning only
     READS. The compile happens later in the derivation this task emits, run by
     nix-ninja-task, not here.
