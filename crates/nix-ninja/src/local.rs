@@ -59,7 +59,45 @@ pub fn symlink_derived_files(
         })
         .collect();
 
-    create_symlinks(prefix, store_dir, opaque_files, true)?;
+    // PLACEHOLDER -> REAL OUTER PATH, by COPY, and NEVER exposed as the
+    // placeholder first. A task output that names an outer output path
+    // carries the placeholder (task.rs outer_rewrite_map); the build tree
+    // needs the real one, and a store file is read-only, so such an output
+    // is materialized as a rewritten copy. Symlinking everything and THEN
+    // replacing the placeholder-carrying ones leaves a window in which a
+    // parallel consumer reads the placeholder, so restore-needing outputs
+    // are written to a temp name and renamed into place: every visible
+    // state is post-restore. Everything else stays a symlink.
+    let restore = crate::task::outer_restore_map();
+    let mut symlink_files: Vec<DerivedFile> = Vec::new();
+    for (df, store_path) in opaque_files.iter().zip(store_paths.iter()) {
+        let target = store_path.to_absolute_path(store_dir);
+        let mut restored = false;
+        if !restore.is_empty() && target.is_file() {
+            let data = std::fs::read(&target)?;
+            if let Some(rewritten) = crate::task::rewrite_bytes(&data, &restore) {
+                let dest = prefix.join(&df.build_path);
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let tmp = dest.with_extension("nn-restore-tmp");
+                std::fs::write(&tmp, rewritten)?;
+                if let Ok(md) = std::fs::metadata(&target) {
+                    let _ = std::fs::set_permissions(&tmp, md.permissions());
+                }
+                if dest.is_symlink() || dest.exists() {
+                    let _ = std::fs::remove_file(&dest);
+                }
+                std::fs::rename(&tmp, &dest)?;
+                restored = true;
+            }
+        }
+        if !restored {
+            symlink_files.push(df.clone());
+        }
+    }
+
+    create_symlinks(prefix, store_dir, symlink_files, true)?;
 
     Ok(())
 }

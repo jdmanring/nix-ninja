@@ -143,6 +143,23 @@ impl Runner {
             if key.starts_with("NIX_CFLAGS_COMPILE") {
                 *value = remove_frandom_seed(value);
             }
+            // SAME CLASS, OTHER VARIABLE. The outer derivation's
+            // cc-wrapper puts `-rpath $out/lib` into NIX_LDFLAGS, and
+            // $out is the OUTER output path: it moves with every change
+            // to the outer derivation, a source edit included, so every
+            // task re-keyed on it and a one-line edit rebuilt all 105 of
+            // qtsvg's translation units (measured 2026-08-23). Nothing
+            // inside a task needs it: a compile never links, and the
+            // install step rewrites RPATH off the build tree anyway.
+            if key.starts_with("NIX_LDFLAGS") {
+                *value = remove_outer_rpath(value);
+            }
+        }
+
+        // Outer output paths -> placeholders in the forwarded env too.
+        let rewrite = outer_rewrite_map();
+        for value in wrapper_vars.values_mut() {
+            *value = rewrite_str(value, &rewrite);
         }
 
         // Extract store paths from wrapper variables once
@@ -453,6 +470,15 @@ fn build_task_derivation(
         .into_bytes()
         .into(),
     );
+    // Outer output paths -> placeholders (see outer_rewrite_map), EXCEPT
+    // for an LTO compile, which keeps the real paths everywhere: see
+    // task_is_lto for the measured reason.
+    let lto_raw = task.deps.as_deref() == Some("gcc") && task_is_lto(cmdline, &task.wrapper_vars);
+    let cmdline = &if lto_raw {
+        cmdline.to_string()
+    } else {
+        rewrite_str(cmdline, &outer_rewrite_map())
+    };
     drv.args.push(cmdline.to_string().into_bytes().into());
 
     if let Some(desc) = &task.desc {
@@ -460,8 +486,20 @@ fn build_task_derivation(
             .push(format!("--description={desc}").into_bytes().into());
     }
 
-    // Propagate wrapper environment variables to the task.
+    // Propagate wrapper environment variables to the task. They were
+    // placeholdered at task creation; an LTO task gets them restored,
+    // the exact inverse map, because its output cannot be restored.
+    let env_restore = if lto_raw {
+        outer_restore_map()
+    } else {
+        Vec::new()
+    };
     for (key, value) in &task.wrapper_vars {
+        let value = &if lto_raw {
+            rewrite_str(value, &env_restore)
+        } else {
+            value.clone()
+        };
         let final_value = if key.starts_with("NIX_CFLAGS_COMPILE") {
             // Also add a deterministic random seed based on the task's
             // cmdline for reproducible builds.
@@ -545,6 +583,39 @@ fn build_task_derivation(
                 input_set.insert(encoded);
                 drv.inputs.insert(derived_file.derived_path.clone());
                 discovered_inputs.push(derived_file);
+            }
+        }
+    }
+
+    // The input half of keeping an LTO task on real outer paths: any
+    // input this task reads that was uploaded with the placeholder
+    // substituted is re-uploaded raw and swapped in.
+    if lto_raw {
+        let rewritten = rewritten_uploads().lock().unwrap().clone();
+        if !rewritten.is_empty() {
+            let mut swapped = 0usize;
+            for i in task.inputs.iter().chain(discovered_inputs.iter()) {
+                if !matches!(i.derived_path, SingleDerivedPath::Opaque(_)) {
+                    continue;
+                }
+                let abs = task.build_dir.join(&i.build_path);
+                let Ok(canonical) = fs::canonicalize(&abs) else {
+                    continue;
+                };
+                if !rewritten.contains(&canonical) {
+                    continue;
+                }
+                let fresh = new_opaque_file_raw(rpc_client, &task.build_dir, abs)?;
+                input_set.remove(&i.to_encoded(&task.store_dir));
+                drv.inputs.remove(&i.derived_path);
+                input_set.insert(fresh.to_encoded(&task.store_dir));
+                drv.inputs.insert(fresh.derived_path.clone());
+                swapped += 1;
+            }
+            if swapped > 0 {
+                eprintln!(
+                    "nix-ninja: LTO task keeps real outer paths in {swapped} input(s) (resumable only while $out is unchanged)"
+                );
             }
         }
     }
@@ -882,7 +953,45 @@ fn new_opaque_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "source".to_string());
-    let store_path = rpc_client.add_to_store_nar(&name, &canonical_path)?;
+    // A file that names an outer output path is uploaded with the path
+    // rewritten to its placeholder (a config.h carrying $out/share/alsa),
+    // so the upload's hash, and every task reading it, is stable across
+    // changes to the outer derivation. Regular files only; a directory is
+    // uploaded as it is.
+    let upload_src = if canonical_path.is_file() {
+        let map = outer_rewrite_map();
+        let data = fs::read(&canonical_path)?;
+        match rewrite_bytes(&data, &map) {
+            Some(rewritten) => {
+                // UNIQUE PER CALL, not per pid: batched adds run this
+                // concurrently, and two uploads of one file racing a
+                // pid-keyed tmp name hand the daemon a truncated stream.
+                let tmp = std::env::temp_dir().join(format!(
+                    "nn-outer-{}-{}",
+                    std::process::id(),
+                    NEXT_REWRITE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                ));
+                fs::write(&tmp, rewritten)?;
+                if let Ok(md) = fs::metadata(&canonical_path) {
+                    let _ = fs::set_permissions(&tmp, md.permissions());
+                }
+                rewritten_uploads()
+                    .lock()
+                    .unwrap()
+                    .insert(canonical_path.clone());
+                Some(tmp)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let store_path =
+        rpc_client.add_to_store_nar(&name, upload_src.as_deref().unwrap_or(&canonical_path))?;
+    if let Some(tmp) = &upload_src {
+        let _ = fs::remove_file(tmp);
+    }
 
     Ok(DerivedFile {
         derived_path: SingleDerivedPath::Opaque(store_path),
@@ -890,6 +999,8 @@ fn new_opaque_file(
         rel_path: None, // None for opaque files - store path points directly to file
     })
 }
+
+static NEXT_REWRITE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> DerivedFile {
     let output_name = normalize_output(&build_path.to_string_lossy());
@@ -953,6 +1064,227 @@ pub fn discover_c_includes(
     Ok((discovered_deps, discovered_store_paths))
 }
 
+/// THE OUTER OUTPUT PATHS ARE REWRITTEN TO SAME-LENGTH PLACEHOLDERS IN
+/// EVERYTHING A TASK SEES, AND BACK IN EVERYTHING IT PRODUCES.
+///
+/// `$out` of the outer derivation moves with every change to that
+/// derivation, a one-line source edit included, and configure writes it
+/// into generated headers (`ALSA_CONFIG_DIR` in alsa-lib's config.h, which
+/// every TU includes) and into command lines. Measured 2026-08-23: one
+/// edited .c file rebuilt 110 of 116 translation units. This is the same
+/// problem Nix solves for content-addressed outputs the same way: a
+/// placeholder of identical length stands in during the build, and the
+/// real path is substituted into the result afterwards. Same length
+/// because the substitution has to be valid inside an object file.
+///
+/// The task derivation and its output carry ONLY the placeholder, which is
+/// what makes the derivation stable and its cached output reusable under
+/// a different `$out`; the driver alone holds the mapping and applies it
+/// when it materializes an output into the build tree (`local.rs`).
+pub fn outer_rewrite_map() -> Vec<(String, String)> {
+    let store_dir = std::env::var("NIX_STORE").unwrap_or_else(|_| "/nix/store".into());
+    std::env::var("outputs")
+        .unwrap_or_else(|_| "out".into())
+        .split_whitespace()
+        .filter_map(|name| std::env::var(name).ok().map(|p| (name.to_string(), p)))
+        .filter_map(|(name, real)| {
+            // /nix/store/<32 base32 chars>-<rest>
+            let rel = real.strip_prefix(&format!("{store_dir}/"))?;
+            let (hash, rest) = rel.split_once('-')?;
+            if hash.len() != 32 {
+                return None;
+            }
+            let digest = Sha256::digest(format!("nix-ninja-outer-output:{name}").as_bytes());
+            let alphabet = b"0123456789abcdfghijklmnpqrsvwxyz";
+            let fake: String = digest
+                .iter()
+                .take(32)
+                .map(|b| alphabet[(*b as usize) % 32] as char)
+                .collect();
+            Some((real.clone(), format!("{store_dir}/{fake}-{rest}")))
+        })
+        .collect()
+}
+
+/// Apply `map` (from -> to) to `s`; a no-op where nothing matches.
+pub fn rewrite_str(s: &str, map: &[(String, String)]) -> String {
+    let mut out = s.to_string();
+    for (from, to) in map {
+        if out.contains(from.as_str()) {
+            out = out.replace(from.as_str(), to);
+        }
+    }
+    out
+}
+
+/// Byte-wise form for file contents, which may be binary.
+pub fn rewrite_bytes(data: &[u8], map: &[(String, String)]) -> Option<Vec<u8>> {
+    let mut out = data.to_vec();
+    let mut changed = false;
+    for (from, to) in map {
+        let (f, t) = (from.as_bytes(), to.as_bytes());
+        debug_assert_eq!(f.len(), t.len());
+        let mut i = 0;
+        while i + f.len() <= out.len() {
+            if &out[i..i + f.len()] == f {
+                out[i..i + f.len()].copy_from_slice(t);
+                changed = true;
+                i += f.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    changed.then_some(out)
+}
+
+/// The reverse map: placeholder -> real.
+pub fn outer_restore_map() -> Vec<(String, String)> {
+    outer_rewrite_map()
+        .into_iter()
+        .map(|(r, p)| (p, r))
+        .collect()
+}
+
+/// The outer derivation's output paths, from the `outputs` env var the
+/// builder is given (`$out`, `$dev`, ...). Empty outside a build.
+fn outer_output_paths() -> Vec<String> {
+    std::env::var("outputs")
+        .unwrap_or_else(|_| "out".into())
+        .split_whitespace()
+        .filter_map(|o| std::env::var(o).ok())
+        .collect()
+}
+
+/// Removes -frandom-seed flag from a string of CFLAGS.
+/// Drop every `-rpath <path>` pair whose path names one of the OUTER
+/// derivation's outputs ($out, $dev, ... as the `outputs` env lists them).
+/// Other rpath entries (store libraries) are inputs and stay.
+fn remove_outer_rpath(value: &str) -> String {
+    let outer = outer_output_paths();
+    let toks: Vec<&str> = value.split_whitespace().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(toks.len());
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i] == "-rpath"
+            && i + 1 < toks.len()
+            && outer.iter().any(|o| toks[i + 1].starts_with(o.as_str()))
+        {
+            i += 2;
+            continue;
+        }
+        out.push(toks[i]);
+        i += 1;
+    }
+    out.join(" ")
+}
+
+/// Last-wins scan of `-flto*` / `-fno-lto` over one flag string, from a
+/// starting state.
+fn scan_lto_flags(flags: &str, start: bool) -> bool {
+    let mut lto = start;
+    for tok in flags.split_whitespace() {
+        if tok == "-fno-lto" {
+            lto = false;
+        } else if tok == "-flto" || tok.starts_with("-flto=") {
+            lto = true;
+        }
+    }
+    lto
+}
+
+/// The compiler's view, not the command line's. A stdenv can inject
+/// -flto from INSIDE its cc wrapper (nixpkgs `cc-cflags-before`), where
+/// neither the ninja edge nor the task env shows it, so a task whose
+/// command reads `gcc -O2 -c` is LTO all the same. The wrapper's order
+/// decides precedence and is reproduced here: the wrapper's own
+/// baseline first (NIX_NINJA_ASSUME_LTO=1, set by a stdenv that injects
+/// -flto globally), then the command line, then NIX_CFLAGS_COMPILE,
+/// which the wrapper appends AFTER the command line - so a package's
+/// -fno-lto opt-out delivered that way wins, exactly as it does for gcc.
+fn task_is_lto(cmdline: &str, wrapper_vars: &HashMap<String, String>) -> bool {
+    let assume = std::env::var("NIX_NINJA_ASSUME_LTO")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let after_cmdline = scan_lto_flags(cmdline, assume);
+    match wrapper_vars.get("NIX_CFLAGS_COMPILE") {
+        Some(extra) => scan_lto_flags(extra, after_cmdline),
+        None => after_cmdline,
+    }
+}
+
+/// Does this compile emit LTO bytecode? The last of `-flto*` / `-fno-lto`
+/// on the line wins, as it does for gcc. `-ffat-lto-objects` changes
+/// nothing here: the linker still consumes the IR half.
+///
+/// WHY IT MATTERS - lto_task_keeps_real_outer_paths. The outer-output
+/// placeholder is restored in task OUTPUTS by an equal-length byte
+/// rewrite (rewrite_bytes, local.rs). That is sound for a plain object,
+/// whose literals sit verbatim in .rodata, and UNSOUND for LTO
+/// bytecode: gcc streams the IR through a compressed, checksummed
+/// section, so the placeholder is invisible to the byte search at the
+/// default level and the object is corrupted by the rewrite at
+/// -flto-compression-level=0 ("compressed stream: data error" from
+/// lto1, measured 2026-08-24). Nothing downstream can repair it either:
+/// the link that consumes the IR embeds the placeholder into the final
+/// binary, where it names a path that does not exist. bison under the
+/// make drop-in shipped PKGDATADIR as the placeholder and failed 698 of
+/// 744 tests, twice, the first time misattributed to a materialization
+/// window (the local.rs comment); the window was real and was not the
+/// cause. So an LTO compile task never sees a placeholder at all: real
+/// paths on its command line and in its environment, and a raw upload
+/// of every input the global rewrite touched. Such a task re-keys when
+/// the outer output path moves, which is the honest cost - only tasks
+/// that actually read an outer path pay it, and a wrong artifact is not
+/// a cache hit.
+// Exercised by this module's tests and named by the comments at :2166 and
+// :2408 that explain why LTO tasks are handled the way they are. dead_code
+// fires because the non-test callers went away when that handling moved, not
+// because the predicate stopped being the documented one - deleting it would
+// delete the tests that pin the behaviour those comments describe.
+#[allow(dead_code)]
+fn cmdline_is_lto(cmdline: &str) -> bool {
+    scan_lto_flags(cmdline, false)
+}
+
+/// Canonical paths whose upload carried an outer output path and was
+/// therefore uploaded with the placeholder substituted. An LTO task must
+/// not read those (see lto_task_keeps_real_outer_paths).
+fn rewritten_uploads() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// The RAW upload of a build-dir file: no outer-output placeholder, and
+/// past the NAR stamp cache, which is keyed by canonical path and would
+/// otherwise hand back the placeholder-carrying object for the same
+/// path. Content-addressed on the daemon side, so a repeat costs one
+/// dedup round trip.
+fn new_opaque_file_raw(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &std::path::Path,
+    path: PathBuf,
+) -> Result<DerivedFile> {
+    let relative_path = relative_from(&path, build_dir).unwrap_or(path);
+    let mut path = relative_path
+        .to_str()
+        .context("Path was not valid UTF-8")?
+        .to_owned();
+    canon::canonicalize_path(&mut path);
+    let canonical_path = fs::canonicalize(&path).with_context(|| format!("canonicalize {path}"))?;
+    let name = canonical_path
+        .file_name()
+        .map(|n| normalize_output(&n.to_string_lossy()))
+        .unwrap_or_else(|| "source".to_string());
+    let store_path = rpc_client.add_to_store_nar(&name, &canonical_path)?;
+    Ok(DerivedFile {
+        derived_path: SingleDerivedPath::Opaque(store_path),
+        build_path: relative_path,
+        rel_path: None,
+    })
+}
+
 /// Removes -frandom-seed flag from a string of CFLAGS.
 fn remove_frandom_seed(flags: &str) -> String {
     flags
@@ -968,4 +1300,164 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+#[cfg(test)]
+mod outer_placeholder_tests {
+    use std::collections::HashMap;
+
+    /// Both tests below set `outputs`/`out`/`dev`, which are PROCESS-wide:
+    /// cargo runs tests in threads, so without this lock one test reads the
+    /// other's assertions. Poisoning is survivable: a panicking holder must
+    /// not fail the other test twice.
+    static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn cmdline_is_lto_last_flag_wins_and_fat_changes_nothing() {
+        assert!(super::cmdline_is_lto("gcc -O3 -flto=8 -c a.c -o a.o"));
+        assert!(super::cmdline_is_lto("gcc -flto -c a.c"));
+        assert!(super::cmdline_is_lto(
+            "gcc -flto=auto -ffat-lto-objects -c a.c"
+        ));
+        assert!(
+            !super::cmdline_is_lto("gcc -flto=8 -fno-lto -c a.c"),
+            "later -fno-lto wins"
+        );
+        assert!(
+            super::cmdline_is_lto("gcc -fno-lto -flto -c a.c"),
+            "later -flto wins"
+        );
+        assert!(!super::cmdline_is_lto("gcc -O3 -c a.c -o a.o"));
+        // the placeholder-restore hazard is about IR, not the word: a
+        // path containing 'flto' is not a flag
+        assert!(!super::cmdline_is_lto("gcc -c /src/flto/a.c"));
+    }
+
+    #[test]
+    fn task_is_lto_sees_the_wrapper_baseline_and_the_opt_out_after_it() {
+        // Never read the real environment here; the baseline is
+        // exercised through scan_lto_flags's start state, which is what
+        // task_is_lto folds NIX_NINJA_ASSUME_LTO into.
+        let mut vars: std::collections::HashMap<String, String> = Default::default();
+        // no baseline, nothing on the line: not LTO
+        assert!(!super::scan_lto_flags("gcc -O2 -c a.c", false));
+        // wrapper baseline with a bare command line (the bison shape): LTO
+        assert!(super::scan_lto_flags("gcc -O2 -c a.c", true));
+        // a package's -fno-lto opt-out arrives via NIX_CFLAGS_COMPILE and
+        // wins over the baseline, as the wrapper appends it last
+        vars.insert("NIX_CFLAGS_COMPILE".into(), "-O3 -fno-lto".into());
+        assert!(!super::scan_lto_flags(
+            vars["NIX_CFLAGS_COMPILE"].as_str(),
+            super::scan_lto_flags("gcc -O2 -c a.c", true)
+        ));
+        // and the env-driven path with no baseline set in this process
+        std::env::remove_var("NIX_NINJA_ASSUME_LTO");
+        assert!(!super::task_is_lto("gcc -O2 -c a.c", &vars));
+        vars.insert("NIX_CFLAGS_COMPILE".into(), "-O3 -flto=8".into());
+        assert!(super::task_is_lto("gcc -O2 -c a.c", &vars));
+        // THE WRAPPER BASELINE ITSELF. Only "1" turns it on: a stdenv
+        // exporting NIX_NINJA_ASSUME_LTO=0 must not be read as yes, and
+        // nothing else covered the comparison.
+        let empty: HashMap<String, String> = HashMap::new();
+        std::env::set_var("NIX_NINJA_ASSUME_LTO", "1");
+        assert!(super::task_is_lto("gcc -O2 -c a.c", &empty));
+        std::env::set_var("NIX_NINJA_ASSUME_LTO", "0");
+        assert!(!super::task_is_lto("gcc -O2 -c a.c", &empty));
+        std::env::remove_var("NIX_NINJA_ASSUME_LTO");
+    }
+
+    #[test]
+    fn outer_rewrite_map_is_same_length_stable_and_reversible() {
+        let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("outputs", "out dev");
+        std::env::set_var(
+            "out",
+            "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-1.2.16.1",
+        );
+        std::env::set_var(
+            "dev",
+            "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-alsa-lib-1.2.16.1-dev",
+        );
+        let m = super::outer_rewrite_map();
+        assert_eq!(m.len(), 2);
+        for (real, fake) in &m {
+            assert_eq!(real.len(), fake.len());
+            assert_ne!(real, fake);
+            assert!(fake.starts_with("/nix/store/"));
+        }
+        // Round trip FIRST, while $out still holds the path `m` was built
+        // from - the stability check below moves it, and the restore map
+        // reads the environment fresh.
+        let data = format!("#define DIR \"{}/share\"\0bin", m[0].0);
+        let fwd = super::rewrite_bytes(data.as_bytes(), &m).expect("rewritten");
+        assert!(!fwd.windows(m[0].0.len()).any(|w| w == m[0].0.as_bytes()));
+        // Through outer_restore_map, not a hand-built inverse: the
+        // hand-built one passed with outer_restore_map returning an empty
+        // vec. Mutation, 2026-08-30.
+        let back = super::outer_restore_map();
+        assert_eq!(back.len(), m.len());
+        assert!(back
+            .iter()
+            .all(|(p, r)| m.contains(&(r.clone(), p.clone()))));
+        assert_eq!(super::rewrite_bytes(&fwd, &back).unwrap(), data.as_bytes());
+        // A LEADING MATCH, so the scan's advance is exercised from offset 0
+        // as well as from the middle.
+        let lead = format!("{}/lib", m[0].0);
+        assert!(super::rewrite_bytes(lead.as_bytes(), &m).is_some());
+        assert!(super::rewrite_bytes(b"nothing here", &m).is_none());
+        // Stable under a different $out hash: the placeholder depends on the
+        // output NAME only.
+        std::env::set_var(
+            "out",
+            "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-alsa-lib-1.2.16.1",
+        );
+        assert_eq!(super::outer_rewrite_map()[0].1, m[0].1);
+    }
+
+    #[test]
+    fn remove_outer_rpath_strips_the_out_lib_pair() {
+        let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("outputs", "out dev");
+        std::env::set_var(
+            "out",
+            "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-cc-dropin-1.2.16.1",
+        );
+        std::env::set_var(
+            "dev",
+            "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-alsa-lib-cc-dropin-1.2.16.1-dev",
+        );
+        let v = "-rpath /nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-cc-dropin-1.2.16.1/lib  -L/nix/store/klkb81wkzlz3bpfv6brnh3gwcapy5b4w-boost-1.89.0/lib";
+        assert_eq!(
+            super::remove_outer_rpath(v),
+            "-L/nix/store/klkb81wkzlz3bpfv6brnh3gwcapy5b4w-boost-1.89.0/lib"
+        );
+        // AN RPATH THAT IS NOT AN OUTER OUTPUT MUST SURVIVE. Without this
+        // the whole test passes when outer_output_paths returns [""], on
+        // which starts_with is true for every path and every rpath is
+        // stripped - a task then links against nothing. Found by mutation
+        // 2026-08-30.
+        let keep = "-rpath /nix/store/klkb81wkzlz3bpfv6brnh3gwcapy5b4w-boost-1.89.0/lib -lfoo";
+        assert_eq!(super::remove_outer_rpath(keep), keep);
+        // A TRAILING BARE `-rpath` HAS NO PAIR. The bound is what stops
+        // the peek running off the end; drop it and the flag is consumed
+        // as if it had a value.
+        assert_eq!(super::remove_outer_rpath("-lfoo -rpath"), "-lfoo -rpath");
+    }
+
+    /// `rewrite_str` had no direct test: replacing its whole body with
+    /// `String::new()` survived the suite, because every caller of it in
+    /// the tests went through `rewrite_bytes` instead. Mutation, 2026-08-30.
+    #[test]
+    fn rewrite_str_substitutes_and_leaves_non_matches_alone() {
+        let map = vec![(
+            "/nix/store/aaa-x".to_string(),
+            "/nix/store/bbb-x".to_string(),
+        )];
+        assert_eq!(
+            super::rewrite_str("-L/nix/store/aaa-x/lib -lfoo", &map),
+            "-L/nix/store/bbb-x/lib -lfoo"
+        );
+        assert_eq!(super::rewrite_str("nothing here", &map), "nothing here");
+        assert_eq!(super::rewrite_str("anything", &[]), "anything");
+    }
 }
