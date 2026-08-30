@@ -5371,6 +5371,34 @@ mod accepted_depfile_output_tests {
         );
     }
 
+    /// THE libvmaf REGRESSION. meson's nasm rule is `deps = gcc` with
+    /// `-MQ <target> -MF <path>` and NO generation flag. nasm writes nothing,
+    /// exits 0, and declaring the depfile an output fails the task on an
+    /// output the command never produces. `-MF` names a destination; it does
+    /// not ask for a depfile.
+    #[test]
+    fn nasm_naming_a_depfile_without_asking_for_one_is_refused() {
+        let nasm = "nasm -f elf64 -I ../src/ -MQ src/cpuid.obj \
+                    -MF src/cpuid.obj.ndep ../src/x86/cpuid.asm -o src/cpuid.obj";
+        assert_eq!(
+            accepted_depfile_output_of(Some("src/cpuid.obj.ndep"), Some("gcc"), Some(nasm), None),
+            None,
+            "-MF alone must not be read as a promise that anything writes it"
+        );
+    }
+
+    /// And the same command WITH a generation flag is accepted, so the fix
+    /// narrows the gate rather than closing it.
+    #[test]
+    fn the_same_command_with_a_generation_flag_is_accepted() {
+        let nasm =
+            "nasm -f elf64 -MD -MQ src/cpuid.obj -MF src/cpuid.obj.ndep ../src/x86/cpuid.asm";
+        assert_eq!(
+            accepted_depfile_output_of(Some("src/cpuid.obj.ndep"), Some("gcc"), Some(nasm), None),
+            Some(PathBuf::from("src/cpuid.obj.ndep"))
+        );
+    }
+
     /// The flag can live in the rspfile rather than the command line.
     #[test]
     fn the_depfile_flag_is_honoured_from_the_rspfile() {
@@ -6893,12 +6921,35 @@ fn same_project_tree(base: &Path, target: &Path) -> bool {
 /// declaration is a promise about the RULE; the command is the truth.
 /// -MMD implies -MD's writing behaviour; -MF names the file explicitly
 /// (spaced or fused). The rspfile is part of the command line.
+/// Does this command actually WRITE a dependency file?
+///
+/// `-MF` DOES NOT ANSWER THAT, and treating it as though it did cost a real
+/// package. `-MF` names where a depfile would go; `-MQ` and `-MT` set the
+/// target inside it. Only a dependency-GENERATION flag makes one appear.
+///
+/// gcc does not merely skip the depfile in that case, it REFUSES the compile:
+/// `cc1: error: to generate dependencies you must specify either '-M' or
+/// '-MM'`. So no gcc command line reaching this function can have a bare
+/// `-MF` and still be a command that runs.
+///
+/// nasm is the case that reached a build. meson's nasm rule is `deps = gcc`
+/// with `-MQ ... -MF ...` and no generation flag, and nasm accepts that,
+/// exits 0, and writes nothing. #17 then declared the depfile a
+/// content-addressed output and the task failed collecting an output the
+/// command never produces: `canonicalize(...cpuid.obj.ndep): No such file or
+/// directory`. Measured 2026-08-30 driving libvmaf, the package that named
+/// failure class 3. This is the exact hazard the gate exists to prevent, and
+/// it was in the gate.
 fn command_writes_depfile(cmdline: Option<&str>, rsp: Option<&str>) -> bool {
     let writes = |s: &str| {
         s.split_whitespace().any(|t| {
-            t == "-MD"
+            // Generation flags. `-M`/`-MM` write to stdout unless redirected
+            // by `-MF`, and both are dependency modes, so both count.
+            t == "-M"
+                || t == "-MM"
+                || t == "-MD"
                 || t == "-MMD"
-                || t.starts_with("-MF")
+                || t == "-MG"
                 // The LINKER spelling: CMake 3.27+ link edges write their
                 // depfile via `-Wl,--dependency-file=...` (capstone's LTO
                 // link died writing link.d into a directory only the
@@ -7001,7 +7052,21 @@ mod target_resolution_tests {
         // Ordinary CMake/meson compile lines.
         assert!(w(Some("gcc -MD -MT a.o -MF a.o.d -o a.o -c a.c"), None));
         assert!(w(Some("gcc -MMD -o a.o -c a.c"), None));
-        assert!(w(Some("gcc -MFa.o.d -o a.o -c a.c"), None));
+        // `-MF` WITHOUT A GENERATION FLAG WRITES NOTHING, and this line
+        // used to assert the opposite. gcc does not merely skip the depfile,
+        // it refuses the compile outright:
+        //     cc1: error: to generate dependencies you must specify
+        //                 either '-M' or '-MM'
+        // (measured 2026-08-30). nasm is the case that reached a build: it
+        // accepts `-MQ`/`-MF` with no generation flag, exits 0, and writes
+        // nothing - so declaring the depfile an output failed the task on an
+        // output the command never produces. libvmaf, whose meson nasm rule
+        // is exactly that shape.
+        assert!(!w(Some("gcc -MFa.o.d -o a.o -c a.c"), None));
+        assert!(!w(
+            Some("nasm -f elf64 -MQ x.obj -MF x.obj.ndep x.asm -o x.obj"),
+            None
+        ));
         // Flags riding an rspfile count as the command.
         assert!(w(Some("gcc @rsp"), Some("-MD -MF a.o.d -c a.c")));
         // The linker spelling: CMake 3.27+ link edges.
