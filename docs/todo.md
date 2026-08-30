@@ -44,8 +44,13 @@
     existed: local mode materializes only the requested targets, so no
     per-object depfile ever reached the build directory. Two thirds of this
     item read as done for a week while the pipeline it forms was open.
-  - STILL OWED: none of it is exercised end to end. The examples drive
-    derivation mode; collection runs in local mode.
+  - STILL OWED, and it is the newest part that is owed: collection runs in
+    LOCAL mode and every example drives DERIVATION mode, so no build has
+    executed it. It is not unreachable - `connect_from_env` talks to the
+    daemon socket and decides `in_drv` from `NIX_BUILD_TOP` alone, so
+    `nix-ninja <target>` run by hand in a configured build directory against
+    a `builder-rpc-v0` daemon exercises it, and a second run in the same
+    directory is what proves the skip. That is a test nobody has written.
 - [ ] mkMesonPackage do configure caching
   - Separate out configure and build into two derivations
   - Put source into one output path

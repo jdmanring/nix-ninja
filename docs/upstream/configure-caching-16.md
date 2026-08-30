@@ -36,11 +36,32 @@ prints the edited string - so nothing is stale-cached.
 and on this path the binary answering that probe is nix-ninja itself, which
 reports `1.8.2` for exactly this reason. So `nix-ninja` is a CONFIGURE-time
 dependency, and splitting configure into its own derivation does not decouple
-configure from the driver. The driver's store path is an input of the
-configure derivation too.
+configure from the driver.
+
+**Checked rather than reasoned**, because the whole value of this file is that
+its claims are checked. The configure derivation has five input derivations
+and one of them is the driver:
+
+    $ nix derivation show ...-example-hello-cached-configure-configure.drv
+    input drvs mentioning nix-ninja:
+      ['fklxb8sz3vxqdn2lk08bzwzgl32nlrc6-nix-ninja-0.1.0.drv']
 
 That bounds what the cache can buy before any measurement: it cannot survive a
 driver bump.
+
+The driver's path is also written INTO the configured tree, and the first
+version of this file said it lands in `build.ninja`'s regeneration rule. It
+does not. Reading the actual file:
+
+    30: rule REGENERATE_BUILD
+    31:  command = /nix/store/...-meson-1.10.2/bin/meson --internal regenerate ...
+    98:  COMMAND = /nix/store/...-nix-ninja-0.1.0/bin/nix-ninja -t clean
+
+The regeneration rule names MESON. The ninja binary is baked into the **clean**
+target instead. That matters for remedy 2 below and makes it more attractive,
+not less: `clean` is a target nothing in this pipeline builds, so a different
+ninja answering the configure probe would leave the driver's own graph
+untouched.
 
 ## The measurement, which is the point of this file
 
@@ -79,9 +100,12 @@ maintainer's view.
    version probe; it is never executed, because the build phase is
    `nix-ninja <target>`. That decouples the configure output from driver
    bumps, which matters a great deal here - a driver bump re-keys every task
-   derivation, and keeping configure cached across one is real. The risk is
-   that meson records the ninja command in `build.ninja`'s regeneration rule,
-   so the graph the driver parses would name a different binary. Unmeasured.
+   derivation, and keeping configure cached across one is real. The feared
+   risk, that the recorded ninja command sits in the regeneration rule, was
+   read off the file and is not so: it sits in the `clean` target, which this
+   pipeline never builds. So the cost of this remedy looks like a different
+   string in a target nobody runs. NOT TRIED - meson may consult the probed
+   ninja for more than its version, and that is the thing to check next.
 
 ## The other win, which is not caching at all
 
