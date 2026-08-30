@@ -251,7 +251,8 @@ invocation, not a machine-wide edit:
 | subject | file |
 |---|---|
 | the design, and why dynamic derivations | `docs/design.md` |
-| dynamic dependencies, dyndep, C++20 modules | `docs/dynamic-deps.md` |
+| dynamic dependencies, and generated sources | `docs/dynamic-deps.md` |
+| ninja `dyndep`, Fortran `.mod` and C++20 modules | the header comment of `crates/nix-ninja/src/dyndep.rs`, which is where that subject is written down; `docs/` has nothing on it |
 | the daemon wedge: incident and failed reproduction | `docs/daemon-wedge.md` |
 | what is staged for upstream, and its plan | `docs/upstream/` |
 | incidents, per date | `docs/incidents/` |

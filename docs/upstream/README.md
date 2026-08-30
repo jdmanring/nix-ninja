@@ -29,6 +29,27 @@ hand before the next one makes sense.
 | 6 | `${rspfile}` support, and the n2 dependency | `evmar/n2`, NOT `hinshun/n2` | destination corrected 2026-08-21, see below |
 | 7 | `contrib/devstore.sh` | PR on nix-ninja | drafted, `devstore-pr.md`; **behind 0 as of 2026-08-21** |
 | 0 | Reply into their PR #26 | comment on nix-ninja PR #26 | drafted, `pr26-reply.md`; **send first** |
+| 9 | The bug-fix batch, five fixes in their crates | PR on nix-ninja | drafted 2026-08-29, `bugfix-batch-pr.md`; the one item blocked by nothing else here |
+| 10 | ninja `dyndep` support | a QUESTION first, then maybe a PR | not drafted, and it needs James's decision before it is |
+
+**9 AND 10 WERE ADDED 2026-08-29, and 10 is a question rather than an offer.**
+Everything between 2026-08-26 and 2026-08-29 was unmapped until then: this
+index was last touched 2026-08-22 and `roadmap-coverage.md` 2026-08-24, while
+nine commits landed after that. The fourth sweep in `roadmap-coverage.md`
+carries the mapping, read against the forge the same day.
+
+Item 10 is dyndep, which is 880 lines across three commits and answers NO open
+issue: a search over every open and closed issue for `dyndep`, `fortran` and
+`c++20` returns nothing, and all 12 open issues were enumerated by hand. By
+this file's own rule - answering an open question earns the read an unsolicited
+PR does not - arriving with it unannounced is the wrong move. Ask whether
+upstream wants dyndep in tree, alongside round 5's pre-PR question, and let the
+answer decide whether the PR is written.
+
+Item 9 is the exception to everything below: five bug fixes in their crates,
+independent of the inference argument, of PR #43, of #26 and of #56. Nothing in
+this directory blocks it except its own audit, which wants minimal repros for
+two of the five.
 
 **0 GOES FIRST, AND IT DISPLACED 7 ON 2026-08-21.** Until then this file said 7
 went first, on the grounds that it is the only item answering a request the

@@ -14,10 +14,10 @@ code already written, and neither was visible as covered.
 | Depfile support | #17 | **built end to end** 2026-08-23: declared CA output (dd73947), named via NIX_NINJA_DEPFILE, and the read-back - a fresh on-disk depfile replaces the include scan, guarded by mtime against staleness in the fail-toward-the-scan direction (50fad25). The dynamic task keeps scanning by design: its build dir is reconstructed fresh |
 | `mkMesonPackage` configure caching | #16 | not built; we have a measured argument FOR it |
 | Writing derivation caching for local mode | - | **partly built**: `resolve_cache.rs` |
-| `nix store add` async | #18 | not built |
-| Benchmarks for generating derivations | #4 | profiler samples, no benchmark |
-| Benchmarks for end-to-end compilation | #7 | profiler samples, no benchmark |
-| CMake example (`help wanted`) | #20 | **the recipe is now known and RUN**, 2026-08-21 |
+| `nix store add` async | #18 | **built** 2026-08-23, both halves: batched per-task adds (be123e1) and a NAR stamp map that survives a restart (cfba53e, flushed at end of run by 4a7edff). This row said "not built" until 2026-08-29 while the sweep below said landed, which is the summary contradicting its own body |
+| Benchmarks for generating derivations | #4 | the instrument exists (per-phase timers, see the second sweep); no benchmark against their reference tree |
+| Benchmarks for end-to-end compilation | #7 | same instrument, same gap |
+| CMake example (`help wanted`) | #20 | **built** - `mkCMakePackage` plus `example-cmake-hello`, which builds and runs (0c53804); absent from `upstream/main`, so it is ours to offer. Still gated on PR #43, see below |
 | meson `-fuse-ld` linker missing from task PATH | #52 | **built** 2026-08-23 (50fad25): the requested linker resolves outside the sandbox and rides in as input + PATH; bfd exempt, unresolved keeps the compiler's own error |
 
 ## The two that are covered and did not look it
@@ -267,3 +267,35 @@ Third sweep, same day:
   shape (f56bc0f, `symlinked_include_dir_declares_nested_quoted_include_at_both_spellings`).
 - The empty-`config.h` conflict root cause: pid-keyed temp names raced
   under the batched adds (95b1b9a); see the correction note above.
+
+## Fourth sweep, 2026-08-26 to 2026-08-29
+
+Read against the forge on 2026-08-29: 12 issues open (4, 5, 6, 7, 14, 16, 17,
+18, 20, 31, 41, 52) and 7 pull requests (8, 26, 30, 37, 42, 43, 56). A search
+over every open and closed issue for `dyndep`, `fortran` and `c++20` returns
+nothing, which is what decides the first row below.
+
+| work | commits | upstream thread | what it is |
+|---|---|---|---|
+| ninja `dyndep`: parse the file, fold it into the loaded graph, follow `include`/`subninja` when scanning, and load every dyndep file before scheduling | e9c959b, d1838a6, db555fb | NONE, and that is the finding | Fortran and C++20 modules declare their real edges through dyndep; without it those graphs cannot be driven at all |
+| a link edge carries `deps = gcc`, so every link was being treated as a compile | 127adcc | none | found alongside the dyndep work, same graph reading |
+| generated headers materialize into the task through the `virtual_paths` map, and task outputs are excluded from it | 2f7b8f2, dc296f3 | none | this is the fix for our libvmaf and liblapack classes; recovered from dangling commits on 2026-08-29 |
+| a trailing colon in `RPATH` survives patchelf's round trip | f8bb3bd | closed #1 is the mechanism's own issue | patchelf drops it, and the empty entry is meaningful |
+| `cc` resolves lazily, so a package with no compile targets does not need one | 7fb756e | none | `Tools::new()` resolved it at startup and killed hicolor-icon-theme |
+| a directory on the include path is not a header | 4e591a0 | none | `canonicalize_cached` was gated on `path.exists()`, true for a directory, so `#include <memory>` resolved to a directory and `fs::read` hit EISDIR. Regression test verified failing first |
+
+**dyndep is the one that needs a question before a patch.** It answers no open
+issue, and this directory's own rule is that answering an open question earns
+the read an unsolicited PR does not. Ask whether upstream wants dyndep in tree
+at all, in the same breath as round 5's pre-PR question, rather than arriving
+with 880 lines.
+
+**The five bug fixes need no permission question.** They are in their crates,
+each has a failure that reproduces, and `pr-plan.md` already argues this class
+must travel separately from the inference heuristics rather than being held
+hostage to that argument. Drafted as `bugfix-batch-pr.md`.
+
+Not offered, and deliberately: the input bump and the harmonia
+`DerivationInputs` port (2e8bc87, 45f90dc) are fork-local maintenance against
+our own flake pins, and the ArtNix opt-out triage (ce2d2a1, 99846d2) is a
+record of the consumer's failures, not of nix-ninja's.
