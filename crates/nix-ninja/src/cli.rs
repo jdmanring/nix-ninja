@@ -1,5 +1,6 @@
 use crate::build::{self, BuildConfig};
 use crate::local;
+use crate::subtool::compdb;
 use crate::subtool::dynamic_task;
 use anyhow::{anyhow, Context as _, Result};
 use clap::Parser;
@@ -32,6 +33,19 @@ pub struct Cli {
     /// Run a subtool (use '-t list' to list subtools)
     #[arg(short = 't')]
     pub tool: Option<String>,
+
+    /// `-t compdb -x`: expand rspfiles into the emitted command.
+    ///
+    /// Accepted rather than merely tolerated, because meson passes it. It
+    /// sends `-t compdb -x <rules>` to any ninja advertising >= 1.9
+    /// (`generate_compdb` in mesonbuild/backend/ninjabackend.py), and
+    /// `--version` here reports 1.8.2, so today it is never sent. The moment
+    /// that string goes up this flag arrives, and clap rejects an unknown
+    /// flag with exit 2 - which meson catches, warns "Could not create
+    /// compilation database" about, and carries on from with no file at all.
+
+    #[arg(short = 'x', default_value = "false")]
+    pub expand_rspfile: bool,
 
     /// Run N jobs in parallel (0 means infinity)
     #[arg(short = 'j', default_value = "0", hide = true)]
@@ -162,6 +176,11 @@ fn subtool(
             println!("nix-ninja subtools:");
             println!("  drv           show Nix derivation generated for a target");
             println!("  dynamic-task  generate task derivation from task + discovered deps");
+            println!("  compdb        JSON compilation database on stdout");
+            println!("  restat        accepted and ignored: no persistent build state");
+            println!("  recompact     accepted and ignored: no persistent build state");
+            println!("  clean         accepted and ignored: no persistent build state");
+            println!("  cleandead     accepted and ignored: no persistent build state");
             Ok(())
         }
         "drv" => {
@@ -192,12 +211,30 @@ fn subtool(
             Ok(())
         }
         "dynamic-task" => dynamic_task::run(store_dir, targets),
-        // Meson compatibility tools.
-        "restat" | "clean" | "cleandead" | "compdb" => {
-            // TODO: Implement what's necessary, I think only compdb needs to
-            // work and the rest can no-op.
-            Ok(())
+        // `compdb` WRITES DATA. It shared the no-op arm below until
+        // 2026-08-30, which handed every caller an empty
+        // compile_commands.json and an exit status of zero.
+        "compdb" => {
+            let cli = Cli::parse();
+            let loader = crate::build::load_file("build.ninja")?;
+            compdb::run(&loader.graph, build_dir, &targets, cli.expand_rspfile)
         }
+        // These four ARE no-ops here, and for one reason rather than four:
+        // this driver keeps no persistent build state. ninja and n2 both
+        // carry an on-disk database of mtimes and stale outputs, so for them
+        // `restat` marks entries current and `clean`/`cleandead` delete
+        // things. The Nix store is our only state, and it is content
+        // addressed, so there is nothing local to mark or to sweep. n2 takes
+        // the same view of `recompact` - "CMake unconditionally invokes this
+        // tool, yuck" (`vendor-n2/src/run.rs`) - and it is added here because
+        // its absence is what stopped CMake configuring a Fortran project.
+        //
+        // `restat` must also ACCEPT PATHS THAT DO NOT EXIST and ignore them.
+        // CMake passes them, evmar/n2 #142, and n2's own regression test
+        // passes `path_that_does_not_exist` on purpose. Returning Ok here
+        // satisfies that by construction; a version of this that resolved its
+        // arguments would have to keep it deliberately.
+        "restat" | "clean" | "cleandead" | "recompact" => Ok(()),
         _ => {
             anyhow::bail!(
                 "Unknown subtool '{subtool_name}'. Use '-t list' to get a list of available subtools."
