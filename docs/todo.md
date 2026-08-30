@@ -131,3 +131,55 @@
   - It stays a latent defect for the codegen-heavy packages that DO emit
     dynamic tasks, and it should be fixed when that path is next touched. It
     is not the cost anybody has measured.
+- [ ] #14 aarch64: the literal is fixed, the hardware is not
+  - `build.rs:47` stamped `"x86_64-linux"` into `drv.platform` of every
+    emitted derivation. It now comes from the host, with `NIX_NINJA_SYSTEM`
+    overriding, so anybody can reproduce the aarch64 emission path without an
+    aarch64 machine. Two tests, one of which asserts the value is UNCHANGED on
+    x86_64 - a replacement for a literal is only free if it returns the same
+    string.
+  - Still owed, and none of it is code in this crate: `systems` in `flake.nix`
+    is `[ "x86_64-linux" ]`, and adding `aarch64-linux` makes `nix flake
+    check` try to BUILD six NixOS VM tests for a platform with no builder
+    here. Do not add it until there is a builder or the checks are made
+    per-system.
+  - Also unverified: whether `nix-ninja-task`'s patchelf pass and the
+    `deps-infer` scanner behave on aarch64. Nothing suggests they do not, and
+    nothing has run there. Say that rather than implying the platform works.
+- [ ] #6 snix backend: not today, and the gap is specific
+  - The requirement is the surface in `nix-builder-rpc-client`: 13 public
+    entry points, of which the load-bearing ones are `add_drv_to_store`
+    (adding a derivation from INSIDE a build), `build_paths` over
+    `SingleDerivedPath`, and `submit_output`, which is `builder-rpc-v0` and is
+    unreleased even in nix - 2.36.0pre has it, 2.35.2 does not.
+  - Read from `cachix/snix` on 2026-08-29, the development fork of
+    git.snix.dev: `snix/nix-daemon/src/lib.rs` implements THREE store
+    operations - `query_path_info`, `query_path_from_hash_part`,
+    `add_to_store_nar`. No build operation, no derived paths, nothing about
+    dynamic derivations. Their own `snix/docs/src/TODO.md` does not mention
+    dynamic derivations, ca-derivations or recursive evaluation either.
+  - The instrument matters here: `gh search code` returned empty for every
+    query INCLUDING a positive control that had to match, so it is not
+    indexing that repo and its nulls prove nothing. The findings above come
+    from reading files through the contents API instead.
+  - So the honest answer to "is it possible" is: not against snix as it
+    stands, and the gap is a build protocol rather than a missing convenience.
+    Worth saying to the maintainer with those specifics, because "we looked
+    and here is what is missing" retires the question better than silence.
+- [ ] #16 configure caching: feasible, and the hazard is not what it looks like
+  - What the issue asks: cache `meson setup build`, put the build directory in
+    one content-addressed output, and replace `build_dir_inputs` with that
+    single derived path.
+  - The win is bigger than caching. `Runner::new_task` walks the build
+    directory and calls `new_opaque_file` PER FILE (`task.rs:598`), so every
+    configured artefact is its own NAR upload and its own map entry. One
+    directory output replaces N uploads with one, for every package.
+  - The hazard people assume - meson baking absolute paths into build.ninja -
+    is NOT the blocker. `docs/design.md:144-162` shows real meson output using
+    relative spellings (`src/libexpr/...`, `../src/libexpr/parser.y`).
+  - The actual blocker is that this is a COORDINATED change across both
+    binaries. `build_dir_inputs` is consumed at `task.rs:1751` when resolving
+    an argument to a task input, and `nix-ninja-task` materialises inputs by
+    symlinking build paths individually. Moving to one directory output
+    changes what the task binary receives, so driver and task must land
+    together or nothing builds. That is the reason this is not an afternoon.

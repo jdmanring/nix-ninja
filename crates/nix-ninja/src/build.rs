@@ -23,6 +23,38 @@ pub struct BuildConfig {
     pub load_limit: f64,
 }
 
+/// The nix system string for the machine this driver is running on.
+///
+/// UPSTREAM #14 (aarch64 support). This was the literal `"x86_64-linux"`, and
+/// it is stamped into `drv.platform` of EVERY emitted derivation, so on any
+/// other host nix-ninja emitted derivations that host could not build. That
+/// is one of the things #14 needs and it is not the only one - see
+/// `docs/todo.md` for what remains, which is mostly testing this on real
+/// hardware.
+///
+/// `NIX_NINJA_SYSTEM` overrides it, because cross and remote-builder setups
+/// legitimately want a platform that is not the host's, and because it gives
+/// anyone reproducing #14 a lever that needs no aarch64 machine.
+///
+/// Deliberately NOT a general Rust-triple-to-nix-system mapping: those two
+/// namings agree for linux and disagree for darwin (`macos` versus `darwin`),
+/// and this tree is linux-only today. A wrong guess for a platform nobody has
+/// tested is worse than an error saying so.
+fn host_nix_system() -> String {
+    if let Ok(s) = std::env::var("NIX_NINJA_SYSTEM") {
+        return s;
+    }
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    match os {
+        "linux" => format!("{arch}-linux"),
+        // Reached only on a platform this has never run on. Naming the
+        // override in the value itself means the failure explains its own fix
+        // when it surfaces in a derivation that will not build.
+        _ => format!("{arch}-{os}-UNSUPPORTED-set-NIX_NINJA_SYSTEM"),
+    }
+}
+
 pub fn build(
     build_filename: &str,
     targets: Vec<String>,
@@ -44,7 +76,7 @@ pub fn build(
         tools,
         rpc_client.clone(),
         task::RunnerConfig {
-            system: "x86_64-linux".to_string(),
+            system: host_nix_system(),
             build_dir: config.build_dir,
             store_dir: config.store_dir,
             is_output_derivation: config.is_output_derivation,
@@ -534,5 +566,28 @@ impl<'a> Scheduler<'a> {
             anyhow::bail!("{failed} task(s) failed under keep-going; each is reported above");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod system_tests {
+    use super::host_nix_system;
+
+    /// The point of this one is that it must FAIL if the refactor changed what
+    /// gets stamped into `drv.platform` on the machine everything was built
+    /// on. `host_nix_system()` replaced a literal, and a replacement for a
+    /// literal is only free if it returns the same string.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn unchanged_on_the_platform_this_tree_is_built_on() {
+        std::env::remove_var("NIX_NINJA_SYSTEM");
+        assert_eq!(host_nix_system(), "x86_64-linux");
+    }
+
+    #[test]
+    fn the_override_wins_so_14_is_reproducible_without_the_hardware() {
+        std::env::set_var("NIX_NINJA_SYSTEM", "aarch64-linux");
+        assert_eq!(host_nix_system(), "aarch64-linux");
+        std::env::remove_var("NIX_NINJA_SYSTEM");
     }
 }

@@ -3,9 +3,30 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    # WORKAROUND, with a removal trigger, for a bug in nix's own packaging.
+    #
+    # `packaging/dependencies.nix` passes a `patches` argument to
+    # `pkgs.boost.override`, and nixpkgs' `boost/generic.nix` PREPENDS that to
+    # its own list rather than replacing it. Since nixpkgs commit b5e044308f1
+    # (2026-08-02, "boost: backport regression fixes for boost.context") that
+    # list contains two ordered boostorg/context patches, and nix's prepended
+    # copy - which is byte-for-byte commit 5883212, one of those very two -
+    # breaks the order. `0921b9fd` then fails its hunk at
+    # `fiber_fcontext.hpp:87` and boost does not build.
+    #
+    # It cannot be fixed with an overlay here: nix's flake imports its nixpkgs
+    # itself, so nothing in this tree reaches the `pkgs.boost` it overrides.
+    # Without this, NOTHING in this flake that needs `nix` builds - every
+    # example and all six NixOS VM checks - which is why it is worth carrying.
+    #
+    # DEFER(upstream nix drops the `patches` argument, or nixpkgs stops
+    # carrying 5883212): delete `nixpkgs-for-nix` and restore
+    # `inputs.nixpkgs.follows = "nixpkgs"`. Staged as item 12 in
+    # `docs/upstream/`. Checked 2026-08-29: NixOS/nix master still has it.
+    nixpkgs-for-nix.url = "github:NixOS/nixpkgs/6c9e167faa53a09769013922b0c1fc8087f4b7b2";
     nix = {
       url = "github:NixOS/nix";
-      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.nixpkgs.follows = "nixpkgs-for-nix";
       inputs.nixpkgs-23-11.follows = "";
       inputs.nixpkgs-regression.follows = "";
     };
