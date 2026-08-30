@@ -24,3 +24,12 @@ sha2 = "0.10"
 shell-words = "1.1.0"
 walkdir = "2"
 which = "7.0.2"
+
+[dev-dependencies]
+# divan for the benchmark harness; libc for the mmap comparison in #41.
+divan = "0.1.16"
+libc = "0.2"
+
+[[bench]]
+name = "generate"
+harness = false
