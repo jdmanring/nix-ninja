@@ -82,7 +82,7 @@ pub fn run() -> Result<()> {
         return subtool(&build_dir, &cli.store_dir, &tool, cli.targets.clone());
     }
 
-    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env()?);
+    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(None)?);
     let derived_file = build(&cli, &build_dir, &rpc_client)?;
     if cli.is_output_derivation {
         submit_outer_output(&cli.store_dir, &derived_file, &rpc_client)?;
@@ -112,7 +112,7 @@ fn submit_outer_output(
         output_name: &output_name,
     }
     .to_string();
-    let bytes = rpc_client.clone_drv(final_drv).ok_or_else(|| {
+    let bytes = rpc_client.clone_drv(store_dir, final_drv).ok_or_else(|| {
         anyhow!(
             "final drv {} not in uploaded_drvs cache",
             final_drv_path.display()
@@ -166,10 +166,10 @@ fn subtool(
         }
         "drv" => {
             let cli = Cli::parse();
-            let rpc_client = Arc::new(BuilderRpcClient::connect_from_env()?);
+            let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(None)?);
             let derived_file = build(&cli, build_dir, &rpc_client)?;
             let drv_path = derived_file.derived_path.root_path();
-            let bytes = rpc_client.clone_drv(drv_path).ok_or_else(|| {
+            let bytes = rpc_client.clone_drv(store_dir, drv_path).ok_or_else(|| {
                 anyhow!(
                     "drv {} not in uploaded_drvs cache",
                     drv_path.to_absolute_path(store_dir).display()
