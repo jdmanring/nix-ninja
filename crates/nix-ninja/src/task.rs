@@ -403,6 +403,49 @@ impl Runner {
             input_set.insert(input.build_path.clone(), input.clone());
         }
 
+        // A GRIT MANIFEST NAMES ITS OWN INPUTS AND NINJA DOES NOT.
+        // grit reads a .grd's referenced files two edges downstream, so
+        // the edge that consumes the manifest declares the manifest and
+        // nothing it points at; every asset is then absent inside the
+        // task. Walk the manifest textually, and follow .grdp includes,
+        // which is where the second level of references lives.
+        let mut grd_list: Vec<PathBuf> = input_set
+            .keys()
+            .filter(|p| p.extension().is_some_and(|e| e == "grd" || e == "grdp"))
+            .cloned()
+            .collect();
+        while let Some(grd) = grd_list.pop() {
+            if !Path::new(&grd).is_file() {
+                continue;
+            }
+            for r in grd_references(&grd)? {
+                if input_set.contains_key(&r) {
+                    continue;
+                }
+                let up = new_opaque_file(&self.rpc_client, &self.config.build_dir, r.clone())?;
+                self.add_derived_file(files, up.clone());
+                input_set.insert(up.build_path.clone(), up);
+                if r.extension().is_some_and(|e| e == "grdp") {
+                    grd_list.push(r);
+                }
+            }
+            // A grd can also reference GENERATED files (a preprocessed
+            // .css another task emits), which exist nowhere on disk at
+            // scan time and so never pass the existence filter above.
+            // A candidate that names a graph node routes as a built input.
+            for cand in grd_reference_candidates(&grd)? {
+                if input_set.contains_key(&cand) {
+                    continue;
+                }
+                let Some(gfid) = files.lookup(&cand.to_string_lossy()) else {
+                    continue;
+                };
+                if let Some(df) = self.derived_files.get(&gfid) {
+                    input_set.insert(df.build_path.clone(), df.clone());
+                }
+            }
+        }
+
         let mut inputs: Vec<DerivedFile> = input_set.into_values().collect();
         inputs.sort();
 
@@ -953,6 +996,110 @@ pub fn discover_c_includes(
     Ok((discovered_deps, discovered_store_paths))
 }
 
+/// Files a grit manifest references textually: every file="..." and
+/// path="..." attribute value, resolved against the manifest's own
+/// directory, kept only where the file exists on disk (grd files also
+/// carry output filenames in the same attributes; existence is the
+/// discriminator, and a generated input would be a graph node already).
+///
+/// chrome_scaled_image structures resolve their file value through a
+/// per-scale context directory INSERTED between the manifest dir and the
+/// value (grit's ChromeScaledImage._FindInputFile), so a bare join misses
+/// every image asset. The context names come from the top-level grd's
+/// <output context="..."> nodes, which this per-file scan cannot see from
+/// a .grdp, so the conventional chromium scale dirs are tried as well;
+/// existence keeps the false candidates out, same as the base case.
+fn grd_references(grd: &Path) -> Result<Vec<PathBuf>> {
+    let body = fs::read_to_string(grd)
+        .map_err(|e| anyhow!("read({}) for grd scan: {e}", grd.display()))?;
+    let dir = grd.parent().unwrap_or(Path::new(""));
+    let mut contexts: Vec<String> = [
+        "default_100_percent",
+        "default_200_percent",
+        "default_300_percent",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for chunk in body.split("context=\"").skip(1) {
+        if let Some(val) = chunk.split('"').next() {
+            if !val.is_empty() && !contexts.iter().any(|c| c == val) {
+                contexts.push(val.to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for attr in ["file=\"", "path=\""] {
+        for chunk in body.split(attr).skip(1) {
+            let Some(val) = chunk.split('"').next() else {
+                continue;
+            };
+            if val.is_empty() || val.contains("://") {
+                continue;
+            }
+            let p = dir.join(val);
+            if p.is_file() {
+                out.push(p);
+                continue;
+            }
+            for ctx in &contexts {
+                let p = dir.join(ctx).join(val);
+                if p.is_file() {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every file="..."/path="..." value of a grit manifest resolved
+/// lexically against the manifest's directory, EXISTENCE-BLIND: the
+/// caller matches these against graph nodes to catch generated
+/// references, which exist nowhere on disk at scan time.
+fn grd_reference_candidates(grd: &Path) -> Result<Vec<PathBuf>> {
+    let body = fs::read_to_string(grd)
+        .map_err(|e| anyhow!("read({}) for grd candidates: {e}", grd.display()))?;
+    let dir = grd.parent().unwrap_or(Path::new(""));
+    let mut out = Vec::new();
+    for attr in ["file=\"", "path=\""] {
+        for chunk in body.split(attr).skip(1) {
+            let Some(val) = chunk.split('"').next() else {
+                continue;
+            };
+            if val.is_empty() || val.contains("://") {
+                continue;
+            }
+            out.push(lexical_join(dir, Path::new(val)));
+        }
+    }
+    Ok(out)
+}
+
+/// Join a relative path onto a base LEXICALLY: each `..` pops a base
+/// component instead of surviving into the result, so
+/// gen/ui/webui/resources/js + ../../../../../../../../../../src/x
+/// becomes ../../../../../src/x against the build dir - resolvable by
+/// the existing five-up sandbox mirror, where the raw twenty-component
+/// climb is not. Pops past the base accumulate as leading `..`.
+fn lexical_join(base: &Path, rel: &Path) -> PathBuf {
+    let mut stack: Vec<std::path::Component> = base.components().collect();
+    for c in rel.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                if matches!(stack.last(), Some(std::path::Component::Normal(_))) {
+                    stack.pop();
+                } else {
+                    stack.push(c);
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => stack.push(other),
+        }
+    }
+    stack.iter().map(|c| c.as_os_str()).collect()
+}
+
 /// Removes -frandom-seed flag from a string of CFLAGS.
 fn remove_frandom_seed(flags: &str) -> String {
     flags
@@ -968,4 +1115,103 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+#[cfg(test)]
+mod grd_tests {
+
+    #[test]
+    fn grd_scaled_image_resolves_through_context_dir() {
+        use super::grd_references;
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("grd-test-{}", std::process::id()));
+        let scaled = dir.join("default_100_percent/flags_ui");
+        fs::create_dir_all(&scaled).unwrap();
+        fs::write(scaled.join("favicon.png"), b"png").unwrap();
+        fs::write(dir.join("direct.xtb"), b"xtb").unwrap();
+        // A CONTEXT THE CONVENTIONAL LIST DOES NOT CARRY, so the scan has
+        // to have read it off this manifest. Declared TWICE, and with an
+        // empty context beside it, because the three things the collector
+        // does - take a new name, skip a repeat, skip an empty - are one
+        // condition each and a single context exercises none of them.
+        let custom = dir.join("touch_200_percent/flags_ui");
+        fs::create_dir_all(&custom).unwrap();
+        fs::write(custom.join("touchy.png"), b"png").unwrap();
+        let grd = dir.join("res.grd");
+        fs::write(
+            &grd,
+            r#"<grit><outputs><output context="default_100_percent"/>
+               <output context="touch_200_percent"/>
+               <output context="touch_200_percent"/>
+               <output context=""/></outputs>
+               <file path="direct.xtb"/>
+               <file path=""/>
+               <file path="https://example.invalid/remote.png"/>
+               <structure type="chrome_scaled_image" file="flags_ui/favicon.png"/>
+               <structure type="chrome_scaled_image" file="flags_ui/touchy.png"/>
+               <structure type="chrome_scaled_image" file="flags_ui/absent.png"/></grit>"#,
+        )
+        .unwrap();
+        let refs = grd_references(&grd).unwrap();
+        assert!(refs.contains(&dir.join("direct.xtb")));
+        assert!(refs.contains(&scaled.join("favicon.png")));
+        assert!(
+            refs.contains(&custom.join("touchy.png")),
+            "a context named only by the manifest must be used: {refs:?}"
+        );
+        // Three, not four: the absent image is not invented, the empty
+        // value is not a path, and a URL is not a path either. Each of
+        // those is a separate branch, and only listing all three at once
+        // tells them apart.
+        assert_eq!(refs.len(), 3, "{refs:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The existence-blind twin. A grd that names a file NO tool has
+    /// written yet - the generated .css shape - yields nothing from
+    /// grd_references and must still yield a candidate, or a generated
+    /// resource can never be matched against a graph node.
+    #[test]
+    fn candidates_are_existence_blind_and_join_lexically() {
+        use super::grd_reference_candidates;
+        use std::path::Path;
+        let dir = std::env::temp_dir().join(format!("nn-grdc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let grd = dir.join("res.grd");
+        std::fs::write(
+            &grd,
+            r#"<grit><file path="../gen/theme.css"/>
+               <structure file="nowhere/absent.png"/>
+               <file path="https://example.invalid/x"/></grit>"#,
+        )
+        .unwrap();
+        let c = grd_reference_candidates(&grd).unwrap();
+        // The `..` pops a base component rather than surviving into the
+        // result, which is what makes the path resolvable against the
+        // build dir.
+        assert!(c.contains(&Path::new(&dir).parent().unwrap().join("gen/theme.css")));
+        // Existence-blind: absent.png is on the list precisely because it
+        // does not exist.
+        assert!(c.contains(&dir.join("nowhere/absent.png")));
+        // A URL is not a path.
+        assert_eq!(c.len(), 2, "{c:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lexical_join_pops_parents_against_base() {
+        use super::lexical_join;
+        use std::path::Path;
+        assert_eq!(
+            lexical_join(
+                Path::new("gen/ui/webui/resources/js"),
+                Path::new("../../../../../../../../../../src/x.d.ts"),
+            ),
+            Path::new("../../../../../src/x.d.ts")
+        );
+        assert_eq!(
+            lexical_join(Path::new("gen/a"), Path::new("b/./c")),
+            Path::new("gen/a/b/c")
+        );
+    }
 }
