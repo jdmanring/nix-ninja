@@ -347,3 +347,38 @@ numbers this fork keeps producing ad hoc and then arguing about in prose.
 `docs/todo.md` lists both as unchecked items, in upstream's own words, which
 means upstream wrote them down, labelled them help wanted, and we have been
 reading past them for weeks.
+
+## Fifth sweep, same day, after acting on it
+
+The sweep above was written to be uncomfortable and then acted on. What moved:
+
+| # | Was | Now |
+|---|---|---|
+| 4 | nothing | `crates/nix-ninja/benches/generate.rs`, divan, no new dependency. Numbers recorded in the commit: graph load linear at 563 µs/1k and 7.80 ms/10k edges, include scan ~30 µs per TU |
+| 41 | nothing | Answered by measurement rather than opinion. mmap beats the read 1.7x (10.9 µs against 18.9 µs) and the read is 0.26% of the graph load it feeds, so it buys ~0.1% and costs a SIGBUS fallback for page-multiple files |
+| 7 | nothing | `bench/e2e.sh` runs one example end to end and records wall clock plus the driver's own counters. Validated on `example-hello` |
+| 14 | nothing | The hardcoded `"x86_64-linux"` in `build.rs` is gone, host-derived with `NIX_NINJA_SYSTEM` overriding. The rest of #14 is hardware, not code |
+| 6 | nothing | Prepared with evidence: snix's daemon implements three store operations against the thirteen this driver needs, none of them a build |
+| 16 | nothing | Prepared: the assumed blocker is wrong and the real one is named |
+
+Three things the work turned up that were not on anybody's list:
+
+- **The driver never printed its own totals.** The summary is gated on
+  `n_tasks.is_multiple_of(500)`, so a build under 500 tasks printed no
+  accounting at all - every example here - and a longer one reported its last
+  tick rather than its result. Every number this campaign has argued over was
+  a mid-run reading. Fixed with `report_progress_final`.
+- **The summary reports whole seconds**, so the first end-to-end run returned
+  a row of zeros that look like measurements and are rounding.
+  `NIX_NINJA_STATS_JSON=1` now emits the same counters in milliseconds,
+  additively, because the seconds line already has readers.
+- **The boost collision blocks every example**, not the six VM checks alone,
+  because `mkMesonPackage` takes `nix` as a build input. Worked around by
+  giving `inputs.nix` its own pre-collision nixpkgs, with a `DEFER` naming the
+  condition for removing it.
+
+What is still NOT developed, so this sweep does not repeat the flattery the
+last one had to correct: #16 is prepared and unimplemented, #6 is answered and
+unimplementable against snix as it stands, #14 is unverified on aarch64
+hardware, and #7 has a harness whose only subject so far is the smallest
+example in the tree.
