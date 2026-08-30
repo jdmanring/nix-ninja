@@ -35,8 +35,34 @@ let
   # An ORDINARY derivation: a real $out, no builder-rpc-v0, no dynamic
   # derivations. That is the entire point - it is cacheable and
   # substitutable by any machine, which the ninja derivation is not.
-  configureDrv = stdenv.mkDerivation (baseArgs // {
+  # THREE ATTRIBUTES A PACKAGE CAN SET THAT THIS OPTION CANNOT HONOUR.
+  # Each would diverge silently, so each is refused with its reason.
+  cacheBlockers =
+    (lib.optional (args' ? configurePhase)
+      "sets its own configurePhase, which the cached path replaces")
+    ++ (lib.optional (args' ? dontUseMesonConfigure)
+      "sets dontUseMesonConfigure, so the configure derivation would produce no build directory")
+    ++ (lib.optional (args' ? mesonBuildDir && lib.hasPrefix "/" (toString args'.mesonBuildDir))
+      "sets an absolute mesonBuildDir, whose relative spellings would not resolve after the copy");
+
+  configureDrv = assert lib.assertMsg (cacheBlockers == [ ])
+    "mkMesonPackage: useConfigureCache cannot be used with a package that ${lib.head cacheBlockers}";
+    stdenv.mkDerivation (baseArgs // {
     name = "${name}-configure";
+
+    # THE PREFIX MUST MATCH THE UNCACHED BUILD OR THE OPTION IS NOT
+    # TRANSPARENT. stdenv defaults `prefix` to `$out`, and meson's setup hook
+    # passes `--prefix=$prefix`, so without this the configure derivation
+    # bakes a real store path into build.ninja and meson-private/coredata.dat
+    # where the ordinary path bakes `/nonexistent` (the ninja derivation sets
+    # `out = "/nonexistent"` for the builder-rpc reason above). Any package
+    # deriving a compile flag from `get_option('prefix')` - a -DPREFIX=, an
+    # install_rpath, a configure_file into a header - would then emit command
+    # lines naming the configure output, which is an input of the ninja
+    # derivation but NOT of the per-TU derivations it emits.
+    # example-hello uses no prefix, which is exactly why it could not catch
+    # this.
+    prefix = "/nonexistent";
 
     # nix-ninja IS A CONFIGURE-TIME DEPENDENCY, which is not obvious and
     # is the first thing this derivation taught us. meson refuses to
