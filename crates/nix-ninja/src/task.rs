@@ -100,6 +100,10 @@ pub struct RunnerConfig {
 /// Runner is an async runtime that spawns threads for each task.
 pub struct Runner {
     pub derived_files: HashMap<FileId, DerivedFile>,
+    /// A phony output -> the inputs it stands for. A phony has no derived
+    /// file of its own, so dependents inherit its inputs at input assembly
+    /// and a phony named as a CLI target resolves through this.
+    phony_aliases: HashMap<FileId, Vec<FileId>>,
     build_dir_inputs: HashMap<FileId, DerivedFile>,
 
     tx: mpsc::Sender<BuildResult>,
@@ -155,6 +159,7 @@ impl Runner {
         let (tx, rx) = mpsc::channel();
         Ok(Runner {
             derived_files: HashMap::new(),
+            phony_aliases: HashMap::new(),
             build_dir_inputs: HashMap::new(),
             tx,
             rx,
@@ -193,6 +198,27 @@ impl Runner {
         Ok(())
     }
 
+    /// Every concrete output a requested TARGET resolves to.
+    ///
+    /// A phony has no derived file of its own, which is right for the graph
+    /// and leaves one gap at the CLI boundary: a phony named as a target
+    /// would otherwise resolve to nothing and be reported as a missing
+    /// derived file for a build that in fact succeeded.
+    ///
+    /// Transitive, because a phony may alias another phony; the seen-set
+    /// makes an alias cycle terminate.
+    pub fn resolve_target(&self, fid: FileId) -> Vec<DerivedFile> {
+        resolve_target_in(&self.derived_files, &self.phony_aliases, fid)
+    }
+
+    /// Whether a target is a phony alias. A header-only CMake project emits
+    /// `build all: phony` with ZERO inputs, so resolving it is legitimately
+    /// empty and real ninja succeeds doing nothing. The caller uses this to
+    /// tell that no-op apart from a target that failed to resolve.
+    pub fn is_phony(&self, fid: FileId) -> bool {
+        self.phony_aliases.contains_key(&fid)
+    }
+
     pub fn start(
         &mut self,
         files: &mut graph::GraphFiles,
@@ -200,6 +226,28 @@ impl Runner {
         build: &Build,
     ) -> Result<()> {
         let tx = self.tx.clone();
+
+        // A PHONY RULE HAS NO COMMAND. Record the alias and complete the
+        // build immediately, spawning nothing - there is no derivation to
+        // emit, and `build_task_derivation` would refuse it.
+        //
+        // Ordering falls out of the nix model for free: dependents inherit
+        // the phony's inputs as their own derivation inputs, via the
+        // expansion in `new_task` below, so a phony orders work without
+        // being work.
+        if build.cmdline.is_none() {
+            let ins: Vec<FileId> = build.ordering_ins().to_vec();
+            for fid in build.outs() {
+                self.phony_aliases.insert(*fid, ins.clone());
+            }
+            let _ = tx.send(BuildResult {
+                bid,
+                derived_path: None,
+                derived_files: Vec::new(),
+                err: None,
+            });
+            return Ok(());
+        }
 
         let tools = self.tools.clone();
         let task = self.new_task(files, build)?;
@@ -312,8 +360,36 @@ impl Runner {
         // Iterate over all explict, implicit and order-only dependencies as
         // they must all be linked into the derivation's source directory.
         let mut input_set: HashMap<PathBuf, DerivedFile> = HashMap::new();
-        for fid in build.ordering_ins() {
-            // TODO: what about phony inputs?
+        // A PHONY INPUT IS EXPANDED TO WHAT IT STANDS FOR, transitively: a
+        // phony may alias another phony, and the seen-set is what makes an
+        // alias cycle terminate rather than hang - ninja permits the file to
+        // declare one, so it is reachable input rather than a defensive
+        // flourish.
+        let mut worklist: Vec<(FileId, bool)> =
+            build.ordering_ins().iter().map(|f| (*f, false)).collect();
+        let mut seen: HashSet<FileId> = HashSet::new();
+        while let Some((fid, via_phony)) = worklist.pop() {
+            if !seen.insert(fid) {
+                continue;
+            }
+            if let Some(alias_ins) = self.phony_aliases.get(&fid) {
+                worklist.extend(alias_ins.iter().map(|f| (*f, true)));
+                continue;
+            }
+            let fid = &fid;
+            // A PHONY'S INPUTS ARE NOT ALL FILES, and one of CMake's is the
+            // build directory itself:
+            //     build cmake_object_order_depends_target_hello: phony || .
+            // Reached through the expansion, `.` looked like an ordinary
+            // undeclared input, so the WHOLE build directory was uploaded as
+            // one opaque object and then symlinked over itself:
+            //     Failed to create symlink from "<store>-build"
+            //     to /build/source/build/.: File exists
+            // Only a regular file is materializable; anything else reached
+            // through an alias is ordering and nothing more.
+            if via_phony && !Path::new(&files.by_id[*fid].name).is_file() {
+                continue;
+            }
             let input = match self.derived_files.get(fid) {
                 Some(df) => df.to_owned(),
                 None => {
@@ -953,6 +1029,32 @@ pub fn discover_c_includes(
     Ok((discovered_deps, discovered_store_paths))
 }
 
+fn resolve_target_in(
+    derived_files: &HashMap<FileId, DerivedFile>,
+    phony_aliases: &HashMap<FileId, Vec<FileId>>,
+    fid: FileId,
+) -> Vec<DerivedFile> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<FileId> = HashSet::new();
+    let mut worklist = vec![fid];
+    while let Some(next) = worklist.pop() {
+        if !seen.insert(next) {
+            continue;
+        }
+        // A concrete output ends the walk. Checked FIRST because a fid can
+        // be both an alias target and a real output, and the real output is
+        // the thing a caller asked for.
+        if let Some(df) = derived_files.get(&next) {
+            out.push(df.clone());
+            continue;
+        }
+        if let Some(alias_ins) = phony_aliases.get(&next) {
+            worklist.extend(alias_ins.iter().copied());
+        }
+    }
+    out
+}
+
 /// Removes -frandom-seed flag from a string of CFLAGS.
 fn remove_frandom_seed(flags: &str) -> String {
     flags
@@ -968,4 +1070,93 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+#[cfg(test)]
+mod phony_resolution_tests {
+    use super::{resolve_target_in, DerivedFile};
+    use harmonia_store_derivation::derived_path::SingleDerivedPath;
+    use harmonia_store_path::{StoreDir, StorePath};
+    use n2::graph::FileId;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn df(name: &str) -> DerivedFile {
+        let store_dir = StoreDir::default();
+        let sp: StorePath = store_dir
+            .parse("/nix/store/00000000000000000000000000000000-x")
+            .expect("store path");
+        DerivedFile {
+            derived_path: SingleDerivedPath::Opaque(sp),
+            build_path: PathBuf::from(name),
+            rel_path: None,
+        }
+    }
+
+    #[test]
+    fn a_concrete_target_resolves_to_itself() {
+        let mut outs = HashMap::new();
+        outs.insert(FileId::from(1), df("a.o"));
+        let got = resolve_target_in(&outs, &HashMap::new(), FileId::from(1));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].build_path, PathBuf::from("a.o"));
+    }
+
+    #[test]
+    fn a_phony_resolves_to_what_it_stands_for_transitively() {
+        let mut outs = HashMap::new();
+        outs.insert(FileId::from(1), df("a.o"));
+        outs.insert(FileId::from(2), df("b.o"));
+        let mut phony = HashMap::new();
+        // all -> mid -> {a.o, b.o}
+        phony.insert(FileId::from(9), vec![FileId::from(8)]);
+        phony.insert(FileId::from(8), vec![FileId::from(1), FileId::from(2)]);
+        let mut got: Vec<String> = resolve_target_in(&outs, &phony, FileId::from(9))
+            .into_iter()
+            .map(|d| d.build_path.to_string_lossy().into_owned())
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["a.o".to_string(), "b.o".to_string()]);
+    }
+
+    /// AN EMPTY PHONY RESOLVES TO NOTHING, and that is not an error - the
+    /// caller separates the two with `is_phony`. opencl-headers emits
+    /// `build all: phony` with zero inputs and real ninja succeeds.
+    #[test]
+    fn an_empty_phony_resolves_to_nothing() {
+        let got = resolve_target_in(
+            &HashMap::new(),
+            &HashMap::from([(FileId::from(9), vec![])]),
+            FileId::from(9),
+        );
+        assert!(got.is_empty());
+    }
+
+    /// THE SEEN-SET IS REACHABLE INPUT, NOT A FLOURISH. ninja permits a
+    /// build file to declare an alias cycle; without the set this hangs.
+    #[test]
+    fn an_alias_cycle_terminates() {
+        let mut outs = HashMap::new();
+        outs.insert(FileId::from(1), df("a.o"));
+        let phony = HashMap::from([
+            (FileId::from(9), vec![FileId::from(8)]),
+            (FileId::from(8), vec![FileId::from(9), FileId::from(1)]),
+        ]);
+        let got = resolve_target_in(&outs, &phony, FileId::from(9));
+        assert_eq!(got.len(), 1);
+    }
+
+    /// A fid can be BOTH an alias target and a real output. The real output
+    /// is what the caller asked for, so the concrete check comes first -
+    /// swap the order and this returns the alias's expansion instead.
+    #[test]
+    fn a_concrete_output_wins_over_an_alias_of_the_same_fid() {
+        let mut outs = HashMap::new();
+        outs.insert(FileId::from(9), df("real.o"));
+        outs.insert(FileId::from(1), df("other.o"));
+        let phony = HashMap::from([(FileId::from(9), vec![FileId::from(1)])]);
+        let got = resolve_target_in(&outs, &phony, FileId::from(9));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].build_path, PathBuf::from("real.o"));
+    }
 }

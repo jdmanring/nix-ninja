@@ -74,14 +74,25 @@ pub fn build(
     }
     scheduler.run()?;
 
-    let mut outputs = Vec::with_capacity(target_fids.len());
+    let mut outputs = Vec::new();
     for (name, fid) in &target_fids {
-        let derived_file = runner.derived_files.get(fid).ok_or(anyhow!(
-            "Missing derived file {:?} for target {}",
-            fid,
-            name
-        ))?;
-        outputs.push(derived_file.clone());
+        // THROUGH resolve_target, not the derived-file map: a phony target
+        // has no derived file of its own and would otherwise be reported
+        // missing for a build that in fact succeeded.
+        let resolved = runner.resolve_target(*fid);
+        // An EMPTY PHONY IS NOT A FAILURE. A header-only CMake project
+        // emits `build all: phony` with zero inputs - every real edge is a
+        // utility target outside `all` - and real ninja succeeds doing
+        // nothing. `is_phony` is what tells that no-op apart from a target
+        // that failed to resolve.
+        if resolved.is_empty() && !runner.is_phony(*fid) {
+            return Err(anyhow!(
+                "Missing derived file {:?} for target {}",
+                fid,
+                name
+            ));
+        }
+        outputs.extend(resolved);
     }
 
     Ok(outputs)
