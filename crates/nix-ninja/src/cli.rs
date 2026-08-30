@@ -1,6 +1,7 @@
 use crate::build::{self, BuildConfig};
 use crate::local;
 use crate::subtool::dynamic_task;
+use crate::task;
 use anyhow::{anyhow, Context as _, Result};
 use clap::Parser;
 use harmonia_store_derivation::derivation::OutputPathName;
@@ -221,6 +222,42 @@ pub fn run() -> Result<()> {
         submit_outer_output(&cli.store_dir, derived_file, &rpc_client)?;
     } else {
         local::symlink_derived_files(&rpc_client, &cli.store_dir, &build_dir, &derived_files)?;
+
+        // UPSTREAM #17, STEPS TWO AND THREE. Step one made the depfile a
+        // declared content-addressed output of each task; this puts those
+        // outputs back into the build directory, which is the only thing
+        // standing between the existing read-back and a second run that
+        // skips inference entirely.
+        //
+        // WHY IT WAS NEVER REACHED: `derived_files` above is the requested
+        // TARGETS, so local mode materialized the final artifacts and
+        // nothing else. Every per-object depfile stayed in the store as an
+        // output nobody asked for, `depfile_read_back` found no file on
+        // disk, and every run re-scanned from scratch. The read half has
+        // been correct and unreachable.
+        //
+        // Best-effort BY DESIGN, and the polarity is the point: a depfile
+        // that fails to materialize costs a scan on the next run, which is
+        // the behavior that has always been in force. Failing the build
+        // here would turn a cache miss into a build failure, and the
+        // read-back guards freshness on its own anyway.
+        let depfiles = task::take_collected_depfiles();
+        if !depfiles.is_empty() {
+            let n = depfiles.len();
+            match local::symlink_derived_files(
+                &rpc_client,
+                &cli.store_dir,
+                &build_dir,
+                &depfiles,
+            ) {
+                Ok(()) => eprintln!(
+                    "nix-ninja: collected {n} depfile(s) into the build directory;                      a rebuild reads them instead of scanning"
+                ),
+                Err(e) => eprintln!(
+                    "nix-ninja: could not collect {n} depfile(s) ({e}); the next run                      scans as before"
+                ),
+            }
+        }
     }
     Ok(())
 }

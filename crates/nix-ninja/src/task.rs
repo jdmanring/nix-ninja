@@ -22,7 +22,7 @@ use std::{
     env, fs,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, Condvar, Mutex},
+    sync::{mpsc, Arc, Condvar, LazyLock, Mutex},
 };
 use walkdir::WalkDir;
 use which::which;
@@ -839,6 +839,18 @@ impl Runner {
                     if !paths.contains(&dir) {
                         drv_outputs.push(new_built_file(final_derived_path.clone(), dir));
                     }
+                }
+                // UPSTREAM #17: record this task's depfile output. NOT
+                // pushed into drv_outputs - the depfile is not a ninja
+                // graph output, and putting it there would offer it to
+                // consumers as a build product and feed undeclared_outputs
+                // a path it never reasoned about. It is a side channel for
+                // the collector alone.
+                if let Some(dpath) = accepted_depfile_output(&task) {
+                    COLLECTED_DEPFILES
+                        .lock()
+                        .unwrap()
+                        .push(new_built_file(final_derived_path.clone(), dpath));
                 }
                 drv_outputs
             } else {
@@ -2517,28 +2529,9 @@ fn build_task_derivation(
             task_outputs.push(dir);
         }
     }
-    let depfile_out: Option<PathBuf> = match (&task.depfile, task.deps.as_deref()) {
-        (Some(d), Some("gcc"))
-            if !d.is_empty()
-                && command_writes_depfile(
-                    task.cmdline.as_deref(),
-                    task.rspfile.as_ref().map(|(_, c)| c.as_str()),
-                ) =>
-        {
-            let p = PathBuf::from(d);
-            // An absolute or escaping depfile path is not ours to copy: the
-            // task's outputs are build-dir-relative by construction, and a
-            // path outside that tree would be silently rebased. Skip it and
-            // leave the task exactly as it was.
-            if p.is_absolute() || p.starts_with("..") {
-                None
-            } else {
-                task_outputs.push(p.clone());
-                Some(p)
-            }
-        }
-        _ => None,
-    };
+    let depfile_out: Option<PathBuf> = accepted_depfile_output(&task).inspect(|p| {
+        task_outputs.push(p.clone());
+    });
 
     // Add all ninja build outputs.
     let mut outputs: Vec<String> = Vec::new();
@@ -5218,6 +5211,149 @@ fn store_rel_path(build_path: &Path) -> PathBuf {
             }
         })
         .collect()
+}
+
+/// UPSTREAM #17: WHICH tasks emit a depfile as a declared output, in ONE
+/// place. Two sites need this answer - the derivation builder, which adds
+/// the path to the output list, and the collector, which records the
+/// finished output so local mode can materialize it - and a copy of the
+/// gate in each is how the two rel_path construction sites drifted before
+/// e9b9f68 folded them together.
+///
+/// GATED ON `deps = gcc`, NOT ON `depfile` ALONE. A declared output the
+/// command does not produce FAILS the task; `depfile` on its own is a path
+/// ninja would read if one appeared, while `deps = gcc` is ninja's own
+/// statement that the command writes a gcc-style depfile there.
+#[cfg(test)]
+mod accepted_depfile_output_tests {
+    use super::accepted_depfile_output_of;
+    use std::path::PathBuf;
+
+    const CC: &str = "cc -MD -MF foo.o.d -c foo.c -o foo.o";
+
+    #[test]
+    fn a_gcc_deps_edge_with_a_relative_depfile_is_accepted() {
+        assert_eq!(
+            accepted_depfile_output_of(Some("foo.o.d"), Some("gcc"), Some(CC), None),
+            Some(PathBuf::from("foo.o.d"))
+        );
+    }
+
+    /// THE GATE THAT COSTS A BUILD IF IT WIDENS. A declared output the
+    /// command does not produce fails the task, and `depfile` without
+    /// `deps = gcc` is a path ninja would read IF one appeared - not a
+    /// promise that anything writes it. meson's nasm rule is the real
+    /// case: `depfile =` and no `deps`.
+    #[test]
+    fn a_depfile_without_deps_gcc_is_refused() {
+        assert_eq!(
+            accepted_depfile_output_of(Some("foo.o.d"), None, Some(CC), None),
+            None
+        );
+    }
+
+    /// And a command that declares no depfile flag writes nothing, however
+    /// the rule is spelled.
+    #[test]
+    fn a_command_that_writes_no_depfile_is_refused() {
+        assert_eq!(
+            accepted_depfile_output_of(Some("foo.o.d"), Some("gcc"), Some("cc -c foo.c"), None),
+            None
+        );
+    }
+
+    /// An absolute or escaping path would be silently rebased into the
+    /// build dir, so it is left alone entirely.
+    #[test]
+    fn a_depfile_outside_the_build_dir_is_refused() {
+        for d in ["/tmp/foo.o.d", "../foo.o.d"] {
+            assert_eq!(
+                accepted_depfile_output_of(Some(d), Some("gcc"), Some(CC), None),
+                None,
+                "{d} must not be adopted as an output"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_depfile_path_is_refused() {
+        assert_eq!(
+            accepted_depfile_output_of(Some(""), Some("gcc"), Some(CC), None),
+            None
+        );
+    }
+
+    /// The flag can live in the rspfile rather than the command line.
+    #[test]
+    fn the_depfile_flag_is_honoured_from_the_rspfile() {
+        assert_eq!(
+            accepted_depfile_output_of(
+                Some("foo.o.d"),
+                Some("gcc"),
+                Some("cc @foo.rsp"),
+                Some("-MD -MF foo.o.d -c foo.c")
+            ),
+            Some(PathBuf::from("foo.o.d"))
+        );
+    }
+}
+
+///
+/// Takes the four fields rather than a `&Task`, for the reason
+/// `is_compile_edge` does: a Task needs a whole ninja graph to construct,
+/// and a gate nobody can unit-test is a gate that drifts.
+fn accepted_depfile_output(task: &Task) -> Option<PathBuf> {
+    accepted_depfile_output_of(
+        task.depfile.as_deref(),
+        task.deps.as_deref(),
+        task.cmdline.as_deref(),
+        task.rspfile.as_ref().map(|(_, c)| c.as_str()),
+    )
+}
+
+fn accepted_depfile_output_of(
+    depfile: Option<&str>,
+    deps: Option<&str>,
+    cmdline: Option<&str>,
+    rspfile_content: Option<&str>,
+) -> Option<PathBuf> {
+    let (Some(d), Some("gcc")) = (depfile, deps) else {
+        return None;
+    };
+    if d.is_empty() || !command_writes_depfile(cmdline, rspfile_content) {
+        return None;
+    }
+    let p = PathBuf::from(d);
+    // An absolute or escaping depfile path is not ours to copy: the task's
+    // outputs are build-dir-relative by construction, and a path outside
+    // that tree would be silently rebased. Skip it and leave the task
+    // exactly as it was.
+    if p.is_absolute() || p.starts_with("..") {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// UPSTREAM #17, THE COLLECTION HALF. Every depfile a task emitted, as a
+/// derived path that can be realized after the run.
+///
+/// The read-back half already existed and could never fire on a fresh
+/// build directory, which is why this looked finished and was not: the
+/// depfile is a content-addressed OUTPUT of the task derivation, and local
+/// mode materializes only the requested TARGETS (`cli.rs`), so no
+/// per-object depfile ever reached the build directory for a later run to
+/// read. Collect them here, materialize them in local mode, and
+/// `depfile_read_back` does the skipping it was always written to do.
+static COLLECTED_DEPFILES: LazyLock<Mutex<Vec<DerivedFile>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Drains the collected depfile outputs. Drained rather than cloned: the
+/// caller materializes them once at the end of a run, and leaving them
+/// behind would make a second call in the same process re-realize paths it
+/// already wrote.
+pub fn take_collected_depfiles() -> Vec<DerivedFile> {
+    std::mem::take(&mut *COLLECTED_DEPFILES.lock().unwrap())
 }
 
 fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> DerivedFile {
