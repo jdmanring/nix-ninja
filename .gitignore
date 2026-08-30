@@ -25,3 +25,7 @@ __pycache__/
 # upstream value. Anything that IS useful to upstream or other users belongs
 # in a tracked path with a ledger entry naming its destination.
 /local/
+
+# Symlinks into the fork-only area; the files live in local/.
+/CLAUDE.md
+/.graphifyignore

@@ -1,6 +1,0 @@
-target/
-vendor-n2/
-docs/
-*.md
-*.json
-*.lock
