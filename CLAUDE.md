@@ -130,11 +130,18 @@ redirect exists to prevent.
 ## Open failure classes
 
 Four packages ArtNix cannot drive through nix-ninja. Traced 2026-08-28 in
-`docs/incidents/2026-08-28-four-failure-classes.md`. Code has since landed for
-three of them and NONE of it has been verified on a package, which is a
-different state from fixed; the per-class notes below say which commit and what
-is still owed. Read the verification rule at the end of this section before
+`docs/incidents/2026-08-28-four-failure-classes.md`. Code has landed for three
+of them; classes 3 and 4 now have a package behind them and 1 and 2 do not,
+which is a different state from fixed. The per-class notes say which commit and
+what is still owed. Read the verification rule at the end of this section before
 reporting any of them as done.
+
+**The mechanism to carry away, because it survives these four:** a generated
+file is reachable at THREE points, and fixing one leaves the next one fatal.
+It must resolve (so the include is declared), it must not be SCANNED (there
+are no bytes yet), and it must not be UPLOADED (there is nothing to upload).
+`virtual_paths` did the first alone from 2026-08-29 to 2026-08-30, which reads
+as a fix and fails on the second file that exercises it.
 
 1. **bison** - `installCheckPhase` recompiles through the `cc` shim, producing
    objects unlike the originals: 698 test failures. Fix is a passthrough hook
@@ -155,15 +162,31 @@ reporting any of them as done.
 
 3 and 4 share a fix and should be ONE change, so the closure re-keys once.
 That change is the `virtual_paths` map for generated headers, recovered from
-dangling commits on 2026-08-29 (`2f7b8f2`, `dc296f3`, live at
-`crates/nix-ninja/src/task.rs:2299`). Neither package has been built with it.
+dangling commits on 2026-08-29 (`2f7b8f2`, `dc296f3`).
+
+**The class was verified on 2026-08-30 by a package, and the recovered fix was
+one third of it.** `example-nix` is the first package in this tree carrying a
+generated header on a compile edge: meson writes
+`src/nix/nix.p/unpack-channel.nix.gen.hh` with a `CUSTOM_COMMAND` and declares
+it order-only on every compile edge in `src/nix`. It failed twice more before
+it built, each failure one layer past the last, and neither was reachable until
+the layer above it was fixed:
+
+    Failed to read file ...unpack-channel.nix.gen.hh   the SCAN   -> c45cc88
+    canonicalize ...unpack-channel.nix.gen.hh          the UPLOAD -> cf75635
+
+Then it built: 345 tasks, 446 derivations, 371 s
+(`bench/records/2026-08-30-example-nix.json`). libvmaf and liblapack have still
+not been driven through it and are the ones that named the class;
 `docs/opt-out-triage.md` reads dav1d, p11-kit and valgrind as the same class,
-so testing one small package here is the cheapest work in the tree: it can
+so driving one of them is still the cheapest work in the tree and can now
 retire up to five opt-outs with no new code.
 
 **Verify every fix on a single small package before it reaches a closure.**
 Each of these has been "fixed" at least once without that, and one was reported
-as done while never having been deployed at all.
+as done while never having been deployed at all. 2026-08-30 is the case FOR the
+rule rather than against it: the fix that had been read as complete for a day
+was the first of three, and the only thing that said so was a build.
 
 ## Working rules that cost something to learn
 
@@ -248,6 +271,7 @@ you to use: `example-hello` for the smallest possible emission diff,
                                       # green off the wrong command twice on
                                       # 2026-08-29.
     ./bench/e2e.sh example-hello      # one build end to end -> a JSON record
+                                      # records kept in bench/records/
     cargo bench -p nix-ninja          # derivation-generation benchmarks
     nix develop                       # meson, taplo, just, agg, gnumake
 
