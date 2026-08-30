@@ -905,8 +905,35 @@ fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> Deriv
 
 // Derivation outputs cannot have `/` in them as its suffixed to the derivation
 // store path.
+/// Map an output path to a Nix store NAME.
+///
+/// Store names accept only `[A-Za-z0-9+._?=-]`, and may not begin with a
+/// period. Replacing `/` with `-` leaves every other illegal byte in place,
+/// so an output containing a space, an `@`, or any non-ASCII character
+/// produces a name the daemon rejects - and it rejects it when the derivation
+/// is added, far from the edge that named the file. Chromium's generated
+/// sources hit this with `@` and with spaces; a leading period comes up
+/// wherever a build writes into a dot directory.
+///
+/// Everything outside the permitted set maps to `-`, an empty result falls
+/// back to `source` rather than producing a nameless derivation, and a
+/// leading period is prefixed rather than dropped, so two inputs differing
+/// only there cannot collide.
 fn normalize_output(output: &str) -> String {
-    output.replace('/', "-")
+    let mapped: String = output
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '+' | '.' | '_' | '?' | '=' => c,
+            _ => '-',
+        })
+        .collect();
+    if mapped.is_empty() {
+        "source".to_string()
+    } else if mapped.starts_with('.') {
+        format!("-{mapped}")
+    } else {
+        mapped
+    }
 }
 
 /// Discovers C include dependencies from a command line and input files.
@@ -968,4 +995,49 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+#[cfg(test)]
+mod normalize_output_tests {
+    use super::normalize_output;
+
+    #[test]
+    fn slash_still_maps_to_dash() {
+        assert_eq!(normalize_output("src/main.o"), "src-main.o");
+    }
+
+    #[test]
+    fn at_sign_is_sanitized() {
+        // The three shapes measured in the wild: mac asset suffixes,
+        // npm scope directories, gettext locale variants.
+        assert_eq!(normalize_output("icon@2x.png"), "icon-2x.png");
+        assert_eq!(
+            normalize_output("node_modules/@babel/core/lib/index.js"),
+            "node_modules--babel-core-lib-index.js"
+        );
+        assert_eq!(normalize_output("sr@latin.po"), "sr-latin.po");
+    }
+
+    #[test]
+    fn allowed_charset_passes_through() {
+        assert_eq!(
+            normalize_output("libfoo+bar_1.2-r3?x=y.so"),
+            "libfoo+bar_1.2-r3?x=y.so"
+        );
+    }
+
+    #[test]
+    fn leading_period_is_prefixed() {
+        assert_eq!(normalize_output(".hidden.c"), "-.hidden.c");
+    }
+
+    #[test]
+    fn empty_falls_back() {
+        assert_eq!(normalize_output(""), "source");
+    }
+
+    #[test]
+    fn spaces_and_unicode_are_sanitized() {
+        assert_eq!(normalize_output("a b\u{e9}.c"), "a-b-.c");
+    }
 }
