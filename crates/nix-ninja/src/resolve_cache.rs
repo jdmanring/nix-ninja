@@ -204,17 +204,39 @@ pub fn init(store_dir: StoreDir, build_dir: PathBuf) {
                 // strands every entry this run banks - measured round 71,
                 // which banked 11,000 tasks' memos that round 72 then threw
                 // away unread.
-                let _ = fs::remove_file(&path);
-                println!(
+                // AND SAY SO IF THE REMOVE FAILS, because the incident in
+                // the comment above is exactly what a failed remove
+                // re-enables, silently. stderr, not stdout: `-t drv` writes
+                // its derivation JSON to stdout and this runs on that path.
+                if let Err(e) = fs::remove_file(&path) {
+                    eprintln!(
+                        "nix-ninja: resolve cache {} has a stale header and could not be \
+                         removed ({e}); persistence is disabled for this run rather than \
+                         appending under it",
+                        path.display()
+                    );
+                    return None;
+                }
+                eprintln!(
                     "nix-ninja: resolve cache {} had a different version/cap header; removed",
                     path.display()
                 );
             }
         }
+        // ALWAYS, including zero. Zero is the state an operator most needs
+        // to know - every scan runs cold - and printing nothing made it
+        // indistinguishable from the cache being disabled or this code never
+        // running.
         let loaded = unvalidated.len();
-        if loaded > 0 {
-            println!("nix-ninja: resolve cache loaded, {loaded} directory entries");
-        }
+        eprintln!(
+            "nix-ninja: resolve cache {}: {loaded} directory entries loaded{}",
+            path.display(),
+            if loaded == 0 {
+                ", so this run scans cold"
+            } else {
+                ""
+            }
+        );
         Some(Cache {
             store_dir,
             build_dir,
@@ -323,7 +345,13 @@ pub fn load_nar_stamps() -> Vec<(PathBuf, u64, u128, StorePath)> {
     };
     let mut lines = body.lines();
     if lines.next() != Some(NAR_HEADER) {
-        let _ = fs::remove_file(&path);
+        if let Err(e) = fs::remove_file(&path) {
+            eprintln!(
+                "nix-ninja: NAR stamp cache {} has a stale header and could not be removed \
+                 ({e}); every upload this run re-sends",
+                path.display()
+            );
+        }
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -375,6 +403,9 @@ pub fn save_nar_stamps(entries: &[(PathBuf, u64, u128, StorePath)]) -> Result<()
 }
 
 #[cfg(test)]
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -403,6 +434,14 @@ mod tests {
         // init() would return None, failing every assertion below with
         // "matching entry must validate" - which is how this test found
         // the gate's blind spot on the first sandboxed build of the fix.
+        // UNDER THE SAME LOCK THE OTHER ENV SUITES USE. set_var mutates
+        // process-global state, and two other test modules in this binary
+        // (build.rs's ENV_LOCK, task.rs's OUT_ENV_LOCK) read the environment
+        // under their own locks - so an unsynchronised write here races them.
+        // Contained today only because nothing else reads THIS variable; it
+        // becomes a hard error on an edition bump, since set_var is unsafe
+        // from 2024.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("NIX_NINJA_RESOLVE_CACHE", "1");
         let bd = std::env::temp_dir().join(format!("nn-rc-{}", std::process::id()));
         fs::create_dir_all(bd.join("srcs")).unwrap();

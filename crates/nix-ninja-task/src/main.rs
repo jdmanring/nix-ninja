@@ -479,11 +479,19 @@ fn main() -> Result<()> {
             if let Some(parent) = bp.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            if fs::write(bp, b"").is_ok() {
-                println!(
+            // SAY SO ON FAILURE TOO. On success this printed; on failure
+            // it printed nothing, and the task then died on a missing
+            // declared output with no hint that the stamp was attempted.
+            match fs::write(bp, b"") {
+                Ok(()) => println!(
                     "nix-ninja-task: created empty custom-target stamp {}",
                     bp.display()
-                );
+                ),
+                Err(e) => println!(
+                    "nix-ninja-task: could not create custom-target stamp {} ({e}); \
+                     the task will fail on the missing declared output",
+                    bp.display()
+                ),
             }
         }
     }
@@ -510,29 +518,43 @@ fn main() -> Result<()> {
     for output in &outputs {
         if output.build_path.is_dir() {
             let mut n = 0usize;
+            // AN UNREADABLE ENTRY MANUFACTURES A LOW COUNT, and a low count
+            // is this block's alarm - it exists to catch "syncqt exited 0
+            // having written 5 headers instead of 500". Swallowing the error
+            // silently produces the very symptom it watches for, so count
+            // the failures and say so beside the total.
+            let mut unreadable = 0usize;
             let mut sample: Vec<String> = Vec::new();
             let mut stack = vec![output.build_path.clone()];
             while let Some(d) = stack.pop() {
-                if let Ok(rd) = fs::read_dir(&d) {
-                    for e in rd.flatten() {
-                        let q = e.path();
-                        match fs::metadata(&q) {
-                            Ok(m) if m.is_dir() => stack.push(q),
-                            Ok(_) => {
-                                n += 1;
-                                if sample.len() < 6 {
-                                    sample.push(q.display().to_string());
+                match fs::read_dir(&d) {
+                    Ok(rd) => {
+                        for e in rd.flatten() {
+                            let q = e.path();
+                            match fs::metadata(&q) {
+                                Ok(m) if m.is_dir() => stack.push(q),
+                                Ok(_) => {
+                                    n += 1;
+                                    if sample.len() < 6 {
+                                        sample.push(q.display().to_string());
+                                    }
                                 }
+                                Err(_) => unreadable += 1,
                             }
-                            Err(_) => {}
                         }
                     }
+                    Err(_) => unreadable += 1,
                 }
             }
             println!(
-                "nix-ninja-task: tree output {} holds {} file(s): {}",
+                "nix-ninja-task: tree output {} holds {} file(s){}: {}",
                 output.build_path.display(),
                 n,
+                if unreadable > 0 {
+                    format!(" ({unreadable} entr(y/ies) unreadable, so this count is a FLOOR)")
+                } else {
+                    String::new()
+                },
                 sample.join(" ")
             );
         }

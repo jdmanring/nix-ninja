@@ -7,16 +7,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn fix_rpaths(store_dir: &Path, outputs: &[DerivedFile]) -> Result<()> {
+    // ONE LINE PER TASK, not per output. This printed a line for every ELF
+    // it touched, and a task whose output is a tree (Qt's syncqt, cmake
+    // custom targets) has hundreds - so the log of a link-heavy target was
+    // mostly this message. The count is the part worth reading: it says how
+    // many of the task's outputs were dynamic ELF at all.
+    let mut fixed = 0usize;
     for output in outputs {
         let canonical_path = fs::canonicalize(&output.build_path)
             .map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", output.build_path.display()))?;
         if is_elf_dynamic(&canonical_path)? {
             fix_rpath(store_dir, &canonical_path)?;
-            println!(
-                "nix-ninja-task: Fixed RPATH for {}",
-                output.build_path.display()
-            );
+            fixed += 1;
         }
+    }
+    if fixed > 0 {
+        println!(
+            "nix-ninja-task: fixed RPATH on {fixed} of {} output(s)",
+            outputs.len()
+        );
     }
 
     Ok(())
@@ -127,6 +136,33 @@ fn retained_entries(current_rpath: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The RPATH a rewritten output should carry, from what it had and the store
+/// directories its NEEDED libraries resolved to. `None` means nothing was
+/// added and the binary should be left alone.
+///
+/// PURE, AND SEPARATE FROM THE ELF READING, so the retention rule can be
+/// pinned where it is actually applied. Nine tests covered `retained_entries`
+/// in isolation and NOTHING covered the fact that this function calls it: a
+/// mutation replacing the call with `current_rpath.to_vec()` left the whole
+/// suite green while restoring the defect `f8bb3bd` fixed - an empty RPATH
+/// element, which the loader reads as the CURRENT DIRECTORY, written into a
+/// store output. The build succeeds and the artifact is wrong.
+pub fn assemble_rpath(current_rpath: &[String], needed_dirs: &[String]) -> Option<Vec<String>> {
+    let mut new_rpath = retained_entries(current_rpath);
+    let mut path_added = false;
+    for lib_str in needed_dirs {
+        if !new_rpath.contains(lib_str) {
+            new_rpath.push(lib_str.clone());
+            path_added = true;
+        }
+    }
+    if path_added {
+        Some(new_rpath)
+    } else {
+        None
+    }
+}
+
 fn compute_new_rpath(
     store_dir: &Path,
     elf_path: &Path,
@@ -135,11 +171,8 @@ fn compute_new_rpath(
     // Resolve RPATH entries with $ORIGIN expansion
     let resolved_rpath = resolve_rpath(current_rpath, elf_path)?;
 
-    // Get needed libraries and collect directories that need to be added to RPATH
-    let mut path_added = false;
-    let mut new_rpath = retained_entries(current_rpath);
-
     let needed_libs = get_needed_libs(elf_path)?;
+    let mut needed_dirs: Vec<String> = Vec::new();
 
     for lib_name in &needed_libs {
         let Some(lib_path) = resolve_needed(lib_name, &resolved_rpath, store_dir)? else {
@@ -150,21 +183,15 @@ fn compute_new_rpath(
             continue;
         };
 
-        let lib_str = lib_dir
-            .to_str()
-            .context("Library directiory was not UTF-8")?
-            .to_owned();
-        if !new_rpath.contains(&lib_str) {
-            new_rpath.push(lib_str);
-            path_added = true;
-        }
+        needed_dirs.push(
+            lib_dir
+                .to_str()
+                .context("Library directiory was not UTF-8")?
+                .to_owned(),
+        );
     }
 
-    if !path_added {
-        Ok(None)
-    } else {
-        Ok(Some(new_rpath))
-    }
+    Ok(assemble_rpath(current_rpath, &needed_dirs))
 }
 
 fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {

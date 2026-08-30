@@ -117,6 +117,10 @@ impl Deref for Task {
 /// BuildResult is the output of a Task.
 pub struct BuildResult {
     pub bid: BuildId,
+    /// What a READER can act on. `BuildId` is an index into the graph and
+    /// means nothing in a log file, so a failed run of 16,000 tasks used to
+    /// report which NUMBER failed. This carries the edge's first output.
+    pub label: String,
     pub derived_path: Option<SingleDerivedPath>,
     pub derived_files: Vec<DerivedFile>,
     pub err: Option<Error>,
@@ -636,6 +640,11 @@ impl Runner {
             }
             tx.send(BuildResult {
                 bid,
+                label: build
+                    .outs()
+                    .first()
+                    .map(|fid| files.by_id[*fid].name.clone())
+                    .unwrap_or_else(|| format!("{bid:?}")),
                 derived_path: None,
                 derived_files: Vec::new(),
                 err: None,
@@ -815,20 +824,41 @@ impl Runner {
             };
 
             // Create DerivedFiles for all outputs if successful
-            let derived_files = if let Some(ref final_derived_path) = derived_path {
-                let mut drv_outputs: Vec<DerivedFile> = Vec::new();
-                for fid in task.outs() {
-                    let file = &task.files[fid];
-                    // Normalization already happened in new_task for
-                    // task.outputs; apply the same here so the recorded
-                    // DerivedFile agrees with what the task wrote.
-                    match normalize_build_path(&config.build_dir, file.name.clone().into()) {
-                        Ok(p) => drv_outputs.push(new_built_file(final_derived_path.clone(), p)),
-                        Err(e) => {
-                            eprintln!("Error: {e}");
-                        }
+            // The edge's first output, as a name a reader can grep for.
+            let label = task
+                .outs()
+                .first()
+                .map(|fid| task.files[fid].name.clone())
+                .unwrap_or_else(|| format!("{bid:?}"));
+
+            // A DECLARED OUTPUT THAT CANNOT BE NORMALIZED NOW FAILS THE TASK.
+            // It used to print a bare `Error: {e}` - no prefix, no task, no
+            // filename - and CONTINUE, so the task reported success with an
+            // output missing from its DerivedFiles. Every consumer of that
+            // output then resolved against nothing, which is the silent
+            // wrong-artifact shape this driver exists to avoid. Dropping an
+            // output is a task failure.
+            let mut derived_path = derived_path;
+            let mut err = err;
+            let derived_files = if let Some(ref final_derived_path) = derived_path.clone() {
+                let names: Vec<String> = task
+                    .outs()
+                    .iter()
+                    .map(|fid| task.files[fid].name.clone())
+                    .collect();
+                let mut drv_outputs = match normalized_task_outputs(
+                    &config.build_dir,
+                    &names,
+                    final_derived_path,
+                    &label,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        err = Some(e);
+                        derived_path = None;
+                        Vec::new()
                     }
-                }
+                };
                 // THE TREE, BY THE SAME RULE new_task USED. Its FileId is
                 // synthetic - ninja has no node for a directory - so it can
                 // only reach a consumer by being attached to the outputs the
@@ -851,21 +881,25 @@ impl Runner {
                 // `cli.rs` drains this in the else-branch, so on the
                 // NIX_NINJA_DRV path every push was a normalize_output plus a
                 // store_rel_path per task for a value nothing would read.
-                if let Some(dpath) =
-                    accepted_depfile_output(&task).filter(|_| !config.is_output_derivation)
+                if let Some(dpath) = collectable_depfile_output(&task, config.is_output_derivation)
                 {
                     COLLECTED_DEPFILES
                         .lock()
                         .unwrap()
                         .push(new_built_file(final_derived_path.clone(), dpath));
                 }
-                drv_outputs
+                if err.is_some() {
+                    Vec::new()
+                } else {
+                    drv_outputs
+                }
             } else {
                 Vec::new()
             };
 
             let result = BuildResult {
                 bid,
+                label,
                 derived_path,
                 derived_files,
                 err,
@@ -884,22 +918,27 @@ impl Runner {
     pub fn wait(&mut self, files: &mut graph::GraphFiles) -> Result<(BuildId, bool)> {
         let result = self.rx.recv().unwrap();
         if let Some(err) = result.err {
-            eprintln!("Error: {err}");
+            // PREFIXED, because the failure path was the one part of the
+            // driver that was not: grepping `nix-ninja:` out of a 200k-line
+            // build log dropped exactly the lines saying a build failed.
+            // Named by the edge's output rather than by a BuildId, which is
+            // a graph index and means nothing to a reader.
+            eprintln!("nix-ninja: FAILED {}: {err}", result.label);
 
-            eprintln!("Caused by:");
+            eprintln!("nix-ninja: caused by:");
             for cause in err.chain().skip(1) {
-                eprintln!("    {cause}");
+                eprintln!("nix-ninja:     {cause}");
             }
 
             let debug_info = if let Some(derived_path) = &result.derived_path {
-                format!(
-                    "derivation: {}",
-                    self.config.store_dir.display(derived_path)
-                )
+                format!("derivation {}", self.config.store_dir.display(derived_path))
             } else {
-                format!("build_id: {:?}", result.bid)
+                "no derivation was produced".to_string()
             };
-            eprintln!("Failed to build task derivation for {}", debug_info);
+            eprintln!(
+                "nix-ninja: FAILED {} ({}), build_id {:?}",
+                result.label, debug_info, result.bid
+            );
 
             return Ok((result.bid, false));
         }
@@ -4317,7 +4356,7 @@ fn upload_python_closure_uncached(
                 Ok(true)
             }
             None => {
-                println!(
+                eprintln!(
                     "nix-ninja: python dep dir {} exceeds {} files; skipped",
                     dir.display(),
                     cap
@@ -4997,7 +5036,7 @@ fn upload_referenced_dir_uncached(
                     }
                 }
             }
-            println!(
+            eprintln!(
                 "nix-ninja: dir arg {} exceeds {} files; uploaded only its \
                  python packages ({} files)",
                 dir.display(),
@@ -5343,6 +5382,51 @@ fn accepted_depfile_output_of(
     }
 }
 
+/// Which depfile, if any, this run should COLLECT - the accepted output,
+/// minus the case where nothing will drain it.
+///
+/// Split out because the `is_output_derivation` half had no test: inside a
+/// derivation `cli.rs` never calls `take_collected_depfiles`, so every push
+/// there was a `normalize_output` plus a `store_rel_path` per task for a
+/// value nothing would read.
+fn collectable_depfile_output(task: &Task, is_output_derivation: bool) -> Option<PathBuf> {
+    collectable(accepted_depfile_output(task), is_output_derivation)
+}
+
+/// The decision alone, over values rather than a `Task`, so it can be tested.
+fn collectable(accepted: Option<PathBuf>, is_output_derivation: bool) -> Option<PathBuf> {
+    if is_output_derivation {
+        None
+    } else {
+        accepted
+    }
+}
+
+#[cfg(test)]
+mod collectable_tests {
+    use super::collectable;
+    use std::path::PathBuf;
+
+    #[test]
+    fn local_mode_collects_and_derivation_mode_does_not() {
+        let d = Some(PathBuf::from("a.o.d"));
+        assert_eq!(collectable(d.clone(), false), d, "local mode drains these");
+        assert_eq!(
+            collectable(d, true),
+            None,
+            "inside a derivation nothing drains the collector, so pushing is \
+             a normalize_output and a store_rel_path per task for a value \
+             nothing reads"
+        );
+    }
+
+    #[test]
+    fn a_task_with_no_accepted_depfile_collects_nothing_either_way() {
+        assert_eq!(collectable(None, false), None);
+        assert_eq!(collectable(None, true), None);
+    }
+}
+
 /// UPSTREAM #17, THE COLLECTION HALF. Every depfile a task emitted, as a
 /// derived path that can be realized after the run.
 ///
@@ -5362,6 +5446,109 @@ static COLLECTED_DEPFILES: LazyLock<Mutex<Vec<DerivedFile>>> =
 /// already wrote.
 pub fn take_collected_depfiles() -> Vec<DerivedFile> {
     std::mem::take(&mut *COLLECTED_DEPFILES.lock().unwrap())
+}
+
+#[cfg(test)]
+mod normalized_task_outputs_tests {
+    use super::{normalized_task_outputs, SingleDerivedPath};
+    use harmonia_store_path::StorePath;
+    use std::path::Path;
+
+    fn drv() -> SingleDerivedPath {
+        SingleDerivedPath::Opaque(
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-x.drv"
+                .parse::<StorePath>()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn ordinary_outputs_all_come_back() {
+        let got = normalized_task_outputs(
+            Path::new("/build/source/build"),
+            &["src/a.o".to_string(), "src/b.o".to_string()],
+            &drv(),
+            "src/a.o",
+        )
+        .unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    /// THE REGRESSION. An output that cannot be placed under the build
+    /// directory used to be logged and SKIPPED, so the task reported success
+    /// with that output missing from its DerivedFiles and every consumer of
+    /// it resolved against nothing.
+    /// The shape that actually fails: `relative_from` hands an absolute path
+    /// straight back when the base is relative, so it never becomes relative
+    /// to the build dir and normalizing it would silently relocate it.
+    #[test]
+    fn an_output_that_cannot_be_placed_fails_the_whole_task() {
+        let err = normalized_task_outputs(
+            Path::new("build"),
+            &["src/a.o".to_string(), "/etc/passwd".to_string()],
+            &drv(),
+            "src/a.o",
+        )
+        .map(|v| v.len())
+        .expect_err("an unplaceable output must fail, not be dropped");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("/etc/passwd"),
+            "the error must name the offending output: {text}"
+        );
+        assert!(
+            text.contains("src/a.o"),
+            "and the task it belongs to: {text}"
+        );
+    }
+
+    /// A PARTIAL SET IS THE SAME DEFECT WITH A SMALLER NUMBER, so the good
+    /// outputs before the bad one must not be returned either.
+    #[test]
+    fn no_partial_output_set_is_returned() {
+        assert!(normalized_task_outputs(
+            Path::new("build"),
+            &["src/a.o".to_string(), "/etc/passwd".to_string()],
+            &drv(),
+            "t",
+        )
+        .map(|v| v.len())
+        .is_err());
+    }
+}
+
+/// Every declared output of an edge as a `DerivedFile`, or an error naming the
+/// one that could not be placed.
+///
+/// EXTRACTED SO THE GUARANTEE CAN BE TESTED, and the guarantee is the point:
+/// this loop used to print a bare `Error: {e}` - no prefix, no task, no
+/// filename - and CONTINUE, so the task reported SUCCESS with an output
+/// missing from its `DerivedFile`s. Every consumer of that output then
+/// resolved against nothing, which is the silent wrong-artifact shape this
+/// driver exists to prevent.
+///
+/// Refusing the whole set on the first bad name is deliberate. A partial
+/// output set is the same defect wearing a smaller number.
+fn normalized_task_outputs(
+    build_dir: &Path,
+    names: &[String],
+    final_derived_path: &SingleDerivedPath,
+    label: &str,
+) -> Result<Vec<DerivedFile>> {
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        match normalize_build_path(build_dir, name.clone().into()) {
+            Ok(p) => out.push(new_built_file(final_derived_path.clone(), p)),
+            Err(e) => {
+                return Err(e.context(format!(
+                    "task {label}: declared output {name} is not under the build directory {}; \
+                     failing the task rather than dropping the output",
+                    build_dir.display()
+                )))
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> DerivedFile {
@@ -5885,7 +6072,7 @@ mod rewrite_ancestor_paths_tests {
 #[cfg(test)]
 mod depfile_read_back_tests {
     use super::depfile_read_back;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn fresh_stale_and_empty() {
@@ -5898,6 +6085,7 @@ mod depfile_read_back_tests {
         // Fresh depfile (written after the source): its answer is used.
         let got = depfile_read_back(
             &d,
+            Path::new("/nonexistent-store"),
             Some(PathBuf::from("a.o.d").as_path()),
             &[PathBuf::from("a.c")],
         )
@@ -5911,6 +6099,7 @@ mod depfile_read_back_tests {
             .unwrap();
         assert!(depfile_read_back(
             &d,
+            Path::new("/nonexistent-store"),
             Some(PathBuf::from("a.o.d").as_path()),
             &[PathBuf::from("a.c")]
         )
@@ -5944,6 +6133,7 @@ mod depfile_read_back_tests {
         assert!(
             depfile_read_back(
                 &d,
+                Path::new("/nonexistent-store"),
                 Some(PathBuf::from("a.o.d").as_path()),
                 &[PathBuf::from("a.c")]
             )
@@ -5955,6 +6145,7 @@ mod depfile_read_back_tests {
         assert!(
             depfile_read_back(
                 &d,
+                Path::new("/nonexistent-store"),
                 Some(PathBuf::from("a.o.d").as_path()),
                 &[PathBuf::from("a.c")]
             )
@@ -5963,11 +6154,53 @@ mod depfile_read_back_tests {
         );
         std::fs::remove_file(&hdr).unwrap();
 
+        // A DEPFILE THAT RESOLVES INTO THE STORE IS REFUSED OUTRIGHT.
+        // Store files carry mtime 1, so comparing against one is not a
+        // freshness test at all - it silently answers "stale" forever, which
+        // is how the whole read-back was inert for a day. Faked with a
+        // directory standing in for the store, which is why the function
+        // takes the prefix instead of hardcoding /nix/store.
+        let fake_store = d.join("fake-store");
+        std::fs::create_dir_all(&fake_store).unwrap();
+        let in_store = fake_store.join("b.o.d");
+        std::fs::write(&in_store, "a.o: a.c\n").unwrap();
+        let linked = d.join("linked.o.d");
+        std::os::unix::fs::symlink(&in_store, &linked).unwrap();
+        assert!(
+            depfile_read_back(
+                &d,
+                &fake_store,
+                Some(PathBuf::from("linked.o.d").as_path()),
+                &[]
+            )
+            .is_none(),
+            "a depfile resolving into the store must be refused, not compared"
+        );
+        // ...and the SAME file, not in the store, is read normally. Without
+        // this half the assertion above would also pass if the function
+        // simply never worked.
+        assert!(
+            depfile_read_back(
+                &d,
+                Path::new("/nonexistent-store"),
+                Some(PathBuf::from("linked.o.d").as_path()),
+                &[]
+            )
+            .is_some(),
+            "outside the store the same depfile must be read"
+        );
+
         // Empty depfile is no answer, not an empty answer.
         std::fs::write(&dep, "").unwrap();
-        assert!(depfile_read_back(&d, Some(PathBuf::from("a.o.d").as_path()), &[]).is_none());
+        assert!(depfile_read_back(
+            &d,
+            Path::new("/nonexistent-store"),
+            Some(PathBuf::from("a.o.d").as_path()),
+            &[]
+        )
+        .is_none());
         // No depfile declared: the scan is the only source.
-        assert!(depfile_read_back(&d, None, &[]).is_none());
+        assert!(depfile_read_back(&d, Path::new("/nonexistent-store"), None, &[]).is_none());
     }
 }
 
@@ -6106,7 +6339,11 @@ mod normalize_output_tests {
     fn generate_grd_cmdline_files_resolve_against_tool_root() {
         use super::generate_grd_input_files;
         use std::fs;
-        let root = std::env::temp_dir().join("nn-grd-input-files-test");
+        let root = std::env::temp_dir().join(format!(
+            "nn-grd-input-files-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let imgs = root.join("ui/webui/resources/images");
         fs::create_dir_all(&imgs).unwrap();
         fs::create_dir_all(root.join("ui/webui/resources/tools")).unwrap();
@@ -6179,6 +6416,7 @@ mod normalize_output_tests {
 /// new as every source file offered, and parses cleanly.
 fn depfile_read_back(
     build_dir: &Path,
+    store_dir: &Path,
     depfile: Option<&Path>,
     sources: &[PathBuf],
 ) -> Option<Vec<PathBuf>> {
@@ -6196,7 +6434,10 @@ fn depfile_read_back(
     // the scan ran anyway. `local.rs` now COPIES depfiles rather than
     // symlinking them, and this refuses a store path outright rather than
     // pretending to compare against one.
-    if d.canonicalize().is_ok_and(|c| c.starts_with("/nix/store/")) {
+    // The store prefix is a PARAMETER, not the `/nix/store` literal, because
+    // a guard whose subject cannot be faked cannot be tested - and this one
+    // shipped untested, which is how the bug above shipped at all.
+    if d.canonicalize().is_ok_and(|c| c.starts_with(store_dir)) {
         return None;
     }
     let dep_m = std::fs::metadata(&d).ok()?.modified().ok()?;
@@ -6335,7 +6576,13 @@ fn generated_not_yet_written(
     let Some(vp) = virtual_declared else {
         return false;
     };
-    if !(vp.contains_key(include) || vp.values().any(|v| v == include)) {
+    // KEY LOOKUP ONLY, to agree with `is_declared_virtual` in deps-infer.
+    // That one dropped its `values()` fallback for cost; this one kept it, so
+    // the two predicates disagreed for any non-identity map. The map is built
+    // identity today (build_path -> build_path), which is why no test could
+    // tell them apart - a divergence that goes live the first time a real
+    // mapping is introduced.
+    if !vp.contains_key(include) {
         return false;
     }
     let abs = if include.is_absolute() {
@@ -6366,83 +6613,84 @@ pub fn discover_c_includes(
     // fails toward the scan (the old behavior), never toward trusting a
     // stale answer. Incremental local builds are where this pays - ninja's
     // own model, a depfile per object from the previous run.
-    let c_includes = match depfile_read_back(build_dir, depfile, &files) {
-        Some(deps) => deps,
-        None => {
-            let (scanned, incomplete) = c_include_parser::retrieve_c_includes_checked(
-                cmdline,
-                files.clone(),
-                virtual_paths,
-            )?;
-            // THE SCAN NOW SAYS WHEN IT CANNOT ANSWER, AND THIS IS WHAT
-            // ACTS ON IT. A computed include through a function-like macro
-            // needs real expansion against the command line's -D set, which
-            // a textual parser cannot do and which the preprocessor does by
-            // definition. Measured 2026-08-24 on cmake-minimal's bootstrap:
-            // `#include KWSYS_HEADER(Directory.hxx)` with
-            // -DKWSYS_NAMESPACE=cmsys, so every kwsys TU reached its task
-            // with no cmsys/ header declared and died "No such file or
-            // directory" - the scan's silence read as a complete answer.
-            //
-            // It runs for those TUs ALONE. The scan is exact for the
-            // overwhelming majority, and paying a preprocess per object
-            // would hand back the time per-TU derivations exist to save.
-            //
-            // The fallback's polarity is deliberate: if gcc itself fails
-            // here, keep the scan's answer and let the TASK fail loudly.
-            // Substituting an empty or partial set on a failed preprocess
-            // would turn a build error into a wrong artifact, which is the
-            // one outcome worse than the bug being fixed.
-            if incomplete {
-                match deps_infer::gcc_depfile::retrieve_c_includes(cmdline) {
-                    Ok(deps) => {
-                        // THE PREPROCESSOR ADDS TO THE SCAN, IT DOES NOT REPLACE IT.
-                        // `-MM` (include_system_headers: false) omits every header gcc
-                        // considers a SYSTEM header, and that is a property of the
-                        // FILE rather than of where it lives: gnulib writes
-                        // `#pragma GCC system_header` into the replacement headers it
-                        // GENERATES INTO THE BUILD DIRECTORY. So the depfile answer
-                        // silently drops build-dir files that must be materialized.
-                        // Measured 2026-08-24 on gnum4-1.4.21: `gcc -MM -I. quotearg.c`
-                        // declares 15 headers with lib/wchar.h and lib/limits.h absent,
-                        // `gcc -M` lists both, and the textual scan finds both. The
-                        // task then compiled against the SYSTEM wchar.h and died
-                        // `implicit declaration of function 'mbszero'` - a wrong-header
-                        // failure wearing a missing-prototype message, because an angle
-                        // include that was never materialized SUCCEEDS at finding the
-                        // wrong file.
-                        //
-                        // Neither answer is a superset of the other: the scan is blind
-                        // to computed includes (cmake's kwsys), the depfile is blind to
-                        // pragma-marked build-dir headers (every autotools package
-                        // carrying gnulib). Union them, scan order first. Over-declaring
-                        // is the pipeline's safe polarity - an extra input costs one
-                        // upload - while under-declaring is silent and ships the wrong
-                        // artifact.
-                        let merged = merge_scan_and_preprocessor(scanned, deps);
-                        eprintln!(
-                            "nix-ninja: computed include unresolvable by scan; \
+    let c_includes =
+        match depfile_read_back(build_dir, AsRef::<Path>::as_ref(store_dir), depfile, &files) {
+            Some(deps) => deps,
+            None => {
+                let (scanned, incomplete) = c_include_parser::retrieve_c_includes_checked(
+                    cmdline,
+                    files.clone(),
+                    virtual_paths,
+                )?;
+                // THE SCAN NOW SAYS WHEN IT CANNOT ANSWER, AND THIS IS WHAT
+                // ACTS ON IT. A computed include through a function-like macro
+                // needs real expansion against the command line's -D set, which
+                // a textual parser cannot do and which the preprocessor does by
+                // definition. Measured 2026-08-24 on cmake-minimal's bootstrap:
+                // `#include KWSYS_HEADER(Directory.hxx)` with
+                // -DKWSYS_NAMESPACE=cmsys, so every kwsys TU reached its task
+                // with no cmsys/ header declared and died "No such file or
+                // directory" - the scan's silence read as a complete answer.
+                //
+                // It runs for those TUs ALONE. The scan is exact for the
+                // overwhelming majority, and paying a preprocess per object
+                // would hand back the time per-TU derivations exist to save.
+                //
+                // The fallback's polarity is deliberate: if gcc itself fails
+                // here, keep the scan's answer and let the TASK fail loudly.
+                // Substituting an empty or partial set on a failed preprocess
+                // would turn a build error into a wrong artifact, which is the
+                // one outcome worse than the bug being fixed.
+                if incomplete {
+                    match deps_infer::gcc_depfile::retrieve_c_includes(cmdline) {
+                        Ok(deps) => {
+                            // THE PREPROCESSOR ADDS TO THE SCAN, IT DOES NOT REPLACE IT.
+                            // `-MM` (include_system_headers: false) omits every header gcc
+                            // considers a SYSTEM header, and that is a property of the
+                            // FILE rather than of where it lives: gnulib writes
+                            // `#pragma GCC system_header` into the replacement headers it
+                            // GENERATES INTO THE BUILD DIRECTORY. So the depfile answer
+                            // silently drops build-dir files that must be materialized.
+                            // Measured 2026-08-24 on gnum4-1.4.21: `gcc -MM -I. quotearg.c`
+                            // declares 15 headers with lib/wchar.h and lib/limits.h absent,
+                            // `gcc -M` lists both, and the textual scan finds both. The
+                            // task then compiled against the SYSTEM wchar.h and died
+                            // `implicit declaration of function 'mbszero'` - a wrong-header
+                            // failure wearing a missing-prototype message, because an angle
+                            // include that was never materialized SUCCEEDS at finding the
+                            // wrong file.
+                            //
+                            // Neither answer is a superset of the other: the scan is blind
+                            // to computed includes (cmake's kwsys), the depfile is blind to
+                            // pragma-marked build-dir headers (every autotools package
+                            // carrying gnulib). Union them, scan order first. Over-declaring
+                            // is the pipeline's safe polarity - an extra input costs one
+                            // upload - while under-declaring is silent and ships the wrong
+                            // artifact.
+                            let merged = merge_scan_and_preprocessor(scanned, deps);
+                            eprintln!(
+                                "nix-ninja: computed include unresolvable by scan; \
                              scan and preprocessor union to {} input(s)",
-                            merged.len()
-                        );
-                        merged
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "nix-ninja: computed include unresolvable by scan and the \
+                                merged.len()
+                            );
+                            merged
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "nix-ninja: computed include unresolvable by scan and the \
                              preprocessor fallback failed ({e}); keeping the scan's {} \
                              input(s), so the task fails loudly rather than silently \
                              building with the wrong ones",
-                            scanned.len()
-                        );
-                        scanned
+                                scanned.len()
+                            );
+                            scanned
+                        }
                     }
+                } else {
+                    scanned
                 }
-            } else {
-                scanned
             }
-        }
-    };
+        };
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
     let mut to_upload: Vec<PathBuf> = Vec::new();
