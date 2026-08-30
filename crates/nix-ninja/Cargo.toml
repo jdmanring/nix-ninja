@@ -33,6 +33,8 @@ which = "7.0.2"
 # Already in the lock via vendor-n2's own benches, so this adds no new
 # dependency to the tree - see upstream #4.
 divan = "0.1.16"
+# for the #41 mmap comparison; already a dependency of this crate.
+libc = "0.2"
 
 [[bench]]
 name = "generate"
