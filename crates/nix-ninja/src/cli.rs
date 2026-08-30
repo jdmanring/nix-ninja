@@ -83,11 +83,22 @@ pub fn run() -> Result<()> {
     }
 
     let rpc_client = Arc::new(BuilderRpcClient::connect_from_env()?);
-    let derived_file = build(&cli, &build_dir, &rpc_client)?;
+    let derived_files = build(&cli, &build_dir, &rpc_client)?;
     if cli.is_output_derivation {
-        submit_outer_output(&cli.store_dir, &derived_file, &rpc_client)?;
+        // ONE output derivation is submitted back, so this mode still takes
+        // exactly one target: a derivation has one result to hand back and
+        // there is no defined answer for two. Refused by name rather than
+        // by silently submitting the first.
+        let [derived_file] = derived_files.as_slice() else {
+            return Err(anyhow!(
+                "NIX_NINJA_DRV builds submit one output derivation, so exactly \
+                 one target is required; got {}",
+                derived_files.len()
+            ));
+        };
+        submit_outer_output(&cli.store_dir, derived_file, &rpc_client)?;
     } else {
-        local::symlink_derived_files(&rpc_client, &cli.store_dir, &build_dir, &[derived_file])?;
+        local::symlink_derived_files(&rpc_client, &cli.store_dir, &build_dir, &derived_files)?;
     }
     Ok(())
 }
@@ -127,7 +138,11 @@ fn submit_outer_output(
     Ok(())
 }
 
-fn build(cli: &Cli, build_dir: &Path, rpc_client: &Arc<BuilderRpcClient>) -> Result<DerivedFile> {
+fn build(
+    cli: &Cli,
+    build_dir: &Path,
+    rpc_client: &Arc<BuilderRpcClient>,
+) -> Result<Vec<DerivedFile>> {
     let config = BuildConfig {
         build_dir: build_dir.to_path_buf(),
         store_dir: cli.store_dir.clone(),
@@ -167,7 +182,18 @@ fn subtool(
         "drv" => {
             let cli = Cli::parse();
             let rpc_client = Arc::new(BuilderRpcClient::connect_from_env()?);
-            let derived_file = build(&cli, build_dir, &rpc_client)?;
+            let derived_files = build(&cli, build_dir, &rpc_client)?;
+            // `-t drv` prints ONE derivation as a JSON object keyed by its
+            // path, mimicking `nix derivation show`. Two targets have no
+            // single answer, so this refuses rather than picking the first
+            // and printing something a consumer would parse as complete.
+            let [derived_file] = derived_files.as_slice() else {
+                return Err(anyhow!(
+                    "-t drv shows one derivation, so exactly one target is \
+                     required; got {}",
+                    derived_files.len()
+                ));
+            };
             let drv_path = derived_file.derived_path.root_path();
             let bytes = rpc_client.clone_drv(drv_path).ok_or_else(|| {
                 anyhow!(

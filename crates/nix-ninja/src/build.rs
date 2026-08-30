@@ -22,7 +22,14 @@ pub fn build(
     targets: Vec<String>,
     config: BuildConfig,
     rpc_client: &Arc<BuilderRpcClient>,
-) -> Result<DerivedFile> {
+) -> Result<Vec<DerivedFile>> {
+    // An empty target list is refused HERE rather than producing an empty
+    // result: `nix-ninja` with no target used to reach `targets.first()`,
+    // find None and report "unimplemented", which named the wrong thing.
+    if targets.is_empty() {
+        return Err(anyhow!("at least one target is required"));
+    }
+
     let mut loader = load_file(build_filename)?;
 
     let tools = task::Tools::new(&config.store_dir)?;
@@ -41,26 +48,43 @@ pub fn build(
 
     let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner);
 
-    // TODO: Support multiple targets, probably treat it like a dynamically
-    // generated phony target.
-    let Some(name) = targets.first() else {
-        return Err(anyhow!("unimplemented"));
-    };
-    let fid = scheduler
-        .lookup(name)
-        .ok_or_else(|| anyhow!("unknown path requested: {}", name))?;
-    let _ = scheduler.want_file(fid);
+    // `ninja a b c` is ordinary usage, and the TODO this replaces has been
+    // open since the first commit.
+    //
+    // EVERY NAME IS RESOLVED BEFORE THE SCHEDULER RUNS, so an unknown
+    // target names itself immediately instead of surfacing later as a
+    // missing derived file for a FileId the reader cannot map back to a
+    // name.
+    //
+    // The multi-target idea and the want_file fix below are
+    // @RCoeurjoly's, from #43. This is that PR's CLI boundary rebased,
+    // WITHOUT its phony mechanism, which is a separate design question
+    // discussed in #5.
+    let mut target_fids: Vec<(String, FileId)> = Vec::with_capacity(targets.len());
+    for name in &targets {
+        let fid = scheduler
+            .lookup(name)
+            .ok_or_else(|| anyhow!("unknown path requested: {}", name))?;
+        // Was `let _ = scheduler.want_file(fid)`. want_file is what detects
+        // a dependency CYCLE, so discarding its Result turned the one error
+        // it exists to raise into a build that proceeds and fails later
+        // somewhere else. @RCoeurjoly's fix, not ours.
+        scheduler.want_file(fid)?;
+        target_fids.push((name.clone(), fid));
+    }
     scheduler.run()?;
 
-    // println!("Successfully generated all derivations");
+    let mut outputs = Vec::with_capacity(target_fids.len());
+    for (name, fid) in &target_fids {
+        let derived_file = runner.derived_files.get(fid).ok_or(anyhow!(
+            "Missing derived file {:?} for target {}",
+            fid,
+            name
+        ))?;
+        outputs.push(derived_file.clone());
+    }
 
-    let derived_file = runner.derived_files.get(&fid).ok_or(anyhow!(
-        "Missing derived file {:?} for target {}",
-        fid,
-        name
-    ))?;
-
-    Ok(derived_file.clone())
+    Ok(outputs)
 }
 
 fn load_file(build_filename: &str) -> Result<load::Loader> {
