@@ -9,9 +9,28 @@ drafts in this directory described PRs that had no branch behind them.
     pr/<slug>      one branch per PR, branched from upstream/main, pushed to origin
 
 `upstream/main`, never our `main`: a branch cut from `main` carries 284 commits
-of unrelated work and is not reviewable. The four `feature/*` branches in
-`git branch -r` are UPSTREAM's, mirrored by fetch - do not build on them and do
-not treat their names as ours.
+of unrelated work and is not reviewable.
+
+**The fork's branch list is a published surface, and it carried four branches
+that were not ours.** `feature/cmake-example`, `feature/dep-infer-clang`,
+`feature/example-lix` and `feature/modules-devshell` were on
+`github.com/jdmanring/nix-ninja` from the day the fork was made: GitHub's fork
+operation COPIES every branch, it is not a fetch-time mirror, and a note here
+that called it one was wrong. Anyone opening the fork saw four of the
+maintainer's abandoned WIP branches sitting beside our work as though we were
+carrying them.
+
+Deleted from `origin` on 2026-08-30. Nothing is lost, which is the reason it
+was safe: the `upstream` remote fetches them from pdtpartners, so
+`upstream/feature/*` still resolves and `their-branches.md` still has its
+subject. Restore any of them with
+
+    git push origin upstream/feature/<name>:refs/heads/feature/<name>
+
+**The rule: only branches we author belong on `origin`.** A `pr/*` branch is
+ours and is meant to be seen. An inherited `feature/*` is upstream's record,
+reachable through the `upstream` remote, and republishing it says something
+about us that is not true.
 
 There is no `develop` branch in this repository and nothing to cherry-pick onto.
 That convention belongs to other repos; here the default branch is `main`, as

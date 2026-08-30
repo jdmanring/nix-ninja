@@ -4,6 +4,11 @@ Written 2026-08-30 after `git branch -r` surfaced four upstream branches no
 sweep had looked at. The first version of this file drew the wrong conclusion
 from them twice, and both corrections are the point of it.
 
+**Where they live, corrected 2026-08-30:** these were also on OUR fork, because
+GitHub copies every branch when a fork is created. They have been deleted from
+`origin`; the `upstream` remote still fetches them, so every ref cited below
+resolves. See `branching.md`.
+
 ## The four branches are PR head branches, not stray WIP
 
     upstream/feature/cmake-example      306a434  2025-04-02  -> PR #24, CLOSED
