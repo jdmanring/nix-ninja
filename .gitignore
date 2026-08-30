@@ -30,3 +30,7 @@ __pycache__/
 # looks for them. Untracked, so they never reach upstream.
 /CLAUDE.md
 /.graphifyignore
+
+# cargo-mutants writes its run directory here (local/mutants.sh).
+/mutants.out/
+/mutants.out.old/
