@@ -310,7 +310,7 @@ invocation, not a machine-wide edit:
 | dynamic dependencies, and generated sources | `docs/dynamic-deps.md` |
 | ninja `dyndep`, Fortran `.mod` and C++20 modules | the header comment of `crates/nix-ninja/src/dyndep.rs`, which is where that subject is written down; `docs/` has nothing on it |
 | the daemon wedge: incident and failed reproduction | `docs/daemon-wedge.md` |
-| what is staged for upstream, and its plan | `docs/upstream/` |
+| what is staged for upstream, and its plan | `docs/upstream/`, and `docs/upstream/ledger.tsv` is the CHECKABLE list - run `scripts/upstream-ledger.py`, which fails when a path deviating from `upstream/main` belongs to no item. Do not answer "is everything staged" from prose or memory |
 | incidents, per date | `docs/incidents/` |
 | ArtNix's thirteen opt-outs, in six families | `docs/opt-out-triage.md` |
 | dynamic derivations, from the beginning | `docs/dynamic-derivations.md` |

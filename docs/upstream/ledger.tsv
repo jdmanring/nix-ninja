@@ -1,0 +1,21 @@
+# id	title	destination	branch	draft	status	paths
+1	daemon wedge	NixOS/nix issue	-	nix-daemon-wedge-issue.md	drafted	scripts/daemon-stress-bisect.py
+2	dependency inference input classes	nix-ninja PR	-	-	undrafted	crates/deps-infer/src/c_include_parser.rs;crates/deps-infer/src/gcc_include_parser.rs;crates/deps-infer/src/gcc_depfile.rs;crates/deps-infer/Cargo.toml;crates/nix-ninja/tests/include_dir_shadow.rs
+3	driver performance	comment into their #7/#4	-	issue-replies.md	drafted	-
+4	multiple CLI targets	nix-ninja PR	-	pr3-multiple-targets.md	drafted	-
+5	resolve-memo cache	comment into their #17	-	issue-replies.md	drafted	crates/nix-ninja/src/resolve_cache.rs
+7	devstore script	nix-ninja PR	pr/devstore-script	devstore-pr.md	branched	contrib/devstore.sh;CONTRIBUTING.md
+9	bug-fix batch (4 fixes)	nix-ninja PR	-	bugfix-batch-pr.md	drafted	crates/nix-ninja-task/src/patchelf.rs
+10	ninja dyndep support	QUESTION first	-	-	blocked-on-james	crates/nix-ninja/src/dyndep.rs
+11	n2 scanner soundness	evmar/n2 PR	-	n2-scanner-soundness.md	drafted	vendor-n2/src/scanner.rs;vendor-n2/Cargo.toml
+12	boost patch collision	NixOS/nix issue	-	nix-boost-patch-collision.md	drafted	flake.nix;flake.lock
+13	configure caching (their #16)	nix-ninja PR	pr/configure-caching	configure-caching-16.md	branched	modules/flake/pkgs/mkMesonPackage/default.nix
+14	end-to-end benchmarks (their #7)	nix-ninja PR	pr/bench-e2e	bench-prs.md	branched	bench/e2e.sh;bench/records/README.md;bench/records/2026-08-30-example-nix.json;bench/records/2026-08-30-example-dynamic-deps.json
+15	generation benchmarks (their #4)	nix-ninja PR	pr/bench-generate	bench-prs.md	branched	crates/nix-ninja/benches/generate.rs
+16	async nix store add (their #18)	nix-ninja PR	-	-	undrafted	crates/nix-builder-rpc-client/src/lib.rs;crates/nix-builder-rpc-client/Cargo.toml
+17	whole-graph task-builder classes	nix-ninja PR	-	-	undrafted	crates/nix-ninja-task/src/main.rs;crates/nix-ninja-task/src/derived_file.rs
+18	CMake support (their #20)	nix-ninja PR	-	-	undrafted	modules/flake/pkgs/mkCMakePackage/default.nix;modules/flake/examples/cmake-hello/CMakeLists.txt;modules/flake/examples/cmake-hello/main.cpp
+19	the driver itself	SEVERAL offers	-	-	unseparated	crates/nix-ninja/src/task.rs;crates/nix-ninja/src/build.rs;crates/nix-ninja/src/cli.rs;crates/nix-ninja/src/local.rs;crates/nix-ninja/src/lib.rs;crates/nix-ninja/src/subtool/dynamic_task.rs;crates/nix-ninja/Cargo.toml
+20	packaging glue	SEVERAL offers	-	-	unseparated	modules/flake/overlays.nix;modules/flake/packages.nix
+21	vendored n2 fork	consumed as a library	-	n2-scanner-soundness.md	carried	vendor-n2/
+22	local-only, never sent	-	-	-	local-only	docs/;.graphifyignore;Cargo.lock;README.md;modules/flake/examples/hello/;.gitignore;CLAUDE.md

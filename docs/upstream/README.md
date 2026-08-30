@@ -226,6 +226,29 @@ that differ. The count of files in a vendored copy says nothing about the
 divergence, and quoting it as though it did is what turned a forty-line patch
 into an unsendable pile.
 
+## The ledger, which is the only answer to "is everything staged"
+
+`ledger.tsv` lists every contribution item with its destination, its branch and
+its draft. `scripts/upstream-ledger.py` checks it against the repository and
+FAILS when they disagree:
+
+    scripts/upstream-ledger.py              # full report, exit 1 on any gap
+    scripts/upstream-ledger.py --summary    # counts only
+
+It answers three questions every run: does every path deviating from
+`upstream/main` belong to an item (an unclaimed path is a contribution nobody
+has chosen a destination for), does every branch the ledger names exist, and
+does every draft it names exist. Its first run found two unclaimed paths, which
+is the check working rather than a formality.
+
+**This proves the ledger is CONSISTENT. It never proves an item is READY.**
+Readiness is each draft's own audit block, and the blocking condition below is
+unchanged. A green ledger with `undrafted=4` is an accurate report of an
+incomplete job.
+
+`coverage-inventory.md` is the prose reading of the same data, taken 2026-08-30,
+and it says the four branches carry about 3% of the changed lines.
+
 ## Every file in this directory, because five of them were not indexed here
 
 A file nobody links is a file the next sweep does not read, and this directory
@@ -249,6 +272,9 @@ Offers, each drafted as something that goes somewhere:
 
 Working documents, which are OURS and go nowhere:
 
+    ledger.tsv                   the checkable list; scripts/upstream-ledger.py
+    coverage-inventory.md        the deviation count, and what is not staged
+    bench-prs.md                 PR bodies for the two benchmark branches
     roadmap-coverage.md          their todo.md and milestones, against this fork
     their-branches.md            their branches and PRs, and which were unread
     pr37-libclang.md             their open libclang draft, read and answered
