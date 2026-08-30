@@ -13,6 +13,14 @@ largest of them four source files. Most of what follows is not a feature request
 report of what breaks at that scale, with the fix that was needed to get past
 it.
 
+**BEFORE ADDING AN ITEM, ENUMERATE THE PULL REQUESTS.** Issues here were
+enumerated by hand more than once; PRs never were, so until 2026-08-30 this
+directory referenced exactly the three PRs something else had led it to (#26,
+#43, #56) out of seven open. `gh pr list --state all` is one command.
+`their-branches.md` has what that missed, and the one that bears on the
+largest item is **#37**, the maintainer's own open draft replacing dependency
+inference with libclang.
+
 ## What is being offered, in the order it should go
 
 The order is not arbitrary. Each item is placed by what a maintainer needs in

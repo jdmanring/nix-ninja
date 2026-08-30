@@ -17,7 +17,7 @@ code already written, and neither was visible as covered.
 | `nix store add` async | #18 | **built** 2026-08-23, both halves: batched per-task adds (be123e1) and a NAR stamp map that survives a restart (cfba53e, flushed at end of run by 4a7edff). This row said "not built" until 2026-08-29 while the sweep below said landed, which is the summary contradicting its own body |
 | Benchmarks for generating derivations | #4 | the instrument exists (per-phase timers, see the second sweep); no benchmark against their reference tree |
 | Benchmarks for end-to-end compilation | #7 | same instrument, same gap |
-| CMake example (`help wanted`) | #20 | **built** - `mkCMakePackage` plus `example-cmake-hello`, which builds and runs (0c53804); absent from `upstream/main`, so it is ours to offer. Still gated on PR #43, see below |
+| CMake example (`help wanted`) | #20 | **built** - `mkCMakePackage` plus `example-cmake-hello`, which builds and runs (0c53804); absent from `upstream/main`, so it is ours to offer. Gated on PR #43 (see below) and on PR **#24**, the maintainer's own CMake example, CLOSED 2025-04-03 with one comment: "Conflicts with #25". It lost a merge race rather than an argument, and its 18 lines of `task.rs` include a defect we later rediscovered - see `their-branches.md` |
 | meson `-fuse-ld` linker missing from task PATH | #52 | **built** 2026-08-23 (50fad25): the requested linker resolves outside the sandbox and rides in as input + PATH; bfd exempt, unresolved keeps the compiler's own error |
 
 ## The two that are covered and did not look it
