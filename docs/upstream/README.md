@@ -32,6 +32,7 @@ hand before the next one makes sense.
 | 9 | The bug-fix batch, five fixes in their crates | PR on nix-ninja | drafted 2026-08-29, `bugfix-batch-pr.md`; the one item blocked by nothing else here |
 | 10 | ninja `dyndep` support | a QUESTION first, then maybe a PR | not drafted, and it needs James's decision before it is |
 | 11 | UB in n2's `read_file_with_nul` | PR on **`evmar/n2`** | drafted 2026-08-29, `n2-scanner-soundness.md`; best odds in this directory |
+| 12 | boost patch collision from nix's own override | issue/PR on **NixOS/nix** | drafted 2026-08-29, `nix-boost-patch-collision.md`; reproduced by build here |
 
 **9 AND 10 WERE ADDED 2026-08-29, and 10 is a question rather than an offer.**
 Everything between 2026-08-26 and 2026-08-29 was unmapped until then: this

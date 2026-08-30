@@ -54,9 +54,28 @@
   - Reaches us at `modules/flake/overlays.nix:96` and `:100`, which build
     `inputs.nix.packages.<sys>.nix`, and at the NixOS test in
     `modules/nixos/tests/nix-build.nix:87`.
-  - Read off the pinned sources on 2026-08-29 and NOT reproduced by a build
-    here. ArtNix has the failing build and the two drvPaths either side of the
-    fix; this tree has only the mechanism. Those are different claims.
+  - REPRODUCED HERE 2026-08-29, by `nix flake check`. The six NixOS VM checks
+    fail because `boost-1.89.0` fails, and the log is unambiguous: nix's
+    patch applies, `cmake-paths-188` applies, then nixpkgs' `0921b9fd` fails
+    "Hunk #1 FAILED at 87" in `boost/context/fiber_fcontext.hpp`. This entry
+    previously said the mechanism was read and not reproduced; that is no
+    longer the weaker claim it was.
+  - And the patch nix prepends is REDUNDANT, which is stronger than the
+    ordering argument this entry used to make. Its header reads
+    `From 5883212311535a0046031d74d1568ae173c1e35b` - the same commit nixpkgs
+    already fetches as its second context patch. nixpkgs applies `0921b9fd`
+    first because it adds `BOOST_NOINLINE` to the very lines `5883212` then
+    rewrites; nix prepending `5883212` breaks that order and adds nothing,
+    because nixpkgs was going to apply it anyway.
+  - Not fixable from this flake. `inputs.nix.inputs.nixpkgs.follows =
+    "nixpkgs"`, but nix's flake imports that nixpkgs itself, so an overlay
+    here never reaches the `pkgs.boost` its `dependencies.nix` calls
+    `.override` on. Checked on the forge the same day: NixOS/nix master still
+    carries the override, so an input bump does not fix it either.
+  - Consequence to state plainly rather than work around: the six NixOS VM
+    checks CANNOT pass here until upstream nix drops that patches argument or
+    nixpkgs stops carrying `5883212`. The seven code-quality checks are
+    unaffected and pass.
   - It is nix's bug rather than nixpkgs'. If it survives a bump it belongs
     upstream at NixOS/nix, not in `docs/upstream/`, which is for
     pdtpartners/nix-ninja.
