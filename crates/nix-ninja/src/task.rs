@@ -6039,6 +6039,75 @@ fn merge_scan_and_preprocessor(scanned: Vec<PathBuf>, preprocessed: Vec<PathBuf>
     out
 }
 
+#[cfg(test)]
+mod generated_not_yet_written_tests {
+    use super::generated_not_yet_written;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// The example-nix shape: declared virtual, not on disk. Skipped,
+    /// because the producing edge supplies it as an order-only input.
+    #[test]
+    fn a_declared_virtual_file_that_is_absent_is_skipped() {
+        let bd = std::env::temp_dir();
+        let g = PathBuf::from("src/nix/nix.p/unpack-channel.nix.gen.hh");
+        let mut vp = HashMap::new();
+        vp.insert(g.clone(), g.clone());
+        assert!(generated_not_yet_written(&bd, &g, Some(&vp)));
+    }
+
+    /// NEGATIVE CONTROL ONE: absent but never declared virtual. This is a
+    /// real missing input and must still reach the upload, where it fails
+    /// loudly rather than vanishing from the task's inputs.
+    #[test]
+    fn an_absent_file_nobody_declared_is_not_skipped() {
+        let bd = std::env::temp_dir();
+        let vp: HashMap<PathBuf, PathBuf> = HashMap::new();
+        let missing = PathBuf::from("no-such-header-anywhere.h");
+        assert!(!generated_not_yet_written(&bd, &missing, Some(&vp)));
+        assert!(!generated_not_yet_written(&bd, &missing, None));
+    }
+
+    /// NEGATIVE CONTROL TWO, and it is the one that would silently corrupt
+    /// a build: a file that IS declared virtual but exists on disk is a
+    /// real file and must still be uploaded. Skipping it would drop its
+    /// bytes from the task.
+    #[test]
+    fn a_declared_virtual_file_that_exists_is_still_uploaded() {
+        let bd = std::env::temp_dir().join(format!("nngen{}", std::process::id()));
+        std::fs::create_dir_all(&bd).unwrap();
+        let rel = PathBuf::from("real.h");
+        std::fs::write(bd.join(&rel), b"#pragma once\n").unwrap();
+        let mut vp = HashMap::new();
+        vp.insert(rel.clone(), rel.clone());
+        assert!(!generated_not_yet_written(&bd, &rel, Some(&vp)));
+        std::fs::remove_dir_all(&bd).ok();
+    }
+}
+
+/// A discovered include that the caller declared virtual and that nothing
+/// has written yet: generated during the build, so it is a dependency with
+/// no bytes to upload. Gated on BOTH - a file that merely does not exist is
+/// a real defect and must still reach the upload, where it fails loudly.
+fn generated_not_yet_written(
+    build_dir: &Path,
+    include: &Path,
+    virtual_declared: Option<&HashMap<PathBuf, PathBuf>>,
+) -> bool {
+    let Some(vp) = virtual_declared else {
+        return false;
+    };
+    if !(vp.contains_key(include) || vp.values().any(|v| v == include)) {
+        return false;
+    }
+    let abs = if include.is_absolute() {
+        include.to_path_buf()
+    } else {
+        build_dir.join(include)
+    };
+    !abs.exists()
+}
+
 pub fn discover_c_includes(
     rpc_client: &Arc<BuilderRpcClient>,
     store_dir: &StoreDir,
@@ -6048,6 +6117,9 @@ pub fn discover_c_includes(
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
     depfile: Option<&Path>,
 ) -> Result<(Vec<DerivedFile>, Vec<StorePath>)> {
+    // The virtual set is consumed by the scan below; the UPLOAD filter
+    // further down needs it too, so keep a copy. See generated_not_yet_written.
+    let virtual_declared: Option<HashMap<PathBuf, PathBuf>> = virtual_paths.clone();
     // UPSTREAM #17, THE READ-BACK HALF: a depfile already on disk is the
     // COMPILER'S OWN answer to the question the BFS scan approximates, so
     // when one exists and is FRESH it replaces the scan outright. Fresh
@@ -6165,6 +6237,29 @@ pub fn discover_c_includes(
                 discovered_store_paths.push(store_path);
                 continue;
             }
+        }
+
+        // A GENERATED HEADER HAS NO BYTES TO UPLOAD YET, AND UPLOADING IT
+        // IS THE SECOND HALF OF THE SAME FAILURE. The scan now declares a
+        // declared-but-absent build-dir file instead of dying on it, which
+        // is correct - it IS a dependency - but the declaration then
+        // arrived here and `new_opaque_file` canonicalized it:
+        //     canonicalize src/nix/nix.p/unpack-channel.nix.gen.hh
+        //     No such file or directory (os error 2)
+        // Measured driving example-nix on 2026-08-30, one layer past the
+        // read that failed before it.
+        //
+        // Skipping the upload does NOT drop the dependency, and that is the
+        // whole reason this is safe rather than a silent under-declaration:
+        // ninja declares the generated header ORDER-ONLY on the compile
+        // edge, and `Task::new` reads `build.ordering_ins()`, which spans
+        // order-only inputs by construction (`vendor-n2/src/graph.rs`). So
+        // the file is already a Built input of this task, supplied by the
+        // derivation of the edge that generates it. Uploading it as an
+        // opaque source would be a second, contentless spelling of an input
+        // the task already has.
+        if generated_not_yet_written(build_dir, &include, virtual_declared.as_ref()) {
+            continue;
         }
 
         // Regular file: queued for a batched store add below.
