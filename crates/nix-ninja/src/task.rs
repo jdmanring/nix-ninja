@@ -1958,7 +1958,7 @@ impl Runner {
         for dir in tmpl_dirs {
             for entry in std::fs::read_dir(&dir)?.flatten() {
                 let p = dir.join(entry.file_name());
-                if !p.extension().is_some_and(|e| e == "template")
+                if p.extension().is_none_or(|e| e != "template")
                     || input_set.contains_key(&p)
                     || !p.is_file()
                 {
@@ -4753,7 +4753,7 @@ fn python_syspath_dirs(dir: &Path) -> Result<Vec<PathBuf>> {
         .map_err(|e| anyhow!("read_dir({}) for sys.path scan: {e}", dir.display()))?;
     for entry in entries.flatten() {
         let p = entry.path();
-        if !p.extension().is_some_and(|e| e == "py") {
+        if p.extension().is_none_or(|e| e != "py") {
             continue;
         }
         let Ok(body) = fs::read_to_string(&p) else {
@@ -4997,7 +4997,7 @@ fn python_import_names_uncached(pkg: &Path) -> Result<Vec<String>> {
         .map_err(|e| anyhow!("read_dir({}) for import scan: {e}", pkg.display()))?;
     for entry in entries.flatten() {
         let p = entry.path();
-        if !p.extension().is_some_and(|e| e == "py") {
+        if p.extension().is_none_or(|e| e != "py") {
             continue;
         }
         let body = fs::read_to_string(&p)

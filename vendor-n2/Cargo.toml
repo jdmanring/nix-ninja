@@ -82,4 +82,3 @@ suspicious = { level = "allow", priority = -1 }
 dead_code = "allow"
 # rustc lints, not clippy ones, so [lints.clippy] above does not reach them.
 mismatched_lifetime_syntaxes = "allow"
-
