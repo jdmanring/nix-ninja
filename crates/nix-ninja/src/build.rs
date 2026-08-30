@@ -242,7 +242,7 @@ pub fn build(
     Ok(outputs)
 }
 
-fn load_file(build_filename: &str) -> Result<load::Loader> {
+pub(crate) fn load_file(build_filename: &str) -> Result<load::Loader> {
     let mut loader = load::Loader::new();
 
     let id = loader
