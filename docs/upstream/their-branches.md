@@ -132,6 +132,59 @@ grounds.
 recognising it as the head of a PR the directory already knew, and writing it
 up as an unread duplicate was a failure to check before accusing.
 
+## `feature/example-lix` and `feature/modules-devshell`, read on 2026-08-30
+
+Both had been judged from their DIFFSTAT rather than their content, and one of
+those judgements was wrong.
+
+**`example-lix`.** Dismissed earlier as "nothing here touches lix". The
+diffstat said `crates/nix-ninja/src/task.rs | 74 ++++-----` - seventy-four
+lines of the file this whole fork is about, waved past because the branch name
+said lix. Read now: the driver changes are two refactors and **both landed in
+`upstream/main` through other PRs**, so there is genuinely nothing to take.
+`new_opaque_file` gained a `build_dir` parameter (`upstream/main:task.rs:863`
+has that signature today) and inputs deduplicate through a set, which is PR #9
+merged, now a `HashMap<PathBuf, DerivedFile>` keyed on build path and stronger
+than the branch's `HashSet<String>`. The only unlanded content is a 169-line
+lix package we have no use for. The conclusion is unchanged and it is now
+CHECKED instead of assumed.
+
+**`modules-devshell`.** Solves `contrib/devstore.sh`'s problem the other way -
+a self-contained `nix-portable` needing no daemon, against our daemon running
+the repository's own pinned `nix`. Three details of theirs are better:
+
+1. **direnv integration**: the `shellHook` uses `direnv_layout_dir` to put the
+   store and its config beside the project. `devstore.sh` hardcodes a location.
+2. **the feature list is declared once**, as `NP_CONF_ADDITIONAL_FEATURES`,
+   where ours respells the features at each invocation.
+3. **`max-jobs = auto` and `cores = 0` are written into the store's own
+   config**; `devstore.sh` says nothing about either, so a user inherits
+   whatever their global config had.
+
+One defect to raise if we comment on #26, as review rather than as a gotcha:
+`ADDITIONAL_CONFIG_FILE` is set only inside `if command -v direnv_layout_dir`,
+then appended to unconditionally afterwards, so without direnv the two `echo`s
+redirect to an empty path. The preceding `rm $ADDITIONAL_CONFIG_FILE` is
+unguarded and unquoted.
+
+## What was taken from the four, in total
+
+    dep-infer-clang    a design answer, not code: the right engine for stage 2
+                       of the pipeline this fork already runs. Its Err(_) arm
+                       under-declares silently and must not ship either way.
+                       Written up in pr37-libclang.md.
+    cmake-example      confirmation that the which_store_path tolerance landed
+                       upstream and that ours refines it; and, found while
+                       checking it, a defect STILL LIVE in upstream/main
+                       (eager cc resolution, task.rs:43).
+    modules-devshell   three concrete improvements to devstore.sh, and one bug
+                       to raise on #26.
+    example-lix        nothing, verified rather than assumed.
+
+**Never judge a branch by the filenames in its diffstat.** Both branches in
+this section were set aside because their names described something we do not
+care about, and one was seventy-four lines of `task.rs`.
+
 ## The rule
 
 **Enumerate the PULL REQUESTS as a list, not incidentally.** Issues were
