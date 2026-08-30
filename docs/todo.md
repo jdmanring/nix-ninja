@@ -26,7 +26,7 @@
   - Left undone deliberately, both cosmetic: `DerivedFile` has no `name`
     field, and the symlink logic is a free function rather than a method on
     `DerivedFile`. Neither changes behavior and the issue asks for neither.
-- [ ] Depfile support (upstream #17) - three parts built, not yet exercised
+- [x] Depfile support (upstream #17) - three parts, exercised end to end
   - [x] If depfile defined, add that as an additional output. Gated on
     `deps = gcc` rather than on `depfile` alone: a declared output the command
     does not produce fails the task, and `depfile` on its own is a path ninja
@@ -42,11 +42,15 @@
     names, since it is the headers it speaks for: editing a header to add an
     include does not touch the .c file, and checking only the sources lets a
     stale depfile under-declare silently. Fails toward the scan.
-  - Unchecked at the top because none of it has been exercised end to end.
-    The collection runs in LOCAL mode and the examples all drive derivation
-    mode, so no build has executed it. Running `nix-ninja <target>` by hand in
-    a configured build directory against a `builder-rpc-v0` daemon exercises
-    it, and a second run in the same directory is what proves the skip.
+  - [x] Exercised end to end 2026-08-30: two local-mode runs of a two-task
+    meson project. Run 1 scans (`scan 2/6 parsed`) and collects one depfile;
+    run 2 reads it back and scans NOTHING (`scan 0/0 parsed`). Both exit 0 and
+    the binary runs.
+  - The second run is what found the defect the first could not: the command
+    line names the depfile (`-MF ...`), so once the file exists the driver
+    resolved the task's own declared output as one of its inputs and
+    materialized it read-only over the path the compiler writes. A path an
+    edge declares as an output is now never resolved as an input.
 - [ ] mkMesonPackage do configure caching
   - [x] Separate out configure and build into two derivations, behind an
     opt-in `useConfigureCache`. Opting out leaves the emitted derivation
