@@ -116,10 +116,12 @@ our approach to anything.
 
 Round 1 (2026-08-29):
 
-- Checked that the fix keeps the property the code exists for. It does:
-  capacity is reserved once and `read_to_end` writes into it. NOT measured -
-  no allocation count was taken either side, and the claim in the PR body is
-  therefore about shape, not about a benchmark. Say so or say nothing.
+- Checked that the fix keeps the property the code exists for, and MEASURED
+  it rather than leaving that as a wording problem. The test now asserts
+  `bytes.capacity() == bytes.len()` after the read and the NUL push, so the
+  buffer is still exactly `size + 1` and `read_to_end` grew nothing. The
+  earlier note said "NOT measured - say so or say nothing", which was the
+  wrong pair of options: the instrument was one assertion away.
 - The truncation repair is a behaviour change riding inside a soundness fix.
   Named in the body above rather than left for review to find, which is the
   ground rule this directory runs on.

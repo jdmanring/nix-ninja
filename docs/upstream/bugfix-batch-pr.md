@@ -37,24 +37,21 @@ than saying it in the PR body.
    declared it. Known-generated inputs now map to themselves so resolution
    succeeds before the file exists; task outputs are excluded from the map,
    which is what `dc296f3` fixes.
-5. **A trailing colon in `RPATH` survives the round trip** (`f8bb3bd`). An
-   RPATH ending in a colon carries a meaningful empty final entry;
-   `compute_new_rpath` rebuilt the list and dropped it, so the rewritten
-   search path was shorter than the one we were handed.
+5. ~~**A trailing colon in `RPATH` survives the round trip** (`f8bb3bd`).~~
+   **WITHDRAWN 2026-08-29. It fixes nothing upstream and its premise is
+   wrong.** See round 4 below. This PR carries FOUR fixes.
 
 ## What this PR must say about itself, and it is not flattering
 
-**Three of the five have not been verified against the package that named
+**Three of the four have not been verified against the package that named
 them.** hicolor-icon-theme has not been driven through the lazy `cc` path;
 libvmaf and liblapack have not been built with the virtual-path map; no
 package has been linked through the RPATH fix. Each compiles, each has the
-reasoning written down, and TWO of the five carry tests. The
-include-directory fix (`4e591a0`) has one regression test, verified failing
-first. The RPATH fix now has nine in `patchelf.rs`, a file that had none when
-`f8bb3bd` shipped - which is why `f8bb3bd` repaired one of three spellings of
-its own bug and then introduced a worse one. Recounted against the tip rather
-than restated: this body said ONE for several rounds after it stopped being
-true. "No symptom
+reasoning written down, and ONE of the four carries a test: the
+include-directory fix (`4e591a0`), whose regression test was verified failing
+first. The nine tests in `patchelf.rs` cover the withdrawn item and stay in
+this fork, since they pin a regression this fork caused and upstream never
+had. "No symptom
 appeared" is the absence of one symptom, not evidence.
 
 Say that in the PR body rather than letting a reviewer find it. The honest
@@ -69,7 +66,10 @@ send it, and it is the only item in this directory in that position.
 
 ## Audit
 
-Round 1 (2026-08-29), adversarial read of this draft against ground rule 3:
+Round 1 (2026-08-29), adversarial read of this draft against ground rule 3
+(NOTE, added at round 4: rounds 1 to 3 all audited the DRAFT against this
+fork, and none of them read `upstream/main`, which is what finally withdrew
+fix 5):
 
 - **Blocking, fixed: the draft first listed the five fixes as a flat set and
   buried the `bash` input among them.** A missing input on every task
@@ -155,7 +155,50 @@ Still owed, and none of it fixed by `e285861`:
   targets.
 - Fixes 1, 2 and 4 are untouched by all of this.
 
-Status: NOT SENDABLE, and the reason has narrowed twice. Round 1 said missing
+Round 4 (2026-08-29), after an adversarial audit and a read of
+`upstream/main`. **Fix 5 is withdrawn from this PR entirely.**
+
+- Its premise was wrong, and dangerously. An empty element in
+  `DT_RPATH`/`DT_RUNPATH` means the current directory, as in `PATH`.
+  `f8bb3bd` called the trailing empty entry "meaningful" and re-appended it;
+  round 3 went further and preserved every empty entry in place. Both wrote a
+  cwd search into patched STORE OUTPUTS, ahead of the store paths just
+  resolved - a library-injection surface, shipped as a bug fix. Reverted here:
+  the read side stays faithful, the write side drops empties.
+- **And neither defect exists upstream.** `git show
+  upstream/main:crates/nix-ninja-task/src/patchelf.rs` has
+  `.filter(|p| !p.is_empty())` in `get_rpath` and exactly ONE
+  `--print-rpath` call site. The empty-entry loss and the doubled subprocess
+  were both created by `f8bb3bd`, which is this fork's commit. So round 2's
+  two "blocking findings", and round 3's claim that the two commits must
+  travel together, were about damage we did to ourselves.
+- Had this gone as staged, a maintainer would have received a fix for a bug
+  their tree does not have, whose effect on their tree would have been to
+  introduce one. That is the worst outcome this directory exists to prevent,
+  and three rounds of auditing the DRAFT did not catch it, because none of
+  them read `upstream/main`.
+- The standing repair is a habit, not a line: **read the target branch before
+  claiming a fix applies to it.** Rounds 1 to 3 verified the fix against this
+  fork and never asked whether the bug was upstream's.
+- **Sibling sweep, because one instance of a defect is a class.** The same
+  question was put to the other four against `upstream/main`, and all four
+  survive:
+
+      1 bash input     `tools.bash` appears ZERO times upstream. Real.
+      2 include dir    upstream's `canonicalize_cached` gates on
+                       `path.as_ref().exists()`, which is true for a
+                       directory. Real, and it is the exact defect.
+      3 lazy cc        upstream resolves `which_store_path(store_dir, "cc")`
+                       eagerly in `Tools::new`. Real.
+      4 virtual_paths  upstream HAS the mechanism - the parameter and the
+                       lookup in `canonicalize_cached` - but populates it only
+                       from built inputs. Ours adds known-generated targets.
+                       An enhancement on their design rather than a bug fix,
+                       and the PR body should say so in those words.
+
+  So the batch is four, and the withdrawal was the only one of its kind.
+
+Status: NOT SENDABLE, and the reason has narrowed three times. Round 1 said missing
 repros; round 2 said fix 5 was defective; round 3 says fix 5 is repaired and
 tested at the parser but unexercised by any link, and the repros are still
 absent. The honest gate now is a single small package built at
