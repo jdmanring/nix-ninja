@@ -44,8 +44,19 @@ emits.** Two independent tests, and passing the first is not enough:
 1. **The fileset test.** `nix-ninja-task`'s `src` in `modules/flake/overlays.nix`
    is an explicit allowlist: `Cargo.{toml,lock}`, `crates/nix-{libstore,ninja-task}`,
    `crates/deps-infer`, `vendor-n2`. An edit inside it re-keys the task binary,
-   which is the builder of every emitted derivation. `crates/nix-ninja` - the
-   driver - is NOT in the allowlist.
+   which is the builder of every PLAIN task derivation (`task.rs:2139`, and
+   `tools.nix_ninja_task` is among its inputs at `:2255`). `crates/nix-ninja` -
+   the driver - is NOT in the allowlist.
+   **The driver is nevertheless the builder of every DYNAMIC task derivation**,
+   and reading only the sentence above will price that edit wrong.
+   `build_dynamic_task_derivation` sets the builder to
+   `${nix_ninja}/bin/nix-ninja` at `task.rs:2815` and inserts
+   `tools.nix_ninja` into `drv.inputs` at `:2820`, so the driver's own store
+   path is IN the key of every derivation for an edge with dynamic
+   dependencies - and of the final task derivations those emit. A pure
+   refactor of `subtool/dynamic_task.rs`, touching nothing about what is
+   emitted, still re-keys that whole subset. Free means free of BOTH binaries'
+   store paths, not only the task binary's.
    This applies to TESTS too, and a test reads as costless, which is why nobody
    prices it. A regression test added under `crates/deps-infer` moved
    `nix-ninja-task` from `2ai4n9fh` to `da3j2y88` on 2026-08-24, spending every

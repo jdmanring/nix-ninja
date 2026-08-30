@@ -60,3 +60,21 @@
   - It is nix's bug rather than nixpkgs'. If it survives a bump it belongs
     upstream at NixOS/nix, not in `docs/upstream/`, which is for
     pdtpartners/nix-ninja.
+- [ ] The dynamic task copies the whole source tree, once per translation unit
+  - `subtool/dynamic_task.rs:78` calls `copy_dir_all($src, source_dir)` in
+    stage 1, and `copy_dir_all` at `:201` does `fs::copy` per regular file: a
+    byte-for-byte recursive copy of the entire source, inside every per-TU
+    dynamic task. Cost is source size times TU count.
+  - It is there so the include scanner can resolve paths, and scanning only
+    READS. The compile happens later in the derivation this task emits, run by
+    nix-ninja-task, not here.
+  - Fits ArtNix's 2026-08-29 measurement rather than merely being consistent
+    with it: 0.50 cores of 24 with six drivers alive and two gcc processes is
+    what BLOCKED looks like, and raising `--cores` from 4 to 6 LOWERING
+    throughput is what contention on one disk looks like, not what a
+    concurrency cap looks like.
+  - Not measured here. The cheap discriminating probe is bytes copied per
+    task, or the wall time of stage 1 alone, against the same 30s window.
+  - Any fix re-keys every dynamic task derivation: the driver is their builder
+    (see the cost model in `CLAUDE.md`), so this batches with the patchelf
+    repairs rather than landing alone.
