@@ -32,6 +32,14 @@ which = "7.0.2"
 [dev-dependencies]
 # Already in the lock via vendor-n2's own benches, so this adds no new
 # dependency to the tree - see upstream #4.
+#
+# DEFER(a `cargo update` bumps divan, or the benches move to their own crate
+# outside the workspace): a dev-dependency of the DRIVER still writes a line
+# into Cargo.lock, and Cargo.lock is inside nix-ninja-task's fileset
+# allowlist. So a version bump to a benchmark that never runs inside a build
+# would re-key every banked per-TU output. Harmless in the batch that
+# introduced it, because patchelf.rs and vendor-n2 re-keyed the task binary
+# anyway, but it is a standing hazard rather than a spent one.
 divan = "0.1.16"
 # for the #41 mmap comparison; already a dependency of this crate.
 libc = "0.2"

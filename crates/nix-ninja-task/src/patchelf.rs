@@ -215,6 +215,15 @@ fn resolve_needed(lib_name: &str, rpath: &[PathBuf], store_dir: &Path) -> Result
         let lib_path = search_dir.join(lib_name);
 
         // If it's already in nix store, return None (don't add to rpath)
+        //
+        // PRE-EXISTING and untouched by this week's changes, flagged during
+        // the 2026-08-29 audit so it is on the record rather than rediscovered:
+        // this returns on the FIRST rpath entry that is store-prefixed,
+        // without checking the library actually exists there. For an rpath of
+        // `/nix/store/a/lib:/build/out/lib`, a library that lives only in the
+        // second entry is skipped. Not fixed here because nothing has been
+        // observed failing on it and a speculative change to rpath resolution
+        // is how this file acquired its last two defects.
         if lib_path.starts_with(store_dir) {
             return Ok(None);
         }

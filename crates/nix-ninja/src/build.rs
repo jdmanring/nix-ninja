@@ -56,6 +56,13 @@ fn host_nix_system() -> String {
             return s;
         }
     }
+    // These are the driver's COMPILE TARGET, not a runtime reading of the
+    // machine. They agree for a natively built binary, which is every case
+    // this tree has, and they disagree under binfmt emulation or when a
+    // remote builder runs a foreign binary - where a function named
+    // host_nix_system would then name the wrong host. NIX_NINJA_SYSTEM is
+    // the escape hatch for those, and it is the reason the escape hatch is
+    // not only about cross-compilation.
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
     match os {
