@@ -361,11 +361,40 @@ to every member of the set it governs.** Item 6's destination is dead, above.
 Nothing else in the routing moved - the nix-ninja numbers and authors were
 re-read and stand.
 
-Status: NOT SENDABLE. Six rounds are recorded; the blocking findings are in
+Round 7 (2026-08-29) was run by three independent adversarial reviewers rather
+than by the author: one on error handling and silent failure in the code, one
+on correctness against the cost model, and one standing in for the MAINTAINERS
+of the three receiving projects with instructions to falsify rather than help.
+Audit provenance, since a status line without it is an opinion:
+
+- **Every draft lost something.** The boost draft's central claim - that nix's
+  patch IS commit 5883212, "checkable from the patch header alone" - was
+  falsified by one fetch: 144 lines across two files upstream against 102 in
+  one, rebased and path-rewritten. The added hunks ARE byte-identical, which
+  is the claim that survives, and the rebase turned out to be the root cause
+  the draft had only half-stated.
+- **One whole item was withdrawn**, and only because a reviewer asked a
+  question six earlier rounds had not: what does `upstream/main` actually
+  contain. Fix 5 repaired a bug this fork created.
+- **A published number was backwards.** #41's mmap figure came from a bench
+  that touched two bytes while its comparison read 400 KB. Corrected, and the
+  direction reversed.
+- **Three of five "located, not recalled" line references were wrong** by
+  about a hundred lines, one of them citing a unit test as an implementation
+  site. That section is now cited by symbol, because a line number in a
+  document rots on the next edit and these rotted the same day.
+
+Status: NOT SENDABLE. Seven rounds are recorded; the blocking findings are in
 each draft's own audit block. What holds the set is not draft coverage: it is
 round 5's pre-PR question, which is James's to send and has not been sent.
 Drafting the remaining items does not change that and must not be reported as
 if it did.
+
+The lesson round 7 leaves for round 8 is narrower than "audit harder": the
+first six rounds audited DRAFTS against THIS TREE. Every finding above came
+from reading something else - the target branch, the upstream patch file, the
+benchmark's own code. **A draft can only be checked against the thing it
+claims about.**
 
 ## The prose gate, which lives in the other tree and so never ran here
 
