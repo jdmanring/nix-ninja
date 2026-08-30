@@ -130,6 +130,45 @@ pub fn create_symlinks(
             fs::remove_file(&dest_path)?;
         }
 
+        // A PYTHON SCRIPT IS COPIED, NOT SYMLINKED, and the reason is
+        // python's own import machinery rather than anything about nix.
+        //
+        // Python resolves `__main__`'s symlink before deriving `sys.path[0]`,
+        // so a script materialized as a symlink into the store gets
+        // /nix/store as its import root instead of the directory it appears
+        // to live in. Its siblings are then unimportable no matter how
+        // correctly they were uploaded:
+        //     from helpers import fmt
+        //     ModuleNotFoundError: No module named 'helpers'
+        // with helpers/__init__.py sitting right there beside it. Measured
+        // in isolation 2026-08-30: identical script, identical tree, symlink
+        // fails and copy succeeds.
+        //
+        // Same shape as the depfile case, where a symlink carries the
+        // store's mtime 1 and the freshness guard reads it as stale: a
+        // symlink is not a transparent stand-in for a file when something
+        // reads a property OF the link.
+        //
+        // Bounded to `.py`, and by extension rather than by content: the
+        // cost is one copy of a source file, and getting it wrong in the
+        // other direction is a build that fails with a message pointing at
+        // the wrong thing.
+        if input.build_path.extension().is_some_and(|e| e == "py") {
+            fs::copy(&source_path, &dest_path).map_err(|e| {
+                anyhow!(
+                    "Failed to copy {:?} to {}: {}",
+                    source_path,
+                    dest_path.display(),
+                    e
+                )
+            })?;
+            let mut perms = fs::metadata(&dest_path)?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(&dest_path, perms)?;
+            continue;
+        }
+
         symlink(&source_path, &dest_path).map_err(|e| {
             anyhow!(
                 "Failed to create symlink from {:?} to {}: {}",

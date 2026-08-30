@@ -330,13 +330,33 @@ impl Runner {
                         continue;
                     }
 
-                    let input = new_opaque_file(
+                    // A DECLARED INPUT CAN BRING MORE THAN ITSELF. A
+                    // python script is the case that forced this: the
+                    // edge declares tool.py and nothing it imports, so
+                    // the script starts inside the sandbox and dies on
+                    // its first `import`. upload_referenced_file uploads
+                    // the file AND, for a .py, walks its import closure.
+                    // Everything else costs one extension check.
+                    let uploaded = upload_referenced_file(
                         &self.rpc_client,
                         &self.config.build_dir,
                         file.name.clone().into(),
                     )?;
-                    self.add_derived_file(files, input.clone().to_owned());
-                    input.to_owned()
+                    let mut declared = None;
+                    for input in uploaded {
+                        self.add_derived_file(files, input.clone());
+                        if declared.is_none() {
+                            declared = Some(input.clone());
+                        } else {
+                            input_set.insert(input.build_path.clone(), input);
+                        }
+                    }
+                    // The first element is the declared file itself; the
+                    // rest are its closure and are inserted above.
+                    match declared {
+                        Some(d) => d,
+                        None => continue,
+                    }
                 }
             };
             input_set.insert(input.build_path.clone(), input.clone());
@@ -953,6 +973,662 @@ pub fn discover_c_includes(
     Ok((discovered_deps, discovered_store_paths))
 }
 
+/// Python module names shipped with the interpreter: an import of one
+/// is satisfied by the runtime, so it must never trigger the ancestor
+/// and vendored-tree probes below. Incomplete by design - a missed name
+/// costs a few stats and a failed directory probe, never a wrong file.
+const PY_STDLIB: &[&str] = &[
+    "abc",
+    "argparse",
+    "ast",
+    "base64",
+    "binascii",
+    "bisect",
+    "codecs",
+    "collections",
+    "contextlib",
+    "copy",
+    "csv",
+    "ctypes",
+    "dataclasses",
+    "datetime",
+    "difflib",
+    "enum",
+    "errno",
+    "fnmatch",
+    "functools",
+    "getopt",
+    "glob",
+    "gzip",
+    "hashlib",
+    "heapq",
+    "html",
+    "http",
+    "io",
+    "importlib",
+    "inspect",
+    "itertools",
+    "json",
+    "keyword",
+    "locale",
+    "logging",
+    "math",
+    "multiprocessing",
+    "operator",
+    "optparse",
+    "os",
+    "pathlib",
+    "pickle",
+    "platform",
+    "posixpath",
+    "pprint",
+    "queue",
+    "random",
+    "re",
+    "shlex",
+    "shutil",
+    "signal",
+    "site",
+    "socket",
+    "stat",
+    "string",
+    "struct",
+    "subprocess",
+    "sys",
+    "tempfile",
+    "textwrap",
+    "threading",
+    "time",
+    "traceback",
+    "types",
+    "typing",
+    "unittest",
+    "urllib",
+    "uuid",
+    "warnings",
+    "xml",
+    "zipfile",
+    "zlib",
+];
+
+/// Upload one referenced source file, plus - for a python script - its
+/// same-directory .py siblings (gcc_link_wrapper.py imports
+/// wrapper_utils.py; python resolves sibling imports from the script's
+/// own directory). Returns every DerivedFile created, main file first.
+/// This is THE upload path for referenced files: the ordering-ins loop,
+/// the cmdline scan's node branch and its non-node branch all route
+/// here, because the sibling rule was first added to only two of the
+/// three and the third is where GN's declared `| script` inputs go.
+fn upload_referenced_file(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    path: PathBuf,
+) -> Result<Vec<DerivedFile>> {
+    let is_py = path.extension().is_some_and(|e| e == "py");
+    let main = new_opaque_file(rpc_client, build_dir, path.clone())?;
+    let mut out = vec![main];
+    if is_py {
+        if let Some(dir) = path.parent() {
+            upload_python_closure(rpc_client, build_dir, dir, &mut out)?;
+        }
+    }
+    Ok(out)
+}
+
+/// Upload the TRANSITIVE python dependency closure rooted at a script's
+/// directory. Chromium's build scripts resolve imports through every
+/// mechanism python has - sibling modules, sibling packages, uncle
+/// directories whose names need not match the module, sys.path splices
+/// assembled across statements, and vendored version-suffixed trees
+/// (beautifulsoup4-4.9.3/py3k/bs4) - and they do it TRANSITIVELY:
+/// parse_html_deps.py, itself two packages deep, imports bs4. So every
+/// uploaded package directory gets the same scan its referencing script
+/// got, until the closure is dry. Bounded by a directory-count cap and
+/// a visited set; existence discriminates every candidate.
+fn upload_python_closure(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    start_dir: &Path,
+    out: &mut Vec<DerivedFile>,
+) -> Result<()> {
+    // Memoized on the script DIRECTORY alone. The key was
+    // (script dir, script) and that coarseness was the whole serial
+    // bottleneck at Chromium scale: the walk depends on the script only
+    // through a skip of the script's own file, so every script in a
+    // shared directory (mojom, grit: hundreds per dir) re-paid the full
+    // tree walk under a fresh key. perf on round 60: Path::join plus
+    // malloc churn under upload_python_closure_uncached at ~50% of all
+    // driver cycles. The skip is gone (the script re-uploads as one
+    // more content-cached file and the consumer's input_set dedupes by
+    // path), so the result is script-independent and one walk per
+    // directory serves every script in it.
+    out.extend(
+        python_closure_cached(rpc_client, build_dir, start_dir)?
+            .iter()
+            .cloned(),
+    );
+    Ok(())
+}
+
+/// Recursive regular-file upload of one directory, or None past the cap.
+fn walk_dir_capped(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    dir: &Path,
+    cap: usize,
+) -> Result<Option<Vec<DerivedFile>>> {
+    // Memoized process-wide: the python closure runs per TASK, and at
+    // Chromium scale the same directories recur thousands of times -
+    // including over-cap refusals, which cost a full capped walk each
+    // (the chromium root was being re-walked to 8192 entries per task,
+    // measured as the driver pinning a core while the build sat idle).
+    // Store dedup makes repeat uploads cheap; this makes them free, and
+    // makes the NEGATIVE result free too, which is the half that
+    // mattered.
+    // Keyed by (directory, cap) because the cap changes which entries a walk
+    // is allowed to return, so a hit under one cap is not a hit under another.
+    // None is a REMEMBERED NEGATIVE - the half that mattered, per the comment
+    // above - not an absent entry.
+    type WalkMemo = std::sync::Mutex<HashMap<(PathBuf, usize), Option<Vec<DerivedFile>>>>;
+    static WALK_MEMO: std::sync::OnceLock<WalkMemo> = std::sync::OnceLock::new();
+    let memo = WALK_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let key = (dir.to_path_buf(), cap);
+    if let Some(hit) = memo.lock().unwrap().get(&key) {
+        return Ok(hit.clone());
+    }
+    let result = walk_dir_capped_uncached(rpc_client, build_dir, dir, cap)?;
+    memo.lock().unwrap().insert(key, result.clone());
+    Ok(result)
+}
+
+fn walk_dir_capped_uncached(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    dir: &Path,
+    cap: usize,
+) -> Result<Option<Vec<DerivedFile>>> {
+    let mut paths = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let entries =
+            fs::read_dir(&d).map_err(|e| anyhow!("read_dir({}) for dir arg: {e}", d.display()))?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.is_file() {
+                if paths.len() >= cap {
+                    return Ok(None);
+                }
+                paths.push(p);
+            }
+        }
+    }
+    // Upload only after the whole walk fits the cap, so an over-cap dir
+    // costs a directory scan and zero store writes. Batched adds: a
+    // node_modules tree is thousands of files at one round trip each.
+    let out = new_opaque_files(rpc_client, build_dir, paths)?;
+    Ok(Some(out))
+}
+
+fn upload_python_closure_uncached(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    start_dir: &Path,
+    out: &mut Vec<DerivedFile>,
+) -> Result<()> {
+    const CLOSURE_DIR_CAP: usize = 64;
+    let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut queue: Vec<PathBuf> = vec![start_dir.to_path_buf()];
+    let upload_dir = |dir: &Path, cap: usize, out: &mut Vec<DerivedFile>| -> Result<bool> {
+        match walk_dir_capped(rpc_client, build_dir, dir, cap)? {
+            Some(files) => {
+                out.extend(files);
+                Ok(true)
+            }
+            None => {
+                eprintln!(
+                    "nix-ninja: python dep dir {} exceeds {} files; skipped",
+                    dir.display(),
+                    cap
+                );
+                Ok(false)
+            }
+        }
+    };
+    while let Some(dir) = queue.pop() {
+        if !visited.insert(dir.clone()) || visited.len() > CLOSURE_DIR_CAP {
+            continue;
+        }
+        // Siblings: every .py module, node_modules for node.py, and
+        // package directories - which recurse, because their own files
+        // import too.
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| anyhow!("read_dir({}) for python closure: {e}", dir.display()))?;
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().is_some_and(|e| e == "py") && p.is_file() {
+                out.push(new_opaque_file(rpc_client, build_dir, p)?);
+            } else if p.is_dir() && p.file_name().is_some_and(|n| n == "node_modules") {
+                upload_dir(&p, 8192, out)?;
+            } else if p.is_dir() && p.join("__init__.py").is_file() && upload_dir(&p, 512, out)? {
+                queue.push(p);
+            }
+        }
+        // Imports this directory's files make that nothing here satisfies.
+        let unsatisfied: Vec<String> = python_import_names(&dir)?
+            .into_iter()
+            .filter(|name| {
+                !PY_STDLIB.contains(&name.as_str())
+                    && !dir.join(format!("{name}.py")).is_file()
+                    && !dir.join(name).is_dir()
+            })
+            .collect();
+        if let Some(parent) = dir.parent() {
+            if !unsatisfied.is_empty() {
+                // Uncles: a directory beside this one holding <name>.py
+                // (common/ holds models.py) or BEING the named package
+                // (tracing/tracing_build/ answers import tracing_build).
+                for uncle in fs::read_dir(parent)
+                    .map_err(|e| anyhow!("read_dir({}) for uncle modules: {e}", parent.display()))?
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir() && *p != dir)
+                {
+                    let hit = unsatisfied.iter().any(|n| {
+                        uncle.join(format!("{n}.py")).is_file()
+                            || (uncle.file_name().is_some_and(|f| f == n.as_str())
+                                && uncle.join("__init__.py").is_file())
+                    });
+                    if hit && upload_dir(&uncle, 512, out)? {
+                        queue.push(uncle);
+                    }
+                }
+                // Ancestors, by chromium's layout: <root>/<name>/,
+                // <root>/third_party/<name>/, and the vendored deep
+                // shape <root>/third_party/<pkg-x.y.z>[/<subdir>]/<name>/
+                // (beautifulsoup4-4.9.3/py3k/bs4). Four levels up, first
+                // hit per name; the deep scan runs only when the cheap
+                // probes miss, and only over third_party.
+                for name in &unsatisfied {
+                    let mut anc = parent.to_path_buf();
+                    'levels: for _ in 0..4 {
+                        let Some(up) = anc.parent() else { break };
+                        anc = up.to_path_buf();
+                        for cand in [anc.join(name), anc.join("third_party").join(name)] {
+                            let module = cand.join(format!("{name}.py")).is_file();
+                            let package = cand.join("__init__.py").is_file();
+                            if module || package {
+                                if upload_dir(&cand, 8192, out)? && package {
+                                    queue.push(cand);
+                                }
+                                break 'levels;
+                            }
+                        }
+                        // A vendored tree can hold SEVERAL copies of one
+                        // package - catapult carries a legacy
+                        // beautifulsoup4/ AND beautifulsoup4-4.9.3/py3k/,
+                        // and its own sys.path assembly picks the py3 one
+                        // across three statements no scan can chase. So
+                        // collect every candidate and prefer the
+                        // python-3, version-suffixed copy: the legacy one
+                        // imports interfaces that no longer exist
+                        // (html5lib.treebuilders._base, measured).
+                        let tp = anc.join("third_party");
+                        let mut cands: Vec<PathBuf> = Vec::new();
+                        if let Ok(subs) = fs::read_dir(&tp) {
+                            for sub in subs.flatten().map(|e| e.path()) {
+                                if !sub.is_dir() {
+                                    continue;
+                                }
+                                let direct = sub.join(name);
+                                if direct.join("__init__.py").is_file() {
+                                    cands.push(direct);
+                                }
+                                // No else: a direct hit must not hide a
+                                // deeper sibling copy of the same package
+                                // (4.9.3/bs4 sits BESIDE 4.9.3/py3k/bs4,
+                                // and only the deeper one is python 3).
+                                if let Ok(subs2) = fs::read_dir(&sub) {
+                                    cands.extend(
+                                        subs2
+                                            .flatten()
+                                            .map(|e| e.path().join(name))
+                                            .filter(|d| d.join("__init__.py").is_file()),
+                                    );
+                                }
+                            }
+                        }
+                        let score = |p: &Path| -> u32 {
+                            let s = p.to_string_lossy().into_owned();
+                            let versioned = s.split('/').any(|c| {
+                                c.contains('-') && c.chars().any(|ch| ch.is_ascii_digit())
+                            });
+                            u32::from(versioned) * 2 + u32::from(s.contains("py3"))
+                        };
+                        if let Some(pkg) = cands.into_iter().max_by_key(|p| score(p)) {
+                            if upload_dir(&pkg, 8192, out)? {
+                                queue.push(pkg);
+                            }
+                            break 'levels;
+                        }
+                    }
+                }
+                // Descendants: a sys.path.insert into the importer's OWN
+                // subtree, carried through a variable the one-line splice
+                // reader cannot chase (json_schema_compiler inserts
+                // ppapi/generators and imports idl_parser from it; the
+                // ppapi dir has no __init__.py, so package recursion never
+                // descends there). Bounded walk for <name>.py or
+                // <name>/__init__.py; the CONTAINING dir uploads and
+                // queues so its own imports (idl_lexer -> ply) get chased.
+                for name in &unsatisfied {
+                    if let Some(holder) = find_module_below(&dir, name, 3) {
+                        if upload_dir(&holder, 512, out)? {
+                            queue.push(holder);
+                        }
+                    }
+                }
+            }
+            // sys.path splices readable on one line still help for the
+            // shapes the structural probes miss.
+            for sp in python_syspath_dirs(&dir)? {
+                if upload_dir(&sp, 8192, out)? {
+                    queue.push(sp);
+                }
+            }
+            // A *_project.py file is catapult's convention for a
+            // vulcanize project definition: its os.path.join lines name
+            // the DATA roots the tool searches (tracing/, polymer
+            // components), assembled from attributes no import scan can
+            // see. Each join line's quoted segments resolve against the
+            // file's own dir, its parent, and the parent's third_party;
+            // existing directories upload, same bound as everything
+            // here.
+            let has_project_file = fs::read_dir(&dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with("_project.py"));
+            if has_project_file {
+                let mut bases = vec![dir.clone()];
+                if let Some(par) = dir.parent() {
+                    bases.push(par.to_path_buf());
+                    bases.push(par.join("third_party"));
+                }
+                for seg_path in python_join_segments(&dir)? {
+                    for base in &bases {
+                        let cand = lexical_join(base, &seg_path);
+                        if cand.is_dir() && cand != dir {
+                            if upload_dir(&cand, 8192, out)? {
+                                queue.push(cand);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The memoized closure behind upload_python_closure, shared by Arc so
+/// a caller that only needs to CHECK membership (the per-task python
+/// sibling pass) iterates the one canonical copy instead of cloning
+/// thousands of DerivedFiles per hit - the clone-on-hit was 15% of
+/// driver cycles (malloc/free) on round 65's profile.
+fn python_closure_cached(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &Path,
+    start_dir: &Path,
+) -> Result<Arc<Vec<DerivedFile>>> {
+    static CLOSURE_MEMO: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<PathBuf, Arc<Vec<DerivedFile>>>>,
+    > = std::sync::OnceLock::new();
+    let memo = CLOSURE_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(hit) = memo.lock().unwrap().get(start_dir) {
+        return Ok(hit.clone());
+    }
+    let mut fresh: Vec<DerivedFile> = Vec::new();
+    upload_python_closure_uncached(rpc_client, build_dir, start_dir, &mut fresh)?;
+    let arc = Arc::new(fresh);
+    memo.lock()
+        .unwrap()
+        .insert(start_dir.to_path_buf(), arc.clone());
+    Ok(arc)
+}
+
+/// Top-level module names imported by a python package's own files:
+/// `import X` and `from X import ...`, first path segment only. Lines
+/// are trimmed before matching, so INDENTED imports count too: this
+/// scanner once matched column 0 only, reasoning that a try-block import
+/// is optional - and chromium's json_parse.py disproved it with a
+/// MANDATORY import inside try/finally whose only job is restoring
+/// sys.path around it (import json_comment_eater, 65 task failures in
+/// round 66). Over-collecting fails toward extra uploads, which the
+/// per-dir caps bound; under-collecting fails the build.
+fn python_import_names(pkg: &Path) -> Result<Vec<String>> {
+    // Memoized like walk_dir_capped and for the same reason: the
+    // closure runs per task and re-reads the same directories' file
+    // bodies thousands of times otherwise.
+    static NAMES_MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Vec<String>>>> =
+        std::sync::OnceLock::new();
+    let memo = NAMES_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(hit) = memo.lock().unwrap().get(pkg) {
+        return Ok(hit.clone());
+    }
+    let result = python_import_names_uncached(pkg)?;
+    memo.lock()
+        .unwrap()
+        .insert(pkg.to_path_buf(), result.clone());
+    Ok(result)
+}
+
+fn python_import_names_uncached(pkg: &Path) -> Result<Vec<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    let entries = fs::read_dir(pkg)
+        .map_err(|e| anyhow!("read_dir({}) for import scan: {e}", pkg.display()))?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().is_none_or(|e| e != "py") {
+            continue;
+        }
+        let body = fs::read_to_string(&p)
+            .map_err(|e| anyhow!("read({}) for import scan: {e}", p.display()))?;
+        for line in body.lines() {
+            let line = line.trim_start();
+            let rest = if let Some(r) = line.strip_prefix("import ") {
+                r
+            } else if let Some(r) = line.strip_prefix("from ") {
+                r
+            } else {
+                continue;
+            };
+            let first = rest.split([' ', '.', ',']).next().unwrap_or("");
+            if !first.is_empty() && first.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                names.insert(first.to_string());
+            }
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// Directories the .py files in `dir` splice onto sys.path, read
+/// textually: every line containing "sys.path" contributes its quoted
+/// string segments, joined in order and resolved lexically against the
+/// script directory. Existence-discriminated by the caller; a segment
+/// list that is not a real relative path simply resolves to nothing.
+fn python_syspath_dirs(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let entries = fs::read_dir(dir)
+        .map_err(|e| anyhow!("read_dir({}) for sys.path scan: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().is_none_or(|e| e != "py") {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&p) else {
+            continue;
+        };
+        for line in body.lines() {
+            if !line.contains("sys.path") {
+                continue;
+            }
+            let mut segs: Vec<&str> = Vec::new();
+            let mut rest = line;
+            while let Some(start) = rest.find(['\'', '"']) {
+                let quote = rest.as_bytes()[start] as char;
+                let after = &rest[start + 1..];
+                let Some(end) = after.find(quote) else { break };
+                let seg = &after[..end];
+                if !seg.is_empty() && !seg.contains(':') {
+                    segs.push(seg);
+                }
+                rest = &after[end + 1..];
+            }
+            if segs.is_empty() {
+                continue;
+            }
+            let rel: PathBuf = segs.iter().collect();
+            let cand = lexical_join(dir, &rel);
+            if cand.is_dir() && cand != dir && !found.contains(&cand) {
+                found.push(cand);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Quoted string segments of every os.path.join line in the *_project.py
+/// files of `dir`, each line yielding one relative path. Used only for
+/// catapult-style project definition files, whose join lines name data
+/// roots; the caller resolves against candidate bases and keeps what
+/// exists.
+fn python_join_segments(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let entries = fs::read_dir(dir)
+        .map_err(|e| anyhow!("read_dir({}) for project scan: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with("_project.py"))
+        {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&p) else {
+            continue;
+        };
+        for line in body.lines() {
+            if !line.contains("os.path.join") {
+                continue;
+            }
+            let mut segs: Vec<&str> = Vec::new();
+            let mut rest = line;
+            while let Some(start) = rest.find(['\'', '"']) {
+                let quote = rest.as_bytes()[start] as char;
+                let after = &rest[start + 1..];
+                let Some(end) = after.find(quote) else { break };
+                let seg = &after[..end];
+                if !seg.is_empty() && !seg.contains(':') {
+                    segs.push(seg);
+                }
+                rest = &after[end + 1..];
+            }
+            if !segs.is_empty() {
+                let rel: PathBuf = segs.iter().collect();
+                if !found.contains(&rel) {
+                    found.push(rel);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The directory below `root` holding `<name>.py`, or the package dir
+/// `<name>/` holding an `__init__.py` - whichever a runtime
+/// sys.path.insert into the importer's own subtree would reach. BFS to
+/// `depth`, skipping hidden dirs and node_modules; first hit wins.
+fn find_module_below(root: &Path, name: &str, depth: usize) -> Option<PathBuf> {
+    let mut frontier = vec![root.to_path_buf()];
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for d in frontier {
+            let entries = fs::read_dir(&d).ok()?;
+            for sub in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+                let fname = sub.file_name().unwrap_or_default().to_string_lossy();
+                if fname.starts_with('.') || fname == "node_modules" {
+                    continue;
+                }
+                if sub.join(format!("{name}.py")).is_file() {
+                    return Some(sub);
+                }
+                if fname == name && sub.join("__init__.py").is_file() {
+                    return Some(sub);
+                }
+                next.push(sub);
+            }
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// Join a relative path onto a base LEXICALLY: each `..` pops a base
+/// component instead of surviving into the result, so
+/// gen/ui/webui/resources/js + ../../../../../../../../../../src/x
+/// becomes ../../../../../src/x against the build dir - resolvable by
+/// the existing five-up sandbox mirror, where the raw twenty-component
+/// climb is not. Pops past the base accumulate as leading `..`.
+fn lexical_join(base: &Path, rel: &Path) -> PathBuf {
+    let mut stack: Vec<std::path::Component> = base.components().collect();
+    for c in rel.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                if matches!(stack.last(), Some(std::path::Component::Normal(_))) {
+                    stack.pop();
+                } else {
+                    stack.push(c);
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => stack.push(other),
+        }
+    }
+    stack.iter().map(|c| c.as_os_str()).collect()
+}
+
+fn new_opaque_files(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &std::path::Path,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<DerivedFile>> {
+    const PER_TASK_ADDS: usize = 8;
+    let mut out = Vec::with_capacity(paths.len());
+    for chunk in paths.chunks(PER_TASK_ADDS) {
+        let results: Vec<Result<DerivedFile>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|p| scope.spawn(move || new_opaque_file(rpc_client, build_dir, p.clone())))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow!("upload thread panicked")))
+                })
+                .collect()
+        });
+        for r in results {
+            out.push(r?);
+        }
+    }
+    Ok(out)
+}
+
 /// Removes -frandom-seed flag from a string of CFLAGS.
 fn remove_frandom_seed(flags: &str) -> String {
     flags
@@ -968,4 +1644,165 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+#[cfg(test)]
+mod python_closure_tests {
+    use super::python_import_names;
+
+    /// `find_module_below` carries the resolution: it decides which
+    /// directory an import name refers to, and every wrong answer is
+    /// either a missing input at build time or an unrelated tree uploaded.
+    /// Four conditions, four cases, because a single fixture that trips
+    /// two of them cannot tell them apart.
+    #[test]
+    fn find_module_below_finds_a_module_and_a_package_and_respects_its_bounds() {
+        use super::find_module_below;
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("nn-fmb-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        // lib/mod.py  -> a MODULE file inside a directory
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(root.join("lib/mod.py"), "").unwrap();
+        // pkg/__init__.py -> a PACKAGE directory named for the import
+        fs::create_dir_all(root.join("pkg")).unwrap();
+        fs::write(root.join("pkg/__init__.py"), "").unwrap();
+        // pkgless/ -> named right, but no __init__.py, so NOT a package
+        fs::create_dir_all(root.join("pkgless")).unwrap();
+        // .hidden and node_modules are skipped by name, and each holds a
+        // module that would otherwise match
+        fs::create_dir_all(root.join(".hidden/inner")).unwrap();
+        fs::write(root.join(".hidden/inner/buried.py"), "").unwrap();
+        fs::create_dir_all(root.join("node_modules/inner")).unwrap();
+        fs::write(root.join("node_modules/inner/vendored.py"), "").unwrap();
+        // deep/er/far.py sits two levels down
+        fs::create_dir_all(root.join("deep/er")).unwrap();
+        fs::write(root.join("deep/er/far.py"), "").unwrap();
+
+        assert_eq!(find_module_below(&root, "mod", 2), Some(root.join("lib")));
+        assert_eq!(find_module_below(&root, "pkg", 2), Some(root.join("pkg")));
+        // A directory named for the import with no __init__.py is not a
+        // package: taking it would upload an unrelated tree.
+        assert_eq!(find_module_below(&root, "pkgless", 2), None);
+        // DEPTH IS A BOUND, not a suggestion: far.py is two levels down
+        // and must be invisible at depth 1.
+        assert_eq!(find_module_below(&root, "far", 1), None);
+        assert_eq!(
+            find_module_below(&root, "far", 2),
+            Some(root.join("deep/er"))
+        );
+        // The two skipped directory names, each proven separately.
+        assert_eq!(find_module_below(&root, "buried", 3), None);
+        assert_eq!(find_module_below(&root, "vendored", 3), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The two quoted-segment scanners share a shape and each had every
+    /// mutant of it survive. Both must join multi-segment paths, skip an
+    /// empty segment and skip a segment carrying a colon (a URL or a
+    /// Windows drive is not a path component here), and dedupe.
+    #[test]
+    fn join_segments_reads_multi_segment_paths_and_skips_the_junk() {
+        use super::python_join_segments;
+        use std::fs;
+        use std::path::PathBuf;
+        let dir = std::env::temp_dir().join(format!("nn-pjs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Only a *_project.py file is read; the other must be ignored.
+        fs::write(dir.join("other.py"), "P = os.path.join('never', 'read')\n").unwrap();
+        fs::write(
+            dir.join("build_project.py"),
+            "A = os.path.join('src', 'gen')\n\
+             B = os.path.join('src', '', 'gen')\n\
+             C = os.path.join('https://x', 'y')\n\
+             D = os.path.join('src', 'gen')\n\
+             E = 'not a join call'\n",
+        )
+        .unwrap();
+        let got = python_join_segments(&dir).unwrap();
+        // A and B collapse to the same path (the empty segment is
+        // dropped, not joined as a component), D is a repeat, C's colon
+        // segment is dropped leaving only 'y', and E is not a join line.
+        assert_eq!(
+            got,
+            vec![PathBuf::from("src/gen"), PathBuf::from("y")],
+            "{got:?}"
+        );
+        // A directory with no *_project.py yields nothing rather than
+        // erroring: the scan is opportunistic.
+        let empty = dir.join("sub");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(python_join_segments(&empty).unwrap().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finds_import_and_from_first_segment() {
+        let d = std::env::temp_dir().join(format!("nn-imports-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("__init__.py"),
+            "import os\nfrom markupsafe import Markup\nfrom .environment import E\nimport sys, re\n",
+        )
+        .unwrap();
+        let names = python_import_names(&d).unwrap();
+        assert!(names.contains(&"markupsafe".to_string()));
+        assert!(names.contains(&"os".to_string()));
+        // relative import's first segment is empty and must not appear
+        assert!(!names.contains(&"".to_string()));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // The json_parse.py shape: a MANDATORY import indented inside a
+    // try/finally whose only job is restoring sys.path around it. The
+    // column-0-only scanner missed it (65 task failures, round 66).
+    #[test]
+    fn finds_indented_import_in_try_block() {
+        let d = std::env::temp_dir().join(format!("nn-imports-ind-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("json_parse.py"),
+            "import sys\ntry:\n  sys.path.insert(0, p)\n  import json_comment_eater\nfinally:\n  sys.path = s\n",
+        )
+        .unwrap();
+        let names = python_import_names(&d).unwrap();
+        assert!(names.contains(&"json_comment_eater".to_string()));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // The idl_parser shape: sys.path.insert into the importer's OWN
+    // subtree, path carried through a variable (json_schema_compiler ->
+    // ppapi/generators/idl_parser.py, 64 task failures, round 72). The
+    // probe must find a bare module two levels down, and a negative
+    // control must stay empty.
+    #[test]
+    fn finds_module_in_own_subtree() {
+        let d = std::env::temp_dir().join(format!("nn-below-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("ppapi/generators")).unwrap();
+        std::fs::write(d.join("ppapi/generators/idl_parser.py"), "x = 1\n").unwrap();
+        let hit = super::find_module_below(&d, "idl_parser", 3).unwrap();
+        assert_eq!(hit, d.join("ppapi/generators"));
+        assert!(super::find_module_below(&d, "no_such_module", 3).is_none());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn syspath_dirs_read_quoted_segments() {
+        use super::python_syspath_dirs;
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("sp-test-{}", std::process::id()));
+        let tools = root.join("tools/polymer");
+        let node = root.join("third_party/node");
+        fs::create_dir_all(&tools).unwrap();
+        fs::create_dir_all(&node).unwrap();
+        fs::write(
+            tools.join("css_to_wrapper.py"),
+            "import sys, os\nsys.path.append(os.path.join(_HERE_PATH, '..', '..', 'third_party', 'node'))\nimport node\n",
+        )
+        .unwrap();
+        let dirs = python_syspath_dirs(&tools).unwrap();
+        assert_eq!(dirs, vec![node]);
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
