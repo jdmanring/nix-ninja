@@ -80,9 +80,13 @@
   - The in-code comment at `:3040` already names the fix class for the dynamic
     copy of this call - "a memo or a batch, not depsets". The same fix applies
     to the ordinary one, which is the one that runs on every task.
-  - Cheapest next step is the timer, not the fix: the number is currently
-    inferred from a slope and a code read, and a `DYN_PLAIN_ADDDRV_MS/N` pair
-    around `:3049` turns it into a measurement. It re-keys, so it batches.
+  - The timer LANDED in `e285861`: `DYN_PLAIN_ADDDRV_MS/N` around `:3049`,
+    printed as `plain adddrv N s/N calls`. No run has produced a number from
+    it yet, so the 0.084 s/task figure is still an elimination rather than a
+    measurement, and this entry stays open until a build prints one.
+  - Do NOT fix the call before reading that number. The comment at `:3040`
+    names two candidate fixes with different shapes - a memo and a batch - and
+    this campaign has twice tuned the wrong one by picking before measuring.
 - [ ] The driver retains ~74 KiB per task and never releases it
   - Measured by ArtNix on xfce, same logs: rss 118 MiB at 1000 tasks rising
     monotonically to 339 MiB at 4000, heap 318 MiB live against 404 MiB
