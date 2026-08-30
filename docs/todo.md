@@ -28,10 +28,24 @@
     `DerivedFile`. Neither changes behaviour and the issue asks for neither.
   - This entry stayed unchecked long after the work landed and misled the
     2026-08-30 milestone sweep into reporting #5 as partial.
-- [ ] Depfile support
-  - If depfile defined, add that as an additional output
-  - Create virtual target of all depfiles to install locally into builddir
-  - Read depfile to skip dep_infer if depfile exists
+- [x] Depfile support (upstream #17) - all three parts, 2026-08-30
+  - [x] If depfile defined, add that as an additional output (dd73947, gated
+    on `deps = gcc`: a declared output the command does not produce fails the
+    task, and `depfile` alone is not a promise that anything writes one)
+  - [x] Create virtual target of all depfiles to install locally into builddir
+    (c60480c). Built as direct materialization rather than a virtual phony
+    target: the driver records each accepted depfile output and local mode
+    symlinks them in after the targets. A phony would buy a name for the set
+    and nothing else, since nothing requests it from a command line - worth
+    saying to the maintainer, whose spelling this bullet is.
+  - [x] Read depfile to skip dep_infer if depfile exists (50fad25) - guarded
+    on freshness against every source, failing toward the scan
+  - The read half was written first and could not fire until collection
+    existed: local mode materializes only the requested targets, so no
+    per-object depfile ever reached the build directory. Two thirds of this
+    item read as done for a week while the pipeline it forms was open.
+  - STILL OWED: none of it is exercised end to end. The examples drive
+    derivation mode; collection runs in local mode.
 - [ ] mkMesonPackage do configure caching
   - Separate out configure and build into two derivations
   - Put source into one output path

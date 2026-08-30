@@ -424,15 +424,15 @@ read as partial. An unchecked box outlives the work it describes unless
 somebody checks it, and this one misled a sweep whose whole purpose was to
 avoid exactly that.
 
-### 0.2.0 - three of five
+### 0.2.0 - four of five
 
 | # | state |
 |---|---|
 | 4 | **Complete.** `benches/generate.rs`, 2026-08-29 |
-| 7 | **Complete as a harness.** `bench/e2e.sh`; its only subjects so far are two small examples |
+| 7 | **Complete as a harness, and it now has a real subject.** `bench/e2e.sh`; `example-nix` drove it on 2026-08-30 and the harness earned its keep twice - it diverted two failed runs away from the record set, and its own defect (diagnostics read from `$OUT.failed.log`, which nothing writes) surfaced and was fixed because a real build failed through it |
 | 18 | **Complete.** Uploads run concurrently through `std::thread::scope` in `new_opaque_files`, NARs stream rather than materialise, and repeat uploads are memoised. The issue asks for async `nix store add` "in a way that keeps the code simple" |
-| 17 | **PARTIAL, and the code says so.** `task.rs` carries `UPSTREAM #17, STEP ONE: the depfile becomes a declared output`, and `depfile_read_back` is the guarded parse. The issue also asks for the collected depfiles to be parsed outside the build into a build-directory cache that a second run reads to skip inference |
-| 16 | **Not developed.** Prepared with a measured blast radius - see `docs/todo.md` |
+| 17 | **Built, 2026-08-30, and the gap was not where this row said it was.** Step one (declared output) and the read-back both existed; what never existed was COLLECTION, so the two halves had never met. Local mode materializes the requested targets only, so no per-object depfile ever reached the build directory and `depfile_read_back` could not fire on any real run. The driver now records each accepted depfile output and local mode materializes them after the targets. Unit-tested gate, six cases; NOT exercised end to end, because the examples drive derivation mode rather than local mode |
+| 16 | **Not developed**, and it is now the only one. Prepared with a measured blast radius - see `docs/todo.md`. It is a coordinated change across both binaries, which is why it is not an afternoon |
 
 ### What this reframes
 
