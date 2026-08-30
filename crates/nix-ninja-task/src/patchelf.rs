@@ -51,15 +51,36 @@ fn is_elf_dynamic(path: &Path) -> Result<bool> {
 }
 
 fn fix_rpath(store_dir: &Path, elf_path: &Path) -> Result<()> {
-    let raw_rpath = get_raw_rpath(elf_path)?;
-    let has_trailing_colon = raw_rpath.ends_with(':');
-    if let Some(mut new_rpath) = compute_new_rpath(store_dir, elf_path)? {
-        if has_trailing_colon {
-            new_rpath.push("".to_string());
-        }
+    // One `patchelf --print-rpath` per file. This used to be two: fix_rpath
+    // read the raw string to spot a trailing colon and compute_new_rpath read
+    // it again through a near-identical helper. This function runs over every
+    // output of every task derivation, so the second one was a subprocess per
+    // output across a whole distribution.
+    let current_rpath = parse_rpath(&get_raw_rpath(elf_path)?);
+    if let Some(new_rpath) = compute_new_rpath(store_dir, elf_path, &current_rpath)? {
         apply_rpath(elf_path, &new_rpath)?;
     }
     Ok(())
+}
+
+/// Split a raw RPATH on ':', PRESERVING empty entries.
+///
+/// An empty entry means "the current directory" and it is meaningful: the
+/// build already decided to keep it, and dropping it hands back a shorter
+/// search path than we were given. The old splitter filtered every empty
+/// entry out, and f8bb3bd compensated by re-appending one when the raw string
+/// ended in a colon - which repairs `a:b:` and silently keeps losing the
+/// element in `:a:b` and `a::b`. Preserving them here fixes all three
+/// spellings in one place, and lets the rebuild in compute_new_rpath put each
+/// one back where it was rather than at the end.
+fn parse_rpath(raw: &str) -> Vec<String> {
+    if raw.is_empty() {
+        // "".split(':') yields one empty entry, which would invent an RPATH
+        // element for a binary that has none.
+        Vec::new()
+    } else {
+        raw.split(':').map(|s| s.to_string()).collect()
+    }
 }
 
 fn get_raw_rpath(elf_path: &Path) -> Result<String> {
@@ -77,17 +98,20 @@ fn get_raw_rpath(elf_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim_end_matches('\n').to_string())
 }
 
-fn compute_new_rpath(store_dir: &Path, elf_path: &Path) -> Result<Option<Vec<String>>> {
+fn compute_new_rpath(
+    store_dir: &Path,
+    elf_path: &Path,
+    current_rpath: &[String],
+) -> Result<Option<Vec<String>>> {
     // Resolve RPATH entries with $ORIGIN expansion
-    let current_rpath = get_rpath(elf_path)?;
-    let resolved_rpath = resolve_rpath(&current_rpath, elf_path)?;
+    let resolved_rpath = resolve_rpath(current_rpath, elf_path)?;
 
     // Get needed libraries and collect directories that need to be added to RPATH
     let mut new_rpath = Vec::new();
     let mut path_added = false;
 
-    // Keep existing non-$ORIGIN paths
-    for path in &current_rpath {
+    // Keep existing non-$ORIGIN paths, empty entries included and in place.
+    for path in current_rpath {
         if path.contains("$ORIGIN") {
             continue;
         }
@@ -122,31 +146,6 @@ fn compute_new_rpath(store_dir: &Path, elf_path: &Path) -> Result<Option<Vec<Str
     }
 }
 
-fn get_rpath(elf_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("patchelf")
-        .arg("--print-rpath")
-        .arg(elf_path)
-        .output()
-        .map_err(|e| anyhow!("Failed to execute patchelf --print-rpath: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("patchelf --print-rpath failed: {stderr}"));
-    }
-
-    let rpath_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    if rpath_str.is_empty() {
-        Ok(Vec::new())
-    } else {
-        Ok(rpath_str
-            .split(':')
-            .filter(|p| !p.is_empty())
-            .map(|p| p.to_string())
-            .collect())
-    }
-}
-
 fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {
     let mut resolved_paths = Vec::new();
 
@@ -156,6 +155,12 @@ fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {
         .to_string_lossy();
 
     for entry in rpath {
+        // An empty entry is the runtime "current directory" marker. It is
+        // preserved in the rebuilt RPATH but it is not a directory we can
+        // resolve a needed library against here.
+        if entry.is_empty() {
+            continue;
+        }
         let expanded = entry.replace("$ORIGIN", &origin);
         resolved_paths.push(PathBuf::from(expanded));
     }
@@ -217,4 +222,45 @@ fn apply_rpath(elf_path: &Path, new_paths: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rpath;
+
+    // This file had no tests, which is why f8bb3bd shipped fixing one of the
+    // three spellings of its own bug. These are the three.
+
+    #[test]
+    fn trailing_empty_entry_survives() {
+        assert_eq!(parse_rpath("/a:/b:"), vec!["/a", "/b", ""]);
+    }
+
+    #[test]
+    fn leading_empty_entry_survives() {
+        assert_eq!(parse_rpath(":/a:/b"), vec!["", "/a", "/b"]);
+    }
+
+    #[test]
+    fn interior_empty_entry_survives_in_place() {
+        assert_eq!(parse_rpath("/a::/b"), vec!["/a", "", "/b"]);
+    }
+
+    #[test]
+    fn no_rpath_is_no_entries_not_one_empty_entry() {
+        assert!(parse_rpath("").is_empty());
+    }
+
+    #[test]
+    fn a_lone_colon_is_two_empty_entries() {
+        assert_eq!(parse_rpath(":"), vec!["", ""]);
+    }
+
+    #[test]
+    fn ordinary_rpath_is_unchanged() {
+        assert_eq!(
+            parse_rpath("/nix/store/a/lib:/nix/store/b/lib"),
+            vec!["/nix/store/a/lib", "/nix/store/b/lib"]
+        );
+    }
 }

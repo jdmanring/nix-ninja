@@ -785,7 +785,8 @@ impl Runner {
             eprintln!(
                 "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
                  (worklist {} s, cmdline {} s, py {} s, grd {} s), \
-                 dyn {} s (realise {} s, discover {} s, update {} s/{} calls, adddrv {} s/{} calls), \
+                 dyn {} s (realise {} s, discover {} s, update {} s/{} calls, adddrv {} s/{} calls, \
+                 plain adddrv {} s/{} calls), \
                  realise {}/{} sent, nar {}/{} sent, scan {}/{} parsed, \
                  rss {} MiB{}{}",
                 RESOLVE_MS.load(Ordering::Relaxed) / 1000,
@@ -800,6 +801,8 @@ impl Runner {
                 upd_n,
                 add_ms / 1000,
                 add_n,
+                DYN_PLAIN_ADDDRV_MS.load(Ordering::Relaxed) / 1000,
+                DYN_PLAIN_ADDDRV_N.load(Ordering::Relaxed),
                 rl_sent,
                 rl_asked,
                 nar_sent,
@@ -3046,7 +3049,26 @@ fn handle_derivation_result(
             Ok(SingleDerivedPath::Opaque(drv_path))
         }
     } else {
+        // THE ARM THAT WAS NEVER TIMED, AND ON THREE EDITION LOGS IT IS THE
+        // ONLY ARM THAT RAN. The four sub-timers above all sit inside the
+        // dynamic arm, while the DynDiscoveryTimer guard at the top of this
+        // function spans BOTH, so every task taking this branch landed in
+        // `dyn` with nothing to account for it. ArtNix read dyn growing
+        // 0.084 s/task on 2026-08-29 with realise, discover, update and
+        // adddrv all zero and `realise 0/0 sent` on every line, which is this
+        // arm running 4000 times with one untimed daemon round trip in it.
+        //
+        // Do not read the number off that slope: it is an elimination, not a
+        // measurement. This pair is what makes it a measurement, and it is
+        // reported separately from DYN_ADDDRV_* on purpose - same call, two
+        // populations, and pooling them would hide which one costs.
+        let t_add = std::time::Instant::now();
         let drv_path = rpc_client.add_drv_to_store(&config.store_dir, &drv)?;
+        DYN_PLAIN_ADDDRV_MS.fetch_add(
+            t_add.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        DYN_PLAIN_ADDDRV_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(SingleDerivedPath::Opaque(drv_path))
     }
 }
@@ -4512,6 +4534,11 @@ static DYN_UPDATE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 // bound it. Raised by the specification session, addendum 733.
 static DYN_UPDATE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_ADDDRV_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// The same add_drv_to_store call on the non-dynamic arm. Separate counters
+// because the two arms have separate populations: pooling a call that runs on
+// every task with one that runs only on dynamic tasks reports neither.
+static DYN_PLAIN_ADDDRV_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYN_PLAIN_ADDDRV_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_ADDDRV_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_REALISE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_DISCOVER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
