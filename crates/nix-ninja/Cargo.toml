@@ -28,3 +28,12 @@ sha2 = "0.10"
 shell-words = "1.1.0"
 walkdir = "2"
 which = "7.0.2"
+
+[dev-dependencies]
+# Already in the lock via vendor-n2's own benches, so this adds no new
+# dependency to the tree - see upstream #4.
+divan = "0.1.16"
+
+[[bench]]
+name = "generate"
+harness = false

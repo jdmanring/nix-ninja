@@ -1416,6 +1416,7 @@ dependencies = [
  "anyhow",
  "clap",
  "deps-infer",
+ "divan",
  "harmonia-store-content-address",
  "harmonia-store-derivation",
  "harmonia-store-path",
