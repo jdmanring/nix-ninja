@@ -529,11 +529,27 @@ pub fn extract_includes(
     //
     // A file the caller declared virtual contributes NO directives rather
     // than an error. That under-declares whatever the generated header
-    // itself includes, and the under-declaration is covered by design
-    // rather than by luck: the dynamic task re-runs discovery inside the
-    // sandbox, where the producing edge has run and the file is real
-    // (`subtool/dynamic_task.rs`). The static pass cannot do better - the
-    // bytes do not exist yet to be read.
+    // itself includes, and the static pass cannot do better - the bytes do
+    // not exist yet to be read.
+    //
+    // WHAT COVERS THAT UNDER-DECLARATION, PRECISELY, because an earlier
+    // version of this comment overclaimed it. `discover_c_includes` has
+    // exactly two callers: `build_task_derivation` (this static pass) and
+    // `discover_dynamic_dependencies` (inside the sandbox, where the
+    // producing edge has run and the file is real). The second only happens
+    // for an edge whose `deps = gcc` - `handle_derivation_result` builds
+    // `built_inputs` under that test alone - so:
+    //
+    //   deps = gcc          the dynamic pass re-runs discovery and recovers
+    //                       whatever this skipped. Covered.
+    //   depfile, no deps    NO dynamic derivation is emitted, so nothing
+    //                       re-runs. Not covered, and the failure is LOUD:
+    //                       the task dies in the sandbox on the missing
+    //                       include rather than shipping a wrong artifact.
+    //
+    // The loud half is acceptable and the silent half does not exist, which
+    // is the property that matters. Saying "covered by design" of both was
+    // wrong.
     //
     // GATED ON THE FILE BEING DECLARED VIRTUAL, never on the read failing.
     // A source that is simply missing is a real defect and must still fail

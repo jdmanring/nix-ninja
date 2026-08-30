@@ -25,7 +25,7 @@
   - Multiple CLI targets: supported, adopted from upstream PR 43.
   - Left undone deliberately, both cosmetic: `DerivedFile` has no `name`
     field, and the symlink logic is a free function rather than a method on
-    `DerivedFile`. Neither changes behaviour and the issue asks for neither.
+    `DerivedFile`. Neither changes behavior and the issue asks for neither.
 - [ ] Depfile support (upstream #17) - three parts built, not yet exercised
   - [x] If depfile defined, add that as an additional output. Gated on
     `deps = gcc` rather than on `depfile` alone: a declared output the command
@@ -111,7 +111,7 @@
   - It is nix's bug rather than nixpkgs'. If it survives a bump it belongs
     upstream at NixOS/nix rather than here.
 - [ ] `dyn` is 82% of a campaign's wall clock and its instrument names none of it
-  - `handle_derivation_result`'s four sub-timers - realise, discover, update,
+  - `handle_derivation_result`'s four sub-timers - realize, discover, update,
     adddrv - all live INSIDE the `!built_inputs.is_empty()` branch. The
     `DynDiscoveryTimer` Drop guard at `:2929` spans the whole function, so
     `dyn` also accumulates every task that takes the other branch, and that
@@ -121,7 +121,7 @@
     timer around it. The dynamic branch times exactly this call at `:3039`
     and the ordinary branch does not.
   - This accounts for the reading taken from three full distribution builds
-    on 2026-08-29: `dyn` growing linearly at 0.084 s/task with realise,
+    on 2026-08-29: `dyn` growing linearly at 0.084 s/task with realize,
     discover, update and adddrv all reading zero and `realise 0/0 sent` on
     every line. 84 ms is a daemon round trip. It is corroborated by `nar` and
     `scan` freezing at the 2000-task line while `dyn` keeps climbing: tasks
