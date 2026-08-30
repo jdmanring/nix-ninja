@@ -395,3 +395,47 @@ last one had to correct: #16 is prepared and unimplemented, #6 is answered and
 unimplementable against snix as it stands, #14 is unverified on aarch64
 hardware, and #7 has a harness whose only subject so far is the smallest
 example in the tree.
+
+## Sixth sweep, 2026-08-29: by MILESTONE, which nobody had looked at
+
+Every sweep in this file, including the fifth, treated the open issues as a
+flat set of twelve. They are not. The maintainer keeps milestones, and reading
+them changes what "coverage" means: it is not how many issues we touched, it is
+how close the fork is to a release the maintainer has already scoped.
+
+    0.1.0    4 closed, 2 open    #20, #5
+    0.2.0    0 closed, 5 open    #18, #17, #16, #7, #4
+
+### 0.1.0 - one item short, and it is a PARTIAL not a gap
+
+| # | state |
+|---|---|
+| 20 | **Complete.** `mkCMakePackage` and `example-cmake-hello`; the issue asks to "expand to other ninja-outputting build systems and add a CMake example" and both exist, neither upstream |
+| 5 | **PARTIAL, and the fifth sweep called it developed, which was wrong.** The issue has THREE parts: phony as a buildEnv-equivalent derivation input, local-mode materialisation that walks a phony's contents and symlinks each file back, and multiple CLI targets via a virtual phony. We have the first and the third. The second is absent - `local.rs` contains no `is_dir` and never walks a directory - and `docs/todo.md:19` carries upstream's OWN unchecked "Phony target support" entry listing exactly the missing pieces, including "if symlink source is directory, walk dir and symlink to dest as prefix" |
+
+So the honest headline is that this fork is **one partially-done issue away from
+upstream's 0.1.0 milestone**, and the missing piece is described in the tree's
+own todo file in upstream's words.
+
+### 0.2.0 - three of five
+
+| # | state |
+|---|---|
+| 4 | **Complete.** `benches/generate.rs`, 2026-08-29 |
+| 7 | **Complete as a harness.** `bench/e2e.sh`; its only subjects so far are two small examples |
+| 18 | **Complete.** Uploads run concurrently through `std::thread::scope` in `new_opaque_files`, NARs stream rather than materialise, and repeat uploads are memoised. The issue asks for async `nix store add` "in a way that keeps the code simple" |
+| 17 | **PARTIAL, and the code says so.** `task.rs` carries `UPSTREAM #17, STEP ONE: the depfile becomes a declared output`, and `depfile_read_back` is the guarded parse. The issue also asks for the collected depfiles to be parsed outside the build into a build-directory cache that a second run reads to skip inference |
+| 16 | **Not developed.** Prepared with a measured blast radius - see `docs/todo.md` |
+
+### What this reframes
+
+Judging the fork against twelve flat issues produced "six of twelve", which
+reads as half a job. Judging it against the maintainer's own release scoping
+produces something both more useful and more demanding: 0.1.0 is nearly done
+and its remainder is small and specified; 0.2.0 is majority done with one item
+untouched.
+
+It also says which work is worth doing next, and it is not the work the flat
+list suggested. Finishing #5's local-mode walk closes a MILESTONE. That is a
+different kind of contribution from another isolated fix, and it is the thing
+to put to the maintainer.
