@@ -112,7 +112,11 @@ redirect exists to prevent.
 ## Open failure classes
 
 Four packages ArtNix cannot drive through nix-ninja. Traced 2026-08-28 in
-`docs/incidents/2026-08-28-four-failure-classes.md`; none is fixed.
+`docs/incidents/2026-08-28-four-failure-classes.md`. Code has since landed for
+three of them and NONE of it has been verified on a package, which is a
+different state from fixed; the per-class notes below say which commit and what
+is still owed. Read the verification rule at the end of this section before
+reporting any of them as done.
 
 1. **bison** - `installCheckPhase` recompiles through the `cc` shim, producing
    objects unlike the originals: 698 test failures. Fix is a passthrough hook
@@ -121,8 +125,9 @@ Four packages ArtNix cannot drive through nix-ninja. Traced 2026-08-28 in
    bypasses the default function, so `runHook preInstallCheck` never fires and
    the passthrough is silently skipped.
 2. **hicolor-icon-theme** - `Tools::new()` resolves `cc` eagerly at startup, so
-   a package with zero compile targets dies on `cc: command not found`. Fix is
-   lazy resolution.
+   a package with zero compile targets dies on `cc: command not found`. Lazy
+   resolution landed in `7fb756e`; hicolor-icon-theme has not been driven
+   through it.
 3. **libvmaf** - the include scanner reads `#include "vcs_version.h"` off disk,
    but meson's `vcs_tag()` generates it during the build. Compile tasks are
    also blanket-excluded from `build_dir_inputs`.
@@ -131,6 +136,12 @@ Four packages ArtNix cannot drive through nix-ninja. Traced 2026-08-28 in
    task derivation.
 
 3 and 4 share a fix and should be ONE change, so the closure re-keys once.
+That change is the `virtual_paths` map for generated headers, recovered from
+dangling commits on 2026-08-29 (`2f7b8f2`, `dc296f3`, live at
+`crates/nix-ninja/src/task.rs:2299`). Neither package has been built with it.
+`docs/opt-out-triage.md` reads dav1d, p11-kit and valgrind as the same class,
+so testing one small package here is the cheapest work in the tree: it can
+retire up to five opt-outs with no new code.
 
 **Verify every fix on a single small package before it reaches a closure.**
 Each of these has been "fixed" at least once without that, and one was reported

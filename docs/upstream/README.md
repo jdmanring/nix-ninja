@@ -364,9 +364,16 @@ already required before anything leaves this directory, and a cross-repo gate
 would put an ArtNix path inside this fork, which is divergence to re-resolve
 at every upstream merge for a check that runs a handful of times a year.
 
-TWO FINDINGS ARE EXPECTED AND MUST NOT BE "FIXED". `roadmap-coverage.md:104`
-quotes the maintainer's own note, which is not ours to edit, and
-`issue-replies.md:356` uses a hedge inside a hypothetical the paragraph is
-rejecting, where the hedge is the subject rather than the claim. A clean run
-is therefore 2 warnings, not 0, and a run reporting 0 means somebody edited a
-quotation.
+A clean run is 0 warnings, measured 2026-08-29 across all ten files. It was 2
+until `59cfdbd` and `5e00068`, both `probably`, at `roadmap-coverage.md:105:71`
+and `issue-replies.md:356:23` (re-measured against those commits' parents on
+2026-08-29). Neither sat inside a quotation, which is what this paragraph used
+to say they were: the first was our own paraphrase of the maintainer's note and
+the second our own hedge, so both were ours to drop, and they were dropped.
+
+That expected-warning count was written here as a state, and a state in an
+instruction paragraph rots - it spent a day telling readers
+that today's correct 0 was evidence somebody had edited a quotation. The
+durable rule is the one that cannot rot: a quotation of somebody else's words
+is not ours to edit, so if an alert lands inside one, record it here with the
+date rather than rewriting the quote.
