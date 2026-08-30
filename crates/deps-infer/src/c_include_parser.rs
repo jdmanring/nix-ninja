@@ -488,13 +488,61 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
 ///
 /// Includes are generally of the form `#include <name>` or `#include "name"`.
 /// Also, C23 `#embed` resolves quoted names the same way.
+/// Is this path one the caller declared as a build-dir file that may not
+/// exist yet? `virtual_paths` is built as build_path -> build_path, so a
+/// queued include can match either side; both are checked rather than
+/// assuming the identity mapping, which is the caller's choice and not this
+/// module's contract. Linear over the values only on a read failure, which
+/// is rare by construction.
+fn is_declared_virtual(path: &Path, virtual_paths: Option<&HashMap<PathBuf, PathBuf>>) -> bool {
+    let Some(vp) = virtual_paths else {
+        return false;
+    };
+    vp.contains_key(path) || vp.values().any(|v| v == path)
+}
+
 pub fn extract_includes(
     path: &Path,
     spelled: &Path,
     include_dirs: &[PathBuf],
     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
-    let scan = scan_directives(path)?;
+    // A GENERATED HEADER IS RESOLVABLE BEFORE IT EXISTS, AND SCANNING IT
+    // IS WHAT KILLED THE FIRST REAL PACKAGE TO CARRY ONE. `virtual_paths`
+    // deliberately resolves a declared-but-absent build-dir file so the
+    // include is DECLARED; canonicalize_cached returns it with no existence
+    // check, the BFS queues it like any other header, and this read then
+    // died `No such file or directory`, failing the whole task derivation.
+    // Measured 2026-08-30 driving `example-nix`: meson generates
+    // `src/nix/nix.p/unpack-channel.nix.gen.hh` with a CUSTOM_COMMAND and
+    // declares it ORDER-ONLY (`||`) on every compile edge in `src/nix`, so
+    // `#include "unpack-channel.nix.gen.hh"` resolves through `-I` to a
+    // path nothing has written yet. This is failure class 3 (libvmaf's
+    // `vcs_version.h`) and class 4 (liblapack's `VerifyFortran.h`) reaching
+    // a package that actually builds.
+    //
+    // A file the caller declared virtual contributes NO directives rather
+    // than an error. That under-declares whatever the generated header
+    // itself includes, and the under-declaration is covered by design
+    // rather than by luck: the dynamic task re-runs discovery inside the
+    // sandbox, where the producing edge has run and the file is real
+    // (`subtool/dynamic_task.rs`). The static pass cannot do better - the
+    // bytes do not exist yet to be read.
+    //
+    // GATED ON THE FILE BEING DECLARED VIRTUAL, never on the read failing.
+    // A source that is simply missing is a real defect and must still fail
+    // loudly; swallowing every NotFound here would turn every genuinely
+    // absent header into a silently under-declared task, which is the
+    // failure shape this whole module exists to prevent.
+    let scan = match scan_directives(path) {
+        Ok(scan) => scan,
+        Err(e) => {
+            if is_declared_virtual(path, virtual_paths) && !path.exists() {
+                return Ok(Vec::new());
+            }
+            return Err(e);
+        }
+    };
     // Quoted includes resolve from where the file was REACHED (spelled),
     // which differs from the canonical parent when the file was reached
     // through a symlink; see the caller.
@@ -1052,5 +1100,77 @@ mod tests {
         assert_eq!(scan_stats().1 - after.1, 1, "the edit cost one re-parse");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// UPSTREAM FAILURE CLASSES 3 AND 4, reproduced from the shape that
+    /// killed `example-nix` on 2026-08-30 rather than from the issue text.
+    ///
+    /// A header that a CUSTOM_COMMAND generates during the build is
+    /// resolvable through `virtual_paths` before it exists, so the BFS
+    /// queues it and the scan reads it. It must contribute no directives
+    /// instead of failing the task.
+    #[test]
+    fn a_declared_virtual_header_that_does_not_exist_yet_scans_as_empty() {
+        let d = std::env::temp_dir().join(format!("nnvirt{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let tu = d.join("nix-channel.cc");
+        // Exactly nix's spelling: a quoted include of a .gen.hh that meson
+        // writes during the build and declares order-only.
+        std::fs::write(&tu, "#include \"unpack-channel.nix.gen.hh\"\n").unwrap();
+
+        let generated = d.join("unpack-channel.nix.gen.hh");
+        assert!(
+            !generated.exists(),
+            "the point of the test is that it is absent"
+        );
+
+        let mut virtual_paths = std::collections::HashMap::new();
+        virtual_paths.insert(generated.clone(), generated.clone());
+
+        // The includer resolves it and DECLARES it: that half must keep
+        // working, or the generated header never reaches the sandbox.
+        let includes =
+            super::extract_includes(&tu, &tu, std::slice::from_ref(&d), Some(&virtual_paths))
+                .unwrap();
+        assert!(
+            includes.contains(&generated),
+            "the generated header must still be declared an input: {includes:?}"
+        );
+
+        // Scanning the absent file itself is the read that used to die.
+        let nested = super::extract_includes(
+            &generated,
+            &generated,
+            std::slice::from_ref(&d),
+            Some(&virtual_paths),
+        )
+        .unwrap();
+        assert!(nested.is_empty(), "a file with no bytes has no directives");
+
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// THE NEGATIVE CONTROL, and it is the half that matters: the fix must
+    /// not turn every genuinely missing header into a silent empty scan.
+    /// A file NOT declared virtual still fails loudly.
+    #[test]
+    fn a_missing_header_that_was_never_declared_virtual_still_fails() {
+        let d = std::env::temp_dir().join(format!("nnvirtneg{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let absent = d.join("not-generated-by-anything.h");
+        assert!(!absent.exists());
+
+        let empty = std::collections::HashMap::new();
+        assert!(
+            super::extract_includes(&absent, &absent, std::slice::from_ref(&d), Some(&empty))
+                .is_err(),
+            "an undeclared missing file must still be an error"
+        );
+        assert!(
+            super::extract_includes(&absent, &absent, std::slice::from_ref(&d), None).is_err(),
+            "and with no virtual map at all"
+        );
+
+        std::fs::remove_dir_all(&d).ok();
     }
 }

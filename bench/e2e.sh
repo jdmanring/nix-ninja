@@ -86,13 +86,22 @@ fi
 # derivations_built are the fields a comparison reads, and a run that died in
 # four seconds has both. Divert the record so no later sweep of *.json can
 # average a fast failure into a fast success.
+# THE LOG KEEPS THE NAME IT WAS WRITTEN UNDER. Reassigning OUT before the
+# greps below made them read "$OUT.failed.log", which nothing ever writes, so
+# every FAILED run recorded driver_line: null and no stats - the diagnostics
+# were dropped from precisely the runs that need them. Found 2026-08-30 when
+# example-nix failed and its record explained nothing.
+LOG="$OUT.log"
 if [ "$rc" -ne 0 ]; then
   OUT="$OUT.failed"
-  echo "build failed (rc=$rc); record written to $OUT" >&2
+  echo "build failed (rc=$rc); record written to $OUT (log: $LOG)" >&2
+  # The last lines of the failure, so the record is not the only artifact and
+  # the reader is not told to go find a file.
+  tail -25 "$LOG" >&2 2>/dev/null || true
 fi
 
-resolved=$(grep -h 'nix-ninja: resolved' "$OUT.log" 2>/dev/null | tail -1)
-stats=$(grep -ho 'nix-ninja-stats {.*}' "$OUT.log" 2>/dev/null | tail -1)
+resolved=$(grep -h 'nix-ninja: resolved' "$LOG" 2>/dev/null | tail -1)
+stats=$(grep -ho 'nix-ninja-stats {.*}' "$LOG" 2>/dev/null | tail -1)
 stats="${stats#nix-ninja-stats }"
 
 python3 - "$OUT" "$TARGET" "$wall" "$rc" "$prebuilt" "$drv" "$resolved" "$stats" "$built" <<'PY'
