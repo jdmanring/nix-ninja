@@ -882,7 +882,16 @@ fn new_opaque_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "source".to_string());
-    let store_path = rpc_client.add_to_store_nar(&name, &canonical_path)?;
+    // An executable whose shebang is `#!/usr/bin/env <prog>` cannot be
+    // EXEC'd inside the task sandbox, which has no /usr/bin/env: protoc
+    // execs protoc-gen-ts_proto.py as a plugin and reports "not found or
+    // is not executable". This is nixpkgs' patchShebangs problem, solved
+    // the same way at the same layer - upload a copy whose shebang names
+    // the interpreter's resolved store path. Scripts INVOKED as
+    // `python3 x.py` never read their shebang, so this is inert for them.
+    let upload_src = patched_env_shebang(&canonical_path)?;
+    let store_path =
+        rpc_client.add_to_store_nar(&name, upload_src.as_deref().unwrap_or(&canonical_path))?;
 
     Ok(DerivedFile {
         derived_path: SingleDerivedPath::Opaque(store_path),
@@ -953,6 +962,76 @@ pub fn discover_c_includes(
     Ok((discovered_deps, discovered_store_paths))
 }
 
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Where `path` is an executable regular file opening with
+/// `#!/usr/bin/env <prog>` (single word, no env options), write a copy
+/// whose shebang is the PATH-resolved absolute location of <prog> and
+/// return it; None leaves the upload untouched. Resolution failure and
+/// exotic shebangs (`env -S`, arguments) fail toward the original file,
+/// whose failure names itself in the task log; a wrong rewrite would
+/// fail strangely. The copy keeps the executable bit, which is the
+/// property the whole exercise exists to make usable.
+fn patched_env_shebang(path: &Path) -> Result<Option<PathBuf>> {
+    use std::os::unix::fs::PermissionsExt;
+    let md = fs::metadata(path)?;
+    if !md.is_file() || md.permissions().mode() & 0o111 == 0 {
+        return Ok(None);
+    }
+    let body = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let Some(first_nl) = body.iter().position(|&b| b == b'\n') else {
+        return Ok(None);
+    };
+    let Ok(first) = std::str::from_utf8(&body[..first_nl]) else {
+        return Ok(None);
+    };
+    let Some(prog) = first.strip_prefix("#!/usr/bin/env ") else {
+        return Ok(None);
+    };
+    let prog = prog.trim();
+    if prog.is_empty() || prog.contains(' ') || prog.starts_with('-') {
+        return Ok(None);
+    }
+    let Some(resolved) = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths).find_map(|d| {
+            let c = d.join(prog);
+            c.is_file().then_some(c)
+        })
+    }) else {
+        return Ok(None);
+    };
+    // Memoized per source path: the same script is uploaded once per
+    // walk memo miss, but several scripts share interpreters and the
+    // tmp copies are tiny; keyed by source so repeat calls are free.
+    static SHEBANG_MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, PathBuf>>> =
+        std::sync::OnceLock::new();
+    let memo = SHEBANG_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(hit) = memo.lock().unwrap().get(path) {
+        return Ok(Some(hit.clone()));
+    }
+    let dir = std::env::temp_dir().join(format!("nix-ninja-shebang-{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    // TMP_SEQ, not memo.len(): two concurrent misses could draw the same
+    // length and write one file from two threads (same race as the
+    // nn-outer copies).
+    let out = dir.join(format!(
+        "{}-{}",
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("script")
+    ));
+    let mut patched = format!("#!{}\n", resolved.display()).into_bytes();
+    patched.extend_from_slice(&body[first_nl + 1..]);
+    fs::write(&out, patched)?;
+    fs::set_permissions(&out, fs::Permissions::from_mode(0o755))?;
+    memo.lock().unwrap().insert(path.to_path_buf(), out.clone());
+    Ok(Some(out))
+}
+
 /// Removes -frandom-seed flag from a string of CFLAGS.
 fn remove_frandom_seed(flags: &str) -> String {
     flags
@@ -968,4 +1047,82 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+#[cfg(test)]
+mod shebang_tests {
+    // The protoc-gen-ts_proto.py shape: an executable env-shebang
+    // script exec'd directly inside a sandbox with no /usr/bin/env.
+    // The negative half matters as much: a non-executable file and an
+    // exotic shebang must both pass through unpatched.
+    #[test]
+    fn env_shebang_patched_only_when_exec_and_simple() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("nn-shebang-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let exec = d.join("plugin.py");
+        std::fs::write(&exec, "#!/usr/bin/env sh\nbody\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let patched = super::patched_env_shebang(&exec).unwrap().expect("patched");
+        let out = std::fs::read_to_string(&patched).unwrap();
+        assert!(out.starts_with("#!/") && !out.contains("/usr/bin/env"));
+        // EXACTLY the original body after the shebang line, not merely
+        // ending with it: an off-by-one in the slice that drops the old
+        // shebang leaves a stray character at the front of the body, and
+        // `ends_with` cannot see it. Mutation, 2026-08-30.
+        assert_eq!(out.lines().skip(1).collect::<Vec<_>>(), vec!["body"]);
+        assert_ne!(
+            std::fs::metadata(&patched).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        let plain = d.join("data.py");
+        std::fs::write(&plain, "#!/usr/bin/env sh\nbody\n").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(super::patched_env_shebang(&plain).unwrap().is_none());
+        // THE EXOTIC SHEBANG, AND WHERE ITS CONTROL HAS TO SIT.
+        // `#!/usr/bin/env -S sh -e` alone does NOT exercise the argument
+        // guard: PATH resolution for "-S sh -e" fails anyway, so deleting
+        // the guard left this passing (measured 2026-08-30). The guard is
+        // only reachable when the multi-word program name RESOLVES, so
+        // point PATH at a directory holding a file with that exact name.
+        // Contrived, and that is the point - it is the one state in which
+        // the guard decides the outcome.
+        let exotic = d.join("exotic.py");
+        std::fs::write(&exotic, "#!/usr/bin/env -S sh -e\nbody\n").unwrap();
+        std::fs::set_permissions(&exotic, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bait = d.join("bait");
+        std::fs::create_dir_all(&bait).unwrap();
+        // Three shapes, because the guard is three conditions joined by
+        // `||` and a single input that trips two of them cannot tell them
+        // apart: `-S sh -e` has both a space and a leading dash, so
+        // turning either `||` into `&&` still rejects it, and both those
+        // mutants survived. One input per condition. Mutation 2026-08-30.
+        let spaced = d.join("spaced.py");
+        std::fs::write(&spaced, "#!/usr/bin/env sh -e\nbody\n").unwrap();
+        std::fs::set_permissions(&spaced, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dashed = d.join("dashed.py");
+        std::fs::write(&dashed, "#!/usr/bin/env -S\nbody\n").unwrap();
+        std::fs::set_permissions(&dashed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["-S sh -e", "sh -e", "-S"] {
+            let decoy = bait.join(name);
+            std::fs::write(&decoy, "").unwrap();
+            std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let old_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", &bait);
+        let verdicts = [
+            super::patched_env_shebang(&exotic).unwrap(),
+            super::patched_env_shebang(&spaced).unwrap(),
+            super::patched_env_shebang(&dashed).unwrap(),
+        ];
+        match old_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        assert!(
+            verdicts.iter().all(|v| v.is_none()),
+            "an argument-bearing env shebang must not be rewritten: {verdicts:?}"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }
