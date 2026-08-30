@@ -671,10 +671,22 @@ fn build_task_derivation(
             format!("{}/bin", task.store_dir.display(&tools.patchelf)),
         ];
 
-        let cmdline_binary = cmdline
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| anyhow!("No command found in cmdline"))?;
+        // A COMMAND CAN OPEN WITH A SHELL BUILTIN, and a builtin is not a
+        // binary to resolve.
+        //
+        // CMake wraps link and custom commands in shell no-op guards -
+        // `: && <real command> && :` - so the first token is `:`, and the
+        // PATH lookup fails the whole task with "Failed to find :", which
+        // reads as a missing tool rather than as a command shape this
+        // resolver does not handle.
+        //
+        // A CMake custom command opens `cd <subdir> &&` instead. `cd` has to
+        // be stepped over as a PAIR, which is why this is a loop rather than
+        // one more name in a filter: its argument is a bare directory name,
+        // which is a plausible binary name and would be resolved in its
+        // place, so the failure would move rather than go away.
+        let cmdline_binary =
+            command_binary(cmdline).ok_or_else(|| anyhow!("No command found in cmdline"))?;
 
         // A command resolving outside the store (e.g. a `../gen.sh` script
         // from the source tree) is a task input handled by
@@ -1055,6 +1067,30 @@ fn resolve_target_in(
     out
 }
 
+/// The tool a command line actually invokes, stepping over shell builtins.
+///
+/// `cd` is stepped over as a PAIR, which is why this is a loop rather than
+/// one more name in a filter: its argument is a bare directory name, which
+/// is a plausible binary name and would be resolved in its place, so the
+/// failure would move rather than go away.
+///
+/// Extracted rather than inlined because the loop IS the thing under test
+/// and its call site needs a builder-rpc client; the alternative was a copy
+/// of it in the test, and a predicate written twice diverges.
+fn command_binary(cmdline: &str) -> Option<&str> {
+    let mut toks = cmdline.split_whitespace();
+    loop {
+        match toks.next() {
+            None => return None,
+            Some(":") | Some("&&") => continue,
+            Some("cd") => {
+                toks.next();
+            }
+            Some(tok) => return Some(tok),
+        }
+    }
+}
+
 /// Removes -frandom-seed flag from a string of CFLAGS.
 fn remove_frandom_seed(flags: &str) -> String {
     flags
@@ -1158,5 +1194,33 @@ mod phony_resolution_tests {
         let got = resolve_target_in(&outs, &phony, FileId::from(9));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].build_path, PathBuf::from("real.o"));
+    }
+}
+
+#[cfg(test)]
+mod command_binary_tests {
+    use super::command_binary as pick;
+
+    #[test]
+    fn shell_builtins_are_stepped_over_to_reach_the_real_tool() {
+        // CMake's link-rule guard.
+        assert_eq!(
+            pick(": && /nix/store/x/bin/c++ -o hello && :"),
+            Some("/nix/store/x/bin/c++")
+        );
+        // CMake's custom-command prologue. The cd TARGET must not be
+        // picked: it is a bare directory name and so a plausible binary
+        // name, which would move the failure rather than remove it.
+        assert_eq!(pick("cd src/svg && cmake -P gen.cmake"), Some("cmake"));
+        // Both at once, which is what a CMake custom command actually emits.
+        assert_eq!(pick(": && cd src && tool a"), Some("tool"));
+        // An ordinary command is untouched.
+        assert_eq!(pick("gcc -c a.c -o a.o"), Some("gcc"));
+        // NEGATIVE CONTROLS. A command that is only builtins names no tool,
+        // and the caller must get None rather than a builtin to look up.
+        assert_eq!(pick(": && :"), None);
+        assert_eq!(pick(""), None);
+        // `cd` with nothing after it must not run off the end.
+        assert_eq!(pick("cd"), None);
     }
 }
