@@ -2904,7 +2904,7 @@ fn report_progress(rpc_client: &Arc<BuilderRpcClient>, n_tasks: u64) {
         "nix-ninja-stats {{\"tasks\":{},\"resolve_ms\":{},\"dyn_ms\":{},\
          \"dyn_realise_ms\":{},\"dyn_discover_ms\":{},\"dyn_adddrv_ms\":{},\
          \"dyn_adddrv_calls\":{},\"plain_adddrv_ms\":{},\"plain_adddrv_calls\":{},\
-         \"rss_mib\":{}}}",
+         \"sandbox_adddrv_ms\":{},\"sandbox_adddrv_calls\":{},\"rss_mib\":{}}}",
         n_tasks,
         RESOLVE_MS.load(Ordering::Relaxed),
         DYN_MS.load(Ordering::Relaxed),
@@ -2914,6 +2914,8 @@ fn report_progress(rpc_client: &Arc<BuilderRpcClient>, n_tasks: u64) {
         DYN_ADDDRV_N.load(Ordering::Relaxed),
         DYN_PLAIN_ADDDRV_MS.load(Ordering::Relaxed),
         DYN_PLAIN_ADDDRV_N.load(Ordering::Relaxed),
+        DYN_SANDBOX_ADDDRV_MS.load(Ordering::Relaxed),
+        DYN_SANDBOX_ADDDRV_N.load(Ordering::Relaxed),
         self_rss_mib(),
     );
     // Persist resolve-cache entries computed since the last tick;
@@ -2986,7 +2988,7 @@ fn report_progress(rpc_client: &Arc<BuilderRpcClient>, n_tasks: u64) {
         "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
              (worklist {} s, cmdline {} s, py {} s, grd {} s), \
              dyn {} s (realise {} s, discover {} s, update {} s/{} calls, adddrv {} s/{} calls, \
-             plain adddrv {} s/{} calls), \
+             plain adddrv {} s/{} calls, sandbox adddrv {} s/{} calls), \
              realise {}/{} sent, nar {}/{} sent, scan {}/{} parsed, \
              rss {} MiB{}{}",
         RESOLVE_MS.load(Ordering::Relaxed) / 1000,
@@ -3003,6 +3005,8 @@ fn report_progress(rpc_client: &Arc<BuilderRpcClient>, n_tasks: u64) {
         add_n,
         DYN_PLAIN_ADDDRV_MS.load(Ordering::Relaxed) / 1000,
         DYN_PLAIN_ADDDRV_N.load(Ordering::Relaxed),
+        DYN_SANDBOX_ADDDRV_MS.load(Ordering::Relaxed) / 1000,
+        DYN_SANDBOX_ADDDRV_N.load(Ordering::Relaxed),
         rl_sent,
         rl_asked,
         nar_sent,
@@ -3052,7 +3056,25 @@ fn handle_derivation_result(
                 drv,
                 built_inputs,
             )?;
+            // THE THIRD add_drv_to_store, and the last untimed one. There are
+            // exactly three in this function - this one emitting the dynamic
+            // task derivation inside the sandbox, DYN_ADDDRV_* on the local
+            // discovery arm, and DYN_PLAIN_ADDDRV_* on the ordinary arm - and
+            // until this pair existed a run could show `dyn` time that none
+            // of the sub-timers accounted for.
+            //
+            // Found by RUNNING example-dynamic-deps, not by reading: dyn
+            // 53 ms against plain adddrv 37 ms and adddrv 0 calls left 16 ms
+            // with nowhere to live. Separate counters again, because this arm
+            // runs only for edges with generated inputs and pooling it with
+            // the other two would report none of the three.
+            let t_dyn_add = std::time::Instant::now();
             let dynamic_drv_path = rpc_client.add_drv_to_store(&config.store_dir, &dynamic_drv)?;
+            DYN_SANDBOX_ADDDRV_MS.fetch_add(
+                t_dyn_add.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            DYN_SANDBOX_ADDDRV_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(SingleDerivedPath::Built {
                 drv_path: Arc::new(SingleDerivedPath::Opaque(dynamic_drv_path)),
                 output: "out".parse().unwrap(),
@@ -4673,6 +4695,11 @@ static DYN_ADDDRV_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 // The same add_drv_to_store call on the non-dynamic arm. Separate counters
 // because the two arms have separate populations: pooling a call that runs on
 // every task with one that runs only on dynamic tasks reports neither.
+// The in-sandbox dynamic arm's add_drv_to_store, which emits the dynamic task
+// derivation. Third of three, and the one that had no timer until a run showed
+// dyn time no sub-timer could account for.
+static DYN_SANDBOX_ADDDRV_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYN_SANDBOX_ADDDRV_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_PLAIN_ADDDRV_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_PLAIN_ADDDRV_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_ADDDRV_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
