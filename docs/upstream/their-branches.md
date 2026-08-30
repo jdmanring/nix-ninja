@@ -69,23 +69,49 @@ said `mkCMakePackage` is "absent from `upstream/main`, so it is ours to offer",
 which is true and now better supported than when it was written.
 
 Worth reading before offering: PR #24 changed **18 lines of
-`crates/nix-ninja/src/task.rs`**, and two are defects this fork hit and fixed
-independently.
+`crates/nix-ninja/src/task.rs`**, and reading them corrects a claim the first
+version of this file made.
 
     -        // TODO: If you don't find it it's ok, e.g. ./generated_binary
     -        let cmdline_path = which_store_path(&cmdline_binary)?;
     +        if let Ok(cmdline_path) = which_store_path(&cmdline_binary) {
 
-That is "a command that is a graph output" - our seventh whole-graph class,
-bought by orc's `orcc` and fixed in `15152f2`. He hit it in April 2025 and
-tolerated the lookup failing; we resolve the command against the graph. Same
-defect, two fixes, and independent rediscovery is the strongest evidence
-available that the class is real rather than an artifact of our scale. Say so
-in the PR.
+The first version said he "left the fix on a WIP branch" and we rediscovered
+it. **Wrong: it LANDED.** `upstream/main:crates/nix-ninja/src/task.rs:607`
+reads `if let Some(cmdline_path) = which_store_path_opt(...)?` today, so the
+tolerance reached main through some later PR and the branch is not where that
+fix lives.
 
-The other is `if let Some(_) = file.input { continue; }`, commented "Skipping
-outputs of phony targets for now" - the #5 area, and his own statement that
-phony handling was incomplete then.
+What this fork adds sits ON TOP of that and is a real refinement rather than a
+duplicate. Upstream tolerates `None` and still propagates an `Err`. Ours
+discriminates the `Err` by the INPUT SET: a which-failure whose token matches a
+task input is a binary this graph produces and needs no store lookup, while one
+that matches nothing is still the missing tool the error names. Upstream's
+version fails the build for a command the graph itself generates; ours fails
+only for a genuinely absent tool. That is worth one paragraph in a PR and it is
+not a rediscovery of #24.
+
+The other hunk is `if let Some(_) = file.input { continue; }`, commented
+"Skipping outputs of phony targets for now" - the #5 area, and his own
+statement that phony handling was incomplete then.
+
+## A defect that IS still live in upstream/main
+
+Found while checking the above, which is the argument for having checked.
+`upstream/main:task.rs:43`:
+
+    cc: which_store_path(store_dir, "cc")?,
+
+`Tools::new()` resolves `cc` EAGERLY, so a package with zero compile targets
+dies at startup on `cc: command not found` before it does anything. That is
+failure class 2 in this fork's `CLAUDE.md`, bought by hicolor-icon-theme, and
+it is fixed here in `7fb756e` by making the resolution lazy:
+
+    cc: which_store_path(store_dir, "cc").ok(),
+
+It is a two-character fix to a live bug in `main`, it is independent of every
+argument in this directory, and it belongs in the bug-fix batch rather than
+anywhere near the inference discussion.
 
 ## THE CORRECTION: the devstore was NOT missed
 
