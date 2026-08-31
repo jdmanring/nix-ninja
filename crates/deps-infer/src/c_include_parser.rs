@@ -662,6 +662,27 @@ where
         if let Some(actual_path) = virtual_paths.get::<Path>(key) {
             return Ok(Some(actual_path.clone()));
         }
+        // THE KEY IS A SPELLING AND THE MAP HOLDS GRAPH PATHS, so probing it
+        // verbatim asks a question the map cannot answer. `#include
+        // "../config.h"` from a compile edge in `coregrind` arrives here as
+        // `<dir>/coregrind/../config.h` while the graph declares
+        // `<dir>/config.h`; the lookup misses and the header is then scanned
+        // off a disk the build has not written it to yet. `./x` against a
+        // declared `x` misses the same way, which is what made the
+        // generated-header example resolve nothing while still passing.
+        //
+        // Lexical rather than `canonicalize`: the header does not exist yet,
+        // so the filesystem cannot normalize it, and this is a map key rather
+        // than a path anything opens.
+        //
+        // Second probe, not first: the verbatim hit is the common case and
+        // already keyed, so a normalized path is built only when it misses.
+        let normalized = lexical_normalize(key);
+        if normalized != key {
+            if let Some(actual_path) = virtual_paths.get::<Path>(normalized.as_path()) {
+                return Ok(Some(actual_path.clone()));
+            }
+        }
     }
 
     {
