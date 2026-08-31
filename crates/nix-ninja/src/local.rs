@@ -147,8 +147,12 @@ mod write_restored_tests {
     use super::write_restored;
     use std::os::unix::fs::PermissionsExt;
 
-    fn dir() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("nn-wr-{}", std::process::id()));
+    /// PER TEST, not per process. Both tests removed the shared directory on
+    /// the way out, so whichever finished first deleted the other's file and
+    /// the suite failed intermittently - only under the full run, because
+    /// that is what schedules them together.
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("nn-wr-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -162,7 +166,7 @@ mod write_restored_tests {
     /// script lands unrunnable.
     #[test]
     fn an_executable_store_object_stays_executable() {
-        let d = dir();
+        let d = dir("exec");
         let target = d.join("gen.sh");
         std::fs::write(&target, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -176,7 +180,7 @@ mod write_restored_tests {
     /// next run cannot replace it in the build tree.
     #[test]
     fn a_read_only_store_object_becomes_writable() {
-        let d = dir();
+        let d = dir("ro");
         let target = d.join("config.h");
         std::fs::write(&target, b"x").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
