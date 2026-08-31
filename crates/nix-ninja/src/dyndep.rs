@@ -16,6 +16,19 @@
 //! with `Cannot open module file 'mymodule.mod'` - measured 2026-08-26 on
 //! liblapack, which blocked the whole server closure.
 //!
+//! DYNDEP IS NECESSARY AND WAS NOT SUFFICIENT, and the other half is not in
+//! this file. A Fortran project has to CONFIGURE before any of this runs, and
+//! CMake learns `CMAKE_Fortran_IMPLICIT_LINK_LIBRARIES` by compiling a probe
+//! with `-v -Wl,-v` and parsing the build output. A task's command runs inside
+//! its own derivation, so ninja's `-v` had nothing to show; CMake recorded an
+//! empty list, reported success, and every Fortran link then failed for want
+//! of `-lgfortran`. The transcript now travels as a derivation OUTPUT under
+//! `-v`; `Cli::verbose` in `cli.rs` carries that. Two further defects sat
+//! behind it, both in dependency discovery rather than here.
+//!
+//! So a reader who fixes dyndep alone and finds Fortran still broken has not
+//! found a dyndep bug.
+//!
 //! WHY IT IS PARSED HERE RATHER THAN IN n2. n2's loader drops the `dyndep`
 //! binding, and adding a field to `graph::Build` would be the obvious fix.
 //! It is not available: `nix-ninja-task`'s `src` fileset in
