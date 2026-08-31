@@ -168,7 +168,7 @@ pub fn build(
     // 500-task tick: a drop-in driver runs ONE task per invocation and
     // so never reached the tick, which left the resolve cache and the
     // NAR stamp cache inert for exactly the mode with the most restarts.
-    if let Err(e) = task::resolve_cache_final_flush(rpc_client) {
+    if let Err(e) = task::persist_resolve_caches(rpc_client) {
         eprintln!("nix-ninja: end-of-run cache flush failed: {e}");
     }
 
@@ -176,7 +176,7 @@ pub fn build(
     // now the accounting appeared only on 500-task boundaries, so short
     // builds reported nothing and long ones reported everything except
     // their last few hundred tasks.
-    task::report_progress_final(rpc_client);
+    task::report_progress_final();
 
     // Deduplicated by build_path, because two targets legitimately share
     // outputs - ask for a phony and one of the files it aliases and the file

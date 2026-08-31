@@ -730,7 +730,13 @@ impl Runner {
             );
         }
         if n_tasks.is_multiple_of(500) {
-            report_progress(&self.rpc_client, n_tasks);
+            report_progress(n_tasks);
+            // Periodic persistence, so a run killed mid-way leaves the
+            // caches usable. Beside the report rather than inside it: they
+            // are two jobs that happen to share a tick.
+            if let Err(e) = persist_resolve_caches(&self.rpc_client) {
+                eprintln!("nix-ninja: cache persist failed: {e}");
+            }
         }
 
         // Stamp-tool edges also record the task's RESOLVED inputs (the
@@ -2135,9 +2141,14 @@ impl Runner {
     }
 }
 
-/// End-of-run persistence for the cross-run caches; see build.rs. Public
-/// because the build loop, not the runner, knows when the run is over.
-pub fn resolve_cache_final_flush(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> {
+/// Persist the cross-run caches: the resolve memo and the NAR stamps.
+///
+/// Named for WHAT it does rather than when, because it runs at two different
+/// times. It used to run at the end of a run under a name that said so, while
+/// the periodic copy lived inside `report_progress` - so the end of a run
+/// persisted both caches twice, back to back, from the same snapshot, and a
+/// reporter could not be replaced without taking cache writes with it.
+pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> {
     crate::resolve_cache::flush()?;
     crate::resolve_cache::save_nar_stamps(&rpc_client.nar_stamps_snapshot())
 }
@@ -2954,16 +2965,18 @@ fn build_dynamic_task_derivation(
 /// last tick landed at the last multiple of 500 and the remainder went
 /// unreported. Both matter for upstream #4 and #7, which ask for benchmarks
 /// and cannot have them from a driver that does not report its own totals.
-pub fn report_progress_final(rpc_client: &Arc<BuilderRpcClient>) {
+/// Takes no client: reporting is a function of the counters and nothing else.
+/// It took one until the cache writes were moved out from under it.
+pub fn report_progress_final() {
     let n = TASKS.load(std::sync::atomic::Ordering::Relaxed);
     // Nothing resolved means nothing to report; printing zeros would put a
     // row of measurements into a log where no measuring happened.
     if n > 0 {
-        report_progress(rpc_client, n);
+        report_progress(n);
     }
 }
 
-fn report_progress(rpc_client: &Arc<BuilderRpcClient>, n_tasks: u64) {
+fn report_progress(n_tasks: u64) {
     use std::sync::atomic::Ordering;
 
     // Machine-readable counters, in MILLISECONDS, when asked for.
@@ -3011,12 +3024,6 @@ fn report_progress(rpc_client: &Arc<BuilderRpcClient>, n_tasks: u64) {
     );
     // Persist resolve-cache entries computed since the last tick;
     // a killed driver loses at most one tick's worth.
-    if let Err(e) = crate::resolve_cache::flush() {
-        eprintln!("nix-ninja: resolve cache flush failed: {e}");
-    }
-    if let Err(e) = crate::resolve_cache::save_nar_stamps(&rpc_client.nar_stamps_snapshot()) {
-        eprintln!("nix-ninja: nar stamp save failed: {e}");
-    }
     // Each stats() call is a fresh pair of atomic loads, so calling
     // one twice in an argument list samples two different instants
     // while other threads advance the counters - which can print a
