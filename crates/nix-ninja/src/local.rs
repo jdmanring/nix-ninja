@@ -4,6 +4,7 @@ use harmonia_store_path::StoreDir;
 use nix_builder_rpc_client::BuilderRpcClient;
 use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub fn build_derived_files(
@@ -150,12 +151,11 @@ fn copy_over(src: &Path, dest: &Path) -> std::io::Result<()> {
     let tmp = dest.with_file_name(format!(".{name}.nn-tmp.{}.{n}", std::process::id()));
 
     let copied = std::fs::copy(src, &tmp).and_then(|_| {
-        if let Ok(md) = std::fs::metadata(&tmp) {
-            let mut perms = md.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            let _ = std::fs::set_permissions(&tmp, perms);
-        }
+        // The source's mode plus owner write, which is a union rather than a
+        // swap. `set_readonly(false)` ORs in every write bit, so a 0444 store
+        // file became 0666 and the depfile landed world-writable.
+        let mode = std::fs::metadata(src)?.permissions().mode() | 0o200;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
         std::fs::rename(&tmp, dest)
     });
     if copied.is_err() {
@@ -167,6 +167,44 @@ fn copy_over(src: &Path, dest: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod copy_over_tests {
     use super::copy_over;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// THE MUTANT THE FIRST TEST DID NOT KILL. A plain `fs::copy` onto the
+    /// destination, with no temp and no pre-removal, survives a failure
+    /// induced at `open` - so it had to be separated from atomicity by a
+    /// case only the rename can pass. A store depfile is read-only, and a
+    /// previous run leaves one here: copying ONTO it fails with EACCES,
+    /// while renaming over it succeeds because the directory is writable.
+    #[test]
+    fn a_read_only_destination_is_replaced() {
+        let d = std::env::temp_dir().join(format!("nn-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let src = d.join("new.d");
+        std::fs::write(&src, b"new\n").unwrap();
+        let dest = d.join("old.d");
+        std::fs::write(&dest, b"old\n").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        copy_over(&src, &dest).expect("rename must replace a read-only file");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new\n");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// And it must not land world-writable: `set_readonly(false)` ORs in
+    /// every write bit, so a 0444 source produced 0666.
+    #[test]
+    fn the_copy_is_not_world_writable() {
+        let d = std::env::temp_dir().join(format!("nn-ww-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let src = d.join("a.d");
+        std::fs::write(&src, b"x").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let dest = d.join("b.d");
+        copy_over(&src, &dest).unwrap();
+        let m = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m, 0o644, "expected owner-write only, got {m:o}");
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     /// THE REGRESSION. A copy that fails must leave what was there. The
     /// previous form removed the destination and then wrote in place, so a
