@@ -69,6 +69,26 @@ pub struct Cli {
     pub load_average: f64,
 
     /// Show all command lines while building
+    ///
+    /// ACCEPTED AND UNREAD, and the reason is the protocol rather than an
+    /// oversight. A task runs inside its own derivation, so its command's
+    /// output reaches no stream of this process. `builder-rpc-v0` carries
+    /// that output on FAILURE only: a successful reply is a status and a set
+    /// of realisations. The daemon's own log is not a way round it either -
+    /// measured 2026-08-31, `nix log` on a task's derivation answers "is not
+    /// available" for the whole of the run that produced it, unchanged after
+    /// waiting ten seconds, and succeeds once the driver has exited.
+    ///
+    /// What that costs is not cosmetic. CMake's compiler ABI detection
+    /// compiles a probe with `-v -Wl,-v` and PARSES THE BUILD OUTPUT for the
+    /// link line, which is where CMAKE_<LANG>_IMPLICIT_LINK_LIBRARIES comes
+    /// from. With nothing to parse it records an empty list and reports
+    /// success, and every Fortran link then fails for want of -lgfortran.
+    /// `local/liblapack-blocker-chain.md` carries the measurement.
+    ///
+    /// So this needs the protocol to carry a successful task's output, or a
+    /// log the client can read during its own session. Forwarding it from
+    /// here is not one of the options.
     #[arg(short = 'v', long = "verbose", default_value = "false")]
     pub verbose: bool,
 
