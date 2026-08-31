@@ -127,7 +127,8 @@ fn get_raw_rpath(elf_path: &Path) -> Result<String> {
 ///
 /// Pulled out of compute_new_rpath so the rule is testable: that function
 /// shells out to patchelf against a real ELF, so nothing asserted on its
-/// output, which is exactly where the behaviour changed twice this week.
+/// output, which is where preserving one is a search of the current
+/// directory baked into a store path.
 fn retained_entries(current_rpath: &[String]) -> Vec<String> {
     current_rpath
         .iter()
@@ -203,9 +204,10 @@ fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {
         .to_string_lossy();
 
     for entry in rpath {
-        // An empty entry is the runtime "current directory" marker. It is
-        // preserved in the rebuilt RPATH but it is not a directory we can
-        // resolve a needed library against here.
+        // An empty entry is the runtime marker for the current directory. It
+        // is dropped from the rebuilt RPATH by `retained_entries`, and it is
+        // not a directory a needed library can be resolved against here
+        // either.
         if entry.is_empty() {
             continue;
         }
