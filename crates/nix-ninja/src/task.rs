@@ -100,6 +100,10 @@ struct Task {
 
     files: HashMap<FileId, File>,
     inputs: Vec<DerivedFile>,
+    // Absolute store paths this edge declares as inputs. Not materialized -
+    // inputSrcs carries them - but seeds for the include scan, which is
+    // otherwise seeded only from `inputs`. See new_task.
+    store_srcs: Vec<PathBuf>,
     outputs: Vec<PathBuf>,
     // Configure-time relative symlinks to recreate in the sandbox; see
     // Runner::alias_symlinks.
@@ -1092,6 +1096,18 @@ impl Runner {
         // map (each ts_library task re-inserts a multi-thousand-entry
         // memoized closure), and FxHash is not DoS-hardened, which this
         // map does not need - its keys are the build graph's own paths.
+        // SOURCES THAT LIVE IN THE STORE, kept because the include scan is
+        // seeded from the task's inputs and store-path inputs are skipped
+        // below. A compile whose source is an absolute store path therefore
+        // reached the scan with an EMPTY seed list, and a scan with no seed
+        // returns no includes at all - so the task declared none and the
+        // build died on the first `#include` of a build-directory header.
+        // CMake's FortranCInterface_VERIFY is exactly that shape: main.c
+        // lives in the cmake module directory in the store and includes
+        // `VerifyFortran.h`, written into the build directory at configure
+        // time. It is why no Fortran project got past configure even once
+        // the version gate was open.
+        let mut store_srcs: Vec<PathBuf> = Vec::new();
         let mut input_set: rustc_hash::FxHashMap<PathBuf, DerivedFile> =
             rustc_hash::FxHashMap::default();
         // Expand phony aliases (transitively) into the real inputs behind
@@ -1232,14 +1248,11 @@ impl Runner {
                         continue;
                     }
                     if file.name.starts_with(&store_dir) {
-                        // TODO: Perhaps need to add this as inputSrc? But
-                        // will also have to change DerivedFile to have source
-                        // Option<PathBuf>, because we don't want it to be
-                        // added to $NIX_NINJA_INPUTS.
-                        // DerivedFile {
-                        //     path: SingleDerivedPath::Opaque(StorePath::new(file.name)),
-                        //     source: &file.name,
-                        // }
+                        // Not an input to materialize - it is already in the
+                        // store and reaches the sandbox through inputSrcs -
+                        // but it IS a scan seed, and dropping it here was
+                        // dropping the only seed a store-sourced compile has.
+                        store_srcs.push(PathBuf::from(&file.name));
                         continue;
                     }
 
@@ -2134,6 +2147,7 @@ impl Runner {
             depfile: build.depfile.clone(),
             files: build_files,
             inputs,
+            store_srcs,
             outputs,
             alias_symlinks: self.alias_symlinks.clone(),
         })
@@ -2328,6 +2342,7 @@ fn build_task_derivation(
                     SingleDerivedPath::Opaque(_) => Some(input.build_path.clone()),
                     SingleDerivedPath::Built { .. } => None, // Will be filled in by dynamic task derivation
                 })
+                .chain(task.store_srcs.iter().cloned())
                 .collect();
 
             // Static analysis virtual paths: map build paths of known
@@ -3887,6 +3902,39 @@ fn rewrite_cmdline(cmdline: &str, build_dir: &Path) -> String {
     rewrite_ancestor_paths(cmdline, build_dir)
 }
 
+/// Replace `needle` with `to` only where it is a WHOLE path rather than the
+/// prefix of a longer name.
+///
+/// `str::replace` would rewrite `/b/VerifyCFoo` on a needle of `/b/VerifyC`,
+/// inventing a path that was never there. Any occurrence followed by `/` is
+/// left alone as well: the caller rewrites those first, with the separator in
+/// the pattern, and a leftover is a directory this level does not own.
+fn replace_path_token(haystack: &str, needle: &str, to: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    let mut out = String::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while let Some(i) = rest.find(needle) {
+        let after = &rest[i + needle.len()..];
+        let boundary = match after.chars().next() {
+            None => true,
+            // A path character means the match is a prefix of something
+            // longer, which is a different path.
+            Some(c) => !(c == '/' || c == '.' || c == '-' || c == '_' || c.is_alphanumeric()),
+        };
+        out.push_str(&rest[..i]);
+        if boundary {
+            out.push_str(to);
+        } else {
+            out.push_str(needle);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Like rewrite_ancestor_paths, but every emitted `../` chain gets
 /// `extra_ups` more levels. For content resolved by a process whose cwd
 /// is `extra_ups` components BELOW the build dir (a `cd <subdir> &&`
@@ -3902,6 +3950,21 @@ fn rewrite_ancestor_paths_ups(cmdline: &str, build_dir: &Path, extra_ups: usize)
         }
         if let Some(dir) = dir.to_str() {
             cmdline = cmdline.replace(&format!("{dir}/"), &"../".repeat(ups));
+            // AND THE DIRECTORY ITSELF, which the pattern above cannot reach
+            // because it requires a trailing separator. `-I<build_dir>` with
+            // nothing after it fell through to the PARENT rule and came out
+            // as `-I../<basename>`. That names the same directory on the
+            // host, so it looks right and builds nothing: inside the sandbox
+            // only the build directory's own subtree is mirrored, so `..` is
+            // a directory that does not exist and the include resolves to
+            // nothing. CMake's FortranCInterface_VERIFY emits exactly this
+            // shape, and `VerifyFortran.h: No such file or directory` is
+            // where every Fortran project died after the version gate.
+            let bare = match ups {
+                0 => ".".to_string(),
+                n => "../".repeat(n).trim_end_matches('/').to_string(),
+            };
+            cmdline = replace_path_token(&cmdline, dir, &bare);
         }
         ups += 1;
         ancestor = dir.parent();
@@ -6120,6 +6183,56 @@ mod python_import_names_tests {
     // rewrite must compensate every emitted ../ chain by the cd depth,
     // and the in-build-dir prefix (ups=0 uncompensated) must gain
     // exactly the compensation - that arithmetic is the fix.
+    /// THE BUILD DIRECTORY ITSELF, which is not the same question as a
+    /// path under it. `-I<build_dir>` carries no trailing separator, so the
+    /// pattern that rewrites children could not match it and it fell through
+    /// to the parent rule as `-I../<basename>` - the same directory on the
+    /// host, and a directory that does not exist inside the sandbox, where
+    /// only the build tree's own subtree is mirrored.
+    #[test]
+    fn the_build_directory_itself_becomes_dot() {
+        let bd = std::path::Path::new("/tmp/x/build/CMakeFiles/Verify");
+        assert_eq!(
+            super::rewrite_ancestor_paths("cc -I/tmp/x/build/CMakeFiles/Verify -c a.c", bd),
+            "cc -I. -c a.c"
+        );
+    }
+
+    /// And a child still resolves to the child, which is the case that
+    /// already worked and must not move.
+    #[test]
+    fn a_path_under_the_build_directory_is_unchanged_by_the_new_rule() {
+        let bd = std::path::Path::new("/tmp/x/build/CMakeFiles/Verify");
+        assert_eq!(
+            super::rewrite_ancestor_paths("cc -I/tmp/x/build/CMakeFiles/Verify/sub -c a.c", bd),
+            "cc -Isub -c a.c"
+        );
+    }
+
+    /// A SIBLING WHOSE NAME EXTENDS THE BUILD DIRECTORY'S must not be
+    /// rewritten. A plain string replace would turn `VerifyFoo` into `.Foo`,
+    /// inventing a path that was never on the command line.
+    #[test]
+    fn a_longer_sibling_name_is_not_a_match() {
+        let bd = std::path::Path::new("/tmp/x/build/CMakeFiles/Verify");
+        assert_eq!(
+            super::rewrite_ancestor_paths("cc -I/tmp/x/build/CMakeFiles/VerifyFoo -c a.c", bd),
+            "cc -I../VerifyFoo -c a.c"
+        );
+    }
+
+    /// With a `cd <subdir> &&` prologue the bare form takes the same
+    /// compensation the children get: one level down means the build
+    /// directory is `..`, not `.`.
+    #[test]
+    fn the_bare_form_takes_the_cd_compensation_too() {
+        let bd = std::path::Path::new("/tmp/x/build/CMakeFiles/Verify");
+        assert_eq!(
+            super::rewrite_ancestor_paths_ups("cc -I/tmp/x/build/CMakeFiles/Verify -c a.c", bd, 1),
+            "cc -I.. -c a.c"
+        );
+    }
+
     #[test]
     fn ancestor_rewrite_compensates_for_cd_depth() {
         use super::{rewrite_ancestor_paths, rewrite_ancestor_paths_ups};
