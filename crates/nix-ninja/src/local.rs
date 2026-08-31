@@ -254,30 +254,123 @@ pub fn copy_derived_files(
 ///
 /// - a previous run leaves a SYMLINK into the store at this path, and
 ///   `fs::copy` onto a symlink writes THROUGH it, into a read-only store
-///   file. Remove first.
+///   file. The rename below replaces the link itself instead.
 /// - store files are read-only and a copy inherits the mode, so without the
 ///   permission fix the next run cannot replace it in place.
 /// - the result must not itself be a symlink, because the whole reason
 ///   depfiles are copied is that `fs::metadata` follows a symlink into the
 ///   store and reads mtime 1, which the freshness guard treats as older than
 ///   every source. That made the feature inert for a day.
+///
+/// WRITTEN TO A SIBLING AND RENAMED, because a copy that fails part way
+/// through is worse here than one that does not happen at all. `fs::copy`
+/// writes in place, so a failure mid-write left a TRUNCATED depfile at the
+/// destination carrying a fresh mtime, and the freshness guard then preferred
+/// it to the scan: the next run compiled that unit against a short input list,
+/// header edits stopped invalidating it, and the object was quietly wrong.
+/// A rename either happens or does not.
+///
+/// The rename also subsumes the symlink case. Renaming over a symlink
+/// replaces the link itself, where a copy would have written through it into
+/// a read-only store file.
 fn copy_over(src: &Path, dest: &Path) -> std::io::Result<()> {
-    if dest.is_symlink() || dest.exists() {
-        let _ = std::fs::remove_file(dest);
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = dest
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "depfile".to_string());
+    // Unique per process AND per call: two restores of different outputs in
+    // one directory must not share a temp.
+    let tmp = dest.with_file_name(format!(".{name}.nn-tmp.{}.{n}", std::process::id()));
+
+    let copied = std::fs::copy(src, &tmp).and_then(|_| {
+        // The source's mode plus owner write, which is a union rather than a
+        // swap. `set_readonly(false)` ORs in every write bit, so a 0444 store
+        // file became 0666 and the depfile landed world-writable.
+        let mode = std::fs::metadata(src)?.permissions().mode() | 0o200;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&tmp, dest)
+    });
+    if copied.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::copy(src, dest)?;
-    if let Ok(md) = std::fs::metadata(dest) {
-        let mut perms = md.permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        perms.set_readonly(false);
-        let _ = std::fs::set_permissions(dest, perms);
-    }
-    Ok(())
+    copied
 }
 
 #[cfg(test)]
 mod copy_over_tests {
     use super::copy_over;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// THE MUTANT THE FIRST TEST DID NOT KILL. A plain `fs::copy` onto the
+    /// destination, with no temp and no pre-removal, survives a failure
+    /// induced at `open` - so it had to be separated from atomicity by a
+    /// case only the rename can pass. A store depfile is read-only, and a
+    /// previous run leaves one here: copying ONTO it fails with EACCES,
+    /// while renaming over it succeeds because the directory is writable.
+    #[test]
+    fn a_read_only_destination_is_replaced() {
+        let d = std::env::temp_dir().join(format!("nn-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let src = d.join("new.d");
+        std::fs::write(&src, b"new\n").unwrap();
+        let dest = d.join("old.d");
+        std::fs::write(&dest, b"old\n").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        copy_over(&src, &dest).expect("rename must replace a read-only file");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new\n");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// And it must not land world-writable: `set_readonly(false)` ORs in
+    /// every write bit, so a 0444 source produced 0666.
+    #[test]
+    fn the_copy_is_not_world_writable() {
+        let d = std::env::temp_dir().join(format!("nn-ww-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let src = d.join("a.d");
+        std::fs::write(&src, b"x").unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let dest = d.join("b.d");
+        copy_over(&src, &dest).unwrap();
+        let m = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m, 0o644, "expected owner-write only, got {m:o}");
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// THE REGRESSION. A copy that fails must leave what was there. The
+    /// previous form removed the destination and then wrote in place, so a
+    /// failure part way through left either nothing or a truncated file
+    /// carrying a fresh mtime - and a fresh mtime is exactly what makes the
+    /// freshness guard prefer a depfile to the scan.
+    ///
+    /// The failure is induced by handing it a directory as the source, which
+    /// `fs::copy` refuses.
+    #[test]
+    fn a_failed_copy_leaves_the_destination_untouched() {
+        let d = std::env::temp_dir().join(format!("nn-cov-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let dest = d.join("main.o.d");
+        std::fs::write(&dest, b"main.o: main.c header.h\n").unwrap();
+        let bad_src = d.join("a-directory");
+        std::fs::create_dir_all(&bad_src).unwrap();
+
+        assert!(copy_over(&bad_src, &dest).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "main.o: main.c header.h\n"
+        );
+        // and no temp is left behind
+        let leftovers: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("nn-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind");
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
