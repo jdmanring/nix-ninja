@@ -1038,6 +1038,14 @@ mod normalize_output_tests {
         );
     }
 
+    /// Defensive rather than required, and the earlier note here named a
+    /// rule current nix does not have. A name MAY begin with a period:
+    /// `nix store add-file --name .hidden.c` is accepted. What is rejected
+    /// is a name of `.` or `..`, or a first dash-separated component that is
+    /// either. These names are `ninja-build-<output>`, so the output's own
+    /// leading period never sits at position 0 and cannot form that
+    /// component. The prefix is kept because it costs nothing and makes the
+    /// mapping total for a caller that does not prepend anything.
     #[test]
     fn leading_period_is_prefixed() {
         assert_eq!(normalize_output(".hidden.c"), "-.hidden.c");
