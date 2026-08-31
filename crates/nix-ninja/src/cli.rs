@@ -201,8 +201,35 @@ pub fn run() -> Result<()> {
     warn_ignored_flags(&cli);
 
     if cli.print_version {
-        // For compatibility with meson, it expects >= 1.8.2.
-        println!("1.8.2");
+        // A VERSION IS A PROMISE TO ACCEPT WHAT THE GENERATOR THEN EMITS,
+        // not a claim about what happens to be implemented. CMake reads this
+        // number and decides which constructs to write; below a gate it
+        // declines to generate them and we are never asked.
+        // `cmGlobalNinjaGenerator.h` carries the table, and 1.10 is five
+        // promises:
+        //
+        //   multiline depfile        n2's escaped_newline_in_depfile
+        //   dyndep, for Fortran      dyndep.rs
+        //   -t restat                accepted, and accepts absent paths
+        //   -t recompact             accepted
+        //   multiple outputs         normalized_task_outputs
+        //
+        // The last was the one nothing had exercised. Driven 2026-08-31 as a
+        // two-output edge feeding two compiles: both objects built, from
+        // distinct store paths, each defining its own symbol - so the edge
+        // produced two files rather than one twice.
+        //
+        // 1.10 RATHER THAN 1.10.2, deliberately: metadata on regeneration is
+        // gated at 1.10.2 and is not implemented. 1.11 wants C++ dyndep and
+        // a code page, so this is the highest honest number.
+        //
+        // BELOW THIS, NO FORTRAN PROJECT USING THE NINJA GENERATOR
+        // CONFIGURES AT ALL. CMake refuses outright, naming 1.10, which is
+        // what liblapack died on before it reached anything of ours.
+        //
+        // And it is why `-x` above had to be accepted first: meson sends
+        // `-t compdb -x` to anything advertising 1.9 or newer.
+        println!("1.10.0");
         return Ok(());
     }
 
