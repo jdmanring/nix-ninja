@@ -1228,7 +1228,7 @@ impl Runner {
                 Some(df) => df.to_owned(),
                 None => {
                     let file = &files.by_id[fid];
-                    if via_phony && !Path::new(&file.name).is_file() {
+                    if via_phony && phony_ordering_only(&self.config.build_dir, &file.name) {
                         continue;
                     }
                     if file.name.starts_with(&store_dir) {
@@ -4395,6 +4395,69 @@ fn python_closure_cached(
         .unwrap()
         .insert(start_dir.to_path_buf(), arc.clone());
     Ok(arc)
+}
+
+/// Is this phony-expanded input ordering and nothing more?
+///
+/// Asked only for a path the GRAPH does not produce - a graph-produced input
+/// is materialized from the store and is answered by `derived_files` before
+/// this is reached. What is left is a path that must already exist to be an
+/// input at all, so anything that is not a regular file is ordering.
+///
+/// CMake's `build X: phony || .` is the case it exists for: `.` joins to the
+/// build directory, which is a directory and materializes as nothing.
+///
+/// RESOLVED AGAINST THE BUILD DIRECTORY, which is what `upload_referenced_file`
+/// two lines below already does. A ninja path is spelled relative to the build
+/// directory, and reading it against the process working directory made the
+/// two agree only because the driver happens to set one from the other at
+/// startup. Taking it as a parameter is also what lets the decision be tested:
+/// the working directory is a process global that this crate's own tests move.
+fn phony_ordering_only(build_dir: &Path, name: &str) -> bool {
+    !build_dir.join(name).is_file()
+}
+
+#[cfg(test)]
+mod phony_ordering_tests {
+    use super::phony_ordering_only;
+    use std::path::PathBuf;
+
+    /// PER TEST and cleared on entry. Per-process alone is two mistakes at
+    /// once: tests run on parallel threads, so they wipe each other's
+    /// fixtures, and a pid is reused, so an old run's leftovers arrive as
+    /// this run's state.
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nn-phony-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// CMake's `phony || .`, the case the guard exists for.
+    #[test]
+    fn the_build_directory_itself_is_ordering_only() {
+        assert!(phony_ordering_only(&scratch("dot"), "."));
+    }
+
+    /// A real file below the build directory is an input, not ordering.
+    #[test]
+    fn a_regular_file_is_an_input() {
+        let d = scratch("file");
+        std::fs::create_dir_all(d.join("gen")).unwrap();
+        std::fs::write(d.join("gen/version.h"), b"#define V 1\n").unwrap();
+        assert!(!phony_ordering_only(&d, "gen/version.h"));
+    }
+
+    /// THE RESOLUTION BASE. The same relative name answers differently
+    /// depending on the directory it is joined to, which is why the
+    /// directory is an argument rather than the process working directory.
+    #[test]
+    fn resolution_is_against_the_given_directory() {
+        let d = scratch("base");
+        std::fs::write(d.join("a.h"), b"x").unwrap();
+        assert!(!phony_ordering_only(&d, "a.h"));
+        assert!(phony_ordering_only(&PathBuf::from("/nonexistent"), "a.h"));
+    }
 }
 
 /// What to do with the directory just taken off the closure queue.
