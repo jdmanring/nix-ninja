@@ -28,14 +28,17 @@ system that outputs ninja like CMake, meson, premake, gn, etc.
 > macOS: the examples below have no macOS attribute to build. This flake
 > declares `systems = [ "x86_64-linux" ]`, so
 > `nix build github:pdtpartners/nix-ninja#example-hello` on a Mac fails with
-> `does not provide attribute 'packages.x86_64-darwin.example-hello'`.
+> `does not provide attribute 'packages.aarch64-darwin.example-hello'`, or the
+> `x86_64-darwin` form on an Intel Mac.
 > See [multi-arch support](https://github.com/pdtpartners/nix-ninja/issues/14).
 >
 > If you hit `experimental Nix feature '...' is disabled` while passing
 > `--extra-experimental-features`, that is a separate and not macOS-specific
-> problem: a multi-user daemon does not take experimental features from the
-> client, so they must also be in the daemon's own `/etc/nix/nix.conf`. A
-> stock multi-user install leaves them out on any platform.
+> problem: a multi-user daemon reads its own `/etc/nix/nix.conf`, so the
+> features must be listed there and the daemon restarted
+> (`sudo launchctl kickstart -k system/org.nixos.nix-daemon` on macOS). A
+> stock multi-user install leaves them out on any platform. Being in
+> `trusted-users` does not substitute for it.
 
 - Parses `ninja.build` files and generates a derivation per compilation unit.
 - Stores build inputs & outputs in content-addressed derivations for granular
