@@ -731,9 +731,8 @@ impl Runner {
         }
         if n_tasks.is_multiple_of(500) {
             report_progress(n_tasks);
-            // Periodic persistence, so a run killed mid-way leaves the
-            // caches usable. Beside the report rather than inside it: they
-            // are two jobs that happen to share a tick.
+            // Persist periodically so a run killed mid-way leaves usable
+            // caches; reporting and persistence share a tick, nothing more.
             if let Err(e) = persist_resolve_caches(&self.rpc_client) {
                 eprintln!("nix-ninja: cache persist failed: {e}");
             }
@@ -2143,11 +2142,8 @@ impl Runner {
 
 /// Persist the cross-run caches: the resolve memo and the NAR stamps.
 ///
-/// Named for WHAT it does rather than when, because it runs at two different
-/// times. It used to run at the end of a run under a name that said so, while
-/// the periodic copy lived inside `report_progress` - so the end of a run
-/// persisted both caches twice, back to back, from the same snapshot, and a
-/// reporter could not be replaced without taking cache writes with it.
+/// Named for what it does rather than when, because it runs at two different
+/// times: the periodic tick and the end of the run.
 pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> {
     crate::resolve_cache::flush()?;
     crate::resolve_cache::save_nar_stamps(&rpc_client.nar_stamps_snapshot())
@@ -2965,8 +2961,7 @@ fn build_dynamic_task_derivation(
 /// last tick landed at the last multiple of 500 and the remainder went
 /// unreported. Both matter for upstream #4 and #7, which ask for benchmarks
 /// and cannot have them from a driver that does not report its own totals.
-/// Takes no client: reporting is a function of the counters and nothing else.
-/// It took one until the cache writes were moved out from under it.
+/// Reporting is a function of the counters and nothing else.
 pub fn report_progress_final() {
     let n = TASKS.load(std::sync::atomic::Ordering::Relaxed);
     // Nothing resolved means nothing to report; printing zeros would put a
