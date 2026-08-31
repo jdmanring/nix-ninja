@@ -737,6 +737,9 @@ mod tests {
         // missing cmsys/ header.
         let _g = SCAN_TEST_LOCK.lock().unwrap();
         let d = std::env::temp_dir().join(format!("nnkw{}", std::process::id()));
+        // Named by pid alone, so a previous run of this same test can leave the
+        // directory behind and `create_dir_all` then races its contents.
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join("kwsysPrivate.h"),
@@ -783,6 +786,9 @@ mod tests {
         // see it; the walk-level table must.
         let _g = SCAN_TEST_LOCK.lock().unwrap();
         let d = std::env::temp_dir().join(format!("nnxf{}", std::process::id()));
+        // Named by pid alone, so a previous run of this same test can leave the
+        // directory behind and `create_dir_all` then races its contents.
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("config.h"), "#define SM_FILE \"sm_impl.h\"\n").unwrap();
         std::fs::write(d.join("body.h"), "#include SM_FILE\n").unwrap();
@@ -885,7 +891,15 @@ mod tests {
 
     #[test]
     fn nasm_percent_include_is_scanned() {
+        // `scan_stats` is a pair of GLOBAL counters and the directive cache is
+        // global too, so a test that parses without this lock is counted by
+        // whichever test is reading those counters at the time. That is the
+        // whole of the intermittent "parsed exactly once: left 2".
+        let _g = SCAN_TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("nn-nasm-{}", std::process::id()));
+        // Named by pid alone, so a previous run of this same test can leave the
+        // directory behind and `create_dir_all` then races its contents.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("cpuid.asm");
         std::fs::write(&src, b"; x86 helpers\n%include \"ext/x86/x86inc.asm\"\n%include\t\"config.asm\"\ncglobal cpu_cpuid\n").unwrap();
@@ -903,12 +917,20 @@ mod tests {
 
     #[test]
     fn non_utf8_line_does_not_end_the_scan() {
+        // `scan_stats` is a pair of GLOBAL counters and the directive cache is
+        // global too, so a test that parses without this lock is counted by
+        // whichever test is reading those counters at the time. That is the
+        // whole of the intermittent "parsed exactly once: left 2".
+        let _g = SCAN_TEST_LOCK.lock().unwrap();
         // groff's lbp.cpp: an ISO-8859 byte in a comment on line 2, every
         // include after it. The old lines()-based loop broke at the bad
         // byte and declared ZERO includes; the task then died on the first
         // missing header. The scan must survive the byte and keep every
         // directive that follows it.
         let dir = std::env::temp_dir().join(format!("nn-8859-{}", std::process::id()));
+        // Named by pid alone, so a previous run of this same test can leave the
+        // directory behind and `create_dir_all` then races its contents.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("lbp.cpp");
         let mut body = b"/*\n   Written by Francisco Andr\xe9s Verd\xfa\n*/\n".to_vec();
@@ -1105,6 +1127,9 @@ mod tests {
         let _g = SCAN_TEST_LOCK.lock().unwrap();
         use std::io::Write;
         let dir = std::env::temp_dir().join(format!("nnscan{}", std::process::id()));
+        // Named by pid alone, so a previous run of this same test can leave the
+        // directory behind and `create_dir_all` then races its contents.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let h = dir.join("shared.h");
         std::fs::File::create(&h)
@@ -1155,6 +1180,9 @@ mod tests {
     #[test]
     fn a_declared_virtual_header_that_does_not_exist_yet_scans_as_empty() {
         let d = std::env::temp_dir().join(format!("nnvirt{}", std::process::id()));
+        // Named by pid alone, so a previous run of this same test can leave the
+        // directory behind and `create_dir_all` then races its contents.
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let tu = d.join("nix-channel.cc");
         // Exactly nix's spelling: a quoted include of a .gen.hh that meson
@@ -1199,6 +1227,9 @@ mod tests {
     #[test]
     fn a_missing_header_that_was_never_declared_virtual_still_fails() {
         let d = std::env::temp_dir().join(format!("nnvirtneg{}", std::process::id()));
+        // Named by pid alone, so a previous run of this same test can leave the
+        // directory behind and `create_dir_all` then races its contents.
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let absent = d.join("not-generated-by-anything.h");
         assert!(!absent.exists());
