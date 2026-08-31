@@ -1006,6 +1006,18 @@ mod normalize_output_tests {
         assert_eq!(normalize_output("src/main.o"), "src-main.o");
     }
 
+    /// The reported case: a real autotools tree carries `lt~obsolete.m4`, and
+    /// a tilde is outside the store name grammar. Before this, the name
+    /// reached the store verbatim and the build died with
+    /// `name 'lt~obsolete.m4' contains illegal character '~'`.
+    #[test]
+    fn the_reported_tilde_case_is_sanitized() {
+        assert_eq!(
+            normalize_output("external/libevent/m4/lt~obsolete.m4"),
+            "external-libevent-m4-lt-obsolete.m4"
+        );
+    }
+
     #[test]
     fn at_sign_is_sanitized() {
         // The three shapes measured in the wild: mac asset suffixes,
