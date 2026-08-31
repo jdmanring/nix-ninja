@@ -4388,6 +4388,54 @@ fn python_closure_cached(
     Ok(arc)
 }
 
+/// What to do with the directory just taken off the closure queue.
+#[derive(Debug, PartialEq, Eq)]
+enum ClosureStep {
+    /// Already walked. Costs nothing and must not count toward the cap.
+    Seen,
+    /// Over the cap. The closure would be partial, so refuse it.
+    Refuse,
+    Scan,
+}
+
+/// Dedup and cap are SEPARATE questions and were one expression, which made
+/// the cap self-feeding: a directory dropped for being over the cap had
+/// already been inserted, so the set kept growing while nothing more was
+/// scanned. Ordering is the defect, so ordering is what this pins.
+fn closure_step(newly_inserted: bool, visited_len: usize, cap: usize) -> ClosureStep {
+    if !newly_inserted {
+        ClosureStep::Seen
+    } else if visited_len > cap {
+        ClosureStep::Refuse
+    } else {
+        ClosureStep::Scan
+    }
+}
+
+#[cfg(test)]
+mod closure_step_tests {
+    use super::{closure_step, ClosureStep};
+
+    #[test]
+    fn a_fresh_directory_under_the_cap_is_scanned() {
+        assert_eq!(closure_step(true, 3, 64), ClosureStep::Scan);
+    }
+
+    #[test]
+    fn over_the_cap_refuses_rather_than_truncating() {
+        assert_eq!(closure_step(true, 65, 64), ClosureStep::Refuse);
+    }
+
+    /// THE ORDERING THAT WAS WRONG. A directory already walked is skipped
+    /// because it is a duplicate, and that answer must not depend on how
+    /// full the set is - a repeat arriving after the cap is still a repeat,
+    /// not a reason to fail the build.
+    #[test]
+    fn a_duplicate_is_seen_even_when_the_set_is_over_the_cap() {
+        assert_eq!(closure_step(false, 9_000, 64), ClosureStep::Seen);
+    }
+}
+
 fn upload_python_closure_uncached(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &Path,
@@ -4414,15 +4462,43 @@ fn upload_python_closure_uncached(
         }
     };
     while let Some(dir) = queue.pop() {
-        if !visited.insert(dir.clone()) || visited.len() > CLOSURE_DIR_CAP {
+        // Dedup and cap are separate questions, and running them as one
+        // expression made the cap self-feeding: every directory dropped for
+        // being over the cap was first INSERTED, so `visited` kept growing
+        // while nothing more was scanned.
+        let step = closure_step(visited.insert(dir.clone()), visited.len(), CLOSURE_DIR_CAP);
+        if step == ClosureStep::Seen {
             continue;
+        }
+        // OVER THE CAP IS A REFUSAL, NOT A TRUNCATION. Dropping the rest
+        // yields a closure missing modules the script imports, and this
+        // crate's whole polarity is that under-declaring ships a wrong
+        // artifact quietly while over-declaring costs an upload. It also
+        // used to depend on readdir order, so which directories survived
+        // differed between machines and the input set was not a function of
+        // the source tree - the one thing a content-addressed per-unit build
+        // cannot tolerate.
+        if step == ClosureStep::Refuse {
+            return Err(anyhow!(
+                "python import closure below {} exceeds {} directories; \
+                 refusing to declare a partial closure",
+                start_dir.display(),
+                CLOSURE_DIR_CAP
+            ));
         }
         // Siblings: every .py module, node_modules for node.py, and
         // package directories - which recurse, because their own files
         // import too.
-        let entries = fs::read_dir(&dir)
-            .map_err(|e| anyhow!("read_dir({}) for python closure: {e}", dir.display()))?;
-        for entry in entries.flatten() {
+        //
+        // SORTED, so the traversal is a function of the tree. readdir order
+        // is filesystem order, and with a LIFO queue that decided which
+        // directories were reached first.
+        let mut entries: Vec<_> = fs::read_dir(&dir)
+            .map_err(|e| anyhow!("read_dir({}) for python closure: {e}", dir.display()))?
+            .flatten()
+            .collect();
+        entries.sort_by_key(|e| e.path());
+        for entry in entries {
             let p = entry.path();
             if p.extension().is_some_and(|e| e == "py") && p.is_file() {
                 out.push(new_opaque_file(rpc_client, build_dir, p)?);
@@ -4446,12 +4522,17 @@ fn upload_python_closure_uncached(
                 // Uncles: a directory beside this one holding <name>.py
                 // (common/ holds models.py) or BEING the named package
                 // (tracing/tracing_build/ answers import tracing_build).
-                for uncle in fs::read_dir(parent)
+                // SORTED, like every other walk here: these are pushed onto
+                // the queue, so readdir order decided which uncle was
+                // reached first and therefore what the closure contained.
+                let mut uncles: Vec<PathBuf> = fs::read_dir(parent)
                     .map_err(|e| anyhow!("read_dir({}) for uncle modules: {e}", parent.display()))?
                     .flatten()
                     .map(|e| e.path())
                     .filter(|p| p.is_dir() && *p != dir)
-                {
+                    .collect();
+                uncles.sort();
+                for uncle in uncles {
                     let hit = unsatisfied.iter().any(|n| {
                         uncle.join(format!("{n}.py")).is_file()
                             || (uncle.file_name().is_some_and(|f| f == n.as_str())
@@ -4523,6 +4604,12 @@ fn upload_python_closure_uncached(
                             });
                             u32::from(versioned) * 2 + u32::from(s.contains("py3"))
                         };
+                        // `max_by_key` returns the LAST maximum, so with an
+                        // unsorted candidate list two equally-scored vendored
+                        // copies were chosen by readdir order. Sorting makes
+                        // the tie-break the path, which is a property of the
+                        // tree.
+                        cands.sort();
                         if let Some(pkg) = cands.into_iter().max_by_key(|p| score(p)) {
                             if upload_dir(&pkg, 8192, out)? {
                                 queue.push(pkg);
@@ -4910,8 +4997,25 @@ fn find_module_below(root: &Path, name: &str, depth: usize) -> Option<PathBuf> {
     for _ in 0..depth {
         let mut next = Vec::new();
         for d in frontier {
-            let entries = fs::read_dir(&d).ok()?;
-            for sub in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+            // SORTED, because this returns the FIRST hit: two sibling
+            // directories each holding `<name>.py` were separated by readdir
+            // order, and the winner is uploaded. That is which file wins, not
+            // merely what order they are visited in.
+            //
+            // A directory that cannot be read is skipped rather than aborting
+            // the search. `?` here discarded every sibling at this level and
+            // every level below it, so one unreadable directory anywhere made
+            // the whole module unresolvable.
+            let Ok(entries) = fs::read_dir(&d) else {
+                continue;
+            };
+            let mut subs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            subs.sort();
+            for sub in subs {
                 let fname = sub.file_name().unwrap_or_default().to_string_lossy();
                 if fname.starts_with('.') || fname == "node_modules" {
                     continue;
