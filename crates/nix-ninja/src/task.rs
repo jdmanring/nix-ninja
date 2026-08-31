@@ -3641,6 +3641,56 @@ fn new_opaque_file(
     } else {
         upload_src
     };
+    // CMAKE'S DEPENDENCY-INFO JSON NAMES THE BUILD TREE ABSOLUTELY, AND
+    // NOTHING ELSE REWRITES A PATH INSIDE A FILE. `cmake -E
+    // cmake_ninja_dyndep` reads `--tdi=<target>.dir/FortranDependInfo.json`
+    // and follows its `linked-target-dirs` to a SIBLING target's
+    // FortranModules.json. Those entries are host-absolute
+    // (`/tmp/<build>/CMakeFiles/myfort.dir`), and inside the sandbox only
+    // the build tree's own subtree is mirrored, so the open fails:
+    //     failed to open .../CMakeFiles/myfort.dir/FortranModules.json
+    //         for module information
+    // The file it wants IS an input and IS materialized, at its build-dir
+    // relative path - the graph declares it, and NIX_NINJA_INPUTS carries
+    // it. Only the spelling inside the JSON is wrong.
+    //
+    // The command line already gets this treatment (rewrite_ancestor_paths);
+    // this is the same rule applied to a file's CONTENT, and it is done at
+    // UPLOAD so the rewritten form is what the task's input hash covers.
+    //
+    // ABSOLUTE, NOT RELATIVE, and that is not a preference. The first
+    // version rewrote the build directory to a relative path the way the
+    // command line gets it, and cmake refused outright:
+    //     -E cmake_ninja_dyndep --tdi= file has no absolute dir-cur-bld
+    // So the host build directory is replaced with the SANDBOX one, which
+    // keeps every entry absolute and makes them name paths that exist where
+    // the command runs.
+    //
+    // DEFER(a package needs it): scoped to CMake's `*DependInfo.json` by
+    // name. C++ modules use the same mechanism through `CXXDependInfo.json`
+    // and would be covered by the same suffix, but nothing here has driven
+    // one, so the claim stops at what has been run.
+    let upload_src = match upload_src {
+        Some(p) => Some(p),
+        None if is_cmake_depend_info(&canonical_path) => {
+            let text = fs::read_to_string(&canonical_path)?;
+            let rewritten = rewrite_to_sandbox_build_dir(&text, build_dir);
+            if rewritten == text {
+                None
+            } else {
+                let tmp = std::env::temp_dir().join(format!(
+                    "nn-tdi-{}-{}-{}",
+                    std::process::id(),
+                    TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    name
+                ));
+                fs::write(&tmp, rewritten)?;
+                Some(tmp)
+            }
+        }
+        None => None,
+    };
+
     let store_path = rpc_client.add_to_store_nar_cached(
         &name,
         upload_src.as_deref().unwrap_or(&canonical_path),
@@ -3652,6 +3702,38 @@ fn new_opaque_file(
         build_path: relative_path,
         rel_path: None, // None for opaque files - store path points directly to file
     })
+}
+
+/// Where a task's build directory lives inside the sandbox.
+///
+/// COUPLED TO `nix-ninja-task`'s `--build-dir` DEFAULT, deliberately and by
+/// value rather than by import: the task crate is inside the task binary's
+/// fileset, so exporting a constant from it would re-key every banked
+/// per-TU output to share a string. The driver never passes `--build-dir`,
+/// so the default is what every task uses. If it ever moves, the Fortran
+/// probe is what fails - `local/fortran-probe.sh` drives the one construct
+/// that reads a path out of a file rather than off the command line.
+const TASK_SANDBOX_BUILD_DIR: &str = "/build/source/build";
+
+/// Rewrite absolute paths under the host build directory to the same paths
+/// under the sandbox build directory, leaving everything else alone.
+///
+/// Only the build directory itself, not its ancestors: a path above the
+/// build tree is not mirrored into the sandbox at all, so rewriting it
+/// would invent a location rather than translate one.
+fn rewrite_to_sandbox_build_dir(text: &str, build_dir: &Path) -> String {
+    match build_dir.to_str() {
+        Some(d) => text.replace(d, TASK_SANDBOX_BUILD_DIR),
+        None => text.to_string(),
+    }
+}
+
+/// CMake's per-target dependency-info JSON, the one `cmake -E
+/// cmake_ninja_dyndep` is pointed at with `--tdi=`.
+fn is_cmake_depend_info(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with("DependInfo.json"))
 }
 
 /// Canonical paths whose upload carried an outer output path and was
@@ -7989,5 +8071,57 @@ mod create_symlink_undeclared_output_tests {
             "the quoted include was not collected either, so this says nothing \
              about angle includes: {names:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod depend_info_rewrite_tests {
+    use super::{is_cmake_depend_info, rewrite_to_sandbox_build_dir, TASK_SANDBOX_BUILD_DIR};
+    use std::path::Path;
+
+    /// THE DEFECT. `cmake -E cmake_ninja_dyndep` follows `linked-target-dirs`
+    /// to a sibling target's module info, and those entries are host
+    /// absolute. Inside the sandbox only the build tree is mirrored, so the
+    /// open failed on a file that WAS an input and WAS materialized - at its
+    /// build-dir relative path.
+    #[test]
+    fn a_sibling_target_dir_is_moved_into_the_sandbox() {
+        let bd = Path::new("/tmp/x/build/CMakeFiles/FortranCInterface");
+        let json = r#"{"linked-target-dirs":["/tmp/x/build/CMakeFiles/FortranCInterface/CMakeFiles/myfort.dir"]}"#;
+        assert_eq!(
+            rewrite_to_sandbox_build_dir(json, bd),
+            format!(
+                r#"{{"linked-target-dirs":["{TASK_SANDBOX_BUILD_DIR}/CMakeFiles/myfort.dir"]}}"#
+            )
+        );
+    }
+
+    /// AND IT MUST STAY ABSOLUTE. Rewriting the build directory to a
+    /// relative path, the way the command line gets it, is refused outright:
+    /// "--tdi= file has no absolute dir-cur-bld".
+    #[test]
+    fn the_result_is_still_an_absolute_path() {
+        let bd = Path::new("/tmp/x/build");
+        let got = rewrite_to_sandbox_build_dir(r#"{"dir-cur-bld":"/tmp/x/build"}"#, bd);
+        assert!(got.contains(r#""dir-cur-bld":"/"#), "got {got}");
+        assert!(!got.contains(r#""dir-cur-bld":"."#), "went relative: {got}");
+    }
+
+    /// A SOURCE PATH IN THE STORE IS NOT THE BUILD TREE and must survive: it
+    /// is mounted at that exact path inside the sandbox.
+    #[test]
+    fn a_store_path_is_untouched() {
+        let bd = Path::new("/tmp/x/build");
+        let json = r#"{"dir-cur-src":"/nix/store/abc-cmake/share/Modules"}"#;
+        assert_eq!(rewrite_to_sandbox_build_dir(json, bd), json);
+    }
+
+    #[test]
+    fn only_cmake_depend_info_is_rewritten() {
+        assert!(is_cmake_depend_info(Path::new("a/FortranDependInfo.json")));
+        assert!(is_cmake_depend_info(Path::new("a/CXXDependInfo.json")));
+        assert!(!is_cmake_depend_info(Path::new("a/DependInfo.cmake")));
+        assert!(!is_cmake_depend_info(Path::new("a/FortranModules.json")));
+        assert!(!is_cmake_depend_info(Path::new("a/compile_commands.json")));
     }
 }
