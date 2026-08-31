@@ -6220,7 +6220,11 @@ mod depfile_read_back_tests {
 
     #[test]
     fn fresh_stale_and_empty() {
+        // REMOVED FIRST. The name is only per-process, and a pid is reused:
+        // a leftover `linked.o.d` from an earlier run made the symlink below
+        // fail with EEXIST, intermittently and only under the full suite.
         let d = std::env::temp_dir().join(format!("nndf{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let src = d.join("a.c");
         std::fs::write(&src, "int x;\n").unwrap();
