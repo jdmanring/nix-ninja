@@ -34,3 +34,8 @@ __pycache__/
 # cargo-mutants writes its run directory here (local/mutants.sh).
 /mutants.out/
 /mutants.out.old/
+
+# `bench/e2e.sh` writes the driver transcript beside each record. The record
+# is the artifact; the transcript is regenerable and would otherwise leave
+# `git status` dirty after every benchmark run.
+bench/records/*.log
