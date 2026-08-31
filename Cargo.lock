@@ -296,6 +296,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "clang-sys"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "157a8ba7b480713b56f4c09fd13fc3e0a22a5dfab8097ba61cbc5feef950788a"
+dependencies = [
+ "glob",
+ "libc",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -497,6 +507,7 @@ name = "deps-infer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clang-sys",
  "clap",
  "n2",
  "regex",

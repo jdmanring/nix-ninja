@@ -1,14 +1,13 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clang_sys::*;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_uint, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 struct VisitorData<'a> {
     includes: &'a mut HashSet<PathBuf>,
-    tu: CXTranslationUnit,
 }
 
 pub fn retrieve_c_includes(cmdline: &str, files: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
@@ -24,26 +23,26 @@ pub fn retrieve_c_includes(cmdline: &str, files: Vec<PathBuf>) -> Result<Vec<Pat
     }
 
     // Try to parse all files in a single translation unit for better performance
-    if files.len() == 1 {
-        // Single file - use the existing approach
-        match parse_file_includes(index, &files[0], &args) {
-            Ok(file_includes) => all_includes.extend(file_includes),
-            Err(_) => {
-                // Skip files that can't be parsed
-            }
-        }
-    } else {
-        // Multiple files - could potentially batch them, but for now keep separate
-        // The real win would be to reuse parsed headers, but that's complex with current API
-        for file in files {
-            match parse_file_includes(index, &file, &args) {
-                Ok(file_includes) => all_includes.extend(file_includes),
-                Err(_) => {
-                    // Skip files that can't be parsed (e.g., missing generated headers)
-                    continue;
-                }
-            }
-        }
+    // A PARSE FAILURE IS AN ERROR, NOT AN EMPTY ANSWER. Skipping it returns
+    // zero includes for the translation unit, the task derivation is built
+    // without them, and the compile then fails inside the sandbox on a missing
+    // header or, worse, succeeds against a different one. Over-declaring costs
+    // an upload; under-declaring produces a wrong artifact quietly, so the two
+    // directions are not symmetric and the caller has to be told.
+    //
+    // The named case, a generated header that does not exist yet, is real and
+    // is the caller's to handle: it knows which paths the build declares and
+    // has not yet written, and this module does not.
+    let parse = |file: &PathBuf| -> Result<()> {
+        let file_includes = parse_file_includes(index, file, &args)
+            .with_context(|| format!("libclang could not parse {}", file.display()))?;
+        all_includes.extend(file_includes);
+        Ok(())
+    };
+    let result = files.iter().try_for_each(parse);
+    if let Err(e) = result {
+        unsafe { clang_disposeIndex(index) };
+        return Err(e);
     }
 
     // Cleanup
@@ -101,12 +100,17 @@ fn build_clang_args(cmdline: &str) -> Result<Vec<CString>> {
 
 fn parse_file_includes(
     index: CXIndex,
-    file_path: &PathBuf,
+    file_path: &Path,
     args: &[CString],
 ) -> Result<HashSet<PathBuf>> {
     let mut includes = HashSet::new();
 
-    let file_str = file_path.to_str().unwrap();
+    // A source path that is not UTF-8 is a real input class, not an
+    // impossibility: this crate has a test for one. Refusing by name beats
+    // panicking inside a driver that is mid-graph.
+    let file_str = file_path
+        .to_str()
+        .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", file_path.display()))?;
     let file_cstring = CString::new(file_str)?;
 
     // Convert args to pointers
@@ -121,7 +125,7 @@ fn parse_file_includes(
             arg_ptrs.len() as i32,
             ptr::null_mut(),
             0,
-            CXTranslationUnit_None,  // Try with no special flags first
+            CXTranslationUnit_None, // Try with no special flags first
         )
     };
 
@@ -132,7 +136,6 @@ fn parse_file_includes(
     // Collect all inclusions using clang_getInclusions
     let mut visitor_data = VisitorData {
         includes: &mut includes,
-        tu,
     };
     unsafe {
         clang_getInclusions(
@@ -163,11 +166,12 @@ extern "C" fn inclusion_visitor(
     let visitor_data = unsafe { &mut *(client_data as *mut VisitorData) };
 
     unsafe {
-        // Check if this is a system header using clang's built-in functionality
-        let location = clang_getLocationForOffset(visitor_data.tu, file, 0);
-        if clang_Location_isInSystemHeader(location) != 0 {
-            return; // Skip system headers
-        }
+        // NO SYSTEM-HEADER FILTER. Under nix there is no system: every header
+        // arrives as a store path reached through -I or -isystem, so a header
+        // dropped for looking like a system header is a missing input, and a
+        // missing input is the failure this crate exists to prevent.
+        // clang_Location_isInSystemHeader reports true for anything reached
+        // through -isystem, which is how a nix toolchain presents libstdc++.
 
         let file_name = clang_getFileName(file);
         let file_name_ptr = clang_getCString(file_name);

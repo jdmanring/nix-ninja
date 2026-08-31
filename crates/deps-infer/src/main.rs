@@ -1,6 +1,8 @@
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
-use deps_infer::{c_include_parser, clang_infer, gcc_depfile};
+use deps_infer::c_include_parser;
+#[cfg(feature = "clang")]
+use deps_infer::{clang_infer, gcc_depfile};
 use n2::{canon, load, scanner};
 use std::{
     path::{Path, PathBuf},
@@ -88,7 +90,12 @@ fn main() -> Result<()> {
             }
         }
         Mode::Benchmark => run_benchmark_mode(targets),
+        #[cfg(feature = "clang")]
         Mode::Correctness => run_correctness_mode(targets),
+        #[cfg(not(feature = "clang"))]
+        Mode::Correctness => Err(anyhow!(
+            "correctness mode compares against libclang; rebuild with --features clang"
+        )),
     }
 }
 
@@ -154,16 +161,24 @@ fn load_targets(build_filename: &str) -> Result<Vec<Target>> {
 }
 
 fn run_scan_mode(target: Target) -> Result<()> {
-    let c_include_includes = c_include_parser::retrieve_c_includes(&target.cmdline, vec![target.filename.clone().into()], None)?;
+    let c_include_includes = c_include_parser::retrieve_c_includes(
+        &target.cmdline,
+        vec![target.filename.clone().into()],
+        None,
+    )?;
     println!("c_include_parser method:");
     for include in c_include_includes {
         println!("{}", include.display());
     }
 
-    let clang_includes =
-        clang_infer::retrieve_c_includes(&target.cmdline, vec![target.filename.clone().into()])?;
-    println!("clang_infer method:");
-    for include in clang_includes {
+    // Benchmark c_include_parser method
+    let c_includes = c_include_parser::retrieve_c_includes(
+        &target.cmdline,
+        vec![target.filename.clone().into()],
+        None,
+    )?;
+    println!("C include parser method:");
+    for include in c_includes {
         println!("{}", include.display());
     }
 
@@ -172,11 +187,15 @@ fn run_scan_mode(target: Target) -> Result<()> {
 
 fn run_benchmark_mode(targets: Vec<Target>) -> Result<()> {
     println!("Benchmarking {} targets...", targets.len());
-    
+
     // Benchmark c_include_parser method
     let c_include_start = Instant::now();
     for target in &targets {
-        let _ = c_include_parser::retrieve_c_includes(&target.cmdline, vec![target.filename.clone().into()], None);
+        c_include_parser::retrieve_c_includes(
+            &target.cmdline,
+            vec![target.filename.clone().into()],
+            None,
+        )?;
     }
     let c_include_duration = c_include_start.elapsed();
     println!(
@@ -184,35 +203,46 @@ fn run_benchmark_mode(targets: Vec<Target>) -> Result<()> {
         c_include_duration.as_millis()
     );
 
-    // Benchmark clang_infer method
-    let clang_start = Instant::now();
-    for target in &targets {
-        let _ = clang_infer::retrieve_c_includes(&target.cmdline, vec![target.filename.clone().into()]);
-    }
-    let clang_duration = clang_start.elapsed();
-    println!(
-        "clang_infer method: {} milliseconds",
-        clang_duration.as_millis()
-    );
+    // Benchmark clang_infer method. Absent without the feature, and saying so
+    // beats printing a comparison against a method that was not built.
+    #[cfg(not(feature = "clang"))]
+    println!("clang_infer method: not built (rebuild with --features clang)");
 
-    // Calculate and display performance comparison
-    let c_include_ms = c_include_duration.as_millis() as f64;
-    let clang_ms = clang_duration.as_millis() as f64;
-
-    if c_include_ms > 0.0 && clang_ms > 0.0 {
-        let ratio = c_include_ms / clang_ms;
-        if ratio > 1.0 {
-            println!("clang_infer is {:.2}x faster than c_include_parser", ratio);
-        } else {
-            println!("c_include_parser is {:.2}x faster than clang_infer", 1.0 / ratio);
+    #[cfg(feature = "clang")]
+    {
+        let clang_start = Instant::now();
+        for target in &targets {
+            let _ = clang_infer::retrieve_c_includes(
+                &target.cmdline,
+                vec![target.filename.clone().into()],
+            );
         }
-        
-        println!("Performance ratio (c_include_parser / clang_infer): {:.2}", ratio);
+        let clang_duration = clang_start.elapsed();
+        println!(
+            "clang_infer method: {} milliseconds",
+            clang_duration.as_millis()
+        );
+
+        let c_include_ms = c_include_duration.as_millis() as f64;
+        let clang_ms = clang_duration.as_millis() as f64;
+        if c_include_ms > 0.0 && clang_ms > 0.0 {
+            let ratio = c_include_ms / clang_ms;
+            if ratio > 1.0 {
+                println!("clang_infer is {ratio:.2}x faster than c_include_parser");
+            } else {
+                println!(
+                    "c_include_parser is {:.2}x faster than clang_infer",
+                    1.0 / ratio
+                );
+            }
+            println!("Performance ratio (c_include_parser / clang_infer): {ratio:.2}");
+        }
     }
 
     Ok(())
 }
 
+#[cfg(feature = "clang")]
 fn run_correctness_mode(targets: Vec<Target>) -> Result<()> {
     let current_dir = std::env::current_dir()?;
     for target in targets {
@@ -271,6 +301,7 @@ fn run_correctness_mode(targets: Vec<Target>) -> Result<()> {
 }
 
 // Helper function to normalize and canonicalize paths
+#[cfg(feature = "clang")]
 fn normalize_paths(paths: Vec<PathBuf>, current_dir: &Path) -> Vec<PathBuf> {
     paths
         .into_iter()

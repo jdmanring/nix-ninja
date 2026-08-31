@@ -1,4 +1,4 @@
-{ self, ... }:
+{ self, lib, ... }:
 {
   perSystem = { pkgs, system, ... }: {
     packages = {
@@ -17,11 +17,16 @@
       };
     };
 
-    legacyPackages = {
+    # The examples are dynamic derivations, which can only be instantiated
+    # when the `dynamic-derivations` experimental feature is enabled (probed
+    # via the feature-gated `builtins.outputOf`).
+    legacyPackages = lib.optionalAttrs (builtins ? outputOf) {
       example-hello = pkgs.example-hello.target;
       example-header = pkgs.example-header.target;
       example-multi-source = pkgs.example-multi-source.target;
       example-shared-lib = pkgs.example-shared-lib.target;
+      example-run-script = pkgs.example-run-script.target;
+      example-dynamic-deps = pkgs.example-dynamic-deps.target;
       example-nix = pkgs.example-nix.target;
     };
 
@@ -35,12 +40,6 @@
         meson
         taplo
       ];
-
-      buildInputs = with pkgs; [
-        libclang.lib
-      ];
-
-      LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
     };
   };
 }
