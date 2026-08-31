@@ -1055,10 +1055,9 @@ const PY_STDLIB: &[&str] = &[
 /// same-directory .py siblings (gcc_link_wrapper.py imports
 /// wrapper_utils.py; python resolves sibling imports from the script's
 /// own directory). Returns every DerivedFile created, main file first.
-/// This is THE upload path for referenced files: the ordering-ins loop,
-/// the cmdline scan's node branch and its non-node branch all route
-/// here, because the sibling rule was first added to only two of the
-/// three and the third is where GN's declared `| script` inputs go.
+/// The sole caller is the ordering-ins loop. The other upload sites still
+/// call `new_opaque_file` directly and so do not pick up siblings; whether
+/// they should is an open question rather than an oversight this hides.
 fn upload_referenced_file(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &Path,
