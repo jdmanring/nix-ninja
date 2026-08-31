@@ -907,18 +907,29 @@ fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> Deriv
 // store path.
 /// Map an output path to a Nix store NAME.
 ///
-/// Store names accept only `[A-Za-z0-9+._?=-]`, and may not begin with a
-/// period. Replacing `/` with `-` leaves every other illegal byte in place,
-/// so an output containing a space, an `@`, or any non-ASCII character
-/// produces a name the daemon rejects - and it rejects it when the derivation
-/// is added, far from the edge that named the file. Chromium's generated
-/// sources hit this with `@` and with spaces; a leading period comes up
-/// wherever a build writes into a dot directory.
+/// Store names accept only `[A-Za-z0-9+._?=-]`. Replacing `/` with `-` leaves
+/// every other illegal byte in place, so an output containing a space, an
+/// `@`, or any non-ASCII character produces a name the store rejects - and it
+/// rejects it when the derivation is added, far from the edge that named the
+/// file. Chromium's generated sources hit this with `@` and with spaces, and
+/// a real autotools tree carries `lt~obsolete.m4`.
 ///
-/// Everything outside the permitted set maps to `-`, an empty result falls
-/// back to `source` rather than producing a nameless derivation, and a
-/// leading period is prefixed rather than dropped, so two inputs differing
-/// only there cannot collide.
+/// Everything outside the permitted set maps to `-`, and an empty result
+/// falls back to `source` rather than producing a nameless derivation.
+///
+/// TWO FURTHER RULES EXIST AND THIS COVERS NEITHER DELIBERATELY. A name may
+/// not be `.` or `..`, and its first dash-separated component may not be
+/// either; these names are `ninja-build-<output>`, so the output's own
+/// leading period never forms that component and the prefix below is
+/// defensive rather than required. A name may also not exceed 211 bytes,
+/// which flattening a path can reach and this does not address.
+///
+/// AND THE MAP IS MANY-TO-ONE. The old form could only collide names
+/// differing by `/`; this one folds every illegal byte to `-`, so `foo@1.o`
+/// and `foo 1.o` and `foo-1.o` all arrive at one name. Across derivations
+/// that is harmless, because the output paths still differ unless the
+/// content does. Within ONE derivation the outputs are a map keyed by this
+/// name and a duplicate key overwrites, which nothing here checks.
 fn normalize_output(output: &str) -> String {
     let mapped: String = output
         .chars()
