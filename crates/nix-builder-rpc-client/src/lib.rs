@@ -401,13 +401,12 @@ impl BuilderRpcClient {
         // Retained ONLY inside a derivation, where builder-rpc-v0 does not
         // materialize the uploaded .drv and this is the sole copy. Outside
         // one the file is on disk and clone_drv reads it back, so retaining
-        // is cost with no reader: both call sites are sandbox-only and
-        // neither runs on the full-graph path this campaign uses.
+        // is cost with no reader, which is why the retention is gated on
+        // `in_drv` rather than on which caller asked.
         //
-        // NO SIZE FIGURE HERE ON PURPOSE. The first version of this comment
-        // claimed ~6 GiB, extrapolated from a 384 KiB mean over every
-        // ninja-build.drv in the store, and the next progress tick falsified
-        // it: driver RSS fell from 13,335 to 4,568 MiB between two 500-task
+        // No size figure here on purpose. Extrapolating a mean drv size over
+        // the store gives a number a progress tick falsifies: driver RSS fell
+        // from 13,335 to 4,568 MiB between two 500-task
         // windows, and a monotonic map cannot exceed a resident size that
         // drops below it. The saving is real and unmeasured; measure it by
         // comparing RSS at equal task counts across a round with and without
