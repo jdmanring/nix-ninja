@@ -36,6 +36,8 @@ pub fn build_derived_files(
     Ok(built_paths)
 }
 
+static RESTORE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn symlink_derived_files(
     rpc_client: &BuilderRpcClient,
     store_dir: &StoreDir,
@@ -77,11 +79,28 @@ pub fn symlink_derived_files(
     // that no byte rewrite can reach - measured both ways in
     // task.rs::cmdline_is_lto. LTO compile tasks now never see a
     // placeholder; this restore stays correct for everything else.
+    //
+    // THIS PATH IS LOCAL MODE ONLY, AND THAT IS A GAP RATHER THAN A CHOICE.
+    // The rewrite map is built from `$out` and `outputs`, which exist only
+    // when the driver runs INSIDE the outer derivation - and there the
+    // artifact is handed to the consumer as a derivation output, so nothing
+    // ever holds its bytes to rewrite. An output carrying the placeholder is
+    // therefore correct here and shipped as-is there. The LTO carve-out above
+    // says an LTO task's output cannot be restored; that is true of every
+    // output on the output-derivation path, and this code read as though the
+    // restore covered it. It needs a design answer, not a patch.
     let restore = crate::task::outer_restore_map();
     let mut symlink_files: Vec<DerivedFile> = Vec::new();
     for (df, store_path) in opaque_files.iter().zip(store_paths.iter()) {
         let target = store_path.to_absolute_path(store_dir);
         let mut restored = false;
+        // A derived file with a `rel_path` points INTO a store directory, so
+        // the store path itself is not a file and the restore was skipped;
+        // build_derived_files joins it for exactly this reason.
+        let target = match &df.rel_path {
+            Some(rel) => target.join(rel),
+            None => target,
+        };
         if !restore.is_empty() && target.is_file() {
             let data = std::fs::read(&target)?;
             if let Some(rewritten) = crate::task::rewrite_bytes(&data, &restore) {
@@ -89,10 +108,26 @@ pub fn symlink_derived_files(
                 if let Some(parent) = dest.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let tmp = dest.with_extension("nn-restore-tmp");
+                // UNIQUE PER CALL. `with_extension` REPLACES the extension,
+                // so `a.o` and `a.c` both became `a.nn-restore-tmp` and two
+                // restores in one directory raced on one temp file.
+                let tmp = dest.with_file_name(format!(
+                    ".{}.nn-restore-tmp.{}.{}",
+                    dest.file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "out".into()),
+                    std::process::id(),
+                    RESTORE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                ));
                 std::fs::write(&tmp, rewritten)?;
-                if let Ok(md) = std::fs::metadata(&target) {
-                    let _ = std::fs::set_permissions(&tmp, md.permissions());
+                // NOT the store's permissions: a store file is read-only and
+                // this lands in the build tree, where a later step may have
+                // to replace it.
+                if let Ok(md) = std::fs::metadata(&tmp) {
+                    let mut perms = md.permissions();
+                    #[allow(clippy::permissions_set_readonly_false)]
+                    perms.set_readonly(false);
+                    let _ = std::fs::set_permissions(&tmp, perms);
                 }
                 if dest.is_symlink() || dest.exists() {
                     let _ = std::fs::remove_file(&dest);
