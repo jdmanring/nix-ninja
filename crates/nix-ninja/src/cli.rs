@@ -78,12 +78,13 @@ pub struct Cli {
     /// for want of -lgfortran.
     ///
     /// A task's command runs inside its own derivation, so its output reaches
-    /// no stream of this process, `builder-rpc-v0` carries that output on
-    /// FAILURE only, and the daemon does not serve a task's log to the client
-    /// still in the session that built it. So under this flag the edge
-    /// declares one more OUTPUT, the task tees its command into it, and
-    /// `cli.rs` materializes and prints it with the depfiles. An output is
-    /// the only thing that crosses the sandbox.
+    /// no stream of this process, and `builder-rpc-v0`'s success reply carries
+    /// a status and a set of realisations rather than the command's output.
+    /// An OUTPUT is the channel the derivation model guarantees, so under this
+    /// flag the edge declares one more, the task tees its command into it, and
+    /// it is materialized and printed with the depfiles. `task.rs` records what
+    /// was observed of the daemon's own log, which is the obvious alternative
+    /// and did not serve.
     #[arg(short = 'v', long = "verbose", default_value = "false")]
     pub verbose: bool,
 
@@ -299,11 +300,11 @@ pub fn run() -> Result<()> {
         // read-back guards freshness on its own anyway.
         // THE COMMAND OUTPUT ninja's `-v` promises. It reaches here as a
         // derivation OUTPUT because nothing else crosses the sandbox: the
-        // driver sees no stream of a task's command, `builder-rpc-v0` carries
-        // that output on FAILURE only, and the daemon does not serve a task's
-        // log to the client still in the session that built it. So the edge
-        // declares one more output under `-v`, the task tees its command into
-        // it, and it is materialized here with the depfiles.
+        // driver sees no stream of a task's command and `builder-rpc-v0`'s
+        // success reply carries no command output. An OUTPUT is the channel
+        // the derivation model guarantees, so the edge declares one more under
+        // `-v`, the task tees its command into it, and it is materialized here
+        // with the depfiles.
         //
         // Printed at the end rather than per task, because an output is not
         // realised at the moment its build result arrives. CMake's compiler

@@ -2740,11 +2740,18 @@ fn build_task_derivation(
     // CMAKE_<LANG>_IMPLICIT_LINK_LIBRARIES.
     //
     // A task's command runs inside its own derivation, so its output reaches
-    // no stream of the driver. `builder-rpc-v0` carries it on FAILURE only,
-    // and the daemon does not serve `nix log` for a task to the client that
-    // is still in the session which built it - measured 2026-08-31, refused
-    // for the whole run and answered once the driver exits, so no amount of
-    // waiting reaches it.
+    // no stream of the driver, and `builder-rpc-v0`'s success reply carries a
+    // status and a set of realisations rather than the command's output. An
+    // OUTPUT is the channel the derivation model does guarantee, which is why
+    // the transcript travels as one.
+    //
+    // The daemon's own log is not a substitute, and the observation is worth
+    // recording because it is the obvious thing to reach for: against nix
+    // 2.36.0pre, `nix log` on a task's derivation was refused for the whole of
+    // the run that produced it and answered once the driver had exited,
+    // unchanged across a hundred retries over ten seconds, with the system and
+    // the pinned nix behaving alike. Whether that is guaranteed or incidental
+    // is not established here; the output path does not depend on the answer.
     //
     // Declaring it as an ordinary output means the existing machinery moves
     // it: placeholder, encoding, the task's own copy step, and the

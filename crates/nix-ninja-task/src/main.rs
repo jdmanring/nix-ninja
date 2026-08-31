@@ -1211,10 +1211,10 @@ fn lexical_normalize(p: &str) -> String {
 fn spawn_process(cmdline: &str) -> Result<i32> {
     ensure_cd_target(cmdline)?;
     // Under ninja's `-v` the driver declares one more output and names it
-    // here, and the command's transcript has to reach it. That output is the
-    // only way the text crosses the sandbox: the driver sees no stream of
-    // this process, and the daemon will not serve this derivation's log to
-    // the client that is still in the session which built it.
+    // here, and the command's transcript has to reach it. An output is how
+    // the text crosses the sandbox: the driver sees no stream of this process,
+    // and the build result it receives carries no command output. The driver's
+    // `task.rs` records why the daemon's own log is not the route.
     if let Some(log_path) = env::var_os("NIX_NINJA_VERBOSE_LOG") {
         return spawn_process_teed(cmdline, Path::new(&log_path));
     }
