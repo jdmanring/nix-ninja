@@ -76,7 +76,7 @@ pub fn symlink_derived_files(
     // failure recurred 2026-08-24 with the window closed, because a slim
     // LTO object carries its literals inside compressed, checksummed IR
     // that no byte rewrite can reach - measured both ways in
-    // task.rs::cmdline_is_lto. LTO compile tasks now never see a
+    // task.rs::scan_lto_flags. LTO compile tasks now never see a
     // placeholder; this restore stays correct for everything else.
     //
     // THIS PATH IS LOCAL MODE ONLY, AND THAT IS A GAP RATHER THAN A CHOICE.

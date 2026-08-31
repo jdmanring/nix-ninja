@@ -2173,8 +2173,9 @@ fn build_task_derivation(
     );
 
     // Outer output paths -> placeholders (see outer_rewrite_map), EXCEPT
-    // for an LTO compile, which keeps the real paths everywhere: see
-    // cmdline_is_lto for the measured reason.
+    // for an LTO compile, which keeps the real paths everywhere: the
+    // placeholder would be baked into checksummed LTO bytecode, so the
+    // equal-length byte rewrite that restores it cannot reach it.
     let lto_raw = task.deps.as_deref() == Some("gcc") && task_is_lto(cmdline, &task.wrapper_vars);
     let cmdline = &if lto_raw {
         cmdline.to_string()
@@ -2414,9 +2415,9 @@ fn build_task_derivation(
         }
     }
 
-    // lto_task_keeps_real_outer_paths, the input half: any input this
-    // task reads that was uploaded with the placeholder substituted is
-    // re-uploaded raw and swapped in. See cmdline_is_lto.
+    // The input half of the same rule: any input this task reads that was
+    // uploaded with the placeholder substituted is re-uploaded raw and
+    // swapped in, because an LTO task must see the real outer paths.
     if lto_raw {
         let rewritten = rewritten_uploads().lock().unwrap().clone();
         if !rewritten.is_empty() {
@@ -3595,8 +3596,7 @@ fn new_opaque_file(
                 if let Ok(md) = fs::metadata(&canonical_path) {
                     let _ = fs::set_permissions(&tmp, md.permissions());
                 }
-                // Remembered, so an LTO task can ask for the raw form
-                // (lto_task_keeps_real_outer_paths).
+                // Remembered, so an LTO task can ask for the raw form.
                 rewritten_uploads()
                     .lock()
                     .unwrap()
@@ -3623,7 +3623,8 @@ fn new_opaque_file(
 
 /// Canonical paths whose upload carried an outer output path and was
 /// therefore uploaded with the placeholder substituted. An LTO task must
-/// not read those (see lto_task_keeps_real_outer_paths).
+/// not read those: its inputs must carry the real outer paths, because the
+/// placeholder would be baked into checksummed LTO bytecode.
 fn rewritten_uploads() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
     static SET: std::sync::OnceLock<std::sync::Mutex<HashSet<PathBuf>>> =
         std::sync::OnceLock::new();
@@ -3665,7 +3666,7 @@ fn new_opaque_file_raw(
 /// on the line wins, as it does for gcc. `-ffat-lto-objects` changes
 /// nothing here: the linker still consumes the IR half.
 ///
-/// WHY IT MATTERS - lto_task_keeps_real_outer_paths. The outer-output
+/// Why it matters. The outer-output
 /// placeholder is restored in task OUTPUTS by an equal-length byte
 /// rewrite (rewrite_bytes, local.rs). That is sound for a plain object,
 /// whose literals sit verbatim in .rodata, and UNSOUND for LTO
@@ -3685,16 +3686,6 @@ fn new_opaque_file_raw(
 /// the outer output path moves, which is the honest cost - only tasks
 /// that actually read an outer path pay it, and a wrong artifact is not
 /// a cache hit.
-// Exercised by this module's tests and named by the comments at :2166 and
-// :2408 that explain why LTO tasks are handled the way they are. dead_code
-// fires because the non-test callers went away when that handling moved, not
-// because the predicate stopped being the documented one - deleting it would
-// delete the tests that pin the behaviour those comments describe.
-#[allow(dead_code)]
-fn cmdline_is_lto(cmdline: &str) -> bool {
-    scan_lto_flags(cmdline, false)
-}
-
 /// Last-wins scan of `-flto*` / `-fno-lto` over one flag string, from a
 /// starting state.
 fn scan_lto_flags(flags: &str, start: bool) -> bool {
@@ -7427,25 +7418,32 @@ mod ninja_pool_tests {
     /// must not fail the other test twice.
     static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// `scan_lto_flags` with no wrapper baseline, which is the state
+    /// `task_is_lto` starts from when the environment sets none. Written as
+    /// a helper so these read as the command-line question they ask.
+    fn scan_lto_flags_no_baseline(cmdline: &str) -> bool {
+        super::scan_lto_flags(cmdline, false)
+    }
+
     #[test]
-    fn cmdline_is_lto_last_flag_wins_and_fat_changes_nothing() {
-        assert!(super::cmdline_is_lto("gcc -O3 -flto=8 -c a.c -o a.o"));
-        assert!(super::cmdline_is_lto("gcc -flto -c a.c"));
-        assert!(super::cmdline_is_lto(
+    fn last_lto_flag_wins_and_fat_changes_nothing() {
+        assert!(scan_lto_flags_no_baseline("gcc -O3 -flto=8 -c a.c -o a.o"));
+        assert!(scan_lto_flags_no_baseline("gcc -flto -c a.c"));
+        assert!(scan_lto_flags_no_baseline(
             "gcc -flto=auto -ffat-lto-objects -c a.c"
         ));
         assert!(
-            !super::cmdline_is_lto("gcc -flto=8 -fno-lto -c a.c"),
+            !scan_lto_flags_no_baseline("gcc -flto=8 -fno-lto -c a.c"),
             "later -fno-lto wins"
         );
         assert!(
-            super::cmdline_is_lto("gcc -fno-lto -flto -c a.c"),
+            scan_lto_flags_no_baseline("gcc -fno-lto -flto -c a.c"),
             "later -flto wins"
         );
-        assert!(!super::cmdline_is_lto("gcc -O3 -c a.c -o a.o"));
+        assert!(!scan_lto_flags_no_baseline("gcc -O3 -c a.c -o a.o"));
         // the placeholder-restore hazard is about IR, not the word: a
         // path containing 'flto' is not a flag
-        assert!(!super::cmdline_is_lto("gcc -c /src/flto/a.c"));
+        assert!(!scan_lto_flags_no_baseline("gcc -c /src/flto/a.c"));
     }
 
     #[test]
