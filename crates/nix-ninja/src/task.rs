@@ -1197,15 +1197,43 @@ fn upload_python_closure_uncached(
         }
     };
     while let Some(dir) = queue.pop() {
-        if !visited.insert(dir.clone()) || visited.len() > CLOSURE_DIR_CAP {
+        // Dedup and cap are separate questions, and running them as one
+        // expression made the cap self-feeding: every directory dropped for
+        // being over the cap was first INSERTED, so `visited` kept growing
+        // while nothing more was scanned.
+        let step = closure_step(visited.insert(dir.clone()), visited.len(), CLOSURE_DIR_CAP);
+        if step == ClosureStep::Seen {
             continue;
+        }
+        // OVER THE CAP IS A REFUSAL, NOT A TRUNCATION. Dropping the rest
+        // yields a closure missing modules the script imports, and this
+        // crate's whole polarity is that under-declaring ships a wrong
+        // artifact quietly while over-declaring costs an upload. It also
+        // used to depend on readdir order, so which directories survived
+        // differed between machines and the input set was not a function of
+        // the source tree - the one thing a content-addressed per-unit build
+        // cannot tolerate.
+        if step == ClosureStep::Refuse {
+            return Err(anyhow!(
+                "python import closure below {} exceeds {} directories; \
+                 refusing to declare a partial closure",
+                start_dir.display(),
+                CLOSURE_DIR_CAP
+            ));
         }
         // Siblings: every .py module, node_modules for node.py, and
         // package directories - which recurse, because their own files
         // import too.
-        let entries = fs::read_dir(&dir)
-            .map_err(|e| anyhow!("read_dir({}) for python closure: {e}", dir.display()))?;
-        for entry in entries.flatten() {
+        //
+        // SORTED, so the traversal is a function of the tree. readdir order
+        // is filesystem order, and with a LIFO queue that decided which
+        // directories were reached first.
+        let mut entries: Vec<_> = fs::read_dir(&dir)
+            .map_err(|e| anyhow!("read_dir({}) for python closure: {e}", dir.display()))?
+            .flatten()
+            .collect();
+        entries.sort_by_key(|e| e.path());
+        for entry in entries {
             let p = entry.path();
             if p.extension().is_some_and(|e| e == "py") && p.is_file() {
                 out.push(new_opaque_file(rpc_client, build_dir, p)?);
@@ -1804,5 +1832,53 @@ mod python_closure_tests {
         let dirs = python_syspath_dirs(&tools).unwrap();
         assert_eq!(dirs, vec![node]);
         fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// What to do with the directory just taken off the closure queue.
+#[derive(Debug, PartialEq, Eq)]
+enum ClosureStep {
+    /// Already walked. Costs nothing and must not count toward the cap.
+    Seen,
+    /// Over the cap. The closure would be partial, so refuse it.
+    Refuse,
+    Scan,
+}
+
+/// Dedup and cap are SEPARATE questions and were one expression, which made
+/// the cap self-feeding: a directory dropped for being over the cap had
+/// already been inserted, so the set kept growing while nothing more was
+/// scanned. Ordering is the defect, so ordering is what this pins.
+fn closure_step(newly_inserted: bool, visited_len: usize, cap: usize) -> ClosureStep {
+    if !newly_inserted {
+        ClosureStep::Seen
+    } else if visited_len > cap {
+        ClosureStep::Refuse
+    } else {
+        ClosureStep::Scan
+    }
+}
+
+#[cfg(test)]
+mod closure_step_tests {
+    use super::{closure_step, ClosureStep};
+
+    #[test]
+    fn a_fresh_directory_under_the_cap_is_scanned() {
+        assert_eq!(closure_step(true, 3, 64), ClosureStep::Scan);
+    }
+
+    #[test]
+    fn over_the_cap_refuses_rather_than_truncating() {
+        assert_eq!(closure_step(true, 65, 64), ClosureStep::Refuse);
+    }
+
+    /// THE ORDERING THAT WAS WRONG. A directory already walked is skipped
+    /// because it is a duplicate, and that answer must not depend on how
+    /// full the set is - a repeat arriving after the cap is still a repeat,
+    /// not a reason to fail the build.
+    #[test]
+    fn a_duplicate_is_seen_even_when_the_set_is_over_the_cap() {
+        assert_eq!(closure_step(false, 9_000, 64), ClosureStep::Seen);
     }
 }
