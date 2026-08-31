@@ -161,25 +161,32 @@ fn load_targets(build_filename: &str) -> Result<Vec<Target>> {
 }
 
 fn run_scan_mode(target: Target) -> Result<()> {
-    let c_include_includes = c_include_parser::retrieve_c_includes(
-        &target.cmdline,
-        vec![target.filename.clone().into()],
-        None,
-    )?;
-    println!("c_include_parser method:");
-    for include in c_include_includes {
-        println!("{}", include.display());
-    }
-
-    // Benchmark c_include_parser method
     let c_includes = c_include_parser::retrieve_c_includes(
         &target.cmdline,
         vec![target.filename.clone().into()],
         None,
     )?;
-    println!("C include parser method:");
+    println!("c_include_parser method:");
     for include in c_includes {
         println!("{}", include.display());
+    }
+
+    // The point of this mode is DISAGREEMENT between two engines. Comparing
+    // one against itself is a diagnostic that cannot fail, which is what it
+    // became when the rebase dropped the other branch.
+    #[cfg(not(feature = "clang"))]
+    println!("clang_infer method: not built (rebuild with --features clang)");
+
+    #[cfg(feature = "clang")]
+    {
+        let clang_includes = clang_infer::retrieve_c_includes(
+            &target.cmdline,
+            vec![target.filename.clone().into()],
+        )?;
+        println!("clang_infer method:");
+        for include in clang_includes {
+            println!("{}", include.display());
+        }
     }
 
     Ok(())

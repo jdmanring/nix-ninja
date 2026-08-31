@@ -133,6 +133,31 @@ fn parse_file_includes(
         return Err(anyhow!("Failed to parse translation unit for {}", file_str));
     }
 
+    // A NON-NULL TRANSLATION UNIT IS NOT A CLAIM THAT THE PARSE SUCCEEDED.
+    // clang returns a usable unit for a source with fatal errors, and
+    // clang_getInclusions then reports only the includes it resolved before
+    // stopping. Returning that as the answer declares a fraction of the real
+    // inputs and the sandbox compile reads whatever survives, which is the
+    // under-declaration this crate exists to prevent. One unresolvable
+    // header - a generated one, a missing -I, a header behind an undefined
+    // -D - is enough to trigger it.
+    let fatal = unsafe {
+        let n = clang_getNumDiagnostics(tu);
+        (0..n).any(|i| {
+            let d = clang_getDiagnostic(tu, i);
+            let severity = clang_getDiagnosticSeverity(d);
+            clang_disposeDiagnostic(d);
+            severity >= CXDiagnostic_Error
+        })
+    };
+    if fatal {
+        unsafe { clang_disposeTranslationUnit(tu) };
+        return Err(anyhow!(
+            "libclang reported errors parsing {file_str}; the include set \
+             would be incomplete"
+        ));
+    }
+
     // Collect all inclusions using clang_getInclusions
     let mut visitor_data = VisitorData {
         includes: &mut includes,
