@@ -993,15 +993,13 @@ pub fn take_collected_depfiles() -> Vec<DerivedFile> {
     std::mem::take(&mut *COLLECTED_DEPFILES.lock().unwrap())
 }
 
-/// Whether a compile command will actually WRITE a depfile. CMake's LTO
-/// capability probe (`_CMakeLTOTest-CXX`) generates an edge declaring
-/// `deps = gcc` and a depfile while its command carries no -MD/-MF, so
-/// gcc never writes the file and a task that declared it as an output
-/// dies collecting it (`canonicalize(...o.d): No such file`). The edge
-/// declaration is a promise about the RULE; the command is the truth.
-/// -MMD implies -MD's writing behaviour; -MF names the file explicitly
-/// (spaced or fused). The rspfile is part of the command line.
 /// Does this command actually WRITE a dependency file?
+///
+/// CMake's LTO capability probe generates an edge declaring `deps = gcc` and
+/// a depfile while its command carries no generation flag, so gcc never
+/// writes the file and a task that declared it as an output dies collecting
+/// it. The edge declaration is a promise about the RULE; the command is the
+/// truth, and the rspfile is part of that command line.
 ///
 /// `-MF` DOES NOT ANSWER THAT, and treating it as though it did cost a real
 /// package. `-MF` names where a depfile would go; `-MQ` and `-MT` set the
