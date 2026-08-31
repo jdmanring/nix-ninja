@@ -921,6 +921,9 @@ pub fn discover_c_includes(
     files: Vec<PathBuf>,
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
 ) -> Result<(Vec<DerivedFile>, Vec<StorePath>)> {
+    // The scan consumes the virtual set; the upload filter below needs it
+    // too. See generated_not_yet_written.
+    let virtual_declared = virtual_paths.clone();
     let c_includes = c_include_parser::retrieve_c_includes(cmdline, files.clone(), virtual_paths)?;
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
@@ -943,6 +946,23 @@ pub fn discover_c_includes(
                 discovered_store_paths.push(store_path);
                 continue;
             }
+        }
+
+        // A generated header has no bytes to upload yet, and uploading it
+        // is the second half of the same failure. The scan declares a
+        // declared-but-absent build-directory file instead of dying on it,
+        // which is correct because it is a dependency, but the declaration
+        // then arrives here and new_opaque_file canonicalizes it:
+        //     canonicalize <build dir>/gen/version.gen.h
+        //     No such file or directory (os error 2)
+        //
+        // Skipping it drops no dependency. ninja declares the generated
+        // header order-only on the compile edge, so the task already holds
+        // it as an input supplied by the derivation of the edge that
+        // generates it; the upload would be a second, contentless spelling
+        // of an input the task has.
+        if generated_not_yet_written(build_dir, &include, virtual_declared.as_ref()) {
+            continue;
         }
 
         // Regular file, add to nix store and treat as derived dependency
@@ -968,4 +988,69 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+/// Is this discovered include a build-directory file that the caller declared
+/// virtual and that nothing has written yet?
+///
+/// Existence is checked against the build directory rather than the process
+/// working directory, because a discovered include is spelled relative to the
+/// build directory.
+fn generated_not_yet_written(
+    build_dir: &Path,
+    include: &Path,
+    virtual_declared: Option<&HashMap<PathBuf, PathBuf>>,
+) -> bool {
+    let Some(vp) = virtual_declared else {
+        return false;
+    };
+    if !(vp.contains_key(include) || vp.values().any(|v| v == include)) {
+        return false;
+    }
+    let abs = if include.is_absolute() {
+        include.to_path_buf()
+    } else {
+        build_dir.join(include)
+    };
+    !abs.exists()
+}
+
+#[cfg(test)]
+mod generated_not_yet_written_tests {
+    use super::generated_not_yet_written;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_declared_virtual_file_that_is_absent_is_skipped() {
+        let build_dir = std::env::temp_dir();
+        let gen = PathBuf::from("gen/version.gen.h");
+        let vp = HashMap::from([(gen.clone(), gen.clone())]);
+        assert!(generated_not_yet_written(&build_dir, &gen, Some(&vp)));
+    }
+
+    /// Negative control: absent, and nobody declared it. It is a genuinely
+    /// missing input and must still reach the upload and fail there.
+    #[test]
+    fn an_absent_file_nobody_declared_is_not_skipped() {
+        let build_dir = std::env::temp_dir();
+        let missing = PathBuf::from("no-such-header-anywhere.h");
+        let empty: HashMap<PathBuf, PathBuf> = HashMap::new();
+        assert!(!generated_not_yet_written(&build_dir, &missing, Some(&empty)));
+        assert!(!generated_not_yet_written(&build_dir, &missing, None));
+    }
+
+    /// Negative control in the other direction: declared virtual but present
+    /// on disk. Skipping this one would drop real bytes from the task.
+    #[test]
+    fn a_declared_virtual_file_that_exists_is_still_uploaded() {
+        let build_dir =
+            std::env::temp_dir().join(format!("nix-ninja-gen-{}", std::process::id()));
+        std::fs::create_dir_all(&build_dir).unwrap();
+        let rel = PathBuf::from("real.h");
+        std::fs::write(build_dir.join(&rel), b"#pragma once\n").unwrap();
+        let vp = HashMap::from([(rel.clone(), rel.clone())]);
+        assert!(!generated_not_yet_written(&build_dir, &rel, Some(&vp)));
+        std::fs::remove_dir_all(&build_dir).ok();
+    }
 }
