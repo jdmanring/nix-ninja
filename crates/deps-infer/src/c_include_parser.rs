@@ -551,7 +551,7 @@ fn fortran_pp_origins(path: &Path, spelled: &Path) -> Vec<PathBuf> {
         // `# <lineno> "<file>"`, and the line number is what separates a
         // marker from a comment that happens to start with a hash.
         let mut parts = rest.splitn(2, ' ');
-        if !parts.next().is_some_and(|n| n.parse::<u64>().is_ok()) {
+        if parts.next().is_none_or(|n| n.parse::<u64>().is_err()) {
             continue;
         }
         let Some(quoted) = parts.next() else { continue };
