@@ -37,8 +37,6 @@ pub fn build_derived_files(
     Ok(built_paths)
 }
 
-static RESTORE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 pub fn symlink_derived_files(
     rpc_client: &BuilderRpcClient,
     store_dir: &StoreDir,
@@ -109,17 +107,7 @@ pub fn symlink_derived_files(
                 if let Some(parent) = dest.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                // UNIQUE PER CALL. `with_extension` REPLACES the extension,
-                // so `a.o` and `a.c` both became `a.nn-restore-tmp` and two
-                // restores in one directory raced on one temp file.
-                let tmp = dest.with_file_name(format!(
-                    ".{}.nn-restore-tmp.{}.{}",
-                    dest.file_name()
-                        .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "out".into()),
-                    std::process::id(),
-                    RESTORE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                ));
+                let tmp = unique_sibling(&dest);
                 write_restored(&tmp, &rewritten, &target)?;
                 if dest.is_symlink() || dest.exists() {
                     let _ = std::fs::remove_file(&dest);
@@ -247,6 +235,22 @@ pub fn copy_derived_files(
     Ok(copied)
 }
 
+/// A hidden sibling of `dest` to write before renaming into place.
+///
+/// UNIQUE PER PROCESS AND PER CALL. The first version used `with_extension`,
+/// which REPLACES the extension rather than appending, so `a.o` and `a.c`
+/// both produced `a.nn-restore-tmp` and two writes into one directory raced
+/// on a single file. The name is kept whole and the discriminator appended.
+fn unique_sibling(dest: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = dest
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".to_string());
+    dest.with_file_name(format!(".{name}.nn-tmp.{}.{n}", std::process::id()))
+}
+
 /// Copy `src` over `dest`, replacing whatever is there, and leave the result
 /// WRITABLE and a REGULAR FILE.
 ///
@@ -274,15 +278,7 @@ pub fn copy_derived_files(
 /// replaces the link itself, where a copy would have written through it into
 /// a read-only store file.
 fn copy_over(src: &Path, dest: &Path) -> std::io::Result<()> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = dest
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "depfile".to_string());
-    // Unique per process AND per call: two restores of different outputs in
-    // one directory must not share a temp.
-    let tmp = dest.with_file_name(format!(".{name}.nn-tmp.{}.{n}", std::process::id()));
+    let tmp = unique_sibling(dest);
 
     let copied = std::fs::copy(src, &tmp).and_then(|_| {
         // The source's mode plus owner write, which is a union rather than a
@@ -439,5 +435,29 @@ mod copy_over_tests {
         copy_over(&src, &dest).unwrap();
         assert!(!std::fs::metadata(&dest).unwrap().permissions().readonly());
         std::fs::remove_dir_all(&d).ok();
+    }
+}
+
+#[cfg(test)]
+mod unique_sibling_tests {
+    use super::unique_sibling;
+    use std::path::Path;
+
+    /// THE REGRESSION. `with_extension` replaced the extension, so two files
+    /// differing only in suffix collided on one temp name.
+    #[test]
+    fn two_names_differing_only_in_extension_do_not_collide() {
+        let a = unique_sibling(Path::new("/b/a.o"));
+        let b = unique_sibling(Path::new("/b/a.c"));
+        assert_ne!(a, b);
+        assert!(a.to_string_lossy().contains("a.o"));
+        assert!(b.to_string_lossy().contains("a.c"));
+    }
+
+    /// And two calls for the SAME name must differ, or two writes race.
+    #[test]
+    fn two_calls_for_one_name_do_not_collide() {
+        let p = Path::new("/b/a.o");
+        assert_ne!(unique_sibling(p), unique_sibling(p));
     }
 }
