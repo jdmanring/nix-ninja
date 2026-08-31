@@ -563,12 +563,27 @@ fn build_task_derivation(
     for output_path in &task.outputs {
         // Declare a content addressed output.
         let normalized_name = normalize_output(&output_path.to_string_lossy());
-        drv.outputs.insert(
+        // REFUSED RATHER THAN OVERWRITTEN. The map from an output path to a
+        // store name is many-to-one, so two outputs of one edge can arrive at
+        // the same name. `insert` would silently replace the first, while the
+        // environment below still names both build paths against a single
+        // placeholder, and one of the two files would simply not be produced.
+        // Two names that differ only outside the store's charset are the
+        // whole reason this mapping exists, so the collision is reachable by
+        // construction rather than exotic.
+        if let Some(prior) = drv.outputs.insert(
             normalized_name.parse()?,
             DerivationOutput::CAFloating(ContentAddressMethodAlgorithm::NixArchive(
                 harmonia_utils_hash::Algorithm::SHA256,
             )),
-        );
+        ) {
+            let _ = prior;
+            return Err(anyhow!(
+                "two outputs of this edge map to the store name {normalized_name}; \
+                 the second is {}",
+                output_path.display()
+            ));
+        }
 
         // Create a placeholder and encode output for nix-ninja-task.
         let placeholder = Placeholder::standard_output(
