@@ -126,13 +126,53 @@ static INCLUDE_REGEX: LazyLock<Regex> =
 /// Given a C-like source, try to resolve includes.
 ///
 /// Includes are generally of the form `#include <name>` or `#include "name"`
+/// Is this a path the caller declared as a build-directory file that may not
+/// exist yet?
+///
+/// `virtual_paths` is built as build_path -> build_path, so a queued include
+/// can match either side. Both are checked rather than assuming the identity
+/// mapping, which is the caller's choice and not this module's contract.
+/// The scan over the values runs only on a read failure, which is rare.
+fn is_declared_virtual(path: &Path, virtual_paths: Option<&HashMap<PathBuf, PathBuf>>) -> bool {
+    let Some(vp) = virtual_paths else {
+        return false;
+    };
+    vp.contains_key(path) || vp.values().any(|v| v == path)
+}
+
 pub fn extract_includes(
     path: &PathBuf,
     include_dirs: &[PathBuf],
     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
-    let f =
-        File::open(path).map_err(|e| anyhow!("Failed to open file {}: {}", path.display(), e))?;
+    // A generated header is resolvable before it exists, and scanning it is
+    // what fails. `virtual_paths` resolves a declared-but-absent build
+    // directory file so the include is declared; the resolver returns it
+    // with no existence check, the search queues it like any other header,
+    // and this read then dies with `No such file or directory`, failing the
+    // whole task derivation.
+    //
+    // A file the caller declared virtual contributes no directives instead
+    // of an error. That under-declares whatever the generated header itself
+    // includes, and the dynamic task covers it by design rather than by
+    // luck: discovery runs again inside the sandbox, where the producing
+    // edge has run and the bytes exist. The static pass cannot do better,
+    // because there is nothing yet to read.
+    //
+    // Gated on the file being declared virtual, never on the read failing.
+    // A source that is simply missing is a real defect and must still fail
+    // loudly; swallowing every read error here would turn every genuinely
+    // absent header into a silently under-declared task, which is the
+    // failure this module exists to prevent.
+    let f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            if is_declared_virtual(path, virtual_paths) && !path.exists() {
+                return Ok(Vec::new());
+            }
+            return Err(anyhow!("Failed to open file {}: {}", path.display(), e));
+        }
+    };
     let reader = BufReader::new(f);
     let mut result = Vec::new();
     let parent_dir = PathBuf::from(path.parent().unwrap());
@@ -219,4 +259,55 @@ where
     cache.insert(path.as_ref().to_path_buf(), result.clone());
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod virtual_path_tests {
+    use super::*;
+
+    fn absent() -> PathBuf {
+        PathBuf::from("nix-ninja-test-no-such-dir/generated.h")
+    }
+
+    fn declaring(path: &Path) -> HashMap<PathBuf, PathBuf> {
+        HashMap::from([(path.to_path_buf(), path.to_path_buf())])
+    }
+
+    /// The generated-header shape: declared virtual, not on disk. The scan
+    /// contributes nothing rather than failing the task.
+    #[test]
+    fn a_declared_virtual_file_that_is_absent_contributes_nothing() {
+        let path = absent();
+        let vp = declaring(&path);
+        let got = extract_includes(&path, &[], Some(&vp)).expect("must not fail");
+        assert!(got.is_empty());
+    }
+
+    /// Negative control: absent, and nobody declared it. This must still be
+    /// an error, or every missing header becomes a silently under-declared
+    /// task.
+    #[test]
+    fn an_absent_file_nobody_declared_is_still_an_error() {
+        let path = absent();
+        assert!(extract_includes(&path, &[], None).is_err());
+        let unrelated = declaring(Path::new("some/other/file.h"));
+        assert!(extract_includes(&path, &[], Some(&unrelated)).is_err());
+    }
+
+    /// The map is build_path -> build_path, but the contract does not
+    /// promise identity, so a match on either side counts.
+    #[test]
+    fn either_side_of_the_mapping_counts_as_declared() {
+        let key = PathBuf::from("a/gen.h");
+        let value = PathBuf::from("b/gen.h");
+        let vp = HashMap::from([(key.clone(), value.clone())]);
+        assert!(is_declared_virtual(&key, Some(&vp)));
+        assert!(is_declared_virtual(&value, Some(&vp)));
+        assert!(!is_declared_virtual(Path::new("c/gen.h"), Some(&vp)));
+    }
+
+    #[test]
+    fn no_map_declares_nothing() {
+        assert!(!is_declared_virtual(Path::new("a/gen.h"), None));
+    }
 }
