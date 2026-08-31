@@ -133,7 +133,7 @@ fn parse_file_includes(
         return Err(anyhow!("Failed to parse translation unit for {}", file_str));
     }
 
-    // A NON-NULL TRANSLATION UNIT IS NOT A CLAIM THAT THE PARSE SUCCEEDED.
+    // A non-null translation unit is not a claim that the parse succeeded.
     // clang returns a usable unit for a source with fatal errors, and
     // clang_getInclusions then reports only the includes it resolved before
     // stopping. Returning that as the answer declares a fraction of the real
@@ -141,13 +141,20 @@ fn parse_file_includes(
     // under-declaration this crate exists to prevent. One unresolvable
     // header - a generated one, a missing -I, a header behind an undefined
     // -D - is enough to trigger it.
+    //
+    // FATAL, not error. A semantic diagnostic - an undeclared identifier, a
+    // type mismatch, a wrong -std - is raised AFTER preprocessing, so the
+    // inclusion callback has already reported the complete set and the answer
+    // is usable. Rejecting at error level would discard those. The case this
+    // guards against, a header that cannot be found, is fatal and stops the
+    // parse where it stands.
     let fatal = unsafe {
         let n = clang_getNumDiagnostics(tu);
         (0..n).any(|i| {
             let d = clang_getDiagnostic(tu, i);
             let severity = clang_getDiagnosticSeverity(d);
             clang_disposeDiagnostic(d);
-            severity >= CXDiagnostic_Error
+            severity >= CXDiagnostic_Fatal
         })
     };
     if fatal {
