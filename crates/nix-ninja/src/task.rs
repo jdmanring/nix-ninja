@@ -1595,8 +1595,25 @@ fn find_module_below(root: &Path, name: &str, depth: usize) -> Option<PathBuf> {
     for _ in 0..depth {
         let mut next = Vec::new();
         for d in frontier {
-            let entries = fs::read_dir(&d).ok()?;
-            for sub in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+            // SORTED, because this returns the FIRST hit: two sibling
+            // directories each holding `<name>.py` were separated by readdir
+            // order, and the winner is uploaded. That is which file wins, not
+            // merely what order they are visited in.
+            //
+            // A directory that cannot be read is skipped rather than aborting
+            // the search. `?` here discarded every sibling at this level and
+            // every level below it, so one unreadable directory anywhere made
+            // the whole module unresolvable.
+            let Ok(entries) = fs::read_dir(&d) else {
+                continue;
+            };
+            let mut subs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            subs.sort();
+            for sub in subs {
                 let fname = sub.file_name().unwrap_or_default().to_string_lossy();
                 if fname.starts_with('.') || fname == "node_modules" {
                     continue;
