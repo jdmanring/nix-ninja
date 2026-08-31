@@ -208,7 +208,7 @@ where
         let virtual_paths = virtual_paths.clone();
 
         handles.push(std::thread::spawn(move || {
-            let includes =
+            let mut includes =
                 match extract_includes(&path, &spelled, &includes, virtual_paths.as_ref().as_ref())
                 {
                     Ok(value) => value,
@@ -216,6 +216,13 @@ where
                         return Err(e);
                     }
                 };
+            // A preprocessed Fortran source needs the file its line markers
+            // name, which no include directive mentions.
+            for origin in fortran_pp_origins(&path, &spelled) {
+                if !includes.contains(&origin) {
+                    includes.push(origin);
+                }
+            }
 
             let (path_defines, macro_uses, computed_unresolvable) = match scan_directives(&path) {
                 // The scan is memoized, so this re-read is a cache hit.
@@ -505,6 +512,73 @@ pub fn is_declared_virtual(path: &Path, virtual_paths: Option<&HashMap<PathBuf, 
     // scanning was once measured at 25% of driver CPU - see
     // canonicalize_cached. Defensive code on a hot map is not free.
     vp.contains_key(path)
+}
+
+/// The original source a preprocessed Fortran file was made from.
+///
+/// A COMPILER OPENS A FILE THE GRAPH NEVER DECLARED. CMake compiles Fortran in
+/// two edges: one preprocesses `x.f` into `x.f-pp.f`, and a second compiles the
+/// `-pp.f` with `-fpreprocessed`. Only the `-pp.f` is declared on that second
+/// edge, because under ordinary ninja the original is simply still on disk.
+/// gfortran follows the `# 1 "x.f"` line markers back to it and dies
+/// `Fatal Error: ...: No such file or directory` when it is absent, which is
+/// what a sandbox that materializes only declared inputs gives it.
+///
+/// Measured on liblapack 2026-08-31, whose ILP64 variant GENERATES its sources
+/// into the build directory, so the file is not merely undeclared here but
+/// absent until another task writes it.
+///
+/// Scoped to CMake's `-pp.` spelling rather than applied to every file: line
+/// markers appear in any preprocessed output, and treating them as
+/// dependencies everywhere would declare the whole system include set of any
+/// preprocessed C this scanner is ever handed.
+fn fortran_pp_origins(path: &Path, spelled: &Path) -> Vec<PathBuf> {
+    let is_pp = spelled
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains("-pp."));
+    if !is_pp {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    for line in String::from_utf8_lossy(&text).lines() {
+        let Some(rest) = line.strip_prefix("# ") else {
+            continue;
+        };
+        // `# <lineno> "<file>"`, and the line number is what separates a
+        // marker from a comment that happens to start with a hash.
+        let mut parts = rest.splitn(2, ' ');
+        if !parts.next().is_some_and(|n| n.parse::<u64>().is_ok()) {
+            continue;
+        }
+        let Some(quoted) = parts.next() else { continue };
+        let Some(name) = quoted
+            .strip_prefix('"')
+            .and_then(|q| q.split('"').next())
+            .filter(|n| !n.is_empty())
+        else {
+            continue;
+        };
+        // `<built-in>` and `<command-line>` are the preprocessor naming
+        // itself, not files. Queuing one makes the scan demand a path that
+        // cannot exist, which fails the edge rather than the lookup.
+        if name.starts_with('<') {
+            continue;
+        }
+        let candidate = PathBuf::from(name);
+        // The marker names the `-pp.f` itself as well as its origin; the
+        // scanner is being asked what ELSE this file needs.
+        if candidate == spelled || candidate == path {
+            continue;
+        }
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
 }
 
 pub fn extract_includes(

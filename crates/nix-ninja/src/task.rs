@@ -105,6 +105,11 @@ struct Task {
     // otherwise seeded only from `inputs`. See new_task.
     store_srcs: Vec<PathBuf>,
     outputs: Vec<PathBuf>,
+    /// Ninja's `-v`. A task's command runs inside its own derivation, so its
+    /// output reaches the driver only by being an OUTPUT. Under this flag the
+    /// edge declares one more, and the task writes the command's transcript
+    /// to it.
+    verbose: bool,
     // Configure-time relative symlinks to recreate in the sandbox; see
     // Runner::alias_symlinks.
     alias_symlinks: Vec<(String, String)>,
@@ -161,6 +166,8 @@ pub struct RunnerConfig {
     pub pools: HashMap<String, usize>,
     /// Ninja's `-l`. 0.0 disables, matching ninja.
     pub load_limit: f64,
+    /// Ninja's `-v`. See `Task::verbose`.
+    pub verbose: bool,
 }
 
 // Counting semaphore bounding concurrent tasks. Permits release on
@@ -910,6 +917,16 @@ impl Runner {
             } else {
                 Vec::new()
             };
+
+            if let Some(dp) = derived_path
+                .as_ref()
+                .filter(|_| task.verbose && err.is_none())
+            {
+                COLLECTED_VERBOSE_LOGS
+                    .lock()
+                    .unwrap()
+                    .push(new_built_file(dp.clone(), verbose_log_path(&task)));
+            }
 
             let result = BuildResult {
                 bid,
@@ -2145,6 +2162,7 @@ impl Runner {
                 .map(|r| (r.path.clone(), r.content.clone()))
                 .or(extra_rspfile),
             depfile: build.depfile.clone(),
+            verbose: self.config.verbose,
             files: build_files,
             inputs,
             store_srcs,
@@ -2162,6 +2180,72 @@ pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> 
     crate::resolve_cache::flush()?;
     crate::resolve_cache::save_nar_stamps(&rpc_client.nar_stamps_snapshot())
 }
+
+/// Whether this edge's real inputs have to be discovered rather than taken
+/// from the graph.
+///
+/// ONE PREDICATE, TWO GATES. The scan gate and the built-input gate asked
+/// this question separately and answered it differently, and the pair is what
+/// made Fortran unbuildable: the scan gate read `deps`/`depfile` and the
+/// dynamic gate read `deps` alone, so an edge could be scanned and never given
+/// anything to scan.
+fn wants_dependency_discovery(task: &Task) -> bool {
+    task.deps.as_deref() == Some("gcc")
+        || task.depfile.is_some()
+        || consumes_preprocessed_fortran(task)
+}
+
+/// A COMPILER OPENS A FILE THE GRAPH NEVER DECLARED, and this is the edge
+/// where it happens. CMake compiles Fortran in two edges: one preprocesses
+/// `x.f` into `x.f-pp.f`, and a second compiles the `-pp.f` with
+/// `-fpreprocessed`. The second declares only the `-pp.f`, because under
+/// ordinary ninja the original is still sitting in the build tree. gfortran
+/// follows the `# 1 "x.f"` line markers back to it and dies
+/// `Fatal Error: ...: No such file or directory` inside a sandbox that
+/// materializes only what was declared.
+///
+/// Its rule sets neither `deps` nor `depfile`, so before this the edge took
+/// neither the scan nor the dynamic path: there was nothing to fix in the
+/// scanner because the scanner was never reached.
+///
+/// liblapack, 2026-08-31. Its ILP64 variant generates its sources into the
+/// build directory, so the file is not merely undeclared, it does not exist
+/// until another task writes it.
+fn consumes_preprocessed_fortran(task: &Task) -> bool {
+    task.inputs.iter().any(|i| {
+        i.build_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("-pp."))
+    })
+}
+
+/// Where a task writes its command transcript under `-v`.
+///
+/// ONE FUNCTION, TWO CALL SITES, and that is the point: the derivation
+/// declares this path and the runner reads the output back at it. A predicate
+/// written twice in this tree has diverged within a day before, so both sides
+/// ask this rather than each deriving a name from its own copy of the output
+/// list.
+///
+/// Derived from the edge's first declared output so it is unique per edge
+/// without the driver inventing a name, and suffixed rather than substituted
+/// so it cannot collide with a real output of the same rule.
+fn verbose_log_path(task: &Task) -> PathBuf {
+    match dedup_paths(&task.outputs).first() {
+        Some(first) => {
+            let mut name = first.clone().into_os_string();
+            name.push(VERBOSE_LOG_SUFFIX);
+            PathBuf::from(name)
+        }
+        // An edge with no declared outputs has nothing to name a transcript
+        // after. The runner treats such a rule as phony and never brings it
+        // here, so this is a total function rather than a reachable case.
+        None => PathBuf::from(VERBOSE_LOG_SUFFIX.trim_start_matches('.')),
+    }
+}
+
+const VERBOSE_LOG_SUFFIX: &str = ".nn-verbose-log";
 
 fn build_task_derivation(
     tools: Tools,
@@ -2332,7 +2416,7 @@ fn build_task_derivation(
     // gate can only over-declare, which is the pipeline's safe polarity.
     let mut discovered_inputs: Vec<DerivedFile> = Vec::new();
     {
-        let wants_discovery = task.deps.as_deref() == Some("gcc") || task.depfile.is_some();
+        let wants_discovery = wants_dependency_discovery(&task);
         if wants_discovery {
             // Only opaque inputs are processed by gcc
             let files: Vec<PathBuf> = task
@@ -2648,6 +2732,33 @@ fn build_task_derivation(
         task_outputs.push(p.clone());
     });
 
+    // THE TRANSCRIPT IS AN OUTPUT, because nothing else crosses the sandbox.
+    // Ninja's `-v` shows the commands and lets their output through, and a
+    // generator depends on the second half: CMake's compiler ABI detection
+    // compiles a probe with `-v -Wl,-v` and PARSES THE BUILD OUTPUT for the
+    // link line, which is the only source of
+    // CMAKE_<LANG>_IMPLICIT_LINK_LIBRARIES.
+    //
+    // A task's command runs inside its own derivation, so its output reaches
+    // no stream of the driver. `builder-rpc-v0` carries it on FAILURE only,
+    // and the daemon does not serve `nix log` for a task to the client that
+    // is still in the session which built it - measured 2026-08-31, refused
+    // for the whole run and answered once the driver exits, so no amount of
+    // waiting reaches it.
+    //
+    // Declaring it as an ordinary output means the existing machinery moves
+    // it: placeholder, encoding, the task's own copy step, and the
+    // realisation the driver already receives. Only under `-v`, which in
+    // practice is a generator's handful of probe compiles, so no real graph
+    // grows an output.
+    let verbose_log_out: Option<PathBuf> = if task.verbose {
+        let p = verbose_log_path(&task);
+        task_outputs.push(p.clone());
+        Some(p)
+    } else {
+        None
+    };
+
     // Add all ninja build outputs.
     let mut outputs: Vec<String> = Vec::new();
     for output_path in &task_outputs {
@@ -2699,6 +2810,15 @@ fn build_task_derivation(
         b"NIX_NINJA_OUTPUTS"[..].into(),
         outputs.join(" ").into_bytes().into(),
     );
+
+    // Name the transcript so the task knows which of its outputs to tee the
+    // command into, rather than re-deriving it from the suffix on both sides.
+    if let Some(p) = &verbose_log_out {
+        drv.env.insert(
+            b"NIX_NINJA_VERBOSE_LOG"[..].into(),
+            p.to_string_lossy().into_owned().into_bytes().into(),
+        );
+    }
 
     // Name the depfile output so a consumer does not have to re-derive which
     // of the outputs it is by matching the path. #17's later steps (collect,
@@ -3162,7 +3282,7 @@ fn handle_derivation_result(
     // early returns, and an untimed one hides the case worth catching.
     let _dyn_timer = DynDiscoveryTimer(std::time::Instant::now());
     // Collect built inputs when deps == "gcc" for dynamic dependency discovery
-    let built_inputs: Vec<DerivedFile> = if task.deps.as_ref() == Some(&"gcc".to_string()) {
+    let built_inputs: Vec<DerivedFile> = if wants_dependency_discovery(&task) {
         task.inputs
             .iter()
             .filter(|input| matches!(input.derived_path, SingleDerivedPath::Built { .. }))
@@ -5800,6 +5920,21 @@ fn accepted_depfile_output_of(
 /// `depfile_read_back` does the skipping it was always written to do.
 static COLLECTED_DEPFILES: LazyLock<Mutex<Vec<DerivedFile>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// The command transcripts collected under `-v`.
+///
+/// Same shape as the depfiles above and for the same reason: a task's output
+/// is a content-addressed OUTPUT of its derivation, and it is not realised at
+/// the moment the build result arrives. Reading it in `wait` gets a
+/// PLACEHOLDER path, which is what the first version of this did.
+static COLLECTED_VERBOSE_LOGS: LazyLock<Mutex<Vec<DerivedFile>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Drains the collected transcripts. Drained rather than cloned, for the same
+/// reason as the depfiles.
+pub fn take_collected_verbose_logs() -> Vec<DerivedFile> {
+    std::mem::take(&mut *COLLECTED_VERBOSE_LOGS.lock().unwrap())
+}
 
 /// Drains the collected depfile outputs. Drained rather than cloned: the
 /// caller materializes them once at the end of a run, and leaving them

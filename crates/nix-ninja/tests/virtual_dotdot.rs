@@ -50,3 +50,65 @@ fn a_dot_spelling_resolves_to_its_declared_generated_header() {
     let got = canonicalize_cached(PathBuf::from("./gen/version.h"), Some(&vp)).unwrap();
     assert_eq!(got, Some(declared), "a leading `./` missed the virtual map");
 }
+
+/// A preprocessed Fortran source depends on the file its line markers name,
+/// and no include directive mentions it. Reached from `crates/nix-ninja` for
+/// the same reason as the tests above.
+#[test]
+fn a_preprocessed_fortran_source_declares_the_original_it_was_made_from() {
+    use deps_infer::c_include_parser::retrieve_c_includes;
+
+    let dir = std::env::temp_dir().join(format!("nn-fpp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let original = dir.join("dtpmv.f");
+    std::fs::write(&original, "      end\n").unwrap();
+    let pp = dir.join("dtpmv.f-pp.f");
+    std::fs::write(&pp, format!("# 1 \"{}\"\n      end\n", original.display())).unwrap();
+
+    let got = retrieve_c_includes(
+        &format!("gfortran -fpreprocessed -c {}", pp.display()),
+        vec![pp.clone()],
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        !got.iter().any(|p| p.to_string_lossy().starts_with('<')),
+        "a preprocessor pseudo-file was declared as an input: {got:?}"
+    );
+    assert!(
+        got.contains(&original),
+        "the original named in the line markers was not declared, so the \
+         compile runs in a sandbox without it: {got:?}"
+    );
+
+    // NEGATIVE CONTROL, and it is the half that matters: the same markers in
+    // a file that is not CMake's `-pp.` spelling must declare nothing, or
+    // every preprocessed C source drags its whole system include set in.
+    let plain = dir.join("plain.f");
+    std::fs::write(
+        &plain,
+        // `<built-in>` beside the real one: the preprocessor names itself in
+        // these markers, and queuing that as a file fails the whole edge
+        // rather than the lookup. Measured on liblapack's configure.
+        format!(
+            "# 1 \"<built-in>\"\n# 1 \"{}\"\n      end\n",
+            original.display()
+        ),
+    )
+    .unwrap();
+    let got = retrieve_c_includes(
+        &format!("gfortran -c {}", plain.display()),
+        vec![plain],
+        None,
+    )
+    .unwrap();
+    assert!(
+        !got.contains(&original),
+        "line markers were followed outside the -pp. spelling: {got:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

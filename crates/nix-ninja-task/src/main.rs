@@ -1210,6 +1210,14 @@ fn lexical_normalize(p: &str) -> String {
 
 fn spawn_process(cmdline: &str) -> Result<i32> {
     ensure_cd_target(cmdline)?;
+    // Under ninja's `-v` the driver declares one more output and names it
+    // here, and the command's transcript has to reach it. That output is the
+    // only way the text crosses the sandbox: the driver sees no stream of
+    // this process, and the daemon will not serve this derivation's log to
+    // the client that is still in the session which built it.
+    if let Some(log_path) = env::var_os("NIX_NINJA_VERBOSE_LOG") {
+        return spawn_process_teed(cmdline, Path::new(&log_path));
+    }
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", cmdline])
         .stdout(Stdio::inherit())
@@ -1218,6 +1226,61 @@ fn spawn_process(cmdline: &str) -> Result<i32> {
 
     let output = cmd.status()?;
     Ok(output.code().unwrap_or(1))
+}
+
+/// Run the command with its output copied to `log_path` as well as to this
+/// process's own streams.
+///
+/// BOTH, not one. The derivation's log stays what it was, which is what a
+/// person reads when a build fails, and the file is what the driver reads.
+/// Sending the output only to the file would empty every task log under
+/// `-v`, trading one blind reader for another.
+///
+/// stdout and stderr are merged into one pipe deliberately: a compiler writes
+/// its `-v` banner to stderr and its own diagnostics to both, and CMake parses
+/// the two as one stream because that is what an inherited terminal gives it.
+/// Splitting them here would interleave differently than the build did.
+fn spawn_process_teed(cmdline: &str, log_path: &Path) -> Result<i32> {
+    use std::io::{Read, Write};
+
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            anyhow::anyhow!(
+                "create_dir_all({}) for the transcript: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    let mut cmd = Command::new("/bin/sh");
+    let mut child = cmd
+        .args(["-c", cmdline])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .envs(env::vars())
+        .spawn()?;
+
+    // One draining thread per pipe, so a command that fills one while the
+    // reader waits on the other cannot deadlock.
+    let out = child.stdout.take().expect("stdout was piped");
+    let err = child.stderr.take().expect("stderr was piped");
+    let drain = |mut src: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = src.read_to_end(&mut buf);
+            buf
+        })
+    };
+    let out_t = drain(Box::new(out));
+    let err_t = drain(Box::new(err));
+    let status = child.wait()?;
+    let mut text = out_t.join().unwrap_or_default();
+    text.extend(err_t.join().unwrap_or_default());
+
+    let _ = std::io::stdout().write_all(&text);
+    let _ = std::io::stdout().flush();
+    fs::write(log_path, &text)
+        .map_err(|e| anyhow::anyhow!("write({}) for the transcript: {e}", log_path.display()))?;
+    Ok(status.code().unwrap_or(1))
 }
 
 #[cfg(test)]

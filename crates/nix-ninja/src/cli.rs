@@ -70,25 +70,20 @@ pub struct Cli {
 
     /// Show all command lines while building
     ///
-    /// ACCEPTED AND UNREAD, and the reason is the protocol rather than an
-    /// oversight. A task runs inside its own derivation, so its command's
-    /// output reaches no stream of this process. `builder-rpc-v0` carries
-    /// that output on FAILURE only: a successful reply is a status and a set
-    /// of realisations. The daemon's own log is not a way round it either -
-    /// measured 2026-08-31, `nix log` on a task's derivation answers "is not
-    /// available" for the whole of the run that produced it, unchanged after
-    /// waiting ten seconds, and succeeds once the driver has exited.
+    /// A build tool that accepts this has promised a generator something.
+    /// CMake's compiler ABI detection compiles a probe with `-v -Wl,-v` and
+    /// PARSES THE BUILD OUTPUT for the link line, which is the only source of
+    /// CMAKE_<LANG>_IMPLICIT_LINK_LIBRARIES. Accepted and unread, it recorded
+    /// an empty list and reported success, and every Fortran link then failed
+    /// for want of -lgfortran.
     ///
-    /// What that costs is not cosmetic. CMake's compiler ABI detection
-    /// compiles a probe with `-v -Wl,-v` and PARSES THE BUILD OUTPUT for the
-    /// link line, which is where CMAKE_<LANG>_IMPLICIT_LINK_LIBRARIES comes
-    /// from. With nothing to parse it records an empty list and reports
-    /// success, and every Fortran link then fails for want of -lgfortran.
-    /// `local/liblapack-blocker-chain.md` carries the measurement.
-    ///
-    /// So this needs the protocol to carry a successful task's output, or a
-    /// log the client can read during its own session. Forwarding it from
-    /// here is not one of the options.
+    /// A task's command runs inside its own derivation, so its output reaches
+    /// no stream of this process, `builder-rpc-v0` carries that output on
+    /// FAILURE only, and the daemon does not serve a task's log to the client
+    /// still in the session that built it. So under this flag the edge
+    /// declares one more OUTPUT, the task tees its command into it, and
+    /// `cli.rs` materializes and prints it with the depfiles. An output is
+    /// the only thing that crosses the sandbox.
     #[arg(short = 'v', long = "verbose", default_value = "false")]
     pub verbose: bool,
 
@@ -302,6 +297,56 @@ pub fn run() -> Result<()> {
         // the behavior that has always been in force. Failing the build
         // here would turn a cache miss into a build failure, and the
         // read-back guards freshness on its own anyway.
+        // THE COMMAND OUTPUT ninja's `-v` promises. It reaches here as a
+        // derivation OUTPUT because nothing else crosses the sandbox: the
+        // driver sees no stream of a task's command, `builder-rpc-v0` carries
+        // that output on FAILURE only, and the daemon does not serve a task's
+        // log to the client still in the session that built it. So the edge
+        // declares one more output under `-v`, the task tees its command into
+        // it, and it is materialized here with the depfiles.
+        //
+        // Printed at the end rather than per task, because an output is not
+        // realised at the moment its build result arrives. CMake's compiler
+        // ABI detection parses the WHOLE captured output of the build command
+        // for the link line, so where in that text the transcript sits does
+        // not matter to it.
+        let verbose_logs = task::take_collected_verbose_logs();
+        if !verbose_logs.is_empty() {
+            match local::copy_derived_files(&rpc_client, &cli.store_dir, &build_dir, &verbose_logs)
+            {
+                Ok(_) => {
+                    for log in &verbose_logs {
+                        let path = build_dir.join(&log.build_path);
+                        match std::fs::read(&path) {
+                            // STDOUT, which is where ninja puts a command's
+                            // output and where a generator looks for it. The
+                            // data-channel rule this tree keeps is about the
+                            // three subcommands whose stdout is parsed, and a
+                            // build invocation is not one of them.
+                            Ok(bytes) => print!("{}", String::from_utf8_lossy(&bytes)),
+                            Err(e) => eprintln!(
+                                "nix-ninja: -v asked for command output and the \
+                                 transcript {} could not be read: {e}",
+                                path.display()
+                            ),
+                        }
+                        // The transcript is a diagnostic, not a build product,
+                        // and leaving it in the build directory would offer a
+                        // file the graph never declared to whatever scans that
+                        // directory next.
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                Err(e) => eprintln!(
+                    "nix-ninja: -v asked for command output and {} transcript(s) \
+                     could not be materialized ({e}). A generator that parses \
+                     this output, CMake's compiler ABI detection among them, \
+                     will read an empty string and record an empty result.",
+                    verbose_logs.len()
+                ),
+            }
+        }
+
         let depfiles = task::take_collected_depfiles();
         if !depfiles.is_empty() {
             let n = depfiles.len();
@@ -370,6 +415,7 @@ fn build(
         // expressible.
         jobs: resolved_jobs(cli),
         load_limit: cli.load_average,
+        verbose: cli.verbose,
     };
 
     build::build(

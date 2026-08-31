@@ -21,6 +21,9 @@ pub struct BuildConfig {
     pub is_output_derivation: bool,
     pub jobs: usize,
     pub load_limit: f64,
+    /// Ninja's `-v`. The edge declares one more output carrying the command's
+    /// transcript, which is the only way it crosses the sandbox.
+    pub verbose: bool,
 }
 
 /// The nix system string for the machine this driver is running on.
@@ -104,6 +107,7 @@ pub fn build(
             // produced these and the runner never received them.
             pools: loader.pools.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             load_limit: config.load_limit,
+            verbose: config.verbose,
         },
     )?;
     // THE BUILD-DIR WALK IS OFF FOR A ONE-EDGE COMPILE. The compiler drop-in
