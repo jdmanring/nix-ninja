@@ -5074,6 +5074,15 @@ fn find_module_below(root: &Path, name: &str, depth: usize) -> Option<PathBuf> {
             // order, and the winner is uploaded. That is which file wins, not
             // merely what order they are visited in.
             //
+            // NO TEST PINS THE SORT, and the reason is the sort's own point.
+            // The filesystem here returns entries already ordered, measured
+            // by creating twenty directories in reverse and reading them
+            // back sorted, so a fixture cannot tell a sorted walk from an
+            // unsorted one: every such test passes against the form it is
+            // meant to reject. What the sort buys is exactly independence
+            // from that, which is why the machine that has it cannot
+            // demonstrate it.
+            //
             // A directory that cannot be read is skipped rather than aborting
             // the search. `?` here discarded every sibling at this level and
             // every level below it, so one unreadable directory anywhere made
@@ -6238,6 +6247,36 @@ mod python_import_names_tests {
         let hit = super::find_module_below(&d, "idl_parser", 3).unwrap();
         assert_eq!(hit, d.join("ppapi/generators"));
         assert!(super::find_module_below(&d, "no_such_module", 3).is_none());
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A DIRECTORY THAT CANNOT BE READ SKIPS ITSELF, NOT THE SEARCH. `?` on
+    /// the read returned from the whole function, so one unreadable
+    /// directory made the module unresolvable and nothing was uploaded for
+    /// it.
+    ///
+    /// THE BLOCKED DIRECTORY HAS TO SIT WHERE THE SEARCH ACTUALLY READS IT.
+    /// Putting it beside the holder proves nothing: the holder is found at
+    /// the first level and the blocked directory is never opened, so the
+    /// test passes against the form it is meant to reject. It has to be on
+    /// the frontier for a level the search must get past.
+    #[test]
+    fn an_unreadable_directory_does_not_abort_the_search() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("nn-below-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let blocked = d.join("aaa-blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        // The holder is one level BELOW the blocked directory's level, so
+        // the search must read the blocked directory to descend past it.
+        std::fs::create_dir_all(d.join("zzz/holder")).unwrap();
+        std::fs::write(d.join("zzz/holder/wanted.py"), "x = 1\n").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = super::find_module_below(&d, "wanted", 3);
+
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(got, Some(d.join("zzz/holder")));
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
