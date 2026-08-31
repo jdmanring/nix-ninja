@@ -1257,12 +1257,17 @@ fn upload_python_closure_uncached(
                 // Uncles: a directory beside this one holding <name>.py
                 // (common/ holds models.py) or BEING the named package
                 // (tracing/tracing_build/ answers import tracing_build).
-                for uncle in fs::read_dir(parent)
+                // SORTED, like every other walk here: these are pushed onto
+                // the queue, so readdir order decided which uncle was
+                // reached first and therefore what the closure contained.
+                let mut uncles: Vec<PathBuf> = fs::read_dir(parent)
                     .map_err(|e| anyhow!("read_dir({}) for uncle modules: {e}", parent.display()))?
                     .flatten()
                     .map(|e| e.path())
                     .filter(|p| p.is_dir() && *p != dir)
-                {
+                    .collect();
+                uncles.sort();
+                for uncle in uncles {
                     let hit = unsatisfied.iter().any(|n| {
                         uncle.join(format!("{n}.py")).is_file()
                             || (uncle.file_name().is_some_and(|f| f == n.as_str())
@@ -1334,6 +1339,12 @@ fn upload_python_closure_uncached(
                             });
                             u32::from(versioned) * 2 + u32::from(s.contains("py3"))
                         };
+                        // `max_by_key` returns the LAST maximum, so with an
+                        // unsorted candidate list two equally-scored vendored
+                        // copies were chosen by readdir order. Sorting makes
+                        // the tie-break the path, which is a property of the
+                        // tree.
+                        cands.sort();
                         if let Some(pkg) = cands.into_iter().max_by_key(|p| score(p)) {
                             if upload_dir(&pkg, 8192, out)? {
                                 queue.push(pkg);
