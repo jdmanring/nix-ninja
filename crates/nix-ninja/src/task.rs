@@ -385,13 +385,26 @@ impl Runner {
             // one opaque object and then symlinked over itself:
             //     Failed to create symlink from "<store>-build"
             //     to /build/source/build/.: File exists
-            // Only a regular file is materializable; anything else reached
-            // through an alias is ordering and nothing more.
-            if via_phony && !Path::new(&files.by_id[*fid].name).is_file() {
+            // THE GRAPH IS ASKED FIRST, AND THAT IS THE LOAD-BEARING HALF.
+            // A graph-produced input is materialized from the STORE, so it is
+            // not a file in the build directory at all and the old
+            // `!is_file()` test answered true for every one of them. A phony
+            // standing for generated headers is the ordinary shape, and
+            // dropping an input is the silent-wrong-artifact direction.
+            //
+            // The filesystem is the authority only for a path the graph does
+            // not produce, and the question there is whether it is a
+            // DIRECTORY, not whether it happens to be present: `!is_file()`
+            // is also false for an unreadable path.
+            let known = self.derived_files.get(fid).cloned();
+            if via_phony
+                && known.is_none()
+                && phony_ordering_only(&self.config.build_dir, &files.by_id[*fid].name)
+            {
                 continue;
             }
-            let input = match self.derived_files.get(fid) {
-                Some(df) => df.to_owned(),
+            let input = match known {
+                Some(df) => df,
                 None => {
                     let file = &files.by_id[*fid];
                     if file.name.starts_with(&store_dir) {
@@ -1158,5 +1171,58 @@ mod phony_resolution_tests {
         let got = resolve_target_in(&outs, &phony, FileId::from(9));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].build_path, PathBuf::from("real.o"));
+    }
+}
+
+/// Is this phony-expanded input ordering and nothing more?
+///
+/// Only asked for a path the graph does not produce. Resolved against the
+/// BUILD DIRECTORY rather than the process working directory, because a
+/// ninja path is spelled relative to the build directory and the driver does
+/// not run there.
+///
+/// CMake's `build X: phony || .` is what this exists for: `.` joins to the
+/// build directory, which is a directory and materializes as nothing.
+fn phony_ordering_only(build_dir: &Path, name: &str) -> bool {
+    build_dir.join(name).is_dir()
+}
+
+#[cfg(test)]
+mod phony_ordering_tests {
+    use super::phony_ordering_only;
+    use std::path::PathBuf;
+
+    fn scratch() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nn-phony-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// CMake's `phony || .`, the case the guard exists for.
+    #[test]
+    fn the_build_directory_itself_is_ordering_only() {
+        assert!(phony_ordering_only(&scratch(), "."));
+    }
+
+    /// THE REGRESSION THIS REPLACES. A generated file that no edge has
+    /// written yet is not a directory, so it is an input rather than
+    /// ordering. The previous test was `!is_file()`, which answered the
+    /// opposite and dropped it.
+    #[test]
+    fn a_generated_file_not_yet_written_is_not_ordering_only() {
+        assert!(!phony_ordering_only(&scratch(), "gen/version.gen.h"));
+    }
+
+    /// The build directory is taken as a parameter rather than read from the
+    /// process, which is what lets these tests exist at all. Today the driver
+    /// sets it FROM the working directory, so the two agree; taking it
+    /// explicitly is what makes the resolution a property of the argument
+    /// instead of the process.
+    #[test]
+    fn resolution_is_against_the_given_directory() {
+        let d = scratch();
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        assert!(phony_ordering_only(&d, "sub"));
+        assert!(!phony_ordering_only(&PathBuf::from("/nonexistent"), "sub"));
     }
 }
