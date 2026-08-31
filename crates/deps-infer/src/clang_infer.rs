@@ -105,9 +105,9 @@ fn parse_file_includes(
 ) -> Result<HashSet<PathBuf>> {
     let mut includes = HashSet::new();
 
-    // A source path that is not UTF-8 is a real input class, not an
-    // impossibility: this crate has a test for one. Refusing by name beats
-    // panicking inside a driver that is mid-graph.
+    // A source path that is not UTF-8 is a real input class rather than an
+    // impossibility. Refusing by name beats panicking inside a driver that is
+    // part way through a graph.
     let file_str = file_path
         .to_str()
         .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", file_path.display()))?;
