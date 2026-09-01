@@ -3570,15 +3570,24 @@ fn extract_store_paths(
 /// Whether this command line asks `lto-wrapper` for PARALLEL LTRANS, which is
 /// the only case that needs `make` in the sandbox.
 ///
-/// Parsing rather than a flag check, because the spellings differ in what they
-/// mean: `-flto=1` is serial by request, bare `-flto` asks for no parallelism
-/// at all, and `auto`/`jobserver` both drive `make`. Getting this wrong in the
-/// permissive direction re-keys derivations that gain nothing.
+/// ANY `-flto` spelling counts, which is narrower reasoning than it looks and
+/// was measured after a first version got it wrong.
+///
+/// That version excluded bare `-flto` and `-flto=1` on the belief that neither
+/// asks for parallelism. Both drive `make` in practice: `lto-wrapper` decides
+/// to parallelize from the PARTITION COUNT, not from the flag's argument, so a
+/// link with several partitions runs the makefile whatever the spelling. A
+/// round measured it directly - 341 links spelled `-flto=auto` emitted no
+/// warning because the gate fired, and all 18 spelled bare `-flto` emitted one
+/// because it did not. Reproduced outside nix on all three spellings, `-flto`,
+/// `-flto=auto` and `-flto=1`, each warning with `make` off PATH.
+///
+/// `-fno-lto` is excluded by requiring the exact token or a `=`, so a prefix
+/// match cannot pull it in.
 fn lto_needs_make(cmdline: &str) -> bool {
     cmdline.split_whitespace().any(|tok| {
-        tok.trim_matches(|c| c == '"' || c == '\'')
-            .strip_prefix("-flto=")
-            .is_some_and(|n| !n.is_empty() && n != "1")
+        let tok = tok.trim_matches(|c| c == '"' || c == '\'');
+        tok == "-flto" || tok.starts_with("-flto=")
     })
 }
 
@@ -3597,13 +3606,21 @@ mod lto_make_gate_tests {
         assert!(lto_needs_make(r#"gcc "-flto=8" a.o -o t"#));
     }
 
+    /// Bare `-flto` and `-flto=1` DO need make - measured, after a first
+    /// version excluded both and left 18 of a round's links serial.
     #[test]
-    fn declines_the_serial_and_absent_spellings() {
-        assert!(!lto_needs_make("gcc -flto=1 a.o -o t"));
-        assert!(!lto_needs_make("gcc -flto a.o -o t"));
-        assert!(!lto_needs_make("gcc -flto= a.o -o t"));
+    fn the_serial_looking_spellings_still_need_make() {
+        assert!(lto_needs_make("gcc -flto a.o -o t"));
+        assert!(lto_needs_make("gcc -flto=1 a.o -o t"));
+        assert!(lto_needs_make("gcc -flto= a.o -o t"));
+    }
+
+    #[test]
+    fn declines_what_is_not_lto() {
         assert!(!lto_needs_make("gcc -c a.c -o a.o"));
+        // A prefix match would pull this in and re-key every non-LTO link.
         assert!(!lto_needs_make("gcc -fno-lto a.o -o t"));
+        assert!(!lto_needs_make("gcc -fltrans-output-list=x a.o -o t"));
     }
 
     /// A substring must not trip the gate, which is how a `-Werror` in a
