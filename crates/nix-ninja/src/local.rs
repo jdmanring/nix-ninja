@@ -73,12 +73,21 @@ pub fn symlink_derived_files(
     // state is post-restore. Everything else stays a symlink.
     //
     // THIS PATH IS LOCAL MODE ONLY, AND THAT IS A GAP RATHER THAN A CHOICE.
-    // The rewrite map is built from `$out` and `outputs`, which exist only
-    // when the driver runs INSIDE the outer derivation - and there the
-    // artifact is handed to the consumer as a derivation output, so nothing
-    // ever holds its bytes to rewrite. An output carrying the placeholder is
-    // therefore correct here and shipped as-is there. See the note on this
-    // in the offer's draft; it needs a design answer, not a patch.
+    // The reasoning here previously ended at "nothing ever holds its bytes to
+    // rewrite", which is true of the driver and does not make the result
+    // correct: the consumer reads the task output through `builtins.outputOf`
+    // and receives whatever the task wrote, placeholder included. Measured on
+    // a store holding both kinds: of thirty `gcc-16.2.0` outputs, seventeen
+    // carry the placeholder inside `cc1`, `cc1plus`, `lto1` and `collect2`,
+    // in the compiler's built-in include search paths. Those builds succeed
+    // only because the wrapper passes the same directories explicitly, so the
+    // corruption is masked rather than absent.
+    //
+    // Rewriting to the outer output path would not fix it, because that is
+    // not the path the consumer resolves; an artifact naming its own final
+    // location is self-referential under content addressing. It needs a
+    // design answer rather than a patch, and `submit_outer_output` now says
+    // so out loud instead of shipping quietly.
     let restore = crate::task::outer_restore_map();
     let mut symlink_files: Vec<DerivedFile> = Vec::new();
     for (df, store_path) in opaque_files.iter().zip(store_paths.iter()) {

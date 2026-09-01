@@ -99,6 +99,35 @@ fn submit_outer_output(
     derived_file: &DerivedFile,
     rpc_client: &Arc<BuilderRpcClient>,
 ) -> Result<()> {
+    // THE RESTORE CANNOT RUN HERE, AND SILENCE IS THE PART THAT IS WRONG.
+    // A task command naming an outer output path carries a placeholder of
+    // the same length, because a per-unit derivation cannot depend on the
+    // outer output path without becoming unreusable. Local mode rewrites the
+    // placeholder back while materializing the bytes into the build
+    // directory. This path never holds those bytes: it clones the final
+    // DERIVATION and submits that, and the consumer reads the task output
+    // through `builtins.outputOf`, so the artifact it receives is whatever
+    // the task wrote, placeholder included.
+    //
+    // Rewriting to the outer output path would not be a fix either, because
+    // that is not the path the consumer resolves. Making the artifact name
+    // its own final location is self-referential under content addressing,
+    // which is why this needs a design answer rather than a patch.
+    //
+    // What is fixable is the silence. Say it once, name a file to check, and
+    // let a build that cares fail on its own evidence rather than shipping a
+    // dangling path nobody looked for.
+    let restore = crate::task::outer_restore_map();
+    if !restore.is_empty() {
+        for (placeholder, _real) in &restore {
+            eprintln!(
+                "nix-ninja: WARNING placeholder {placeholder} is not restored in \
+                 output-derivation mode; an artifact embedding an output path \
+                 ships it dangling. Check with: grep -rl {placeholder} <result>"
+            );
+        }
+    }
+
     let final_drv = derived_file.derived_path.root_path();
     let final_drv_path = final_drv.to_absolute_path(store_dir);
 
