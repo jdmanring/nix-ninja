@@ -7375,6 +7375,62 @@ fn depfile_read_back(
     Some(out)
 }
 
+/// Whether this command line compiles against a precompiled header.
+///
+/// `-include <header>` is how gcc is pointed at one: it looks for
+/// `<header>.gch` beside it and uses it when it validates. The flag is the
+/// discriminator rather than the presence of a `.gch` input, because the
+/// input list is what this decision is trying to get right.
+///
+/// NOT `-Winvalid-pch`, which reads like the same signal and is not: meson
+/// puts it in the default warning set of EVERY C and C++ compile, so keying
+/// on it disabled the depfile read-back for every meson package in the
+/// distribution. Caught by `local/second-run.sh`, which is the gate that
+/// exists for exactly this feature.
+///
+/// Over-triggering costs a scan where a read-back would have done, which is
+/// the behavior that stood before the read-back existed. Under-triggering
+/// ships a task missing headers, so the polarity is deliberate.
+fn uses_precompiled_header(cmdline: &str) -> bool {
+    cmdline.split_whitespace().any(|a| a == "-include")
+}
+
+#[cfg(test)]
+mod precompiled_header_tests {
+    use super::uses_precompiled_header;
+
+    /// zxing-cpp's own compile line, trimmed to the flags that matter.
+    #[test]
+    fn cmake_pch_use_is_recognised() {
+        assert!(uses_precompiled_header(
+            "g++ -Winvalid-pch -include /build/source/build/core/CMakeFiles/ZXing.dir/cmake_pch.hxx -c a.cpp"
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_compile_is_not() {
+        assert!(!uses_precompiled_header("g++ -O2 -I. -c a.cpp -o a.o"));
+    }
+
+    /// MESON PUTS THIS ON EVERY COMPILE. Reading it as a PCH signal turned
+    /// the read-back off for every meson package there is.
+    #[test]
+    fn the_meson_default_warning_flag_is_not_a_pch() {
+        assert!(!uses_precompiled_header(
+            "c++ -Ihello.p -I. -Wall -Winvalid-pch -O0 -g -MD -MF x.d -o x.o -c ../src/main.cpp"
+        ));
+    }
+
+    /// A SUBSTRING IS NOT A FLAG. `-includedir=` and a path ending in the
+    /// letters must not be read as `-include`, which a `contains` would do.
+    #[test]
+    fn a_flag_that_merely_starts_with_the_same_letters_is_not() {
+        assert!(!uses_precompiled_header(
+            "g++ --includedir=/usr/include -c a.cpp"
+        ));
+    }
+}
+
 /// Union of the textual scan and the preprocessor's depfile, scan order
 /// first, deduped. See the call site for why neither alone is sufficient.
 fn merge_scan_and_preprocessor(scanned: Vec<PathBuf>, preprocessed: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -7480,9 +7536,53 @@ pub fn discover_c_includes(
     // fails toward the scan (the old behavior), never toward trusting a
     // stale answer. Incremental local builds are where this pays - ninja's
     // own model, a depfile per object from the previous run.
+    // WHICH ANSWER THE TASK GOT, when the task's own inputs say the answer
+    // was wrong. zxing-cpp declared exactly its three graph-declared inputs
+    // and nothing discovered, and no evidence in the log distinguished "the
+    // read-back replaced the scan with a shorter answer" from "the scan ran
+    // and resolved nothing" - two defects in different crates. Neither is
+    // reproducible outside the distribution's own sandbox, so the driver
+    // says which path it took rather than the next session guessing again.
+    //
+    // Behind an env var and never on by default: at 16,000 tasks this is
+    // 16,000 lines.
+    let explain = std::env::var_os("NIX_NINJA_DEBUG_DISCOVERY").is_some();
+    let seed = files
+        .first()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<no seed>".to_string());
+    // A DEPFILE UNDERSTATES A COMPILE THAT USES A PRECOMPILED HEADER, so the
+    // read-back must not speak for one. gcc does not open a header already
+    // present in the PCH - the include-guard optimization - so the depfile
+    // omits every header the PCH absorbed. That answer is correct only while
+    // the PCH stays valid, and a task sandbox is where it stops being valid:
+    // gcc then falls back to processing the header textually and opens files
+    // the depfile never named.
+    //
+    // zxing-cpp 3.1.1, 2026-09-01, 80 translation units. Every one died on a
+    // header its own source includes by name - Point.h from ResultPoint.h,
+    // CharacterSet.h from AZWriter.h - and both are in that target's
+    // cmake_pch.hxx. The failing tasks declared exactly their three
+    // graph-declared inputs and nothing discovered, which is what a read-back
+    // of a PCH-shortened depfile produces.
+    //
+    // The scan is path-based and does not depend on the PCH validating, and
+    // the PCH header is already among the task's inputs, so it is a scan seed
+    // and its own includes are declared. Falling back to it is the behavior
+    // every such edge had before the read-back existed.
+    let depfile = depfile.filter(|_| !uses_precompiled_header(cmdline));
     let c_includes =
         match depfile_read_back(build_dir, AsRef::<Path>::as_ref(store_dir), depfile, &files) {
-            Some(deps) => deps,
+            Some(deps) => {
+                if explain {
+                    eprintln!(
+                        "nix-ninja: discovery {seed}: read back {} include(s) from {}",
+                        deps.len(),
+                        depfile.map(|d| d.display().to_string()).unwrap_or_default(),
+                    );
+                }
+                deps
+            }
             None => {
                 let (scanned, incomplete) = c_include_parser::retrieve_c_includes_checked(
                     cmdline,
@@ -7554,6 +7654,13 @@ pub fn discover_c_includes(
                         }
                     }
                 } else {
+                    if explain {
+                        eprintln!(
+                            "nix-ninja: discovery {seed}: scanned {} include(s) from {} seed(s)",
+                            scanned.len(),
+                            files.len(),
+                        );
+                    }
                     scanned
                 }
             }
