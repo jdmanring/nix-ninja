@@ -94,6 +94,23 @@ pub fn run() -> Result<()> {
 
 /// builder-rpc-v0 requires the submitted path's name to match the caller's
 /// `outputPathName`; legacy mode copies the drv into `$out`.
+/// One warning per placeholder that will ship unrestored, naming the check
+/// that finds it. Separated from the printing so the TEXT can be pinned: a
+/// warning whose remedy is wrong is worse than none, and the remedy is the
+/// only part a reader acts on.
+fn unrestored_warnings(restore: &[(String, String)]) -> Vec<String> {
+    restore
+        .iter()
+        .map(|(placeholder, _real)| {
+            format!(
+                "nix-ninja: WARNING {placeholder} is not restored in \
+                 output-derivation mode; an artifact embedding an output path \
+                 ships it dangling. Check with: grep -rl {placeholder} <result>"
+            )
+        })
+        .collect()
+}
+
 fn submit_outer_output(
     store_dir: &StoreDir,
     derived_file: &DerivedFile,
@@ -117,15 +134,8 @@ fn submit_outer_output(
     // What is fixable is the silence. Say it once, name a file to check, and
     // let a build that cares fail on its own evidence rather than shipping a
     // dangling path nobody looked for.
-    let restore = crate::task::outer_restore_map();
-    if !restore.is_empty() {
-        for (placeholder, _real) in &restore {
-            eprintln!(
-                "nix-ninja: WARNING placeholder {placeholder} is not restored in \
-                 output-derivation mode; an artifact embedding an output path \
-                 ships it dangling. Check with: grep -rl {placeholder} <result>"
-            );
-        }
+    for line in unrestored_warnings(&crate::task::outer_restore_map()) {
+        eprintln!("{line}");
     }
 
     let final_drv = derived_file.derived_path.root_path();
@@ -231,6 +241,43 @@ fn subtool(
             anyhow::bail!(
                 "Unknown subtool '{subtool_name}'. Use '-t list' to get a list of available subtools."
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod unrestored_warning_tests {
+    use super::unrestored_warnings;
+
+    #[test]
+    fn a_warning_names_the_placeholder_and_a_check_that_finds_it() {
+        // Nothing to restore, nothing to say. A warning on every build is a
+        // warning nobody reads.
+        assert!(unrestored_warnings(&[]).is_empty());
+
+        let restore = vec![
+            (
+                "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-gcc-16.2.0".to_string(),
+                "/nix/store/cmgbh82ibqygf0f2z5bcz7qr1lqa8sjk-gcc-16.2.0".to_string(),
+            ),
+            (
+                "/nix/store/8xflmr65ja7ydycn7gxzcnipi7l9wip4-gcc-16.2.0-dev".to_string(),
+                "/nix/store/f25g2sqsijylwawrixk8zcpkwxqwjyya-gcc-16.2.0-dev".to_string(),
+            ),
+        ];
+        let got = unrestored_warnings(&restore);
+        assert_eq!(got.len(), 2, "one line per placeholder");
+        for (line, (placeholder, real)) in got.iter().zip(restore.iter()) {
+            // THE PLACEHOLDER, NOT THE REAL PATH. Naming the real one would
+            // send a reader looking for a path that is present and correct.
+            assert!(line.contains(placeholder), "names the placeholder");
+            assert!(!line.contains(real.as_str()), "must not name the real path");
+            // The remedy is the part acted on, so it is pinned too.
+            assert!(
+                line.contains(&format!("grep -rl {placeholder}")),
+                "carries a check that would find it"
+            );
+            assert!(line.starts_with("nix-ninja: "), "keeps the log prefix");
         }
     }
 }
