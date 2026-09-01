@@ -598,30 +598,18 @@ impl Runner {
                 }
                 Err(e) => return Err(e.into()),
             };
-            let path = if entry.file_type().is_symlink() {
-                let path = entry.into_path();
-                if let Some(pair) = alias_symlink_entry(&self.config.build_dir, &path) {
-                    self.alias_symlinks.push(pair);
+            let path = match build_dir_disposition(
+                &self.config.build_dir,
+                entry.file_type().is_symlink(),
+                entry.file_type().is_file(),
+                entry.path(),
+            ) {
+                BuildDirDisposition::Alias(link, target) => {
+                    self.alias_symlinks.push((link, target));
                     continue;
                 }
-                // NOT an in-tree alias, so nothing will recreate it in a
-                // sandbox - and dropping it here loses the file entirely.
-                // x265's preBuild links its 10- and 12-bit archives in from
-                // sibling directories the walk never reaches
-                // (`ln -s ../build-10bits/libx265.a ./libx265-10.a`), and
-                // the shared-library link then fails on `cannot find
-                // -lx265-10`. Upload it by CONTENT instead: `is_file`
-                // follows the link, so a dangling or non-regular target
-                // still falls out here.
-                if !path.is_file() {
-                    continue;
-                }
-                path
-            } else {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                entry.into_path()
+                BuildDirDisposition::Skip => continue,
+                BuildDirDisposition::Upload => entry.into_path(),
             };
             let derived_file =
                 match new_opaque_file(&self.rpc_client, &self.config.build_dir, path.clone()) {
@@ -4460,6 +4448,50 @@ fn is_tree_path(p: &Path) -> bool {
 /// and whose link path and target both survive the `link=target`
 /// space-separated encoding. Everything else is skipped, and skipping is
 /// the safe direction: the pre-fix behavior for every symlink.
+/// What the build-directory walk does with one entry.
+#[derive(Debug, PartialEq, Eq)]
+enum BuildDirDisposition {
+    /// An in-tree symlink, recreated in the sandbox as a link.
+    Alias(String, String),
+    /// Upload the bytes at this path.
+    Upload,
+    /// Not an input: a directory, a dangling link, or a special file.
+    Skip,
+}
+
+/// EXTRACTED SO THE WIRING CAN BE PINNED. Reverting the symlink arm to the
+/// entry's own file type left the whole suite green, because every test
+/// covered `alias_symlink_entry` and nothing covered what the walk DOES with
+/// the answer. `WalkDir` does not follow links, so `entry_is_file` is false
+/// for every symlink; the path, which does follow, decides whether there are
+/// bytes to upload.
+fn build_dir_disposition(
+    build_dir: &Path,
+    entry_is_symlink: bool,
+    entry_is_file: bool,
+    path: &Path,
+) -> BuildDirDisposition {
+    if entry_is_symlink {
+        if let Some((link, target)) = alias_symlink_entry(build_dir, path) {
+            return BuildDirDisposition::Alias(link, target);
+        }
+        // Not an in-tree alias, so nothing recreates it in a sandbox and
+        // dropping it loses the file. x265 links its 10- and 12-bit archives
+        // in from sibling directories the walk never enters, and the shared
+        // library link then fails on `cannot find -lx265-10`.
+        return if path.is_file() {
+            BuildDirDisposition::Upload
+        } else {
+            BuildDirDisposition::Skip
+        };
+    }
+    if entry_is_file {
+        BuildDirDisposition::Upload
+    } else {
+        BuildDirDisposition::Skip
+    }
+}
+
 fn alias_symlink_entry(build_dir: &Path, link_abs: &Path) -> Option<(String, String)> {
     let target = std::fs::read_link(link_abs).ok()?;
     if target.is_absolute() {
@@ -8382,5 +8414,63 @@ mod post_cd_rebase_tests {
             rebase_post_cd(Path::new("a"), "../../outside/x"),
             PathBuf::from("../outside/x")
         );
+    }
+}
+
+#[cfg(test)]
+mod build_dir_disposition_tests {
+    use super::{build_dir_disposition, BuildDirDisposition};
+    use std::os::unix::fs::symlink;
+
+    /// Walks a real tree the way `read_build_dir` does and records what each
+    /// entry would become. The x265 shape is the case that regressed: an
+    /// archive linked in from a sibling directory outside the build root.
+    #[test]
+    fn a_link_out_of_the_tree_is_uploaded_and_a_dangling_one_is_not() {
+        let d = std::env::temp_dir().join(format!("nn-disp-{}", std::process::id()));
+        let build = d.join("build");
+        let sib = d.join("build-10bits");
+        std::fs::create_dir_all(build.join("sub")).unwrap();
+        std::fs::create_dir_all(&sib).unwrap();
+        std::fs::write(sib.join("libx265.a"), b"!<arch>\n").unwrap();
+        std::fs::write(build.join("real.o"), b"obj").unwrap();
+        symlink("../build-10bits/libx265.a", build.join("libx265-10.a")).unwrap();
+        symlink("../build-12bits/libx265.a", build.join("libx265-12.a")).unwrap();
+        symlink("real.o", build.join("alias.o")).unwrap();
+
+        let mut got: Vec<(String, BuildDirDisposition)> = Vec::new();
+        for entry in walkdir::WalkDir::new(&build) {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "build" {
+                continue;
+            }
+            got.push((
+                name,
+                build_dir_disposition(
+                    &build,
+                    entry.file_type().is_symlink(),
+                    entry.file_type().is_file(),
+                    entry.path(),
+                ),
+            ));
+        }
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let find = |n: &str| got.iter().find(|(k, _)| k == n).map(|(_, v)| v).unwrap();
+        // The regression: a link out of the tree carries real bytes.
+        assert_eq!(*find("libx265-10.a"), BuildDirDisposition::Upload);
+        // A link out of the tree with no target is not an input.
+        assert_eq!(*find("libx265-12.a"), BuildDirDisposition::Skip);
+        // An in-tree link stays a link rather than being uploaded twice.
+        assert_eq!(
+            *find("alias.o"),
+            BuildDirDisposition::Alias("alias.o".into(), "real.o".into())
+        );
+        // Ordinary file, and a directory which is not an input.
+        assert_eq!(*find("real.o"), BuildDirDisposition::Upload);
+        assert_eq!(*find("sub"), BuildDirDisposition::Skip);
+
+        std::fs::remove_dir_all(&d).ok();
     }
 }
