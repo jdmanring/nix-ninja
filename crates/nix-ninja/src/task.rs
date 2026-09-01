@@ -180,11 +180,22 @@ impl Runner {
             })
         {
             let entry = entry?;
-            if !entry.file_type().is_file() {
+            // `file_type` describes the ENTRY, and WalkDir does not follow
+            // links, so a symlink reports neither file nor directory and
+            // falls out here. A build system that links a generated file
+            // into the build directory then loses it: x265's preBuild
+            // builds two static archives in sibling directories and links
+            // them in with `ln -s ../build-10bits/libx265.a
+            // ./libx265-10.a`, and the shared-library link fails on
+            // `cannot find -lx265-10` with both archives present on disk.
+            // Ask the PATH instead, which follows the link, so a target
+            // that is a regular file is uploaded by content and a dangling
+            // or non-regular one still falls out.
+            let path = entry.into_path();
+            if !path.is_file() {
                 continue;
             }
 
-            let path = entry.into_path();
             let derived_file =
                 new_opaque_file(&self.rpc_client, &self.config.build_dir, path.clone())?;
             let fid = self.add_derived_file(files, derived_file.clone());
@@ -968,4 +979,52 @@ fn generate_frandom_seed(cmdline: &str) -> String {
     hasher.update(cmdline.as_bytes());
     let result = hasher.finalize();
     format!("{result:x}")[..16].to_string()
+}
+
+#[cfg(test)]
+mod build_dir_symlink_tests {
+    use std::os::unix::fs::symlink;
+
+    // THE DISTINCTION THE FIX TURNS ON. `WalkDir` does not follow links, so
+    // the entry's own file type reports a symlink as neither file nor
+    // directory; the PATH, which follows it, reports the target. Reading
+    // the entry drops a linked-in build product, and reading the path keeps
+    // it while still dropping a dangling one.
+    #[test]
+    fn a_link_to_a_file_is_no_file_by_entry_type_and_is_one_by_path() {
+        let d = std::env::temp_dir().join(format!("nn-bd-symlink-{}", std::process::id()));
+        let build = d.join("build");
+        let sibling = d.join("build-10bits");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("libx265.a"), b"!<arch>\n").unwrap();
+
+        let link = build.join("libx265-10.a");
+        symlink("../build-10bits/libx265.a", &link).unwrap();
+        let dangling = build.join("libx265-12.a");
+        symlink("../build-12bits/libx265.a", &dangling).unwrap();
+
+        let mut seen = 0;
+        for entry in walkdir::WalkDir::new(&build) {
+            let entry = entry.unwrap();
+            if entry.file_type().is_dir() {
+                continue;
+            }
+            assert!(
+                !entry.file_type().is_file(),
+                "both entries are links, so the entry type must not call them files"
+            );
+            let path = entry.into_path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            match name.as_str() {
+                "libx265-10.a" => assert!(path.is_file(), "the path follows the link"),
+                "libx265-12.a" => assert!(!path.is_file(), "a dangling link is still skipped"),
+                other => panic!("unexpected entry {other}"),
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, 2, "both links must be visited");
+
+        std::fs::remove_dir_all(&d).ok();
+    }
 }
