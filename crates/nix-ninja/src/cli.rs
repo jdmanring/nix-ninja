@@ -134,8 +134,29 @@ fn submit_outer_output(
     // What is fixable is the silence. Say it once, name a file to check, and
     // let a build that cares fail on its own evidence rather than shipping a
     // dangling path nobody looked for.
-    for line in unrestored_warnings(&crate::task::outer_restore_map()) {
-        eprintln!("{line}");
+    // THE INVARIANT THAT MAKES THIS SAFE, ENFORCED RATHER THAN ASSUMED.
+    // A placeholder is only written for an output whose value is a store
+    // path. Both helpers that drive this mode set `out = "/nonexistent"`,
+    // because builder-rpc-v0 leaves the real output unset and genericBuild
+    // needs the variable to exist, so the map is empty here and nothing is
+    // ever substituted. That is why the restore's absence on this path has
+    // no consequence.
+    //
+    // If the map is NOT empty, this mode is running with a real output path,
+    // the restore cannot reach the bytes, and the artifact would ship a path
+    // that nothing will create. Refuse instead: no package reaches this, and
+    // one that did would otherwise be corrupted silently.
+    let restore = crate::task::outer_restore_map();
+    if !restore.is_empty() {
+        for line in unrestored_warnings(&restore) {
+            eprintln!("{line}");
+        }
+        anyhow::bail!(
+            "output-derivation mode with {} real output path(s): the placeholder \
+             restore runs only where the driver materializes the bytes, so this \
+             configuration would ship an unresolvable path",
+            restore.len()
+        );
     }
 
     let final_drv = derived_file.derived_path.root_path();

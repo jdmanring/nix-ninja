@@ -1301,7 +1301,7 @@ mod outer_placeholder_tests {
     /// cargo runs tests in threads, so without this lock one test reads the
     /// other's assertions. Poisoning is survivable: a panicking holder must
     /// not fail the other test twice.
-    static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// `scan_lto_flags` with no wrapper baseline, which is the state
     /// `task_is_lto` starts from when the environment sets none. Written as
@@ -1457,5 +1457,44 @@ mod outer_placeholder_tests {
         );
         assert_eq!(super::rewrite_str("nothing here", &map), "nothing here");
         assert_eq!(super::rewrite_str("anything", &[]), "anything");
+    }
+}
+
+#[cfg(test)]
+mod outer_map_in_output_derivation_tests {
+    use super::outer_placeholder_tests::OUT_ENV_LOCK;
+    use super::outer_rewrite_map;
+
+    /// THE CASE THAT DECIDES WHETHER OUTPUT-DERIVATION MODE CAN SHIP A
+    /// PLACEHOLDER AT ALL. `mkMesonPackage` and `mkCMakePackage` both set
+    /// `out = "/nonexistent"`, because builder-rpc-v0 deliberately leaves the
+    /// real output unset and stdenv's genericBuild requires the variable to
+    /// exist. The map keeps an output only when its value is a store path, so
+    /// there is nothing to substitute and no placeholder is ever written on
+    /// that route. The restore's absence there is an asymmetry with no
+    /// consequence, which is not what it looks like from the code.
+    #[test]
+    fn a_nonexistent_out_yields_no_placeholder() {
+        let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("outputs", "out");
+        std::env::set_var("out", "/nonexistent");
+        assert!(
+            outer_rewrite_map().is_empty(),
+            "a non-store output must produce no placeholder"
+        );
+
+        // CONTROL: the same call with a real store path DOES produce one, or
+        // the assertion above would pass for a map that never works.
+        std::env::set_var(
+            "out",
+            "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-1.2.16.1",
+        );
+        assert_eq!(
+            outer_rewrite_map().len(),
+            1,
+            "a store path must still produce a placeholder"
+        );
+        std::env::remove_var("out");
+        std::env::remove_var("outputs");
     }
 }
