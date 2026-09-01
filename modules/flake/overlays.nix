@@ -224,6 +224,30 @@
         target = "hello";
       };
 
+      # Configure-time Fortran/C detection, driven through nix-ninja. It
+      # verifies nothing about a TARGET: FortranCInterface_VERIFY() runs
+      # during configure, so this example fails at configure or not at all.
+      #
+      # IT FAILS TODAY, DELIBERATELY, and it is the reproduction of an open
+      # defect rather than a test that regressed. Under NIX_NINJA_DRV the
+      # dyndep pre-build calls BuildPathsWithResults, which the daemon
+      # refuses inside a derivation:
+      #
+      #   Caused by: daemon error: BuildPathsWithResults: remote error:
+      #   Operation 46 not allowed inside derivation
+      #
+      # The same project configures and verifies successfully in LOCAL mode,
+      # which is how every package in this tree has ever been verified - so
+      # this example exists to cover the route the CONSUMER builds on. It is
+      # registered in legacyPackages and NOT as a NixOS VM test, so it does
+      # not redden `nix flake check` while the defect stands.
+      example-fortran-c-interface = self.mkCMakePackage {
+        name = "example-fortran-c-interface";
+        src = ./examples/fortran-c-interface;
+        target = "app";
+        nativeBuildInputs = [ self.gfortran ];
+      };
+
       example-nix = self.callPackage ./examples/nix { src = inputs.nix; };
     };
 

@@ -31,6 +31,7 @@
       example-dynamic-deps = pkgs.example-dynamic-deps.target;
       example-cmake-hello = pkgs.example-cmake-hello.target;
       example-cmake-order-only-header = pkgs.example-cmake-order-only-header.target;
+      example-fortran-c-interface = pkgs.example-fortran-c-interface.target;
       example-nix = pkgs.example-nix.target;
     };
 
