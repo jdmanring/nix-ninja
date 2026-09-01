@@ -8784,6 +8784,34 @@ mod depend_info_rewrite_tests {
         );
     }
 
+    /// THE SAME CASE INSIDE A DERIVATION, which is the one that shipped
+    /// broken. A configure-time sub-project builds in a SUBDIRECTORY of the
+    /// package's build tree, so the task's build directory is
+    /// `<build>/CMakeFiles/FortranCInterface` while the constant names
+    /// `<build>` itself. Replacing the first with the second deleted the
+    /// `CMakeFiles/FortranCInterface` segment and pointed cmake at the OUTER
+    /// tree:
+    ///
+    /// ```text
+    /// cmake_ninja_dyndep failed to open
+    /// /build/source/build/CMakeFiles/myfort.dir/FortranModules.json
+    /// ```
+    ///
+    /// The file was declared AND materialized the whole time, one directory
+    /// level down, which is why reading the input set said nothing. The test
+    /// above cannot catch this because its build directory is under `/tmp`,
+    /// where the fallback is correct.
+    #[test]
+    fn a_sub_project_keeps_its_own_directory_segment() {
+        let bd = Path::new("/build/source/build/CMakeFiles/FortranCInterface");
+        let json = r#"{"linked-target-dirs":["/build/source/build/CMakeFiles/FortranCInterface/CMakeFiles/myfort.dir"]}"#;
+        assert_eq!(
+            rewrite_to_sandbox_build_dir(json, bd),
+            json,
+            "a build directory already under /build is where the task runs,              so the rewrite is the identity"
+        );
+    }
+
     /// AND IT MUST STAY ABSOLUTE. Rewriting the build directory to a
     /// relative path, the way the command line gets it, is refused outright:
     /// "--tdi= file has no absolute dir-cur-bld".

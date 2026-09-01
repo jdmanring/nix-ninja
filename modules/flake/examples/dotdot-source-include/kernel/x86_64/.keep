@@ -1,0 +1,2 @@
+Deliberately empty: nothing here is an input, so this directory exists in the
+sandbox only if something creates it for the `..` traversal.

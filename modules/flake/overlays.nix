@@ -306,6 +306,16 @@
         nativeBuildInputs = [ self.gfortran ];
       };
 
+      # openblas's shape, on the consumer's configuration.
+      example-dotdot-source-include = self.mkRecursivePackage {
+        name = "example-dotdot-source-include";
+        src = ./examples/dotdot-source-include;
+        target = "app";
+        postInstall = ''
+          $out/bin/app | grep -q "generic impl reached through dotdot"
+        '';
+      };
+
       example-nix = self.callPackage ./examples/nix { src = inputs.nix; };
     };
 
