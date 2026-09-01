@@ -300,6 +300,57 @@ impl Drop for RealiseTimer {
     }
 }
 
+/// Worker threads for the RPC runtime, sized to the work it can actually have.
+///
+/// Tokio's default is one worker per hardware thread, which is 24 here. Every
+/// task this runtime runs is an RPC on the connection pool, so at most
+/// `pool_max` of them can be in flight and the rest of the workers can never
+/// hold work. Measured on a live round: a driver spawned for a SINGLE compile
+/// carried 30 to 32 threads at a cumulative 0.30 to 0.43 CPU-seconds, never
+/// one core's worth across all of them.
+///
+/// The cost is not idle threads burning CPU - it is pool CONSTRUCTION, paid
+/// once per driver and never amortized, because a compiler-route driver lives
+/// 0.4 to 4 seconds and there is one per translation unit.
+///
+/// `max(1)` because tokio panics on zero workers, and a caller asking for no
+/// connections still needs a runtime that can run the request that says so.
+fn rpc_worker_threads(pool_max: usize) -> usize {
+    pool_max.max(1)
+}
+
+#[cfg(test)]
+mod rpc_worker_threads_tests {
+    use super::rpc_worker_threads;
+
+    /// The runtime must not be wider than the pool it serves, and must never
+    /// be zero - tokio panics on a zero-worker runtime, so the floor is the
+    /// half of this that cannot be left to a comment.
+    #[test]
+    fn tracks_the_pool_and_never_reaches_zero() {
+        assert_eq!(rpc_worker_threads(0), 1);
+        assert_eq!(rpc_worker_threads(1), 1);
+        assert_eq!(rpc_worker_threads(6), 6);
+        assert_eq!(rpc_worker_threads(24), 24);
+    }
+
+    /// A one-edge driver is the case this exists for: it must not open a
+    /// worker per hardware thread. Asserted as a RELATIONSHIP rather than a
+    /// literal, so it still means something on a machine of any width.
+    #[test]
+    fn a_single_connection_does_not_size_to_the_machine() {
+        let machine = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+        if machine > 1 {
+            assert!(
+                rpc_worker_threads(1) < machine,
+                "a one-connection driver must not build a machine-wide runtime"
+            );
+        }
+    }
+}
+
 impl BuilderRpcClient {
     /// Connect to `$NIX_REMOTE` if set, otherwise the standard daemon
     pub fn connect_from_env(pool_max: Option<usize>) -> Result<Self> {
@@ -335,7 +386,10 @@ impl BuilderRpcClient {
     /// 24-thread machine: the default is 25, so every `-j` from 26 up ran
     /// at 25 with no message.
     pub fn connect_unix_sized(path: &Path, in_drv: bool, pool_max: usize) -> Result<Self> {
-        let runtime = RuntimeBuilder::new_multi_thread().enable_all().build()?;
+        let runtime = RuntimeBuilder::new_multi_thread()
+            .worker_threads(rpc_worker_threads(pool_max))
+            .enable_all()
+            .build()?;
         let pool = ConnectionPool::new(
             path,
             PoolConfig {
