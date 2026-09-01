@@ -520,7 +520,12 @@ impl BuilderRpcClient {
     /// so a NAR larger than the buffer streams through rather than sitting in
     /// it. Safe against retries because there are none: `execute` is FnOnce
     /// and poisons its connection on error, and no caller retries this.
-    pub fn add_to_store_nar(&self, name: &str, path: &Path) -> Result<StorePath> {
+    /// CRATE-PRIVATE ON PURPOSE. The memo above is the only way in from
+    /// outside, so a caller cannot reach the uncached upload and quietly
+    /// lose the memo. This was added because reverting the one call site
+    /// to this method left the whole suite green: the wiring was pinned
+    /// by nothing, and a compile error is a stronger pin than a test.
+    pub(crate) fn add_to_store_nar(&self, name: &str, path: &Path) -> Result<StorePath> {
         let info = self
             .runtime
             .block_on(async {
