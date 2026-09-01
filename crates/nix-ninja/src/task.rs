@@ -3009,7 +3009,11 @@ fn build_task_derivation(
         // and the per-TU bank is the whole point of this tool. `-flto=1` is
         // serial by request and bare `-flto` asks for no parallelism, so
         // neither needs `make`; `auto` and `jobserver` do.
-        if lto_needs_make(cmdline) {
+        let cc_dir: Option<PathBuf> = tools
+            .require_cc()
+            .ok()
+            .map(|cc| PathBuf::from(task.store_dir.display(cc).to_string()));
+        if lto_needs_make(cmdline, cc_dir.as_deref()) {
             if let Ok(Some(sp)) = which_store_path_opt(&task.store_dir, "make") {
                 path.push(format!("{}/bin", task.store_dir.display(&sp)));
                 drv.inputs.insert(SingleDerivedPath::Opaque(sp));
@@ -3584,11 +3588,29 @@ fn extract_store_paths(
 ///
 /// `-fno-lto` is excluded by requiring the exact token or a `=`, so a prefix
 /// match cannot pull it in.
-fn lto_needs_make(cmdline: &str) -> bool {
-    cmdline.split_whitespace().any(|tok| {
+fn lto_needs_make(cmdline: &str, cc_dir: Option<&Path>) -> bool {
+    if cmdline.split_whitespace().any(|tok| {
         let tok = tok.trim_matches(|c| c == '"' || c == '\'');
         tok == "-flto" || tok.starts_with("-flto=")
-    })
+    }) {
+        return true;
+    }
+    // THE FLAG IS USUALLY NOT IN THE COMMAND LINE, and a gate that reads only
+    // the argv is blind to most LTO links by construction. nixpkgs' cc-wrapper
+    // injects `nix-support/cc-cflags-before` at exec time, so a distribution
+    // that puts `-flto=8` there produces links that ARE LTO links and whose
+    // logged argv says nothing about it. Measured on one consumer: 46
+    // gcc-wrappers in the store, 15 carrying `-flto` there, against 13 command
+    // lines mentioning LTO in a whole round beside 57 serial-LTRANS warnings.
+    //
+    // The cc is already an input, so consulting it adds nothing to the key
+    // that was not in it.
+    cc_dir
+        .map(|d| d.join("nix-support/cc-cflags-before"))
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .is_some_and(|flags| {
+            flags.split_whitespace().any(|t| t == "-flto" || t.starts_with("-flto="))
+        })
 }
 
 #[cfg(test)]
@@ -3599,35 +3621,62 @@ mod lto_make_gate_tests {
     /// positive re-keys derivations that gain nothing from `make`.
     #[test]
     fn reads_the_parallel_spellings() {
-        assert!(lto_needs_make("gcc -flto=8 a.o -o t"));
-        assert!(lto_needs_make("gcc -flto=auto a.o -o t"));
-        assert!(lto_needs_make("gcc -flto=jobserver a.o -o t"));
-        assert!(lto_needs_make("gcc -O2 -flto=24 -march=znver4 a.o -o t"));
-        assert!(lto_needs_make(r#"gcc "-flto=8" a.o -o t"#));
+        assert!(lto_needs_make("gcc -flto=8 a.o -o t", None));
+        assert!(lto_needs_make("gcc -flto=auto a.o -o t", None));
+        assert!(lto_needs_make("gcc -flto=jobserver a.o -o t", None));
+        assert!(lto_needs_make("gcc -O2 -flto=24 -march=znver4 a.o -o t", None));
+        assert!(lto_needs_make(r#"gcc "-flto=8" a.o -o t"#, None));
     }
 
     /// Bare `-flto` and `-flto=1` DO need make - measured, after a first
     /// version excluded both and left 18 of a round's links serial.
     #[test]
     fn the_serial_looking_spellings_still_need_make() {
-        assert!(lto_needs_make("gcc -flto a.o -o t"));
-        assert!(lto_needs_make("gcc -flto=1 a.o -o t"));
-        assert!(lto_needs_make("gcc -flto= a.o -o t"));
+        assert!(lto_needs_make("gcc -flto a.o -o t", None));
+        assert!(lto_needs_make("gcc -flto=1 a.o -o t", None));
+        assert!(lto_needs_make("gcc -flto= a.o -o t", None));
     }
 
     #[test]
     fn declines_what_is_not_lto() {
-        assert!(!lto_needs_make("gcc -c a.c -o a.o"));
+        assert!(!lto_needs_make("gcc -c a.c -o a.o", None));
         // A prefix match would pull this in and re-key every non-LTO link.
-        assert!(!lto_needs_make("gcc -fno-lto a.o -o t"));
-        assert!(!lto_needs_make("gcc -fltrans-output-list=x a.o -o t"));
+        assert!(!lto_needs_make("gcc -fno-lto a.o -o t", None));
+        assert!(!lto_needs_make("gcc -fltrans-output-list=x a.o -o t", None));
+    }
+
+    /// THE FLAG IS USUALLY NOT IN THE COMMAND LINE. A gate reading only argv
+    /// covered 13 links in a round that emitted 57 serial-LTRANS warnings,
+    /// because nixpkgs' cc-wrapper injects `cc-cflags-before` at exec time.
+    #[test]
+    fn the_wrappers_injected_flags_count() {
+        let dir = std::env::temp_dir().join(format!("nn-cc-{}", std::process::id()));
+        let ns = dir.join("nix-support");
+        std::fs::create_dir_all(&ns).unwrap();
+
+        // A wrapper that injects LTO: the gate must fire on a plain command.
+        std::fs::write(ns.join("cc-cflags-before"), "-O3 -march=znver4 -flto=8\n").unwrap();
+        assert!(lto_needs_make("gcc -o t a.o b.o", Some(dir.as_path())));
+
+        // A wrapper that does not: it must not.
+        std::fs::write(ns.join("cc-cflags-before"), "-O3 -march=znver4\n").unwrap();
+        assert!(!lto_needs_make("gcc -o t a.o b.o", Some(dir.as_path())));
+        // ... but an explicit flag on the command line still wins.
+        assert!(lto_needs_make("gcc -flto=auto -o t a.o", Some(dir.as_path())));
+
+        // No such file, and no cc at all, must both be handled rather than panic.
+        std::fs::remove_file(ns.join("cc-cflags-before")).unwrap();
+        assert!(!lto_needs_make("gcc -o t a.o", Some(dir.as_path())));
+        assert!(!lto_needs_make("gcc -o t a.o", None));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A substring must not trip the gate, which is how a `-Werror` in a
     /// command line trips a scanner looking for the word `error`.
     #[test]
     fn a_substring_is_not_the_flag() {
-        assert!(!lto_needs_make("gcc -DFLAGS=-flto=8 -c a.c -o a.o"));
+        assert!(!lto_needs_make("gcc -DFLAGS=-flto=8 -c a.c -o a.o", None));
     }
 }
 
