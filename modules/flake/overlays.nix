@@ -248,6 +248,25 @@
         nativeBuildInputs = [ self.gfortran ];
       };
 
+      # The smallest build that cannot succeed without ninja dyndep: one
+      # Fortran module defined in one file and used in another, so the
+      # compile order is not knowable from the graph alone. No
+      # configure-time detection, which is what separates it from
+      # example-fortran-c-interface above and is why it is the one to
+      # measure the blast radius with.
+      #
+      # IT FAILS TODAY, DELIBERATELY, with the same
+      # `Operation 46 not allowed inside derivation` as its neighbour. Two
+      # files and one module are enough, so the defect is EVERY dyndep
+      # consumer - all Fortran, and C++20 modules - rather than packages
+      # that verify Fortran/C interop.
+      example-fortran-module = self.mkCMakePackage {
+        name = "example-fortran-module";
+        src = ./examples/fortran-module;
+        target = "app";
+        nativeBuildInputs = [ self.gfortran ];
+      };
+
       example-nix = self.callPackage ./examples/nix { src = inputs.nix; };
     };
 

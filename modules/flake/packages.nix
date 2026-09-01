@@ -32,6 +32,7 @@
       example-cmake-hello = pkgs.example-cmake-hello.target;
       example-cmake-order-only-header = pkgs.example-cmake-order-only-header.target;
       example-fortran-c-interface = pkgs.example-fortran-c-interface.target;
+      example-fortran-module = pkgs.example-fortran-module.target;
       example-nix = pkgs.example-nix.target;
     };
 
