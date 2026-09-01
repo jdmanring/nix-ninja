@@ -31,7 +31,7 @@ fn a_directory_shadowing_a_header_name_is_skipped() {
     std::fs::write(&src, "#include <memory>\n").unwrap();
 
     let dirs = vec![first.clone(), second.clone()];
-    let got = extract_includes(&src, &src, &dirs, None).expect("scan must not fail");
+    let (got, _dotdot) = extract_includes(&src, &src, &dirs, None).expect("scan must not fail");
 
     assert!(
         !got.iter().any(|p| p.ends_with("first/memory")),

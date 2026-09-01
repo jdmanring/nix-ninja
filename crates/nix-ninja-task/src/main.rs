@@ -224,6 +224,34 @@ fn main() -> Result<()> {
     for pp in dotdot_prefixes(&cli.cmdline, env::var("NIX_BUILD_TOP").ok().as_deref()) {
         let _ = fs::create_dir_all(&pp);
     }
+    // THE SAME NEED FROM A PLACE THE COMMAND LINE CANNOT SHOW. A `..` spelled
+    // inside a generated SOURCE reaches the compiler without ever appearing
+    // as a token here, so the loop above has nothing to key on. openblas
+    // writes 2,602 one-line kernels of the form
+    //     #include "<src>/kernel/x86_64/../generic/imatcopy_ct.c"
+    // and every one of them died ENOENT on a file that WAS declared and WAS
+    // materialized at the path the `..` resolves to. What was missing is the
+    // directory before it, which no input creates.
+    //
+    // The driver's scanner is the only thing that sees the raw spelling, so
+    // it sends the directories here rather than this re-deriving them.
+    // Space-separated, relative or absolute-under-/build only; the driver
+    // drops anything carrying whitespace.
+    if let Ok(raw) = env::var("NIX_NINJA_MKDIRS") {
+        let top = env::var("NIX_BUILD_TOP").ok();
+        for d in raw.split_whitespace() {
+            let p = std::path::Path::new(d);
+            // Confined for the same reason dotdot_prefixes is: an absolute
+            // path outside the sandbox is either already there or not ours
+            // to create.
+            let confined = p.is_relative()
+                || p.starts_with("/build")
+                || top.as_deref().is_some_and(|t| p.starts_with(t));
+            if confined {
+                let _ = fs::create_dir_all(p);
+            }
+        }
+    }
     println!(
         "nix-ninja-task: Setup source directory in {}",
         build_dir.display()

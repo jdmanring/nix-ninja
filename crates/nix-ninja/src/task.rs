@@ -2453,7 +2453,11 @@ fn build_task_derivation(
                 .map(|i| (i.build_path.clone(), i.build_path.clone()))
                 .collect();
 
-            let (discovered_deps, discovered_store_paths) = discover_c_includes(
+            let Discovered {
+                deps: discovered_deps,
+                store_paths: discovered_store_paths,
+                dotdot_dirs,
+            } = discover_c_includes(
                 rpc_client,
                 &task.store_dir,
                 &task.build_dir,
@@ -2462,6 +2466,8 @@ fn build_task_derivation(
                 Some(virtual_paths),
                 task.depfile.as_deref().map(Path::new),
             )?;
+
+            declare_dotdot_dirs(&mut drv, &dotdot_dirs);
 
             // Add discovered store paths as input sources only
             for store_path in discovered_store_paths {
@@ -3402,14 +3408,18 @@ fn handle_derivation_result(
             );
 
             let t_discover = std::time::Instant::now();
-            let (discovered_deps, discovered_store_paths) =
-                dynamic_task::discover_dynamic_dependencies(
-                    rpc_client,
-                    &config.store_dir,
-                    &config.build_dir,
-                    &drv,
-                    built_paths,
-                )?;
+            let Discovered {
+                deps: discovered_deps,
+                store_paths: discovered_store_paths,
+                dotdot_dirs,
+            } = dynamic_task::discover_dynamic_dependencies(
+                rpc_client,
+                &config.store_dir,
+                &config.build_dir,
+                &drv,
+                built_paths,
+            )?;
+            declare_dotdot_dirs(&mut drv, &dotdot_dirs);
             DYN_DISCOVER_MS.fetch_add(
                 t_discover.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -7552,6 +7562,54 @@ fn generated_not_yet_written(
     !abs.exists()
 }
 
+/// What one task's dependency discovery produced.
+///
+/// `dotdot_dirs` is NOT an input list. It names directories the compiler
+/// walks through on its way to an input, which a sandbox that materializes
+/// only declared files does not otherwise have. Keeping it in a separate
+/// field is deliberate: folded into `deps` it would be uploaded as a file.
+/// Record the directories a `..` include spelling must traverse, so the task
+/// creates them before running its command.
+///
+/// MERGED, never replaced: the dynamic pass adds to what the static pass
+/// already recorded, and a task discovered on both paths would otherwise keep
+/// only the later set.
+pub fn declare_dotdot_dirs(drv: &mut Derivation, dirs: &[PathBuf]) {
+    if dirs.is_empty() {
+        return;
+    }
+    let key = b"NIX_NINJA_MKDIRS";
+    let existing = drv
+        .env
+        .iter()
+        .find(|(k, _)| k.as_ref() == key)
+        .map_or(String::new(), |(_, v)| {
+            String::from_utf8_lossy(v).into_owned()
+        });
+    let mut all: Vec<String> = existing.split_whitespace().map(|s| s.to_string()).collect();
+    for d in dirs {
+        let s = d.to_string_lossy().into_owned();
+        // A path carrying a space cannot survive this encoding, and the
+        // task refuses an absolute one anyway; drop it rather than emit a
+        // token that would silently mean something else.
+        if s.contains(char::is_whitespace) {
+            continue;
+        }
+        if !all.contains(&s) {
+            all.push(s);
+        }
+    }
+    all.sort();
+    drv.env
+        .insert(key[..].into(), all.join(" ").into_bytes().into());
+}
+
+pub struct Discovered {
+    pub deps: Vec<DerivedFile>,
+    pub store_paths: Vec<StorePath>,
+    pub dotdot_dirs: Vec<PathBuf>,
+}
+
 pub fn discover_c_includes(
     rpc_client: &Arc<BuilderRpcClient>,
     store_dir: &StoreDir,
@@ -7560,7 +7618,7 @@ pub fn discover_c_includes(
     files: Vec<PathBuf>,
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
     depfile: Option<&Path>,
-) -> Result<(Vec<DerivedFile>, Vec<StorePath>)> {
+) -> Result<Discovered> {
     // The virtual set is consumed by the scan below; the UPLOAD filter
     // further down needs it too, so keep a copy. See generated_not_yet_written.
     let virtual_declared: Option<HashMap<PathBuf, PathBuf>> = virtual_paths.clone();
@@ -7611,6 +7669,14 @@ pub fn discover_c_includes(
     // and its own includes are declared. Falling back to it is the behavior
     // every such edge had before the read-back existed.
     let depfile = depfile.filter(|_| !uses_precompiled_header(cmdline));
+    // COMPUTED FROM THE SEEDS WHETHER OR NOT THE SCAN RUNS, and that is the
+    // point rather than an optimization. A depfile records the path the
+    // compiler RESOLVED, so the `..` spelling that made the directory
+    // necessary is absent from it - and a read-back is exactly the second
+    // run, where the sandbox is fresh again. Deriving this only inside the
+    // scan branch would fix run one and break run two, which is a shape this
+    // project has shipped before.
+    let dotdot_dirs = c_include_parser::seed_dotdot_dirs(cmdline, &files, virtual_paths.as_ref());
     let c_includes =
         match depfile_read_back(build_dir, AsRef::<Path>::as_ref(store_dir), depfile, &files) {
             Some(deps) => {
@@ -7625,7 +7691,11 @@ pub fn discover_c_includes(
                 deps
             }
             None => {
-                let (scanned, incomplete) = c_include_parser::retrieve_c_includes_checked(
+                let c_include_parser::Scan {
+                    includes: scanned,
+                    incomplete,
+                    ..
+                } = c_include_parser::retrieve_c_includes_checked(
                     cmdline,
                     files.clone(),
                     virtual_paths,
@@ -7795,7 +7865,11 @@ pub fn discover_c_includes(
         std::sync::atomic::Ordering::Relaxed,
     );
 
-    Ok((discovered_deps, discovered_store_paths))
+    Ok(Discovered {
+        deps: discovered_deps,
+        store_paths: discovered_store_paths,
+        dotdot_dirs,
+    })
 }
 
 /// Removes -frandom-seed flag from a string of CFLAGS.

@@ -28,14 +28,19 @@ pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
     let (build_dir, built_paths) = prepare_build_environment(store_dir)?;
 
     // Stage 2: Discover dynamic dependencies
-    let (discovered_deps, discovered_store_paths) =
+    let discovered =
         discover_dynamic_dependencies(&rpc_client, store_dir, &build_dir, &drv, built_paths)?;
+
+    // A `..` spelling discovered HERE has to reach the final derivation:
+    // this subtool emits the derivation, it does not run the command, so
+    // creating the directory in this sandbox would help nobody.
+    crate::task::declare_dotdot_dirs(&mut drv, &discovered.dotdot_dirs);
 
     // Stage 3: Update derivation with discovered dependencies
     let new_deps = update_derivation_with_discoveries(
         &mut drv,
-        discovered_deps,
-        discovered_store_paths,
+        discovered.deps,
+        discovered.store_paths,
         store_dir,
     )?;
 
@@ -118,7 +123,7 @@ pub fn discover_dynamic_dependencies(
     build_dir: &Path,
     drv: &Derivation,
     built_paths: HashMap<PathBuf, PathBuf>,
-) -> Result<(Vec<DerivedFile>, Vec<StorePath>)> {
+) -> Result<crate::task::Discovered> {
     let cmdline_bytes = drv
         .args
         .first()

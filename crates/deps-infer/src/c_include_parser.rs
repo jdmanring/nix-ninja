@@ -16,7 +16,20 @@ pub fn retrieve_c_includes(
     files: Vec<PathBuf>,
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
-    Ok(retrieve_c_includes_checked(cmdline, files, virtual_paths)?.0)
+    Ok(retrieve_c_includes_checked(cmdline, files, virtual_paths)?.includes)
+}
+
+/// What one walk of a translation unit's include graph found.
+///
+/// `dotdot_dirs` is not a list of inputs and must not be treated as one: it
+/// names directories the compiler WALKS THROUGH to reach an input, which a
+/// sandbox materializing only declared files does not otherwise have.
+pub struct Scan {
+    pub includes: Vec<PathBuf>,
+    pub dotdot_dirs: Vec<PathBuf>,
+    /// The scan knows it could not expand something, so its answer is a
+    /// lower bound rather than the set.
+    pub incomplete: bool,
 }
 
 /// The same walk, plus whether the scan KNOWS it is incomplete.
@@ -31,7 +44,7 @@ pub fn retrieve_c_includes_checked(
     cmdline: &str,
     files: Vec<PathBuf>,
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
-) -> Result<(Vec<PathBuf>, bool)> {
+) -> Result<Scan> {
     let includes = gcc_include_parser::parse_include_dirs(cmdline)?;
     bfs_parse_includes(files, &includes, virtual_paths)
 }
@@ -41,10 +54,11 @@ fn bfs_parse_includes(
     files: Vec<PathBuf>,
     include_dirs: &[PathBuf],
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
-) -> Result<(Vec<PathBuf>, bool)> {
+) -> Result<Scan> {
     // Set by any file carrying a directive this parser cannot expand.
     let mut incomplete = false;
     let mut visited = rustc_hash::FxHashSet::default();
+    let mut dotdot_dirs: Vec<PathBuf> = Vec::new();
     let mut result = Vec::new();
     let mut queue = VecDeque::new();
     // CROSS-FILE COMPUTED INCLUDES. Defines accumulate over the whole walk
@@ -81,6 +95,11 @@ fn bfs_parse_includes(
 
         // Process each source's includes
         for source in sources_with_includes {
+            for dir in source.dotdot_dirs {
+                if !dotdot_dirs.contains(&dir) {
+                    dotdot_dirs.push(dir);
+                }
+            }
             for include in source.includes {
                 if visited.insert(include.clone()) {
                     queue.push_back(include.clone());
@@ -157,13 +176,20 @@ fn bfs_parse_includes(
         incomplete = true;
     }
 
-    Ok((result, incomplete))
+    Ok(Scan {
+        includes: result,
+        dotdot_dirs,
+        incomplete,
+    })
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]
 pub struct SourceWithIncludes {
     pub path: PathBuf,
     pub includes: Vec<PathBuf>,
+    /// Directories a `..` SPELLING has to walk through, which is not the
+    /// same question as which files are inputs. See `dotdot_prefix`.
+    pub dotdot_dirs: Vec<PathBuf>,
     pub path_defines: Vec<(String, String)>,
     pub macro_uses: Vec<String>,
     pub computed_unresolvable: Vec<String>,
@@ -208,7 +234,7 @@ where
         let virtual_paths = virtual_paths.clone();
 
         handles.push(std::thread::spawn(move || {
-            let mut includes =
+            let (mut includes, dotdot_dirs) =
                 match extract_includes(&path, &spelled, &includes, virtual_paths.as_ref().as_ref())
                 {
                     Ok(value) => value,
@@ -240,6 +266,7 @@ where
             Ok(SourceWithIncludes {
                 path: spelled,
                 includes,
+                dotdot_dirs,
                 path_defines,
                 macro_uses,
                 computed_unresolvable,
@@ -586,7 +613,7 @@ pub fn extract_includes(
     spelled: &Path,
     include_dirs: &[PathBuf],
     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
-) -> Result<Vec<PathBuf>> {
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     // A GENERATED HEADER IS RESOLVABLE BEFORE IT EXISTS, AND SCANNING IT
     // IS WHAT KILLED THE FIRST REAL PACKAGE TO CARRY ONE. `virtual_paths`
     // deliberately resolves a declared-but-absent build-dir file so the
@@ -634,7 +661,7 @@ pub fn extract_includes(
         Ok(scan) => scan,
         Err(e) => {
             if is_declared_virtual(path, virtual_paths) && !path.exists() {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), Vec::new()));
             }
             return Err(e);
         }
@@ -656,29 +683,149 @@ pub fn extract_includes(
     // (2026-08-23, the first make package through the compiler drop-in).
     // Only relative spellings are added - an absolute spelling is a store
     // path or a system header, where symlinks are the store's own business.
-    let mut push_both = |head: &Path, tail: &Path, canonical: PathBuf| {
-        let spelled = lexical_normalize(&head.join(tail));
-        if spelled != canonical && spelled.is_relative() {
-            result.push(spelled);
-        }
-        result.push(canonical);
-    };
-    for d in scan.directives.iter() {
-        if d.quoted {
-            if let Some(p) = try_resolve(&parent_dir, &d.name, virtual_paths) {
-                push_both(&parent_dir, &d.name, p);
-                continue;
+    let mut dotdot_dirs: Vec<PathBuf> = Vec::new();
+    {
+        let mut push_both = |head: &Path, tail: &Path, canonical: PathBuf| {
+            let raw = head.join(tail);
+            // THE DIRECTORY THE COMPILER WALKS THROUGH, which no input names.
+            // Recorded from the RAW join, before normalization collapses the
+            // `..` that makes it necessary.
+            if let Some(prefix) = dotdot_prefix(&raw) {
+                if !dotdot_dirs.contains(&prefix) {
+                    dotdot_dirs.push(prefix);
+                }
             }
-        }
-        if let Some((i, p)) = include_dirs
-            .iter()
-            .find_map(|i| try_resolve(i, &d.name, virtual_paths).map(|p| (i, p)))
-        {
-            push_both(i, &d.name, p);
+            let spelled = lexical_normalize(&raw);
+            if spelled != canonical && spelled.is_relative() {
+                result.push(spelled);
+            }
+            result.push(canonical);
+        };
+        for d in scan.directives.iter() {
+            if d.quoted {
+                if let Some(p) = try_resolve(&parent_dir, &d.name, virtual_paths) {
+                    push_both(&parent_dir, &d.name, p);
+                    continue;
+                }
+            }
+            if let Some((i, p)) = include_dirs
+                .iter()
+                .find_map(|i| try_resolve(i, &d.name, virtual_paths).map(|p| (i, p)))
+            {
+                push_both(i, &d.name, p);
+            }
         }
     }
 
-    Ok(result)
+    Ok((result, dotdot_dirs))
+}
+
+/// Directories a `..` include SPELLING in one of these files has to walk
+/// through, so a caller materializing only declared inputs can create them.
+///
+/// SEEDS ONLY, not the whole include graph. The shape this exists for is a
+/// generated one-line source, and this is called on the path whose whole
+/// purpose is skipping a full walk. A nested header spelling a `..` include
+/// is not covered, and no package has shown one.
+///
+/// Resolution failures are skipped rather than reported: a directory that
+/// cannot be derived leaves the caller exactly where it was, while refusing
+/// here would fail a build over a diagnostic aid.
+pub fn seed_dotdot_dirs(
+    cmdline: &str,
+    files: &[PathBuf],
+    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+) -> Vec<PathBuf> {
+    let Ok(include_dirs) = gcc_include_parser::parse_include_dirs(cmdline) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = Vec::new();
+    for f in files {
+        let Ok((_, dirs)) = extract_includes(f, f, &include_dirs, virtual_paths) else {
+            continue;
+        };
+        for d in dirs {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+/// The directory a `..` spelling has to ENTER, or `None` if it has no `..`.
+///
+/// A path like `/build/source/kernel/x86_64/../generic/impl.c` is resolved by
+/// the kernel component by component, so `kernel/x86_64` must EXIST as a
+/// directory even though nothing is read from it. Inside a task sandbox only
+/// declared inputs are materialized, so a sibling directory that contributes
+/// no input is absent and the open fails ENOENT - naming the whole dotdot
+/// path, which reads as the included file being missing when the file is
+/// present at its resolved location.
+///
+/// openblas spells 2,602 of its kernels this way: cmake writes a one-line
+/// `.c` into the build tree whose only content is
+/// `#include "<src>/kernel/x86_64/../generic/imatcopy_ct.c"`.
+///
+/// The prefix stops at the FIRST `..`, because that is the only directory the
+/// walk is guaranteed to enter; a later one is reached from a directory that
+/// by then exists. Returns `None` for a leading `..`, which has no prefix to
+/// create.
+pub fn dotdot_prefix(raw: &Path) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for c in raw.components() {
+        if c == std::path::Component::ParentDir {
+            return if prefix.components().next().is_some() {
+                Some(prefix)
+            } else {
+                None
+            };
+        }
+        prefix.push(c);
+    }
+    None
+}
+
+#[cfg(test)]
+mod dotdot_prefix_tests {
+    use super::dotdot_prefix;
+    use std::path::{Path, PathBuf};
+
+    /// openblas's spelling. The compiler enters `kernel/x86_64` even though
+    /// it reads nothing from it.
+    #[test]
+    fn the_prefix_before_the_first_parent_is_returned() {
+        assert_eq!(
+            dotdot_prefix(Path::new("/build/source/kernel/x86_64/../generic/impl.c")),
+            Some(PathBuf::from("/build/source/kernel/x86_64"))
+        );
+    }
+
+    /// A path with no `..` needs nothing created.
+    #[test]
+    fn a_path_without_a_parent_component_yields_nothing() {
+        assert_eq!(
+            dotdot_prefix(Path::new("/build/source/kernel/impl.c")),
+            None
+        );
+    }
+
+    /// STOPS AT THE FIRST. A later `..` is reached from a directory the walk
+    /// has already entered, so it needs nothing of its own.
+    #[test]
+    fn only_the_first_parent_component_counts() {
+        assert_eq!(
+            dotdot_prefix(Path::new("a/b/../c/../d.h")),
+            Some(PathBuf::from("a/b"))
+        );
+    }
+
+    /// A LEADING `..` HAS NO PREFIX TO CREATE, and returning the empty path
+    /// would ask the caller to create the current directory.
+    #[test]
+    fn a_leading_parent_component_yields_nothing() {
+        assert_eq!(dotdot_prefix(Path::new("../include/x.h")), None);
+    }
 }
 
 /// Remove `.` and collapse `a/..` components without touching the
@@ -826,8 +973,9 @@ mod tests {
             "#include \"kwsysPrivate.h\"\n#include KWSYS_HEADER(Directory.hxx)\n",
         )
         .unwrap();
-        let (_got, incomplete) =
-            bfs_parse_includes(vec![d.join("Directory.cxx")], &[], None).unwrap();
+        let incomplete = bfs_parse_includes(vec![d.join("Directory.cxx")], &[], None)
+            .unwrap()
+            .incomplete;
         assert!(
             incomplete,
             "a function-like computed include must report the scan incomplete, \
@@ -845,7 +993,11 @@ mod tests {
             "#include <stdio.h>\n#include \"plain.h\"\n",
         )
         .unwrap();
-        let (got2, incomplete2) = bfs_parse_includes(vec![d.join("plain.c")], &[], None).unwrap();
+        let Scan {
+            includes: got2,
+            incomplete: incomplete2,
+            ..
+        } = bfs_parse_includes(vec![d.join("plain.c")], &[], None).unwrap();
         assert!(
             !incomplete2,
             "an ordinary source must NOT trigger the preprocessor fallback: {got2:?}"
@@ -874,7 +1026,7 @@ mod tests {
         .unwrap();
         let got = bfs_parse_includes(vec![d.join("main.c")], &[], None)
             .unwrap()
-            .0;
+            .includes;
         assert!(
             got.iter().any(|p| p.ends_with("sm_impl.h")),
             "cross-file computed include not declared: {:?}",
@@ -885,7 +1037,7 @@ mod tests {
         std::fs::write(d.join("main2.c"), "#include NEVER_DEFINED\n").unwrap();
         let got2 = bfs_parse_includes(vec![d.join("main2.c")], &[], None)
             .unwrap()
-            .0;
+            .includes;
         assert_eq!(got2.len(), 1, "only the source itself: {:?}", got2);
     }
 
@@ -915,7 +1067,7 @@ mod tests {
         std::fs::write(d.join("body_cm.ch"), "\n").unwrap();
         let got = bfs_parse_includes(vec![d.join("root.c")], &[], None)
             .unwrap()
-            .0;
+            .includes;
         let names: Vec<String> = got
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
@@ -948,7 +1100,7 @@ mod tests {
         .unwrap();
         let got = bfs_parse_includes(vec![d.join("mips/init.c")], std::slice::from_ref(&d), None)
             .unwrap()
-            .0;
+            .includes;
         let names: Vec<String> = got
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
@@ -1083,7 +1235,7 @@ mod tests {
             None,
         );
         std::env::set_current_dir(prev).unwrap();
-        let got = got.unwrap().0;
+        let got = got.unwrap().includes;
         let names: Vec<String> = got
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
@@ -1274,7 +1426,7 @@ mod tests {
 
         // The includer resolves it and DECLARES it: that half must keep
         // working, or the generated header never reaches the sandbox.
-        let includes =
+        let (includes, _) =
             super::extract_includes(&tu, &tu, std::slice::from_ref(&d), Some(&virtual_paths))
                 .unwrap();
         assert!(
@@ -1290,7 +1442,10 @@ mod tests {
             Some(&virtual_paths),
         )
         .unwrap();
-        assert!(nested.is_empty(), "a file with no bytes has no directives");
+        assert!(
+            nested.0.is_empty(),
+            "a file with no bytes has no directives"
+        );
 
         std::fs::remove_dir_all(&d).ok();
     }
