@@ -38,5 +38,5 @@
 - [ ] Make `nix store add` async, probably biggest perf bottleneck
 - [x] Add github actions CI
 - [ ] Add benchmarks for generating derivations
-- [ ] Add benchmarks for end-to-end compilation of NixOS/Nix, for perf work
+- [x] Add benchmarks for end-to-end compilation of NixOS/Nix, for perf work
   upstream.
