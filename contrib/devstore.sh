@@ -100,11 +100,19 @@ EOF
   NIX_CONF_DIR="$DEVSTORE/conf" NIX_DAEMON_SOCKET_PATH="$DEVSTORE/sock/socket" \
     "$DAEMON" --extra-experimental-features "$FE" > "$DEVSTORE/daemon.log" 2>&1 &
   echo "$!" > "$DEVSTORE/pid"
-  for _ in 1 2 3 4 5 6 7 8; do
-    [ -S "$DEVSTORE/sock/socket" ] && return 0
+  # WAIT FOR A CONNECTION, NOT FOR A FILE. `-S` is true the moment the daemon
+  # binds, which is before it accepts, so a readiness check on the file races
+  # the daemon and the first client sees `Connection refused` against a socket
+  # that visibly exists. Ask the store the question the caller is about to.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if [ -S "$DEVSTORE/sock/socket" ] \
+       && NIX_REMOTE="unix://$DEVSTORE/sock/socket" \
+          nix store info >/dev/null 2>&1; then
+      return 0
+    fi
     sleep 1
   done
-  echo "devstore: COULD-NOT-RUN - the daemon never opened its socket." >&2
+  echo "devstore: COULD-NOT-RUN - the daemon never accepted a connection." >&2
   tail -5 "$DEVSTORE/daemon.log" >&2
   exit 2
 }
