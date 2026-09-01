@@ -7551,6 +7551,10 @@ pub fn discover_c_includes(
         .first()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<no seed>".to_string());
+    let seed_count = files.len();
+    // Every branch below assigns exactly once, so this carries no initial
+    // value to go stale.
+    let answer_source;
     // A DEPFILE UNDERSTATES A COMPILE THAT USES A PRECOMPILED HEADER, so the
     // read-back must not speak for one. gcc does not open a header already
     // present in the PCH - the include-guard optimization - so the depfile
@@ -7574,6 +7578,7 @@ pub fn discover_c_includes(
     let c_includes =
         match depfile_read_back(build_dir, AsRef::<Path>::as_ref(store_dir), depfile, &files) {
             Some(deps) => {
+                answer_source = "a depfile read-back";
                 if explain {
                     eprintln!(
                         "nix-ninja: discovery {seed}: read back {} include(s) from {}",
@@ -7634,6 +7639,7 @@ pub fn discover_c_includes(
                             // is the pipeline's safe polarity - an extra input costs one
                             // upload - while under-declaring is silent and ships the wrong
                             // artifact.
+                            answer_source = "the scan and the preprocessor";
                             let merged = merge_scan_and_preprocessor(scanned, deps);
                             eprintln!(
                                 "nix-ninja: computed include unresolvable by scan; \
@@ -7643,6 +7649,7 @@ pub fn discover_c_includes(
                             merged
                         }
                         Err(e) => {
+                            answer_source = "the scan, the preprocessor having failed";
                             eprintln!(
                                 "nix-ninja: computed include unresolvable by scan and the \
                              preprocessor fallback failed ({e}); keeping the scan's {} \
@@ -7654,6 +7661,7 @@ pub fn discover_c_includes(
                         }
                     }
                 } else {
+                    answer_source = "the scan";
                     if explain {
                         eprintln!(
                             "nix-ninja: discovery {seed}: scanned {} include(s) from {} seed(s)",
@@ -7665,6 +7673,7 @@ pub fn discover_c_includes(
                 }
             }
         };
+    let c_include_count = c_includes.len();
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
     let mut to_upload: Vec<PathBuf> = Vec::new();
@@ -7725,7 +7734,25 @@ pub fn discover_c_includes(
         // Regular file: queued for a batched store add below.
         to_upload.push(include);
     }
-    discovered_deps.extend(new_opaque_files(rpc_client, build_dir, to_upload)?);
+    // THE PROVENANCE TRAVELS WITH THE FAILURE, because a debug flag cannot
+    // be turned on where this fails. The driver runs inside the package's own
+    // derivation, so a variable exported next to `nix build` never reaches
+    // it, and a silent run is indistinguishable from a path not taken - which
+    // is the worst failure mode a diagnostic can have.
+    //
+    // svt-av1 died here with `canonicalize Source/Lib/Codec/EbVersion.h` and
+    // nothing in the chain said whether that path came from a read-back or a
+    // scan, or which file was being scanned when it was resolved. Those are
+    // different defects in different crates. The failure path costs one
+    // format, runs once per failing task, and answers both.
+    discovered_deps.extend(
+        new_opaque_files(rpc_client, build_dir, to_upload).with_context(|| {
+            format!(
+                "uploading includes discovered for {seed} ({} from {}, {} seed(s))",
+                c_include_count, answer_source, seed_count,
+            )
+        })?,
+    );
 
     USED_HEADERS.fetch_add(
         used_declared.len() as u64,
