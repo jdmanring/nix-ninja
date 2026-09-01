@@ -113,6 +113,26 @@ to discuss larger changes first, especially when the design space is large.
 Please read [CONTRIBUTING](CONTRIBUTING.md) and the [design notes] so you
 understand the big picture and prior art.
 
+## Directories this fork adds
+
+Four directories here do not exist in `pdtpartners/nix-ninja`, and each is
+either an offer prepared for it or the tooling that produced one.
+
+- `vendor-n2/` is n2, by Evan Martin, vendored rather than depended on. It
+  carries its own Apache-2.0 `LICENSE`, and `vendor-n2/VENDORING.md` records
+  the revision it was taken from and the four changes made to it, all of
+  which are prepared to be offered back rather than kept.
+- `bench/` is the end-to-end and generation benchmarks, answering the
+  benchmarking requests in the issue tracker, plus the records they wrote.
+- `contrib/` is a throwaway-store development script, which `CONTRIBUTING.md`
+  asks contributors for.
+- `scripts/` holds one tracked file, a standalone reproducer for a daemon
+  wedge, prepared for a `NixOS/nix` issue. Everything else under that name is
+  local to this checkout and deliberately untracked.
+
+The MIT license below covers the source developed for nix-ninja. It does not
+cover `vendor-n2/`, which is Apache-2.0 and carries its own license file.
+
 ## License
 
 The source code developed for nix-ninja is licensed under MIT License.
