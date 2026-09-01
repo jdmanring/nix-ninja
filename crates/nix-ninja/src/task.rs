@@ -528,7 +528,9 @@ fn build_task_derivation(
     let cmdline = match &task.cmdline {
         Some(c) => c,
         None => {
-            return Err(anyhow!("Phony tasks not yet supported"));
+            return Err(anyhow!(
+                "a task with no command line has no derivation to emit"
+            ));
         }
     };
 
