@@ -17,6 +17,14 @@
       };
     };
 
+    # NOT a dynamic derivation and deliberately not gated with the others:
+    # it is an ORDINARY derivation granting `recursive-nix`, which is the
+    # configuration a consumer's drop-in builds on. Its whole value is being
+    # the one example that does not require `builder-rpc-v0`, so it must stay
+    # buildable where the feature-gated ones are not.
+    packages.example-fortran-module-recursive =
+      pkgs.example-fortran-module-recursive;
+
     # The examples are dynamic derivations, which can only be instantiated
     # when the `dynamic-derivations` experimental feature is enabled (probed
     # via the feature-gated `builtins.outputOf`).

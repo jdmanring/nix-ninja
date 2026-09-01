@@ -271,6 +271,30 @@
         nativeBuildInputs = [ self.gfortran ];
       };
 
+      mkRecursivePackage = self.callPackage ./pkgs/mkRecursivePackage {
+        inherit (self) nix-ninja nix-ninja-task;
+        nix = inputs.nix.packages.${self.system}.nix;
+      };
+
+      # The same two Fortran files as example-fortran-module, built on the
+      # CONSUMER's configuration: plain recursive-nix, driver in local mode.
+      # The pair is the point - one expression per configuration over one
+      # source tree is the only way to tell a tool defect from a
+      # configuration defect, and this tree had no way to tell them apart.
+      example-fortran-module-recursive = self.mkRecursivePackage {
+        name = "example-fortran-module-recursive";
+        src = ./examples/fortran-module;
+        target = "app";
+        nativeBuildInputs = [ self.gfortran ];
+        # RUN IT. A build that resolved no Fortran task would exit 0 and
+        # install nothing this checks, and dyndep's whole job is the ORDER -
+        # the module has to be compiled before its user, and the only
+        # evidence of that surviving into the output is the program working.
+        postInstall = ''
+          $out/bin/app | grep -q "hello from a fortran module"
+        '';
+      };
+
       example-nix = self.callPackage ./examples/nix { src = inputs.nix; };
     };
 
