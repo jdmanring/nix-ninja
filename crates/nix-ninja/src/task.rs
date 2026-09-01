@@ -4727,11 +4727,65 @@ fn upload_referenced_file(
     let main = new_opaque_file(rpc_client, build_dir, path.clone())?;
     let mut out = vec![main];
     if is_py {
-        if let Some(dir) = path.parent() {
-            upload_python_closure(rpc_client, build_dir, dir, &mut out)?;
-        }
+        upload_python_closure(rpc_client, build_dir, &script_dir(&path), &mut out)?;
     }
     Ok(out)
+}
+
+/// The directory a script's sibling imports resolve from.
+///
+/// `Path::parent` of a bare relative name answers `Some("")`, not `None`,
+/// and `read_dir("")` is ENOENT - so a python script named with no directory
+/// component failed the whole build with a message naming no file:
+///
+/// ```text
+/// read_dir() for python closure: No such file or directory (os error 2)
+/// ```
+///
+/// openh264 2.6.0, 2026-09-01. The empty parentheses in that message are
+/// what identify it; the error otherwise reads as a missing interpreter.
+///
+/// A bare name resolves against the process working directory, which the
+/// driver sets to the build directory at startup, so `.` is what the name
+/// already meant.
+fn script_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+#[cfg(test)]
+mod script_dir_tests {
+    use super::script_dir;
+    use std::path::{Path, PathBuf};
+
+    /// THE CASE THAT KILLED A PACKAGE. `parent()` answers `Some("")` here,
+    /// which is a directory that cannot be opened.
+    #[test]
+    fn a_bare_name_resolves_to_the_working_directory() {
+        assert_eq!(script_dir(Path::new("gen.py")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn a_relative_name_keeps_its_directory() {
+        assert_eq!(script_dir(Path::new("tools/gen.py")), PathBuf::from("tools"));
+    }
+
+    #[test]
+    fn an_absolute_name_keeps_its_directory() {
+        assert_eq!(
+            script_dir(Path::new("/build/source/tools/gen.py")),
+            PathBuf::from("/build/source/tools")
+        );
+    }
+
+    /// The root's parent is `None`, which must not become an empty path
+    /// either.
+    #[test]
+    fn a_root_level_name_resolves_to_a_real_directory() {
+        assert_eq!(script_dir(Path::new("/gen.py")), PathBuf::from("/"));
+    }
 }
 
 /// Python module names shipped with the interpreter: an import of one
