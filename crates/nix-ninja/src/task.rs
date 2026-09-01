@@ -1398,17 +1398,25 @@ impl Runner {
             // is relative to the subdir, not to the build root the rewrite
             // above targeted. Depth of the cd target = the `../` levels a
             // post-cd reference needs to climb back to the build root.
-            let cd_depth = if args.len() >= 3
+            // The DIRECTORY as well as the depth. The depth compensates a
+            // rewrite that already produced a build-root-relative spelling;
+            // an argument that was relative to begin with needs the other
+            // direction, because it names a file under the cd target and
+            // the upload path resolves against the build root.
+            let (cd_depth, cd_dir) = if args.len() >= 3
                 && args[0] == "cd"
                 && args[2] == "&&"
                 && !args[1].starts_with('/')
             {
-                Path::new(&args[1])
-                    .components()
-                    .filter(|c| matches!(c, std::path::Component::Normal(_)))
-                    .count()
+                (
+                    Path::new(&args[1])
+                        .components()
+                        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                        .count(),
+                    PathBuf::from(&args[1]),
+                )
             } else {
-                0
+                (0, PathBuf::new())
             };
             // json_schema_compiler resolves a cross-namespace type
             // (extensionTypes.InjectDetails from web_view_internal.json) by
@@ -1657,15 +1665,16 @@ impl Runner {
                     // arg) and its input absent (svt-av1's EbVersion.h,
                     // 2026-08-24, reproduced minimally before the fix).
                     if let Some((_, v)) = arg.split_once('=') {
+                        let rel = rebase_post_cd(&cd_dir, v);
                         if !v.starts_with('/')
                             && v.contains('/')
                             && !v.starts_with('$')
-                            && Path::new(v).is_file()
+                            && self.config.build_dir.join(&rel).is_file()
                         {
                             for input in upload_referenced_file(
                                 &self.rpc_client,
                                 &self.config.build_dir,
-                                PathBuf::from(v),
+                                rel,
                             )? {
                                 self.add_derived_file(files, input.clone());
                                 input_set.insert(input.build_path.clone(), input);
@@ -1675,12 +1684,16 @@ impl Runner {
                     if !arg.starts_with('-')
                         && !arg.starts_with('/')
                         && arg.contains('/')
-                        && Path::new(&arg).is_file()
+                        && self
+                            .config
+                            .build_dir
+                            .join(rebase_post_cd(&cd_dir, &arg))
+                            .is_file()
                     {
                         for input in upload_referenced_file(
                             &self.rpc_client,
                             &self.config.build_dir,
-                            PathBuf::from(&arg),
+                            rebase_post_cd(&cd_dir, &arg),
                         )? {
                             self.add_derived_file(files, input.clone());
                             input_set.insert(input.build_path.clone(), input);
@@ -4477,6 +4490,20 @@ fn alias_symlink_entry(build_dir: &Path, link_abs: &Path) -> Option<(String, Str
         return None;
     }
     Some((l.to_string(), t.to_string()))
+}
+
+/// Resolve a reference that appears AFTER a `cd <subdir> &&` prologue to a
+/// path relative to the build root, which is what the upload path and the
+/// task's input map are expressed in. Without the prologue the reference is
+/// already build-root-relative and is returned unchanged. CMake writes
+/// custom commands this way, so a script's own inputs sat one directory
+/// below where the existence check looked and were silently not uploaded.
+fn rebase_post_cd(cd_dir: &Path, arg: &str) -> PathBuf {
+    if cd_dir.as_os_str().is_empty() {
+        PathBuf::from(arg)
+    } else {
+        lexical_join(cd_dir, Path::new(arg))
+    }
 }
 
 fn leading_parent_components(p: &Path) -> usize {
@@ -8324,5 +8351,36 @@ mod depend_info_rewrite_tests {
         assert!(!is_cmake_depend_info(Path::new("a/DependInfo.cmake")));
         assert!(!is_cmake_depend_info(Path::new("a/FortranModules.json")));
         assert!(!is_cmake_depend_info(Path::new("a/compile_commands.json")));
+    }
+}
+
+#[cfg(test)]
+mod post_cd_rebase_tests {
+    use super::rebase_post_cd;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_post_cd_reference_resolves_under_the_cd_target() {
+        // No prologue: the reference is already build-root-relative.
+        assert_eq!(
+            rebase_post_cd(Path::new(""), "src/gen/version.py"),
+            PathBuf::from("src/gen/version.py")
+        );
+        // `cd src/nix &&`: the same spelling names a file one level down.
+        assert_eq!(
+            rebase_post_cd(Path::new("src/nix"), "gen/version.py"),
+            PathBuf::from("src/nix/gen/version.py")
+        );
+        // A climb pops the cd target instead of surviving into the result,
+        // which is what makes the path resolvable from the build root.
+        assert_eq!(
+            rebase_post_cd(Path::new("src/nix"), "../../scripts/build.py"),
+            PathBuf::from("scripts/build.py")
+        );
+        // Popping past the root accumulates, rather than silently anchoring.
+        assert_eq!(
+            rebase_post_cd(Path::new("a"), "../../outside/x"),
+            PathBuf::from("../outside/x")
+        );
     }
 }
