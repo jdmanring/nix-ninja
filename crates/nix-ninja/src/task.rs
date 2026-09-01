@@ -2204,8 +2204,8 @@ pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> 
 /// dynamic gate read `deps` alone, so an edge could be scanned and never given
 /// anything to scan.
 fn wants_dependency_discovery(task: &Task) -> bool {
-    task.deps.as_deref() == Some("gcc")
-        || task.depfile.is_some()
+    (object_shaped_outputs(task.outputs.iter().filter_map(|p| p.to_str()))
+        && (task.deps.as_deref() == Some("gcc") || task.depfile.is_some()))
         || consumes_preprocessed_fortran(task)
 }
 
@@ -6317,10 +6317,25 @@ fn normalize_output(output: &str) -> String {
 /// wider input set, which is what every edge had before the gate existed.
 /// A link misread as a compile fails to build; a link correctly excluded
 /// only carries more inputs.
-fn is_compile_task<'a>(deps: Option<&str>, mut outs: impl Iterator<Item = &'a str>) -> bool {
-    if deps != Some("gcc") {
-        return false;
-    }
+fn is_compile_task<'a>(deps: Option<&str>, outs: impl Iterator<Item = &'a str>) -> bool {
+    deps == Some("gcc") && object_shaped_outputs(outs)
+}
+
+/// Every declared output is an object file, and there is at least one.
+///
+/// THE DISCRIMINATOR BETWEEN A COMPILE AND A LINK, asked in two places that
+/// had drifted apart. `is_compile_task` gained it when CMake began putting
+/// `deps = gcc` on its LINKER rules; `wants_dependency_discovery` asked the
+/// same question a different way (`deps == gcc || depfile.is_some()`) and
+/// kept answering yes for links, which routed every CMake link through the
+/// dynamic-task path. A dynamic task's output is named `out`, so the target
+/// handle `builtins.outputOf drv "hello"` found no such output and EVERY
+/// mkCMakePackage target was unresolvable - `example-cmake-hello` included,
+/// which is why the CMake route had no working example to test against.
+///
+/// The polarity is the one `is_compile_task` already documents: an edge not
+/// provably a compile answers false and keeps the wider treatment.
+fn object_shaped_outputs<'a>(mut outs: impl Iterator<Item = &'a str>) -> bool {
     let object_shaped = |n: &str| {
         n.ends_with(".o")
             || n.ends_with(".obj")

@@ -30,6 +30,7 @@
       example-run-script = pkgs.example-run-script.target;
       example-dynamic-deps = pkgs.example-dynamic-deps.target;
       example-cmake-hello = pkgs.example-cmake-hello.target;
+      example-cmake-order-only-header = pkgs.example-cmake-order-only-header.target;
       example-nix = pkgs.example-nix.target;
     };
 

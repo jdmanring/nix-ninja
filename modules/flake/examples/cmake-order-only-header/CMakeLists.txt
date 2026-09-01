@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(orderonly C)
+add_subdirectory(lib)
+add_subdirectory(globals)
+add_executable(app main.c)
+target_link_libraries(app PRIVATE $<TARGET_OBJECTS:GLOBALS>)

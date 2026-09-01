@@ -200,6 +200,24 @@
         nativeBuildInputs = [ self.nlohmann_json self.pkg-config ];
       };
 
+      # A generated header reached through TWO order-only phony hops, which
+      # is what CMake emits for `add_dependencies(<lib> <custom target>)`.
+      # The meson example above cannot stand in for it: meson writes
+      # RELATIVE include directories, so the scan's spelling and the graph's
+      # agree there, while CMake writes absolute ones and they do not.
+      #
+      # It is a reduction of svt-av1's arrangement (a BYPRODUCTS stamp edge,
+      # the consumer in a different directory from the generator, one of its
+      # three translation units not including the header) and it does NOT
+      # reproduce svt-av1's failure, which stands open. What it does cover
+      # is the CMake route end to end under NIX_NINJA_DRV, which nothing in
+      # this tree covered before.
+      example-cmake-order-only-header = self.mkCMakePackage {
+        name = "example-cmake-order-only-header";
+        src = ./examples/cmake-order-only-header;
+        target = "app";
+      };
+
       example-cmake-hello = self.mkCMakePackage {
         name = "example-cmake-hello";
         src = ./examples/cmake-hello;
