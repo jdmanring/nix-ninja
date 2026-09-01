@@ -134,6 +134,35 @@ case "${1:-}" in
     NIX_REMOTE="unix://$DEVSTORE/sock/socket" exec "$@"
     ;;
   selftest)
+    # PROBE 0 - THE READINESS CHECK ITSELF, and it runs before the daemon so
+    # a broken check cannot be masked by a daemon that happens to be quick.
+    # `-S` is true from the moment a socket is bound, which is BEFORE it
+    # accepts, so a readiness test on the file races the daemon and the first
+    # client sees ECONNREFUSED against a socket plainly present on disk. That
+    # is not reproducible on a warm machine, so it is pinned here instead.
+    echo "devstore: probe 0 - readiness must mean ACCEPTING, not present"
+    probe_dir=$(mktemp -d)
+    python3 -c "
+import socket, os, sys, time
+p = sys.argv[1]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(p)          # bound, never listening
+time.sleep(6)
+" "$probe_dir/sock" &
+    probe_pid=$!
+    sleep 1
+    if [ ! -S "$probe_dir/sock" ]; then
+      echo "devstore: COULD-NOT-RUN - the probe socket was never created." >&2
+      kill "$probe_pid" 2>/dev/null; rm -rf "$probe_dir"; exit 2
+    fi
+    if NIX_REMOTE="unix://$probe_dir/sock" nix store info >/dev/null 2>&1; then
+      echo "devstore: FAIL - a bound, non-accepting socket read as ready." >&2
+      kill "$probe_pid" 2>/dev/null; rm -rf "$probe_dir"; exit 1
+    fi
+    kill "$probe_pid" 2>/dev/null
+    rm -rf "$probe_dir"
+    echo "devstore:   ok (the file test would have passed here; connecting does not)"
+
     start
     cat > "$DEVSTORE/ca.nix" <<'EOF'
 derivation { name = "ca-probe"; system = builtins.currentSystem;
