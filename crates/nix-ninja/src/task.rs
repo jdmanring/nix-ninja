@@ -2988,6 +2988,35 @@ fn build_task_derivation(
             // Unresolved: leave the command as written and let the link
             // fail with the compiler's own message, which names the linker.
         }
+        // THE SECOND MEMBER OF THE `-fuse-ld` CLASS, and the only other one.
+        // `lto-wrapper` runs the LTRANS phase by writing a makefile and
+        // execing `make`; with no `make` on PATH it falls back to one
+        // partition at a time and says so in a NON-FATAL warning
+        // (`using serial compilation of N LTRANS jobs`). Every LTO link in a
+        // distribution driven this way has been serial, and the only
+        // signature was a line in a build log, so nothing ever reported it.
+        //
+        // The class is closed at two, measured rather than reasoned:
+        // `strace -f -e trace=execve` over a real LTO link shows exactly two
+        // execs whose argv[0] is a BARE NAME - `as` and `make`. Everything
+        // else (cc1, collect2, ld, lto-wrapper) is execed by absolute path
+        // and no PATH can defeat it. `as` needs nothing here because the
+        // cc-wrapper reaches it through `-B<binutils>/bin`, a compiler search
+        // path that never consults PATH - which is also why a four-entry
+        // PATH has always looked adequate.
+        //
+        // GATED, because unconditional would re-key EVERY emitted derivation
+        // and the per-TU bank is the whole point of this tool. `-flto=1` is
+        // serial by request and bare `-flto` asks for no parallelism, so
+        // neither needs `make`; `auto` and `jobserver` do.
+        if lto_needs_make(cmdline) {
+            if let Ok(Some(sp)) = which_store_path_opt(&task.store_dir, "make") {
+                path.push(format!("{}/bin", task.store_dir.display(&sp)));
+                drv.inputs.insert(SingleDerivedPath::Opaque(sp));
+            }
+            // Unresolved: the link still succeeds, serially, exactly as it
+            // does today. This is a throughput fix, never a correctness one.
+        }
         drv.env
             .insert(b"PATH"[..].into(), path.join(":").into_bytes().into());
     }
@@ -3536,6 +3565,53 @@ fn extract_store_paths(
         store_paths.push(store_path);
     }
     Ok(store_paths)
+}
+
+/// Whether this command line asks `lto-wrapper` for PARALLEL LTRANS, which is
+/// the only case that needs `make` in the sandbox.
+///
+/// Parsing rather than a flag check, because the spellings differ in what they
+/// mean: `-flto=1` is serial by request, bare `-flto` asks for no parallelism
+/// at all, and `auto`/`jobserver` both drive `make`. Getting this wrong in the
+/// permissive direction re-keys derivations that gain nothing.
+fn lto_needs_make(cmdline: &str) -> bool {
+    cmdline.split_whitespace().any(|tok| {
+        tok.trim_matches(|c| c == '"' || c == '\'')
+            .strip_prefix("-flto=")
+            .is_some_and(|n| !n.is_empty() && n != "1")
+    })
+}
+
+#[cfg(test)]
+mod lto_make_gate_tests {
+    use super::lto_needs_make;
+
+    /// Both directions matter: a false negative leaves LTRANS serial, a false
+    /// positive re-keys derivations that gain nothing from `make`.
+    #[test]
+    fn reads_the_parallel_spellings() {
+        assert!(lto_needs_make("gcc -flto=8 a.o -o t"));
+        assert!(lto_needs_make("gcc -flto=auto a.o -o t"));
+        assert!(lto_needs_make("gcc -flto=jobserver a.o -o t"));
+        assert!(lto_needs_make("gcc -O2 -flto=24 -march=znver4 a.o -o t"));
+        assert!(lto_needs_make(r#"gcc "-flto=8" a.o -o t"#));
+    }
+
+    #[test]
+    fn declines_the_serial_and_absent_spellings() {
+        assert!(!lto_needs_make("gcc -flto=1 a.o -o t"));
+        assert!(!lto_needs_make("gcc -flto a.o -o t"));
+        assert!(!lto_needs_make("gcc -flto= a.o -o t"));
+        assert!(!lto_needs_make("gcc -c a.c -o a.o"));
+        assert!(!lto_needs_make("gcc -fno-lto a.o -o t"));
+    }
+
+    /// A substring must not trip the gate, which is how a `-Werror` in a
+    /// command line trips a scanner looking for the word `error`.
+    #[test]
+    fn a_substring_is_not_the_flag() {
+        assert!(!lto_needs_make("gcc -DFLAGS=-flto=8 -c a.c -o a.o"));
+    }
 }
 
 /// THE OUTER OUTPUT PATHS ARE REWRITTEN TO SAME-LENGTH PLACEHOLDERS IN
