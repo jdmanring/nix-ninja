@@ -16,11 +16,15 @@
     by meson that just don't use $in and $out in practice.
   - Only fool proof way is to source symlink in, and copy outputs into
     content-addressed output placeholders after
-- [ ] Phony target support
-  - DerivedFile has name: Option<String> again
-  - Move symlinking logic to method under DerivedFile
-  - If symlink source is directory, walk dir and symlink to dest as prefix
-  - Virtual targets e.g. if user inputs list of targets
+- [x] Phony target support
+  - Taken by recording the phony as an alias to the inputs it stands for,
+    rather than by giving it a derived file of its own. A phony has no
+    command, so there is no derivation to emit; ordering falls out of the
+    nix model, because dependents inherit the phony's inputs as their own
+    derivation inputs.
+  - A phony may alias another phony, so resolution is transitive.
+  - A phony named on the command line resolves through the same map, which
+    is the one gap the alias approach leaves at the CLI boundary.
 - [ ] Depfile support
   - If depfile defined, add that as an additional output
   - Create virtual target of all depfiles to install locally into builddir
