@@ -138,13 +138,40 @@ fn warn_ignored_flags(cli: &Cli) {
 }
 
 fn resolved_jobs(cli: &Cli) -> usize {
-    if cli.jobs == 0 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8)
-    } else {
-        cli.jobs
+    jobs_from(cli.jobs, std::env::var_os("NIX_BUILD_CORES"))
+}
+
+/// `-j`, then `NIX_BUILD_CORES`, then the machine.
+///
+/// The env value is a PARAMETER so this is testable without mutating the
+/// process environment, which is shared and makes a test suite order
+/// dependent.
+///
+/// The middle rung is what makes the caller's concurrency reach this driver at
+/// all. A build system sizing a round has two knobs, `max-jobs` and `cores`,
+/// and only the first reached us: with no `-j` on the command line the driver
+/// took the host's core count whatever the caller asked for, so a round
+/// deliberately narrowed to `cores 3` still admitted one task per hardware
+/// thread inside every ninja-route package. `nix` sets `NIX_BUILD_CORES` in
+/// the derivation for exactly this purpose and every other build system in a
+/// sandbox honors it.
+///
+/// A malformed or zero value falls through to the machine rather than to 1:
+/// `NIX_BUILD_CORES=0` is nix's own spelling of "use the core count".
+fn jobs_from(dash_j: usize, env_cores: Option<std::ffi::OsString>) -> usize {
+    if dash_j != 0 {
+        return dash_j;
     }
+    if let Some(n) = env_cores
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return n;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
 }
 
 /// Daemon connections are a DIFFERENT resource from admission slots and must
@@ -594,6 +621,42 @@ mod tests {
         // one TU's codegen fan-out.
         assert_eq!(resolved_jobs(&cli_with(&[])), cores);
         assert!(resolved_jobs(&cli_with(&[])) > 0);
+    }
+
+    /// `-j` beats the environment, the environment beats the machine.
+    ///
+    /// The env value is passed rather than set, so these cases say nothing
+    /// about whatever `NIX_BUILD_CORES` happens to hold in the shell that runs
+    /// the suite - a test reading an ambient tunable asserts about the code AND
+    /// the environment, and fails against correct behavior.
+    #[test]
+    fn jobs_prefers_dash_j_then_env_then_machine() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        let machine = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
+
+        // An explicit -j wins over the environment. A caller who typed a
+        // number must not be silently retuned by the sandbox.
+        assert_eq!(jobs_from(6, os("3")), 6);
+
+        // With no -j, the caller's `cores` reaches the driver. This is the
+        // rung that did not exist.
+        assert_eq!(jobs_from(0, os("3")), 3);
+        assert_eq!(jobs_from(0, os(" 12 ")), 12);
+
+        // Absent, zero, or malformed falls to the machine. Zero is nix's own
+        // spelling of "use the core count", so it must not become 1.
+        assert_eq!(jobs_from(0, None), machine);
+        assert_eq!(jobs_from(0, os("0")), machine);
+        assert_eq!(jobs_from(0, os("")), machine);
+        assert_eq!(jobs_from(0, os("many")), machine);
+        assert_eq!(jobs_from(0, os("-4")), machine);
+
+        // And never zero, whatever the input: a runner with no slots stalls.
+        for v in [None, os("0"), os("x")] {
+            assert!(jobs_from(0, v) > 0);
+        }
     }
 }
 
