@@ -229,17 +229,20 @@
       # during configure, so this example fails at configure or not at all.
       #
       # IT FAILS TODAY, DELIBERATELY, and it is the reproduction of an open
-      # defect rather than a test that regressed. Under NIX_NINJA_DRV the
-      # dyndep pre-build calls BuildPathsWithResults, which the daemon
-      # refuses inside a derivation:
+      # defect rather than a test that regressed. mkCMakePackage asks for
+      # `builder-rpc-v0`, so the daemon runs as RecursiveSubmitted, and the
+      # dyndep pre-build's BuildPathsWithResults is refused:
       #
       #   Caused by: daemon error: BuildPathsWithResults: remote error:
       #   Operation 46 not allowed inside derivation
       #
-      # The same project configures and verifies successfully in LOCAL mode,
-      # which is how every package in this tree has ever been verified - so
-      # this example exists to cover the route the CONSUMER builds on. It is
-      # registered in legacyPackages and NOT as a NixOS VM test, so it does
+      # SCOPED TO THAT CONFIGURATION, and the scope was overstated here once.
+      # A consumer granting plain `recursive-nix` instead gets the Recursive
+      # flag, where that build IS permitted - measured in a distribution
+      # round, where this same dyndep step succeeded and a sibling package
+      # built 29 dyndep files. So this is a defect of the builder-rpc-v0
+      # path, NOT of Fortran, and not of the route ArtNix builds on.
+      # Registered in legacyPackages and NOT as a NixOS VM test, so it does
       # not redden `nix flake check` while the defect stands.
       example-fortran-c-interface = self.mkCMakePackage {
         name = "example-fortran-c-interface";
@@ -257,9 +260,10 @@
       #
       # IT FAILS TODAY, DELIBERATELY, with the same
       # `Operation 46 not allowed inside derivation` as its neighbour. Two
-      # files and one module are enough, so the defect is EVERY dyndep
-      # consumer - all Fortran, and C++20 modules - rather than packages
-      # that verify Fortran/C interop.
+      # files and one module are enough, which bounds the defect to the
+      # dyndep pre-build itself rather than to anything FortranCInterface
+      # does - and, with its neighbour, to the `builder-rpc-v0`
+      # configuration these examples run under.
       example-fortran-module = self.mkCMakePackage {
         name = "example-fortran-module";
         src = ./examples/fortran-module;
