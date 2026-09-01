@@ -25,7 +25,7 @@
   - If depfile defined, add that as an additional output
   - Create virtual target of all depfiles to install locally into builddir
   - Read depfile to skip dep_infer if depfile exists
-- [ ] mkMesonPackage do configure caching
+- [x] mkMesonPackage do configure caching
   - Separate out configure and build into two derivations
   - Put source into one output path
   - Put build_dir_inputs into one output path
