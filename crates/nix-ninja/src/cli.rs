@@ -629,17 +629,25 @@ mod tests {
         assert!(resolved_connections(&cli_with(&["-j", "0"])) >= 1);
     }
 
+    /// `-j 0` means "auto", never "unbounded". An unbounded runner is what
+    /// spawned hundreds of concurrent tasks off one TU's codegen fan-out.
+    ///
+    /// ASSERTED WITHOUT NAMING THE NUMBER, because what "auto" resolves to now
+    /// depends on `NIX_BUILD_CORES`. This test read the machine's core count as
+    /// a literal and passed everywhere until it ran INSIDE a derivation, where
+    /// nix sets that variable and the expected 24 arrived as 4. It failed the
+    /// driver's own build and took a round with it. The machine fallback is
+    /// pinned in `jobs_prefers_dash_j_then_env_then_machine`, which passes the
+    /// environment rather than reading it.
     #[test]
-    fn resolved_jobs_zero_means_cores_not_infinity() {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(8);
-        assert_eq!(resolved_jobs(&cli_with(&["-j", "0"])), cores);
-        // The default is 0, so a bare invocation takes the same path. An
-        // unbounded runner is what spawned hundreds of concurrent tasks off
-        // one TU's codegen fan-out.
-        assert_eq!(resolved_jobs(&cli_with(&[])), cores);
-        assert!(resolved_jobs(&cli_with(&[])) > 0);
+    fn resolved_jobs_zero_means_auto_not_infinity() {
+        let auto = resolved_jobs(&cli_with(&["-j", "0"]));
+        assert!(auto > 0, "auto must resolve to a real bound");
+        // The default is 0, so a bare invocation takes the same path.
+        assert_eq!(resolved_jobs(&cli_with(&[])), auto);
+        // Whatever auto resolves to, an explicit -j still wins over it, which
+        // is what says 0 is a VALUE here rather than a missing argument.
+        assert_eq!(resolved_jobs(&cli_with(&["-j", "7"])), 7);
     }
 
     /// `-j` beats the environment, the environment beats the machine.
