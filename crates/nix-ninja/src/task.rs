@@ -393,8 +393,44 @@ impl Runner {
         // it as an explicit input.
         if let Some(cmdline) = &cmdline {
             let args = shell_words::split(cmdline)?;
+            // A custom command is often written `cd <subdir> && <command>`,
+            // and every relative path after that names a file under the
+            // subdir rather than under the build root. The upload path and
+            // the task's input map are both expressed relative to the build
+            // root, so a reference has to be carried back across the cd
+            // before either can find it.
+            let cd_dir = if args.len() >= 3
+                && args[0] == "cd"
+                && args[2] == "&&"
+                && !args[1].starts_with('/')
+            {
+                PathBuf::from(&args[1])
+            } else {
+                PathBuf::new()
+            };
             for arg in args {
                 let Some(fid) = files.lookup(&arg) else {
+                    // NOT A GRAPH NODE, and a command may still reference a
+                    // real file the graph never declares: a generator that
+                    // assumes it shares a filesystem with the build names
+                    // its helper script and its data by path alone. Such a
+                    // file is an input of the task; upload it. `is_file`
+                    // rejects an include directory and an output that does
+                    // not exist yet, and a flag or absolute path never
+                    // reaches the check.
+                    if !arg.starts_with('-') && !arg.starts_with('/') && arg.contains('/') {
+                        let rel = rebase_post_cd(&cd_dir, &arg);
+                        if self.config.build_dir.join(&rel).is_file() {
+                            for input in upload_referenced_file(
+                                &self.rpc_client,
+                                &self.config.build_dir,
+                                rel,
+                            )? {
+                                self.add_derived_file(files, input.clone());
+                                input_set.insert(input.build_path.clone(), input);
+                            }
+                        }
+                    }
                     continue;
                 };
                 let input = match self.derived_files.get(&fid) {
@@ -1058,6 +1094,19 @@ const PY_STDLIB: &[&str] = &[
 /// The sole caller is the ordering-ins loop. The other upload sites still
 /// call `new_opaque_file` directly and so do not pick up siblings; whether
 /// they should is an open question rather than an oversight this hides.
+/// Resolve a reference appearing after a `cd <subdir> &&` prologue to a path
+/// relative to the build root, which is what the upload path and the task's
+/// input map are expressed in. Without a prologue the reference is already
+/// build-root-relative and is returned unchanged. The join is lexical, so a
+/// climb pops the cd target instead of surviving into the result.
+fn rebase_post_cd(cd_dir: &Path, arg: &str) -> PathBuf {
+    if cd_dir.as_os_str().is_empty() {
+        PathBuf::from(arg)
+    } else {
+        lexical_join(cd_dir, Path::new(arg))
+    }
+}
+
 fn upload_referenced_file(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &Path,
@@ -1907,5 +1956,36 @@ mod closure_step_tests {
     #[test]
     fn a_duplicate_is_seen_even_when_the_set_is_over_the_cap() {
         assert_eq!(closure_step(false, 9_000, 64), ClosureStep::Seen);
+    }
+}
+
+#[cfg(test)]
+mod post_cd_rebase_tests {
+    use super::rebase_post_cd;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_reference_after_a_cd_resolves_against_the_build_root() {
+        // No prologue: already build-root-relative, unchanged.
+        assert_eq!(
+            rebase_post_cd(Path::new(""), "src/gen/version.py"),
+            PathBuf::from("src/gen/version.py")
+        );
+        // `cd src/nix &&`: the same spelling names a file one level down.
+        assert_eq!(
+            rebase_post_cd(Path::new("src/nix"), "gen/version.py"),
+            PathBuf::from("src/nix/gen/version.py")
+        );
+        // A climb pops the cd target rather than surviving into the result,
+        // which is what makes the path resolvable from the build root.
+        assert_eq!(
+            rebase_post_cd(Path::new("src/nix"), "../../scripts/build.py"),
+            PathBuf::from("scripts/build.py")
+        );
+        // Popping past the root accumulates instead of silently anchoring.
+        assert_eq!(
+            rebase_post_cd(Path::new("a"), "../../outside/x"),
+            PathBuf::from("../outside/x")
+        );
     }
 }
