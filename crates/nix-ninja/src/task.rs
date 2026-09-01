@@ -882,7 +882,12 @@ fn new_opaque_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "source".to_string());
-    let store_path = rpc_client.add_to_store_nar(&name, &canonical_path)?;
+    // Through the CACHE, or the cache is mechanism with no effect: a
+    // referenced file is uploaded once per task that names it, and the
+    // same header is named by thousands of them. Key and payload are
+    // the same file here; they differ only where the payload is a
+    // rewritten copy of the key.
+    let store_path = rpc_client.add_to_store_nar_cached(&name, &canonical_path, &canonical_path)?;
 
     Ok(DerivedFile {
         derived_path: SingleDerivedPath::Opaque(store_path),
