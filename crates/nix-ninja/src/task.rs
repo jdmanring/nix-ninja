@@ -598,18 +598,31 @@ impl Runner {
                 }
                 Err(e) => return Err(e.into()),
             };
-            if entry.file_type().is_symlink() {
+            let path = if entry.file_type().is_symlink() {
                 let path = entry.into_path();
                 if let Some(pair) = alias_symlink_entry(&self.config.build_dir, &path) {
                     self.alias_symlinks.push(pair);
+                    continue;
                 }
-                continue;
-            }
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            let path = entry.into_path();
+                // NOT an in-tree alias, so nothing will recreate it in a
+                // sandbox - and dropping it here loses the file entirely.
+                // x265's preBuild links its 10- and 12-bit archives in from
+                // sibling directories the walk never reaches
+                // (`ln -s ../build-10bits/libx265.a ./libx265-10.a`), and
+                // the shared-library link then fails on `cannot find
+                // -lx265-10`. Upload it by CONTENT instead: `is_file`
+                // follows the link, so a dangling or non-regular target
+                // still falls out here.
+                if !path.is_file() {
+                    continue;
+                }
+                path
+            } else {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                entry.into_path()
+            };
             let derived_file =
                 match new_opaque_file(&self.rpc_client, &self.config.build_dir, path.clone()) {
                     Ok(d) => d,
@@ -8067,6 +8080,52 @@ mod alias_symlink_tests {
         assert_eq!(alias_symlink_entry(&d, &plain), None, "regular file");
 
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // THE x265 SHAPE. `preBuild` links two static archives in from sibling
+    // build directories the walk never reaches:
+    //
+    //     ln -s ../build-10bits/libx265.a ./libx265-10.a
+    //
+    // The link escapes the build dir, so it is correctly refused as an
+    // alias - and refusing it is exactly why `read_build_dir` must fall
+    // through to a content upload rather than dropping the entry. This
+    // pins both halves: refused as an alias, and a readable regular file
+    // through the link, which is what the upload branch tests with
+    // `is_file`.
+    #[test]
+    fn an_escaping_symlink_to_a_real_file_is_no_alias_but_is_readable() {
+        let d = std::env::temp_dir().join(format!("nn-x265-test-{}", std::process::id()));
+        let build = d.join("build");
+        let siblings = d.join("build-10bits");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(&siblings).unwrap();
+        let archive = siblings.join("libx265.a");
+        std::fs::write(&archive, b"!<arch>\n").unwrap();
+
+        let link = build.join("libx265-10.a");
+        let _ = std::fs::remove_file(&link);
+        symlink("../build-10bits/libx265.a", &link).unwrap();
+
+        assert_eq!(
+            alias_symlink_entry(&build, &link),
+            None,
+            "target climbs out of the build dir, so it is not an alias"
+        );
+        assert!(
+            link.is_file(),
+            "is_file follows the link, so the upload branch reaches the archive"
+        );
+
+        // Negative control: a link whose target does NOT exist must still
+        // fall out, or the branch uploads nothing and fails later.
+        let dangling = build.join("libx265-12.a");
+        let _ = std::fs::remove_file(&dangling);
+        symlink("../build-12bits/libx265.a", &dangling).unwrap();
+        assert_eq!(alias_symlink_entry(&build, &dangling), None);
+        assert!(!dangling.is_file(), "dangling escape is skipped");
+
+        std::fs::remove_dir_all(&d).ok();
     }
 }
 
