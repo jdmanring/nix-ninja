@@ -295,6 +295,17 @@
         '';
       };
 
+      # liblapack's failing shape on the CONSUMER's configuration, which is
+      # where it actually fails. The builder-rpc-v0 sibling above dies
+      # earlier, at the dyndep pre-build, so it can say nothing about the
+      # empty mangling section.
+      example-fortran-c-interface-recursive = self.mkRecursivePackage {
+        name = "example-fortran-c-interface-recursive";
+        src = ./examples/fortran-c-interface;
+        target = "app";
+        nativeBuildInputs = [ self.gfortran ];
+      };
+
       example-nix = self.callPackage ./examples/nix { src = inputs.nix; };
     };
 

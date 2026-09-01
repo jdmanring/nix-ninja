@@ -24,6 +24,8 @@
     # buildable where the feature-gated ones are not.
     packages.example-fortran-module-recursive =
       pkgs.example-fortran-module-recursive;
+    packages.example-fortran-c-interface-recursive =
+      pkgs.example-fortran-c-interface-recursive;
 
     # The examples are dynamic derivations, which can only be instantiated
     # when the `dynamic-derivations` experimental feature is enabled (probed

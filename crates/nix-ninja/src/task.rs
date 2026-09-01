@@ -2604,9 +2604,12 @@ fn build_task_derivation(
     // to the root and re-descends into `build/<src>/...` - the same file.
     // The mirror is kept for a build dir outside /build (a dev shell).
     if task.build_dir.starts_with("/build/") {
+        // Same function the DependInfo rewrite asks, so the path written
+        // into an uploaded file and the directory the task runs in cannot
+        // disagree again.
         drv.args.push(b"--build-dir"[..].into());
         drv.args.push(
-            task.build_dir
+            sandbox_build_dir(&task.build_dir)
                 .to_string_lossy()
                 .into_owned()
                 .into_bytes()
@@ -3992,11 +3995,44 @@ fn new_opaque_file(
 /// COUPLED TO `nix-ninja-task`'s `--build-dir` DEFAULT, deliberately and by
 /// value rather than by import: the task crate is inside the task binary's
 /// fileset, so exporting a constant from it would re-key every banked
-/// per-TU output to share a string. The driver never passes `--build-dir`,
-/// so the default is what every task uses. If it ever moves, the Fortran
-/// probe is what fails - `local/fortran-probe.sh` drives the one construct
-/// that reads a path out of a file rather than off the command line.
+/// per-TU output to share a string. This is `nix-ninja-task`'s DEFAULT, used
+/// only when the driver passes no `--build-dir`. If it ever moves, the
+/// Fortran probe is what fails - `local/fortran-probe.sh` drives the one
+/// construct that reads a path out of a file rather than off the command
+/// line.
 const TASK_SANDBOX_BUILD_DIR: &str = "/build/source/build";
+
+/// Where the task will actually run, which is what a path inside an uploaded
+/// FILE has to be rewritten to.
+///
+/// ONE DECISION, TWO READERS, and they had drifted. `build_task_derivation`
+/// passes `--build-dir <host build dir>` verbatim whenever that directory is
+/// already under `/build` - the exact-mirror case, which is every build
+/// inside a derivation - while this rewrite used the constant above. The two
+/// agree only when the package's build directory happens to be spelled
+/// `/build/source/build`.
+///
+/// nixpkgs names it after the unpacked source root, so `fetchgit` gives
+/// `source` and the constant is right by luck, while a tarball gives
+/// `/build/<pname>-<version>` and it is wrong. CMake's Fortran dyndep is
+/// where that surfaces, because `FortranDependInfo.json` is read from a FILE
+/// rather than a command line:
+///
+/// ```text
+/// cmake_ninja_dyndep failed to open
+/// /build/source/build/CMakeFiles/myfort.dir/FortranModules.json
+/// ```
+///
+/// with the task running in `/build/fortran-c-interface/build/...`. Every
+/// Fortran and C++20-modules package whose build directory is not literally
+/// `/build/source/build` fails detection this way.
+fn sandbox_build_dir(build_dir: &Path) -> PathBuf {
+    if build_dir.starts_with("/build/") {
+        build_dir.to_path_buf()
+    } else {
+        PathBuf::from(TASK_SANDBOX_BUILD_DIR)
+    }
+}
 
 /// Rewrite absolute paths under the host build directory to the same paths
 /// under the sandbox build directory, leaving everything else alone.
@@ -4006,7 +4042,7 @@ const TASK_SANDBOX_BUILD_DIR: &str = "/build/source/build";
 /// would invent a location rather than translate one.
 fn rewrite_to_sandbox_build_dir(text: &str, build_dir: &Path) -> String {
     match build_dir.to_str() {
-        Some(d) => text.replace(d, TASK_SANDBOX_BUILD_DIR),
+        Some(d) => text.replace(d, &sandbox_build_dir(build_dir).to_string_lossy()),
         None => text.to_string(),
     }
 }
@@ -8675,6 +8711,53 @@ mod create_symlink_undeclared_output_tests {
             names.iter().any(|n| n == "quotearg.h"),
             "the quoted include was not collected either, so this says nothing \
              about angle includes: {names:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_build_dir_tests {
+    use super::{sandbox_build_dir, TASK_SANDBOX_BUILD_DIR};
+    use std::path::{Path, PathBuf};
+
+    /// THE CASE THAT BROKE FORTRAN. nixpkgs names the build directory after
+    /// the unpacked source root, so anything but a `source` root gave a
+    /// rewrite target that did not exist where the task ran.
+    #[test]
+    fn a_build_dir_under_build_is_mirrored_exactly() {
+        assert_eq!(
+            sandbox_build_dir(Path::new("/build/fortran-c-interface/build")),
+            PathBuf::from("/build/fortran-c-interface/build")
+        );
+    }
+
+    /// The spelling the constant assumes still answers itself, so packages
+    /// that unpack to `source` are unaffected by the fix.
+    #[test]
+    fn the_conventional_spelling_is_unchanged() {
+        assert_eq!(
+            sandbox_build_dir(Path::new(TASK_SANDBOX_BUILD_DIR)),
+            PathBuf::from(TASK_SANDBOX_BUILD_DIR)
+        );
+    }
+
+    /// Outside a derivation the task is told nothing and uses its default,
+    /// so that is what a file's contents must be rewritten to.
+    #[test]
+    fn a_build_dir_outside_build_falls_back_to_the_default() {
+        assert_eq!(
+            sandbox_build_dir(Path::new("/home/user/project/build")),
+            PathBuf::from(TASK_SANDBOX_BUILD_DIR)
+        );
+    }
+
+    /// `/buildsomething` is not under `/build`, and a prefix test on the
+    /// string rather than the components would say it is.
+    #[test]
+    fn a_sibling_directory_sharing_the_prefix_is_not_under_build() {
+        assert_eq!(
+            sandbox_build_dir(Path::new("/buildroot/pkg/build")),
+            PathBuf::from(TASK_SANDBOX_BUILD_DIR)
         );
     }
 }
