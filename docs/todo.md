@@ -21,7 +21,7 @@
   - Move symlinking logic to method under DerivedFile
   - If symlink source is directory, walk dir and symlink to dest as prefix
   - Virtual targets e.g. if user inputs list of targets
-- [ ] Depfile support
+- [x] Depfile support
   - If depfile defined, add that as an additional output
   - Create virtual target of all depfiles to install locally into builddir
   - Read depfile to skip dep_infer if depfile exists
