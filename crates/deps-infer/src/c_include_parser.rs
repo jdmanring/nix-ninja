@@ -796,6 +796,101 @@ pub fn dotdot_prefix(raw: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+mod virtual_lookup_agreement_tests {
+    use super::{canonicalize_cached, is_declared_virtual};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    /// THE TWO LOOKUPS DISAGREE ON WHAT THEY ARE ASKED AND AGREE ON WHAT IS
+    /// RETURNED, and only the second is load-bearing.
+    ///
+    /// `canonicalize_cached` probes the map verbatim and then lexically
+    /// normalized; `is_declared_virtual` probes verbatim only. A `.` spelling
+    /// is not the case that separates them - Rust's `Path` equality compares
+    /// COMPONENTS and skips `CurDir`, so `gen/./version.h` and
+    /// `gen/version.h` are already the same key. Only `..` survives into the
+    /// component list and therefore only `..` can miss.
+    ///
+    /// It is safe because everything downstream asks about the path the
+    /// resolver RETURNED rather than the one it was given. This pins that
+    /// property, so a caller that ever passes the probe instead fails here
+    /// rather than in a package.
+    #[test]
+    fn a_dotdot_spelling_resolves_to_a_path_the_skip_check_recognises() {
+        let declared = PathBuf::from("gen/version.h");
+        let vp: HashMap<PathBuf, PathBuf> = HashMap::from([(declared.clone(), declared.clone())]);
+
+        let probe = PathBuf::from("gen/sub/../version.h");
+        let resolved = canonicalize_cached(probe.clone(), Some(&vp))
+            .expect("the normalized probe must resolve")
+            .expect("a declared virtual path resolves without existing");
+
+        // The resolver answers with the DECLARED spelling, which is the one
+        // the upload filter recognises.
+        assert_eq!(resolved, declared);
+        assert!(is_declared_virtual(&resolved, Some(&vp)));
+
+        // The PROBE is not a key, which is the asymmetry. Asking with it
+        // would declare a header and then try to upload a file that never
+        // existed - the shape of svt-av1's canonicalize failure.
+        assert!(
+            !is_declared_virtual(&probe, Some(&vp)),
+            "the asymmetry is gone; the resolver's second probe is now redundant"
+        );
+    }
+
+    /// WHICH SPELLINGS ARE EVEN DIFFERENT, measured rather than assumed,
+    /// because the answer is position-dependent and the wrong half of it
+    /// makes the map look broken when it is not.
+    ///
+    /// Rust normalizes an INTERIOR `.` away in `Path`'s component-wise
+    /// equality and PRESERVES a LEADING one, and never touches `..`:
+    ///
+    /// ```text
+    /// gen/./x.h      == gen/x.h    true
+    /// ./x.h          == x.h        false
+    /// gen/sub/../x.h == gen/x.h    false
+    /// ```
+    ///
+    /// So the map's verbatim probe already answers for an interior dot, and
+    /// the resolver's second, normalizing probe earns its keep only for a
+    /// LEADING dot and for `..`. A test that used an interior dot would show
+    /// the two lookups agreeing and prove nothing.
+    #[test]
+    fn only_a_leading_dot_and_dotdot_are_different_keys() {
+        let vp: HashMap<PathBuf, PathBuf> =
+            HashMap::from([(PathBuf::from("gen/x.h"), PathBuf::from("gen/x.h"))]);
+        assert!(is_declared_virtual(Path::new("gen/./x.h"), Some(&vp)));
+        assert!(!is_declared_virtual(Path::new("gen/sub/../x.h"), Some(&vp)));
+
+        let root: HashMap<PathBuf, PathBuf> =
+            HashMap::from([(PathBuf::from("x.h"), PathBuf::from("x.h"))]);
+        assert!(
+            !is_declared_virtual(Path::new("./x.h"), Some(&root)),
+            "a leading dot is a different key, which is why a header at the \
+             build root with -I. needed the normalizing probe"
+        );
+    }
+
+    /// A path the map does not hold, in any spelling, must not resolve
+    /// virtually at all - otherwise a genuinely missing header would be
+    /// declared instead of failing loudly.
+    #[test]
+    fn an_undeclared_path_does_not_resolve_virtually() {
+        let vp: HashMap<PathBuf, PathBuf> = HashMap::from([(
+            PathBuf::from("gen/version.h"),
+            PathBuf::from("gen/version.h"),
+        )]);
+        let got = canonicalize_cached(PathBuf::from("gen/other.h"), Some(&vp)).unwrap();
+        assert!(
+            got.is_none(),
+            "an undeclared absent header must not resolve"
+        );
+        assert!(!is_declared_virtual(Path::new("gen/other.h"), Some(&vp)));
+    }
+}
+
+#[cfg(test)]
 mod dotdot_prefix_tests {
     use super::dotdot_prefix;
     use std::path::{Path, PathBuf};
