@@ -1192,12 +1192,7 @@ impl Runner {
                 for df in extra {
                     if is_gcc_task {
                         let n = df.build_path.to_string_lossy();
-                        let header_like = n.ends_with(".h")
-                            || n.ends_with(".hpp")
-                            || n.ends_with(".hh")
-                            || n.ends_with(".inc")
-                            || n.ends_with(".ipp");
-                        if !header_like {
+                        if !header_like(Path::new(n.as_ref())) {
                             continue;
                         }
                     }
@@ -1248,13 +1243,7 @@ impl Runner {
                 // the tree's eight files (qtsvg, 2026-08-23). Same
                 // predicate wait() uses to recognise the tree.
                 let tree_like = is_tree_path(Path::new(name.as_str()));
-                let header_like = name.ends_with(".h")
-                    || name.ends_with(".hpp")
-                    || name.ends_with(".hh")
-                    || name.ends_with(".inc")
-                    || name.ends_with(".ipp")
-                    || tree_like;
-                if !header_like {
+                if !header_like(Path::new(name.as_str())) && !tree_like {
                     continue;
                 }
             }
@@ -5550,13 +5539,26 @@ fn prune_line(declared: u64, kept: u64) -> String {
     }
 }
 
-/// One definition, because the numerator and the denominator are counted in
-/// different functions and a header-shape test that disagreed between them
-/// would move the ratio with nothing to show for it.
+/// One definition, because this was written THREE times and the copies had
+/// already diverged: the metric's copy and one of the two filter copies
+/// lacked the module-tree case the third carried.
+///
+/// THE LIST IS THE RISK, NOT THE POLARITY. Unlike the compile-versus-link
+/// test, inverting this one is wrong: the filter exists to keep a
+/// translation unit's closure from swallowing generated OBJECTS and SOURCES
+/// when a phony is expanded, so "drop what is not provably a header" is the
+/// intended direction. What can go wrong is a header spelling nobody listed,
+/// and the cost is identical to the `.ol` regression - the input is dropped
+/// and the compile dies on its own include.
+///
+/// `.hxx` is the one that mattered: it is CMake's OWN spelling for a
+/// generated precompiled header (`cmake_pch.hxx`), and it was in none of the
+/// three copies. `.H`, `.tcc` and `.inl` are the other conventions in wide
+/// use; `.h++` and `.hp` complete the C++ set.
 fn header_like(p: &Path) -> bool {
     matches!(
         p.extension().and_then(|e| e.to_str()),
-        Some("h" | "hpp" | "hh" | "inc" | "ipp")
+        Some("h" | "H" | "hh" | "hp" | "hpp" | "hxx" | "h++" | "inc" | "ipp" | "inl" | "tcc")
     )
 }
 
@@ -6493,6 +6495,44 @@ fn object_shaped_outputs<'a>(mut outs: impl Iterator<Item = &'a str>) -> bool {
     match outs.next() {
         None => false,
         Some(first) => object_shaped(first) && outs.all(object_shaped),
+    }
+}
+
+#[cfg(test)]
+mod header_like_tests {
+    use super::header_like;
+    use std::path::Path;
+
+    /// THE ONE THAT MATTERED. CMake generates `cmake_pch.hxx`, and `.hxx`
+    /// was in none of the three copies of this list. A generated header
+    /// reached through a phony would have been dropped from the compile's
+    /// inputs and the task would have died on its own include, which is the
+    /// `.ol` regression wearing a different suffix.
+    #[test]
+    fn the_cmake_precompiled_header_spelling_is_a_header() {
+        assert!(header_like(Path::new(
+            "core/CMakeFiles/x.dir/cmake_pch.hxx"
+        )));
+    }
+
+    #[test]
+    fn the_conventional_spellings_are_headers() {
+        for h in [
+            "a.h", "a.H", "a.hh", "a.hp", "a.hpp", "a.hxx", "a.h++", "a.inc", "a.ipp", "a.inl",
+            "a.tcc",
+        ] {
+            assert!(header_like(Path::new(h)), "{h} should be header-shaped");
+        }
+    }
+
+    /// THE FILTER'S PURPOSE, which is why this list is an allowlist rather
+    /// than an inverted test: expanding a phony otherwise drags generated
+    /// objects and sources into one translation unit's closure.
+    #[test]
+    fn objects_and_sources_are_not_headers() {
+        for n in ["a.o", "a.c", "a.cpp", "a.gen.cc", "a.so", "app"] {
+            assert!(!header_like(Path::new(n)), "{n} must not be header-shaped");
+        }
     }
 }
 
