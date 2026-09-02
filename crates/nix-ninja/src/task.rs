@@ -7256,6 +7256,15 @@ mod depfile_read_back_tests {
     use super::depfile_read_back;
     use std::path::{Path, PathBuf};
 
+    fn set_mtime(p: &Path, t: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(t))
+            .unwrap();
+    }
+
     #[test]
     fn fresh_stale_and_empty() {
         // REMOVED FIRST. The name is only per-process, and a pid is reused:
@@ -7275,6 +7284,22 @@ mod depfile_read_back_tests {
         // depfile no compiler produces.
         std::fs::create_dir_all(d.join("hdr")).unwrap();
         std::fs::write(d.join("hdr/one.h"), "#pragma once\n").unwrap();
+        // THE ORDER OF THE WRITES IS NOT THE ORDER OF THE TIMES, so the
+        // freshness the first assertion needs is set rather than assumed.
+        // Written this way the test passed everywhere it was run by hand and
+        // failed once inside the build sandbox, where nothing distinguishes a
+        // genuine regression from the ambient clock; a fixture for a
+        // comparison of two timestamps has to own both of them.
+        //
+        // The racer is the HEADER, not the source. It is created after the
+        // depfile, a header newer than the depfile is exactly what invalidates
+        // a read-back, and the two times differed by whatever the filesystem
+        // resolved between two adjacent writes - so the assertion was decided
+        // by rounding.
+        let base = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        set_mtime(&src, base);
+        set_mtime(&d.join("hdr/one.h"), base);
+        set_mtime(&dep, base + std::time::Duration::from_secs(10));
         // Fresh depfile (written after the source): its answer is used.
         let got = depfile_read_back(
             &d,
@@ -7286,11 +7311,7 @@ mod depfile_read_back_tests {
         .unwrap();
         assert_eq!(got, vec![PathBuf::from("a.c"), PathBuf::from("hdr/one.h")]);
         // Source newer than the depfile: no answer, fall back to the scan.
-        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
-        std::fs::File::open(&src)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(newer))
-            .unwrap();
+        set_mtime(&src, base + std::time::Duration::from_secs(20));
         assert!(depfile_read_back(
             &d,
             Path::new("/nonexistent-store"),
