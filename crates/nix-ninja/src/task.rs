@@ -288,7 +288,7 @@ fn admission_weight(inputs: usize, budget: usize) -> usize {
 
 /// Available memory in GiB, or `u64::MAX` where /proc cannot be read - an
 /// unreadable meminfo must not silently serialize the whole round.
-fn available_gib() -> u64 {
+pub(crate) fn available_gib() -> u64 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|s| {

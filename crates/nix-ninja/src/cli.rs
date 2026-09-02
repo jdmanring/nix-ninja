@@ -236,7 +236,72 @@ fn jobs_from(dash_j: usize, env_cores: Option<std::ffi::OsString>) -> usize {
 const MAX_DAEMON_CONNECTIONS: usize = 6;
 
 fn resolved_connections(cli: &Cli) -> usize {
-    resolved_jobs(cli).clamp(1, MAX_DAEMON_CONNECTIONS)
+    resolved_jobs(cli).clamp(1, connection_ceiling(crate::task::available_gib()))
+}
+
+/// The pool ceiling for the machine this is actually running on.
+///
+/// `MAX_DAEMON_CONNECTIONS` was calibrated on ONE machine - 30 GiB, 24
+/// threads - against a measured per-connection daemon RSS of 0.44 to 0.76
+/// GiB. On a smaller machine that same six is six times a figure the box
+/// does not have: at 2 GiB it is the whole machine spent on daemon workers
+/// before a compiler starts.
+///
+/// So the ceiling only ever comes DOWN, and only where no measurement was
+/// taken. A machine with the memory the constant assumes gets the constant
+/// unchanged, so this is not a retune of a number somebody measured - it is
+/// a floor under the machines nobody measured.
+///
+/// One GiB per connection, from the 0.76 worst case rounded up. Unreadable
+/// meminfo answers `u64::MAX` and therefore keeps the ceiling, which is the
+/// same fail-open direction `budget_for_memory` takes: a machine whose
+/// memory cannot be read must not be silently serialized.
+///
+/// IT CANNOT SEE ITS SIBLINGS, and that is not fixable here. Every driver in
+/// a parallel round reads the same `MemAvailable` and reaches the same
+/// answer, so N drivers may each admit what one machine can afford. Sizing
+/// the PRODUCT is the consumer's job, through `max-jobs` and `cores`; this
+/// only stops one driver being absurd on a small box.
+fn connection_ceiling(avail_gib: u64) -> usize {
+    let by_memory = usize::try_from(avail_gib.max(1)).unwrap_or(usize::MAX);
+    MAX_DAEMON_CONNECTIONS.min(by_memory)
+}
+
+#[cfg(test)]
+mod connection_ceiling_tests {
+    use super::{connection_ceiling, MAX_DAEMON_CONNECTIONS};
+
+    /// THE MACHINE THE CONSTANT WAS MEASURED ON keeps the constant, so this
+    /// change is not a retune of anybody's measurement.
+    #[test]
+    fn a_machine_with_the_assumed_memory_is_unchanged() {
+        assert_eq!(connection_ceiling(30), MAX_DAEMON_CONNECTIONS);
+        assert_eq!(connection_ceiling(8), MAX_DAEMON_CONNECTIONS);
+    }
+
+    /// A SMALL MACHINE COMES DOWN. Six connections at the measured 0.76 GiB
+    /// worst case is more than a 2 GiB box has before a compiler starts.
+    #[test]
+    fn a_small_machine_gets_fewer_connections() {
+        assert_eq!(connection_ceiling(2), 2);
+        assert_eq!(connection_ceiling(1), 1);
+    }
+
+    /// NEVER ZERO. A driver with no connections makes no progress at all,
+    /// and a machine reporting no available memory is thrashing rather than
+    /// asking to be stopped.
+    #[test]
+    fn it_never_reaches_zero() {
+        assert_eq!(connection_ceiling(0), 1);
+    }
+
+    /// FAILS OPEN. `available_gib` answers `u64::MAX` when meminfo cannot be
+    /// read, and an unreadable machine must keep the ceiling rather than be
+    /// silently serialized.
+    #[test]
+    fn an_unreadable_meminfo_keeps_the_ceiling() {
+        assert_eq!(connection_ceiling(u64::MAX), MAX_DAEMON_CONNECTIONS);
+    }
 }
 
 pub fn run() -> Result<()> {
