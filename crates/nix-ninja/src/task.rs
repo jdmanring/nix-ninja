@@ -8019,6 +8019,9 @@ pub fn discover_c_includes(
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
     let mut to_upload: Vec<PathBuf> = Vec::new();
+    // Discovered paths that are not on disk and were not recognised as
+    // declared. See the upload guard below.
+    let mut absent: Vec<PathBuf> = Vec::new();
 
     // Convert input files to a set for filtering
     let input_files: HashSet<PathBuf> = files.into_iter().collect();
@@ -8073,6 +8076,22 @@ pub fn discover_c_includes(
             continue;
         }
 
+        // ABSENT AND NOT DECLARED IS THE ANOMALY, and the two ways of
+        // reaching it have different fixes. A path that is absent because it
+        // is a graph OUTPUT is skipped by the guard above; one that is absent
+        // and NOT declared virtual means the producing edge never became an
+        // input of this task, which is an input-assembly defect rather than a
+        // discovery defect. Uploading it fails with a canonicalize error that
+        // names neither condition, so the error says which it was.
+        let abs = if include.is_absolute() {
+            include.clone()
+        } else {
+            build_dir.join(&include)
+        };
+        if !abs.exists() {
+            absent.push(include.clone());
+        }
+
         // Regular file: queued for a batched store add below.
         to_upload.push(include);
     }
@@ -8089,9 +8108,17 @@ pub fn discover_c_includes(
     // format, runs once per failing task, and answers both.
     discovered_deps.extend(
         new_opaque_files(rpc_client, build_dir, to_upload).with_context(|| {
+            let absent_note = match absent.first() {
+                None => String::new(),
+                Some(first) => format!(
+                    "; {} of them absent and not declared, first {}",
+                    absent.len(),
+                    first.display()
+                ),
+            };
             format!(
-                "uploading includes discovered for {seed} ({} from {}, {} seed(s))",
-                c_include_count, answer_source, seed_count,
+                "uploading includes discovered for {seed} ({} from {}, {} seed(s){})",
+                c_include_count, answer_source, seed_count, absent_note,
             )
         })?,
     );
