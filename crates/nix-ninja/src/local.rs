@@ -237,6 +237,20 @@ fn refresh_placed_mtimes(prefix: &Path, store_dir: &StoreDir, files: &[DerivedFi
 /// So the target is asked where it actually points rather than the caller's
 /// list being trusted. An alias resolves to a sibling and is left alone.
 fn placement_is_ours(dest: &Path, src: &Path) -> bool {
+    // THE SOURCE IS ASKED FIRST, AND THE CANONICAL COMPARISON BELOW CANNOT
+    // ANSWER THIS. A link edge declares all three of `libfoo.so.1.2.3`,
+    // `libfoo.so.1` and `libfoo.so` as outputs, so each is a `DerivedFile` and
+    // the two aliases are stored as SYMLINKS. Placing one and then copying it
+    // resolves both sides of that comparison to the same real library, so the
+    // comparison says yes and the alias becomes a third copy - which is the
+    // defect, not a case the comparison excludes.
+    //
+    // An output that is a link in the store is a NAME. Materialising it as
+    // content is what loses the soname relationship, so it is refused on the
+    // source's own type rather than on where anything resolves to.
+    if std::fs::symlink_metadata(src).is_ok_and(|m| m.file_type().is_symlink()) {
+        return false;
+    }
     match (std::fs::canonicalize(dest), std::fs::canonicalize(src)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
@@ -782,6 +796,49 @@ mod cmake_install_rpath_tests {
 #[cfg(test)]
 mod placed_mtime_tests {
     use super::{clone_or_copy, placement_is_ours, unique_sibling};
+
+    /// THE CASE THE FIRST GUARD MISSED, and it is the one brotli actually
+    /// has. When the alias is ITSELF a declared output, both sides of a
+    /// canonical comparison resolve to the same real library, so comparing
+    /// resolved paths says yes and the alias is copied anyway. Only the
+    /// source's own type distinguishes a name from a product.
+    #[test]
+    fn an_alias_that_is_itself_the_placed_output_is_refused() {
+        let dir = std::env::temp_dir().join(format!("nn-alias2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The "store": a real library and an alias beside it, as a link edge
+        // stores its three outputs.
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("libfoo.so.1.2.3"), b"elf").unwrap();
+        let src_alias = store.join("libfoo.so");
+        std::os::unix::fs::symlink("libfoo.so.1.2.3", &src_alias).unwrap();
+        // The build tree: the placement's own symlink at the alias name.
+        let build = dir.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let dest = build.join("libfoo.so");
+        std::os::unix::fs::symlink(&src_alias, &dest).unwrap();
+
+        // Both resolve to the same real library, so a resolved-path
+        // comparison alone cannot refuse this.
+        assert_eq!(
+            std::fs::canonicalize(&dest).unwrap(),
+            std::fs::canonicalize(&src_alias).unwrap()
+        );
+        assert!(
+            !placement_is_ours(&dest, &src_alias),
+            "an output that is a link in the store is a name, not a product"
+        );
+
+        // And the real library beside it is still placed.
+        let src_real = store.join("libfoo.so.1.2.3");
+        let dest_real = build.join("libfoo.so.1.2.3");
+        std::os::unix::fs::symlink(&src_real, &dest_real).unwrap();
+        assert!(placement_is_ours(&dest_real, &src_real));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// THE ALIAS CASE, which is a regression this guard exists to prevent.
     /// Without it every versioned shared library in a placed tree becomes
