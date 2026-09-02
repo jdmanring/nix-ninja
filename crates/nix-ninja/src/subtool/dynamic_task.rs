@@ -34,7 +34,7 @@ pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
     // A `..` spelling discovered HERE has to reach the final derivation:
     // this subtool emits the derivation, it does not run the command, so
     // creating the directory in this sandbox would help nobody.
-    crate::task::declare_dotdot_dirs(&mut drv, &discovered.dotdot_dirs);
+    crate::task::declare_dotdot_dirs(&mut drv, &build_dir, &discovered.dotdot_dirs);
 
     // Stage 3: Update derivation with discovered dependencies
     let new_deps = update_derivation_with_discoveries(

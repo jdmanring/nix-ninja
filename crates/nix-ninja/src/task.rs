@@ -2467,7 +2467,7 @@ fn build_task_derivation(
                 task.depfile.as_deref().map(Path::new),
             )?;
 
-            declare_dotdot_dirs(&mut drv, &dotdot_dirs);
+            declare_dotdot_dirs(&mut drv, &task.build_dir, &dotdot_dirs);
 
             // Add discovered store paths as input sources only
             for store_path in discovered_store_paths {
@@ -3419,7 +3419,7 @@ fn handle_derivation_result(
                 &drv,
                 built_paths,
             )?;
-            declare_dotdot_dirs(&mut drv, &dotdot_dirs);
+            declare_dotdot_dirs(&mut drv, &config.build_dir, &dotdot_dirs);
             DYN_DISCOVER_MS.fetch_add(
                 t_discover.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -7585,7 +7585,7 @@ fn generated_not_yet_written(
 /// MERGED, never replaced: the dynamic pass adds to what the static pass
 /// already recorded, and a task discovered on both paths would otherwise keep
 /// only the later set.
-pub fn declare_dotdot_dirs(drv: &mut Derivation, dirs: &[PathBuf]) {
+pub fn declare_dotdot_dirs(drv: &mut Derivation, build_dir: &Path, dirs: &[PathBuf]) {
     if dirs.is_empty() {
         return;
     }
@@ -7597,12 +7597,37 @@ pub fn declare_dotdot_dirs(drv: &mut Derivation, dirs: &[PathBuf]) {
         .map_or(String::new(), |(_, v)| {
             String::from_utf8_lossy(v).into_owned()
         });
+    let merged = dotdot_dirs_env(&existing, build_dir, dirs);
+    if merged.is_empty() {
+        return;
+    }
+    drv.env.insert(key[..].into(), merged.into_bytes().into());
+}
+
+/// The value of `NIX_NINJA_MKDIRS`, given whatever is already there.
+///
+/// SEPARATE FROM THE DERIVATION so it can be tested: the decision is about
+/// path spelling and merging, and constructing a derivation to ask it would
+/// be a test of the wrong thing.
+fn dotdot_dirs_env(existing: &str, build_dir: &Path, dirs: &[PathBuf]) -> String {
     let mut all: Vec<String> = existing.split_whitespace().map(|s| s.to_string()).collect();
     for d in dirs {
-        let s = d.to_string_lossy().into_owned();
-        // A path carrying a space cannot survive this encoding, and the
-        // task refuses an absolute one anyway; drop it rather than emit a
-        // token that would silently mean something else.
+        // RELATIVE TO THE BUILD DIRECTORY, because the prefix is derived on
+        // the HOST and created inside the SANDBOX, and those are the same
+        // string only when the build directory is already under /build. A
+        // host absolute path would be silently skipped by the task's
+        // confinement check on any other route - the reassuring direction,
+        // since the build then fails exactly as it did before.
+        let Some(rel) = relative_from(d, build_dir) else {
+            continue;
+        };
+        if rel.is_absolute() {
+            continue;
+        }
+        let s = rel.to_string_lossy().into_owned();
+        // A path carrying a space cannot survive this encoding, and the task
+        // refuses an absolute one anyway; drop it rather than emit a token
+        // that would silently mean something else.
         if s.contains(char::is_whitespace) {
             continue;
         }
@@ -7611,8 +7636,84 @@ pub fn declare_dotdot_dirs(drv: &mut Derivation, dirs: &[PathBuf]) {
         }
     }
     all.sort();
-    drv.env
-        .insert(key[..].into(), all.join(" ").into_bytes().into());
+    all.join(" ")
+}
+
+#[cfg(test)]
+mod dotdot_dirs_env_tests {
+    use super::dotdot_dirs_env;
+    use std::path::{Path, PathBuf};
+
+    /// openblas's case: the prefix is a SIBLING of the build directory, so
+    /// it climbs, and the climb is what the task recreates.
+    #[test]
+    fn a_sibling_directory_is_emitted_as_a_climb() {
+        assert_eq!(
+            dotdot_dirs_env(
+                "",
+                Path::new("/build/source/build"),
+                &[PathBuf::from("/build/source/kernel/x86_64")]
+            ),
+            "../kernel/x86_64"
+        );
+    }
+
+    /// THE HOST PATH IS NOT THE SANDBOX PATH. A build directory outside
+    /// /build still yields a climb rather than the host absolute spelling,
+    /// which the task would refuse.
+    #[test]
+    fn a_host_directory_outside_build_still_yields_a_relative_path() {
+        assert_eq!(
+            dotdot_dirs_env(
+                "",
+                Path::new("/tmp/nn-xyz/build"),
+                &[PathBuf::from("/tmp/nn-xyz/src")]
+            ),
+            "../src"
+        );
+    }
+
+    /// MERGED, NOT REPLACED. The static pass and the dynamic pass both
+    /// declare, and the second must not drop the first.
+    #[test]
+    fn an_existing_value_is_kept() {
+        assert_eq!(
+            dotdot_dirs_env(
+                "../a",
+                Path::new("/build/source/build"),
+                &[PathBuf::from("/build/source/b")]
+            ),
+            "../a ../b"
+        );
+    }
+
+    /// A repeat is one entry, so two routes to the same directory do not
+    /// grow the value and move the key.
+    #[test]
+    fn a_repeat_is_not_added_twice() {
+        assert_eq!(
+            dotdot_dirs_env(
+                "../a",
+                Path::new("/build/source/build"),
+                &[PathBuf::from("/build/source/a")]
+            ),
+            "../a"
+        );
+    }
+
+    /// A PATH WITH A SPACE CANNOT SURVIVE THE ENCODING, and emitting it
+    /// would hand the task two tokens that each name something else.
+    #[test]
+    fn a_path_carrying_a_space_is_dropped() {
+        assert_eq!(
+            dotdot_dirs_env(
+                "",
+                Path::new("/build/source/build"),
+                &[PathBuf::from("/build/source/two words")]
+            ),
+            ""
+        );
+    }
 }
 
 pub struct Discovered {
