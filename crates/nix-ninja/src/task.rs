@@ -1420,9 +1420,10 @@ impl Runner {
                         .is_some_and(|e| e == "json" || e == "idl" || e == "webidl")
                     && Path::new(&arg).is_file()
                 {
-                    if let Some(dir) = Path::new(&arg).parent() {
+                    {
+                        let dir = parent_dir_or_here(Path::new(&arg));
                         for input in
-                            upload_referenced_dir(&self.rpc_client, &self.config.build_dir, dir)?
+                            upload_referenced_dir(&self.rpc_client, &self.config.build_dir, &dir)?
                         {
                             self.add_derived_file(files, input.clone());
                             input_set.insert(input.build_path.clone(), input);
@@ -1726,11 +1727,12 @@ impl Runner {
                         // dirs are small and nothing else here uses those
                         // extensions - so a .json argument, which is
                         // everywhere, cannot trigger a sweep.
-                        if let Some(dir) = Path::new(&arg).parent() {
+                        {
+                            let dir = parent_dir_or_here(Path::new(&arg));
                             for input in upload_referenced_dir(
                                 &self.rpc_client,
                                 &self.config.build_dir,
-                                dir,
+                                &dir,
                             )? {
                                 self.add_derived_file(files, input.clone());
                                 input_set.insert(input.build_path.clone(), input);
@@ -1930,9 +1932,7 @@ impl Runner {
             if i.build_path.extension().is_some_and(|e| e == "py")
                 && Path::new(&i.build_path).is_file()
             {
-                if let Some(dir) = i.build_path.parent() {
-                    py_dirs.insert(dir.to_path_buf());
-                }
+                py_dirs.insert(parent_dir_or_here(&i.build_path));
             }
         }
         static PY_SIB_FILLED: std::sync::OnceLock<
@@ -1995,7 +1995,7 @@ impl Runner {
                 i.build_path.extension().is_some_and(|e| e == "template")
                     && Path::new(&i.build_path).is_file()
             })
-            .filter_map(|i| i.build_path.parent().map(Path::to_path_buf))
+            .map(|i| parent_dir_or_here(&i.build_path))
             .collect();
         for dir in tmpl_dirs {
             for entry in std::fs::read_dir(&dir)?.flatten() {
@@ -4806,12 +4806,12 @@ fn upload_referenced_file(
     let main = new_opaque_file(rpc_client, build_dir, path.clone())?;
     let mut out = vec![main];
     if is_py {
-        upload_python_closure(rpc_client, build_dir, &script_dir(&path), &mut out)?;
+        upload_python_closure(rpc_client, build_dir, &parent_dir_or_here(&path), &mut out)?;
     }
     Ok(out)
 }
 
-/// The directory a script's sibling imports resolve from.
+/// The directory a relative path lives in, as a path that can be OPENED.
 ///
 /// `Path::parent` of a bare relative name answers `Some("")`, not `None`,
 /// and `read_dir("")` is ENOENT - so a python script named with no directory
@@ -4824,10 +4824,17 @@ fn upload_referenced_file(
 /// openh264 2.6.0, 2026-09-01. The empty parentheses in that message are
 /// what identify it; the error otherwise reads as a missing interpreter.
 ///
+/// FIXED AT ONE CALL SITE AND NOT THE OTHERS, WHICH IS WHY IT CAME BACK.
+/// openh264 failed identically at the revision carrying that fix, because
+/// FOUR places take a parent and hand it to a directory read: the script
+/// closure's seed, the per-task python sibling pass, and two argument sweeps
+/// that upload a referenced file's directory. A defect found once is a class,
+/// and this one was only ever repaired in the member that reported it.
+///
 /// A bare name resolves against the process working directory, which the
 /// driver sets to the build directory at startup, so `.` is what the name
 /// already meant.
-fn script_dir(path: &Path) -> PathBuf {
+fn parent_dir_or_here(path: &Path) -> PathBuf {
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -4835,21 +4842,21 @@ fn script_dir(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod script_dir_tests {
-    use super::script_dir;
+mod parent_dir_or_here_tests {
+    use super::parent_dir_or_here;
     use std::path::{Path, PathBuf};
 
     /// THE CASE THAT KILLED A PACKAGE. `parent()` answers `Some("")` here,
     /// which is a directory that cannot be opened.
     #[test]
     fn a_bare_name_resolves_to_the_working_directory() {
-        assert_eq!(script_dir(Path::new("gen.py")), PathBuf::from("."));
+        assert_eq!(parent_dir_or_here(Path::new("gen.py")), PathBuf::from("."));
     }
 
     #[test]
     fn a_relative_name_keeps_its_directory() {
         assert_eq!(
-            script_dir(Path::new("tools/gen.py")),
+            parent_dir_or_here(Path::new("tools/gen.py")),
             PathBuf::from("tools")
         );
     }
@@ -4857,7 +4864,7 @@ mod script_dir_tests {
     #[test]
     fn an_absolute_name_keeps_its_directory() {
         assert_eq!(
-            script_dir(Path::new("/build/source/tools/gen.py")),
+            parent_dir_or_here(Path::new("/build/source/tools/gen.py")),
             PathBuf::from("/build/source/tools")
         );
     }
@@ -4866,7 +4873,23 @@ mod script_dir_tests {
     /// either.
     #[test]
     fn a_root_level_name_resolves_to_a_real_directory() {
-        assert_eq!(script_dir(Path::new("/gen.py")), PathBuf::from("/"));
+        assert_eq!(parent_dir_or_here(Path::new("/gen.py")), PathBuf::from("/"));
+    }
+
+    /// EVERY RESULT MUST BE OPENABLE, which is the property all four call
+    /// sites depend on: each hands this to a directory read, and an empty
+    /// path is ENOENT rather than the current directory. The first fix
+    /// covered one site and openh264 failed identically at the revision
+    /// carrying it.
+    #[test]
+    fn no_input_yields_an_unopenable_path() {
+        for p in ["gen.py", "a/gen.py", "/a/gen.py", "/gen.py", ".", "a", ""] {
+            let got = parent_dir_or_here(Path::new(p));
+            assert!(
+                !got.as_os_str().is_empty(),
+                "{p} produced an empty directory"
+            );
+        }
     }
 }
 
