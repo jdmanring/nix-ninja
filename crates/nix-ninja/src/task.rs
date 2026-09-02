@@ -43,7 +43,43 @@ pub struct Tools {
     pub nix_ninja: StorePath,
     pub nix_ninja_task: StorePath,
     pub patchelf: StorePath,
+    /// THE TEXT FILTERS A GENERATOR EDGE EXECS, resolved lazily and absent
+    /// without complaint. See `SCRIPT_TOOLS`.
+    pub script_tools: Vec<StorePath>,
 }
+
+/// Tools a build's own SCRIPTS exec, as opposed to the tools a compile or a
+/// link execs.
+///
+/// THE SANDBOX `$PATH` WAS BOUNDED BY THE WRONG MEASUREMENT. It was closed at
+/// two members by an `strace -f -e trace=execve` over a real LINK, which is
+/// sound about links and blind to generator edges: no link runs a shell
+/// script, so no amount of tracing one enumerates what a script execs. The
+/// claim that the class was closed came from that trace and was wrong in the
+/// reassuring direction.
+///
+/// p11-kit is the specimen. A generator edge runs `gen-pkcs11-gnu.sh`, which
+/// execs `sed` twice and nothing else. With no `sed` on `$PATH` the script
+/// writes a header with correct structure and NO CONTENT, then exits 0, and
+/// three translation units later fail on `expected identifier or '(' before
+/// '}' token` in a file nobody wrote. The tool is named nowhere in the error,
+/// the exit status is a success, and the same shape had already been seen
+/// with `xxd` in libvmaf.
+///
+/// UNCONDITIONAL, NOT GATED ON A PREDICATE. An allowlist is safe when it
+/// gates something the build merely carries and unsafe when it gates
+/// something required for correctness: a task that guesses wrong here cannot
+/// run, and it fails silently. That polarity is the one this project already
+/// paid for with the object-suffix allowlist, where an unrecognised suffix
+/// meant no dependency discovery and a task that could not compile.
+///
+/// DEFER(a sixth member, or a build that pays for the closure): the set is
+/// the POSIX text filters a generated script reaches for, and it is a
+/// judgement rather than an enumeration, because the population is not
+/// bounded by any measurement taken so far. Each is a small store path and
+/// each is already in almost every build's closure. Resolution is optional,
+/// so a build without one loses nothing it was not already missing.
+const SCRIPT_TOOLS: [&str; 5] = ["sed", "awk", "grep", "m4", "xxd"];
 
 impl Tools {
     pub fn new(store_dir: &StoreDir) -> Result<Self> {
@@ -55,6 +91,10 @@ impl Tools {
             nix_ninja: which_store_path(store_dir, "nix-ninja")?,
             nix_ninja_task: which_store_path(store_dir, "nix-ninja-task")?,
             patchelf: which_store_path(store_dir, "patchelf")?,
+            script_tools: SCRIPT_TOOLS
+                .iter()
+                .filter_map(|t| which_store_path(store_dir, t).ok())
+                .collect(),
         })
     }
 
@@ -2545,6 +2585,9 @@ fn build_task_derivation(
         .insert(SingleDerivedPath::Opaque(tools.nix_ninja_task.clone()));
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.patchelf.clone()));
+    for sp in &tools.script_tools {
+        drv.inputs.insert(SingleDerivedPath::Opaque(sp.clone()));
+    }
 
     // Add all ninja build inputs.
     let mut input_set: HashSet<String> = HashSet::new();
@@ -3037,6 +3080,11 @@ fn build_task_derivation(
             format!("{}/bin", task.store_dir.display(&tools.coreutils)),
             format!("{}/bin", task.store_dir.display(&tools.patchelf)),
         ];
+        // See SCRIPT_TOOLS: a generator edge execs these and a missing one
+        // fails silently, with a zero exit status and an empty output file.
+        for sp in &tools.script_tools {
+            path.push(format!("{}/bin", task.store_dir.display(sp)));
+        }
 
         // CMake emits link and custom commands wrapped in shell no-op
         // guards: `: && <real command> && :`. The `:` is a shell builtin,
