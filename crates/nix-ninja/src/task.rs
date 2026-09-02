@@ -2193,9 +2193,49 @@ pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> 
 /// dynamic gate read `deps` alone, so an edge could be scanned and never given
 /// anything to scan.
 fn wants_dependency_discovery(task: &Task) -> bool {
-    (!link_shaped_outputs(task.outputs.iter().filter_map(|p| p.to_str()))
+    ((!link_shaped_outputs(task.outputs.iter().filter_map(|p| p.to_str()))
+        || command_is_compile(task.cmdline.as_deref()))
         && (task.deps.as_deref() == Some("gcc") || task.depfile.is_some()))
         || consumes_preprocessed_fortran(task)
+}
+
+/// The command provably COMPILES, whatever its output is called.
+///
+/// `link_shaped_outputs` reads the output NAME, and one name is genuinely
+/// ambiguous: krb5 compiles its PIC objects to a `.so` suffix, so
+/// `gcc -c threads.c -o threads.so` is an object wearing a shared library's
+/// extension. Classified as a link it ran no discovery, declared its source
+/// and nothing else, and died on its first include - the fourth member of the
+/// family that already holds `.ol`, `.os` and `.So`, and the only one where
+/// widening the name test is not available, because a real shared library is
+/// spelled the same way.
+///
+/// So the name is not asked to carry it. `-c` is what the compiler itself
+/// reads to decide, it is already on the command line, and no link has one.
+///
+/// A `-c` DIRECTLY AFTER A SHELL IS NOT EVIDENCE, and reading it as evidence
+/// would call every shell-wrapped link a compile, routing links back through
+/// the dynamic-task path that made every mkCMakePackage target unresolvable.
+/// A command whose real compiler sits inside a single quoted `sh -c` argument
+/// is not reached by this at all: the inner `-c` is one token with the rest,
+/// so such a task keeps the classification it has today rather than gaining a
+/// guess.
+fn command_is_compile(cmdline: Option<&str>) -> bool {
+    let Some(cmd) = cmdline else {
+        return false;
+    };
+    let Ok(args) = shell_words::split(cmd) else {
+        return false;
+    };
+    let shell = |a: &String| {
+        matches!(
+            a.rsplit('/').next().unwrap_or(a),
+            "sh" | "bash" | "dash" | "zsh" | "ksh"
+        )
+    };
+    args.iter()
+        .enumerate()
+        .any(|(i, a)| a == "-c" && !(i > 0 && shell(&args[i - 1])))
 }
 
 /// Every declared output is plainly a LINK product.
@@ -6524,6 +6564,51 @@ fn object_shaped_outputs<'a>(mut outs: impl Iterator<Item = &'a str>) -> bool {
     match outs.next() {
         None => false,
         Some(first) => object_shaped(first) && outs.all(object_shaped),
+    }
+}
+
+#[cfg(test)]
+mod command_is_compile_tests {
+    use super::command_is_compile;
+
+    /// krb5's own shape: an object named like a shared library.
+    #[test]
+    fn a_dash_c_compile_naming_a_so_output_is_a_compile() {
+        assert!(command_is_compile(Some(
+            "gcc -c threads.c -o threads.so -I../../include"
+        )));
+    }
+
+    #[test]
+    fn a_shared_link_is_not_a_compile() {
+        assert!(!command_is_compile(Some(
+            "gcc -shared -o libfoo.so.1.2.3 a.o b.o"
+        )));
+    }
+
+    /// THE ONE THAT PROTECTS THE OTHER FIX. A shell's own `-c` introduces the
+    /// command rather than describing it, so counting it calls every
+    /// shell-wrapped link a compile and sends links back down the
+    /// dynamic-task path where a target handle cannot resolve.
+    #[test]
+    fn a_shell_dash_c_is_not_the_compilers() {
+        assert!(!command_is_compile(Some(
+            "/bin/sh -c gcc\\ -shared\\ -o\\ libfoo.so"
+        )));
+        assert!(!command_is_compile(Some("bash -c ./link.sh")));
+    }
+
+    /// A compiler reached THROUGH a shell still counts, because the rejection
+    /// above is positional and not a rule about shells appearing at all.
+    #[test]
+    fn a_compile_after_a_shell_wrapper_still_counts() {
+        assert!(command_is_compile(Some("/bin/sh -c gcc -c a.c -o a.so")));
+    }
+
+    #[test]
+    fn no_command_and_unparseable_commands_do_not_claim_a_compile() {
+        assert!(!command_is_compile(None));
+        assert!(!command_is_compile(Some("gcc -c 'unterminated")));
     }
 }
 
