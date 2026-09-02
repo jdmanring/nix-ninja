@@ -142,6 +142,21 @@ fn files_fingerprint(build_dir: &Path, key_dir: &Path, paths: &[PathBuf]) -> Opt
 /// 2026-08-23 on skalibs. NIX_NINJA_RESOLVE_CACHE=1 forces persistence
 /// on for anyone deliberately testing it in a sandbox; =0 disables it
 /// anywhere.
+///
+/// BOTH REASONS ARE ABOUT THE DERIVATION BOUNDARY, AND THE DROP-IN ROUTE
+/// HAS A SECOND BOUNDARY INSIDE IT. A compiler-route package is ONE
+/// derivation whose build tree is shared by thousands of shim invocations,
+/// each a fresh process with an empty in-memory memo. So the stamps are
+/// replayable WITHIN that derivation even though they can never cross one,
+/// and this gate closes both. Measured by the consumer on a resume walk
+/// over an already-built gcc: 2752 invocations, 613,348 NAR sends, one memo
+/// hit per 224 paths, 103.5 s driver-accounted against 1238 s wall.
+/// It is not a resume-only cost either - every autotools package pays it
+/// per source file on a FIRST build, where real compilation hides it.
+/// A within-derivation memo would need a home that is NOT the source tree,
+/// which is what the skalibs failure above constrains; NIX_BUILD_TOP is
+/// itself a directory that exists, is writable, dies with the derivation,
+/// and no packaging check inspects it.
 fn persistence_enabled(setting: Option<&str>, in_nix_build: bool) -> bool {
     match setting {
         Some("0") => false,

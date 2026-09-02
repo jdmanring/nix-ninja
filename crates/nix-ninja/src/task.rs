@@ -7584,6 +7584,48 @@ mod depfile_applies_here_tests {
         );
     }
 
+    /// THE TWO ABOVE ARE ONE CLAIM AND NOTHING SAID SO. They are the same
+    /// depfile answered two ways, and the property is that the map argument
+    /// changes the ANSWER rather than supplying a default: a caller that HAS
+    /// a map and passes `None` silently takes the no-evidence branch and
+    /// loses its read-back. Split across two tests with two fixtures, an
+    /// edit can move one and leave the other green, and the asymmetry that
+    /// makes the argument load-bearing is what disappears.
+    ///
+    /// Asserted here on ONE fixture, so the two outcomes cannot drift apart.
+    /// The `assert_ne` is the half that matters - equal results would mean
+    /// the argument is inert, which is exactly what a passing pair of
+    /// separate tests would still allow.
+    #[test]
+    fn the_map_argument_changes_the_answer_not_a_default() {
+        let d = fixture("asymmetry", "a.o: a.c \\\n gen/version.h\n");
+        let declared: HashMap<PathBuf, PathBuf> = HashMap::from([(
+            PathBuf::from("gen/version.h"),
+            PathBuf::from("gen/version.h"),
+        )]);
+        let without = depfile_read_back(
+            &d,
+            Path::new("/nonexistent-store"),
+            Some(Path::new("a.o.d")),
+            &[PathBuf::from("a.c")],
+            None,
+        );
+        let with = depfile_read_back(
+            &d,
+            Path::new("/nonexistent-store"),
+            Some(Path::new("a.o.d")),
+            &[PathBuf::from("a.c")],
+            Some(&declared),
+        );
+        assert_ne!(without, with, "the map argument must not be inert");
+        assert!(without.is_none(), "no map means no evidence, so refuse");
+        assert_eq!(
+            with,
+            Some(vec![PathBuf::from("a.c"), PathBuf::from("gen/version.h")]),
+            "a declared path keeps the read-back"
+        );
+    }
+
     /// A STORE PATH NEEDS NEITHER, because inputSrcs carries it into the
     /// sandbox whether or not it is on this disk.
     #[test]
