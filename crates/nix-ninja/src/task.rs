@@ -6568,8 +6568,13 @@ mod link_shaped_tests {
     /// declared input after discovery was gated on being provably a compile.
     #[test]
     fn an_unfamiliar_object_suffix_is_not_a_link() {
+        // THREE PACKAGES, THREE SUFFIXES, ONE DEFECT. All measured from a
+        // distribution round: libaio writes `.ol`, keyutils `.os`, dhcpcd
+        // `.So` with a capital S. None is in any object allowlist anyone
+        // would write, which is the argument for asking the other question.
         assert!(!link_shaped_outputs(["io_queue_init.ol"].into_iter()));
         assert!(!link_shaped_outputs(["keyutils.os"].into_iter()));
+        assert!(!link_shaped_outputs(["udev.So"].into_iter()));
         assert!(!link_shaped_outputs(["a.o"].into_iter()));
         assert!(!link_shaped_outputs(["a.obj", "b.o"].into_iter()));
     }
