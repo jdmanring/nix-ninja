@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use harmonia_store_path::StoreDir;
-use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
+use nix_ninja_task::derived_file::{alias_link_target, create_symlinks, DerivedFile};
 use nix_ninja_task::patchelf;
 use std::env;
 use std::fs;
@@ -751,6 +751,40 @@ fn copy_outputs_to_placeholders(store_dir: &StoreDir, outputs: &[DerivedFile]) -
         // ninja never knows, so the driver declares the TREE and this copies
         // whatever is in it. fs::copy is file-to-file and would fail with
         // EISDIR here, which reads as a permissions problem.
+        // AN OUTPUT THAT IS A SYMLINK IS A NAME, AND `fs::copy` FOLLOWS IT.
+        // A link edge declares `libfoo.so.1.2.3`, `libfoo.so.1` and
+        // `libfoo.so` as three outputs, and the command - `cmake -E
+        // cmake_symlink_library` - writes one library and two links to it.
+        // Copying through them stored three real files of identical size,
+        // which loses the soname relationship and, because CMake's
+        // install-time RPATH rewrite skips a path it believes is a link,
+        // shipped the alias with its build-tree RPATH intact. brotli failed
+        // nixpkgs' forbidden-reference audit that way.
+        //
+        // The LINK TEXT is what is stored, not a resolved path. Each output
+        // is its own store object, so a target naming a sibling resolves
+        // against the build directory and nowhere else - which is where
+        // `create_symlinks` recreates it. Same reasoning as the
+        // NIX_NINJA_ALIASES mechanism, which carries text for the same
+        // reason and cannot cover this case: it is fed by the configure-time
+        // build-directory scan, and these links are made by an edge.
+        //
+        // Only a target confined to the link's own directory. Anything with
+        // a separator could climb out of the build tree, where nothing
+        // recreates it.
+        if let Some(target) = alias_link_target(&output.build_path) {
+            if target_path.exists() || target_path.is_symlink() {
+                fs::remove_file(&target_path).ok();
+            }
+            std::os::unix::fs::symlink(&target, &target_path).map_err(|e| {
+                anyhow::anyhow!(
+                    "symlink({} -> {}) for alias output: {e}",
+                    target_path.display(),
+                    target.display()
+                )
+            })?;
+            continue;
+        }
         if output.build_path.is_dir() {
             copy_tree(&output.build_path, &target_path)?;
             continue;

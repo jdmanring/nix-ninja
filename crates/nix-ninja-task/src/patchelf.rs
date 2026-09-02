@@ -14,6 +14,14 @@ pub fn fix_rpaths(store_dir: &Path, outputs: &[DerivedFile]) -> Result<()> {
     // many of the task's outputs were dynamic ELF at all.
     let mut fixed = 0usize;
     for output in outputs {
+        // AN ALIAS RESOLVES TO A SIBLING OUTPUT, which is patched under its
+        // own name. Following the link here would rewrite the same library
+        // once per name it has, and `copy_outputs_to_placeholders` stores
+        // the link rather than its target, so there is nothing at this path
+        // for an RPATH to belong to.
+        if fs::symlink_metadata(&output.build_path).is_ok_and(|md| md.file_type().is_symlink()) {
+            continue;
+        }
         let canonical_path = fs::canonicalize(&output.build_path)
             .map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", output.build_path.display()))?;
         if is_elf_dynamic(&canonical_path)? {

@@ -7,7 +7,7 @@ use harmonia_store_path::StorePath;
 use std::fmt;
 use std::fs;
 use std::os::unix::fs::symlink;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Represents a file input or output for nix-ninja-task builds.
 ///
@@ -98,6 +98,47 @@ impl fmt::Display for DerivedFile {
             write!(f, "{:?}", base_path)
         }
     }
+}
+
+/// The link text of an OUTPUT that is an alias rather than a product, or
+/// `None` for anything that should be stored as content.
+///
+/// A link edge declares `libfoo.so.1.2.3`, `libfoo.so.1` and `libfoo.so` as
+/// three outputs, and its command - `cmake -E cmake_symlink_library`, or
+/// meson's equivalent - writes one library and two links to it. Storing those
+/// by copying THROUGH the link gives three real files of identical size: the
+/// soname relationship is lost, each copy is frozen at the bytes it held, and
+/// CMake's install-time RPATH rewrite skips a path it believes is a link, so
+/// the alias ships with its build-tree RPATH intact. brotli failed nixpkgs'
+/// forbidden-reference audit exactly that way.
+///
+/// ONLY A TARGET CONFINED TO THE LINK'S OWN DIRECTORY. Each output is its own
+/// store object, so the text can only be recreated where the sibling exists,
+/// which is the build directory. A target carrying a separator could name
+/// something outside the build tree that nothing recreates, and is stored as
+/// content as before.
+pub fn alias_link_target(build_path: &Path) -> Option<PathBuf> {
+    if !fs::symlink_metadata(build_path).is_ok_and(|md| md.file_type().is_symlink()) {
+        return None;
+    }
+    let target = fs::read_link(build_path).ok()?;
+    // `parent()` of a bare name is `Some("")`; of `a/b` or `../b` it is not.
+    (target.parent() == Some(Path::new(""))).then_some(target)
+}
+
+/// What a placement should point AT: the store object's own link text when
+/// that object is itself a symlink, and otherwise the store path.
+///
+/// The alias stored by `alias_link_target` names a sibling, and the sibling
+/// exists in the build directory rather than beside the store object.
+/// Pointing at the store object would give a link to a link to nothing.
+pub fn placement_link_text(source_path: &Path) -> PathBuf {
+    if fs::symlink_metadata(source_path).is_ok_and(|md| md.file_type().is_symlink()) {
+        if let Ok(text) = fs::read_link(source_path) {
+            return text;
+        }
+    }
+    source_path.to_path_buf()
 }
 
 /// Creates symlinks for derived files under the specified prefix.
@@ -266,10 +307,19 @@ pub fn create_symlinks(
             continue;
         }
 
-        symlink(&source_path, &dest_path).map_err(|e| {
+        // A STORE OBJECT THAT IS ITSELF A SYMLINK CARRIES A NAME, NOT A
+        // PLACE. `copy_outputs_to_placeholders` stores an alias output as a
+        // link whose target is a bare sibling filename, because each output
+        // is its own store object and a resolved path would point at a
+        // directory the sibling is not in. Recreating the TEXT here is what
+        // makes it resolve: in the build directory the sibling is the
+        // library it names. Pointing at the store object instead would give
+        // a link to a link to nothing.
+        let link_to = placement_link_text(&source_path);
+        symlink(&link_to, &dest_path).map_err(|e| {
             anyhow!(
                 "Failed to create symlink from {:?} to {}: {}",
-                source_path,
+                link_to,
                 dest_path.display(),
                 e
             )
