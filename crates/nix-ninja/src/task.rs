@@ -7133,12 +7133,20 @@ mod depfile_read_back_tests {
         std::fs::write(&src, "int x;\n").unwrap();
         let dep = d.join("a.o.d");
         std::fs::write(&dep, "a.o: a.c \\\n hdr/one.h\n").unwrap();
+        // THE HEADER HAS TO EXIST for the answer to be usable, and the
+        // fixture did not create it. A depfile records what the compiler
+        // OPENED, so every path in a real one was present when it was
+        // written; a fixture naming a file that never existed describes a
+        // depfile no compiler produces.
+        std::fs::create_dir_all(d.join("hdr")).unwrap();
+        std::fs::write(d.join("hdr/one.h"), "#pragma once\n").unwrap();
         // Fresh depfile (written after the source): its answer is used.
         let got = depfile_read_back(
             &d,
             Path::new("/nonexistent-store"),
             Some(PathBuf::from("a.o.d").as_path()),
             &[PathBuf::from("a.c")],
+            None,
         )
         .unwrap();
         assert_eq!(got, vec![PathBuf::from("a.c"), PathBuf::from("hdr/one.h")]);
@@ -7152,7 +7160,8 @@ mod depfile_read_back_tests {
             &d,
             Path::new("/nonexistent-store"),
             Some(PathBuf::from("a.o.d").as_path()),
-            &[PathBuf::from("a.c")]
+            &[PathBuf::from("a.c")],
+            None
         )
         .is_none());
         // A HEADER newer than the depfile is stale too, and checking only
@@ -7186,7 +7195,8 @@ mod depfile_read_back_tests {
                 &d,
                 Path::new("/nonexistent-store"),
                 Some(PathBuf::from("a.o.d").as_path()),
-                &[PathBuf::from("a.c")]
+                &[PathBuf::from("a.c")],
+                None
             )
             .is_some(),
             "with everything older than the depfile the read-back must fire"
@@ -7198,7 +7208,8 @@ mod depfile_read_back_tests {
                 &d,
                 Path::new("/nonexistent-store"),
                 Some(PathBuf::from("a.o.d").as_path()),
-                &[PathBuf::from("a.c")]
+                &[PathBuf::from("a.c")],
+                None
             )
             .is_none(),
             "a header newer than the depfile must fall back to the scan"
@@ -7222,7 +7233,8 @@ mod depfile_read_back_tests {
                 &d,
                 &fake_store,
                 Some(PathBuf::from("linked.o.d").as_path()),
-                &[]
+                &[],
+                None
             )
             .is_none(),
             "a depfile resolving into the store must be refused, not compared"
@@ -7235,7 +7247,8 @@ mod depfile_read_back_tests {
                 &d,
                 Path::new("/nonexistent-store"),
                 Some(PathBuf::from("linked.o.d").as_path()),
-                &[]
+                &[],
+                None
             )
             .is_some(),
             "outside the store the same depfile must be read"
@@ -7247,11 +7260,12 @@ mod depfile_read_back_tests {
             &d,
             Path::new("/nonexistent-store"),
             Some(PathBuf::from("a.o.d").as_path()),
-            &[]
+            &[],
+            None
         )
         .is_none());
         // No depfile declared: the scan is the only source.
-        assert!(depfile_read_back(&d, Path::new("/nonexistent-store"), None, &[]).is_none());
+        assert!(depfile_read_back(&d, Path::new("/nonexistent-store"), None, &[], None).is_none());
     }
 }
 
@@ -7462,6 +7476,87 @@ mod normalize_output_tests {
 /// - discovered_deps: DerivedFiles that need to be encoded and added to NIX_NINJA_INPUTS
 /// - discovered_store_paths: Store paths that only need to be added as input sources
 ///
+#[cfg(test)]
+mod depfile_applies_here_tests {
+    use super::depfile_read_back;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    fn fixture(tag: &str, dep_body: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nnapp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a.c"), "int x;\n").unwrap();
+        std::fs::write(d.join("a.o.d"), dep_body).unwrap();
+        d
+    }
+
+    /// A DEPFILE FROM ANOTHER FILESYSTEM IS NOT AN ANSWER. The task that
+    /// wrote it had a generated header materialized in its sandbox; a later
+    /// invocation reads it back against the outer build directory, which
+    /// never received one. A path that is neither on disk nor declared is a
+    /// file this build cannot supply, so the record does not apply and the
+    /// scan runs instead.
+    #[test]
+    fn a_path_this_build_cannot_supply_refuses_the_read_back() {
+        let d = fixture("absent", "a.o: a.c \\\n gen/version.h\n");
+        assert!(depfile_read_back(
+            &d,
+            Path::new("/nonexistent-store"),
+            Some(Path::new("a.o.d")),
+            &[PathBuf::from("a.c")],
+            None,
+        )
+        .is_none());
+    }
+
+    /// THE SAME PATH, DECLARED, IS FINE. A generated header that IS an input
+    /// of this task is supplied by its producing edge, and the upload filter
+    /// skips it - refusing here would throw away the read-back for the case
+    /// it handles correctly.
+    #[test]
+    fn a_declared_generated_header_keeps_the_read_back() {
+        let d = fixture("declared", "a.o: a.c \\\n gen/version.h\n");
+        let declared: HashMap<PathBuf, PathBuf> = HashMap::from([(
+            PathBuf::from("gen/version.h"),
+            PathBuf::from("gen/version.h"),
+        )]);
+        let got = depfile_read_back(
+            &d,
+            Path::new("/nonexistent-store"),
+            Some(Path::new("a.o.d")),
+            &[PathBuf::from("a.c")],
+            Some(&declared),
+        );
+        assert_eq!(
+            got,
+            Some(vec![PathBuf::from("a.c"), PathBuf::from("gen/version.h")])
+        );
+    }
+
+    /// A STORE PATH NEEDS NEITHER, because inputSrcs carries it into the
+    /// sandbox whether or not it is on this disk.
+    #[test]
+    fn a_store_path_is_not_refused() {
+        let store = std::env::temp_dir().join(format!("nnstore-{}", std::process::id()));
+        let d = fixture(
+            "store",
+            &format!(
+                "a.o: a.c \\\n {}/aaa-glibc/include/stdio.h\n",
+                store.display()
+            ),
+        );
+        assert!(depfile_read_back(
+            &d,
+            &store,
+            Some(Path::new("a.o.d")),
+            &[PathBuf::from("a.c")],
+            None,
+        )
+        .is_some());
+    }
+}
+
 /// The freshness-guarded depfile parse behind upstream #17. Returns None -
 /// meaning "run the scan" - unless the depfile exists and is at least as
 /// new as every source file offered, and parses cleanly.
@@ -7470,6 +7565,7 @@ fn depfile_read_back(
     store_dir: &Path,
     depfile: Option<&Path>,
     sources: &[PathBuf],
+    virtual_declared: Option<&HashMap<PathBuf, PathBuf>>,
 ) -> Option<Vec<PathBuf>> {
     let d = depfile?;
     let d = if d.is_absolute() {
@@ -7546,6 +7642,30 @@ fn depfile_read_back(
             build_dir.join(hdr)
         };
         let Ok(m) = std::fs::metadata(&p).and_then(|md| md.modified()) else {
+            // A DEPFILE IS A RECORD OF THE WRITER'S FILESYSTEM, AND THIS IS
+            // WHERE IT STOPS BEING ONE. The task that wrote it ran in a
+            // sandbox holding every input it had been given, including
+            // generated headers materialized there. A later invocation reads
+            // it back against the OUTER build directory, which never received
+            // those - a graph output is produced into a task sandbox, and
+            // only what is linked back exists here.
+            //
+            // A path that cannot be stat'd is fine when the graph still
+            // accounts for it: a declared input is supplied by its producing
+            // edge, and the upload filter skips it. One that is neither on
+            // disk NOR declared is a path this build cannot supply at all, so
+            // the record does not describe this filesystem and using it
+            // declares a file that will fail to upload. Fall back to the
+            // scan, which resolves a generated header through the virtual
+            // map instead of through the disk.
+            //
+            // Same polarity as the freshness guard above: toward the scan,
+            // which is the behavior in force before the read half existed.
+            if !hdr.starts_with(store_dir)
+                && !c_include_parser::is_declared_virtual(hdr, virtual_declared)
+            {
+                return None;
+            }
             continue;
         };
         if m > dep_m {
@@ -7913,116 +8033,121 @@ pub fn discover_c_includes(
     // scan branch would fix run one and break run two, which is a shape this
     // project has shipped before.
     let dotdot_dirs = c_include_parser::seed_dotdot_dirs(cmdline, &files, virtual_paths.as_ref());
-    let c_includes =
-        match depfile_read_back(build_dir, AsRef::<Path>::as_ref(store_dir), depfile, &files) {
-            Some(deps) => {
-                // NAMING THE FILE, because "a read-back happened" leaves the
-                // next question unanswerable: nothing in this driver writes a
-                // depfile into the build directory before the end of a run,
-                // so one that is readable during resolution came from outside
-                // it and the path is the only clue to what.
-                answer_source = format!(
-                    "a depfile read-back of {}",
-                    depfile.map(|d| d.display().to_string()).unwrap_or_default()
+    let c_includes = match depfile_read_back(
+        build_dir,
+        AsRef::<Path>::as_ref(store_dir),
+        depfile,
+        &files,
+        virtual_declared.as_ref(),
+    ) {
+        Some(deps) => {
+            // NAMING THE FILE, because "a read-back happened" leaves the
+            // next question unanswerable: nothing in this driver writes a
+            // depfile into the build directory before the end of a run,
+            // so one that is readable during resolution came from outside
+            // it and the path is the only clue to what.
+            answer_source = format!(
+                "a depfile read-back of {}",
+                depfile.map(|d| d.display().to_string()).unwrap_or_default()
+            );
+            if explain {
+                eprintln!(
+                    "nix-ninja: discovery {seed}: read back {} include(s) from {}",
+                    deps.len(),
+                    depfile.map(|d| d.display().to_string()).unwrap_or_default(),
                 );
-                if explain {
-                    eprintln!(
-                        "nix-ninja: discovery {seed}: read back {} include(s) from {}",
-                        deps.len(),
-                        depfile.map(|d| d.display().to_string()).unwrap_or_default(),
-                    );
-                }
-                deps
             }
-            None => {
-                let c_include_parser::Scan {
-                    includes: scanned,
-                    incomplete,
-                    ..
-                } = c_include_parser::retrieve_c_includes_checked(
-                    cmdline,
-                    files.clone(),
-                    virtual_paths,
-                )?;
-                // THE SCAN NOW SAYS WHEN IT CANNOT ANSWER, AND THIS IS WHAT
-                // ACTS ON IT. A computed include through a function-like macro
-                // needs real expansion against the command line's -D set, which
-                // a textual parser cannot do and which the preprocessor does by
-                // definition. Measured 2026-08-24 on cmake-minimal's bootstrap:
-                // `#include KWSYS_HEADER(Directory.hxx)` with
-                // -DKWSYS_NAMESPACE=cmsys, so every kwsys TU reached its task
-                // with no cmsys/ header declared and died "No such file or
-                // directory" - the scan's silence read as a complete answer.
-                //
-                // It runs for those TUs ALONE. The scan is exact for the
-                // overwhelming majority, and paying a preprocess per object
-                // would hand back the time per-TU derivations exist to save.
-                //
-                // The fallback's polarity is deliberate: if gcc itself fails
-                // here, keep the scan's answer and let the TASK fail loudly.
-                // Substituting an empty or partial set on a failed preprocess
-                // would turn a build error into a wrong artifact, which is the
-                // one outcome worse than the bug being fixed.
-                if incomplete {
-                    match deps_infer::gcc_depfile::retrieve_c_includes(cmdline) {
-                        Ok(deps) => {
-                            // THE PREPROCESSOR ADDS TO THE SCAN, IT DOES NOT REPLACE IT.
-                            // `-MM` (include_system_headers: false) omits every header gcc
-                            // considers a SYSTEM header, and that is a property of the
-                            // FILE rather than of where it lives: gnulib writes
-                            // `#pragma GCC system_header` into the replacement headers it
-                            // GENERATES INTO THE BUILD DIRECTORY. So the depfile answer
-                            // silently drops build-dir files that must be materialized.
-                            // Measured 2026-08-24 on gnum4-1.4.21: `gcc -MM -I. quotearg.c`
-                            // declares 15 headers with lib/wchar.h and lib/limits.h absent,
-                            // `gcc -M` lists both, and the textual scan finds both. The
-                            // task then compiled against the SYSTEM wchar.h and died
-                            // `implicit declaration of function 'mbszero'` - a wrong-header
-                            // failure wearing a missing-prototype message, because an angle
-                            // include that was never materialized SUCCEEDS at finding the
-                            // wrong file.
-                            //
-                            // Neither answer is a superset of the other: the scan is blind
-                            // to computed includes (cmake's kwsys), the depfile is blind to
-                            // pragma-marked build-dir headers (every autotools package
-                            // carrying gnulib). Union them, scan order first. Over-declaring
-                            // is the pipeline's safe polarity - an extra input costs one
-                            // upload - while under-declaring is silent and ships the wrong
-                            // artifact.
-                            answer_source = "the scan and the preprocessor".to_string();
-                            let merged = merge_scan_and_preprocessor(scanned, deps);
-                            eprintln!(
-                                "nix-ninja: computed include unresolvable by scan; \
+            deps
+        }
+        None => {
+            let c_include_parser::Scan {
+                includes: scanned,
+                incomplete,
+                ..
+            } = c_include_parser::retrieve_c_includes_checked(
+                cmdline,
+                files.clone(),
+                virtual_paths,
+            )?;
+            // THE SCAN NOW SAYS WHEN IT CANNOT ANSWER, AND THIS IS WHAT
+            // ACTS ON IT. A computed include through a function-like macro
+            // needs real expansion against the command line's -D set, which
+            // a textual parser cannot do and which the preprocessor does by
+            // definition. Measured 2026-08-24 on cmake-minimal's bootstrap:
+            // `#include KWSYS_HEADER(Directory.hxx)` with
+            // -DKWSYS_NAMESPACE=cmsys, so every kwsys TU reached its task
+            // with no cmsys/ header declared and died "No such file or
+            // directory" - the scan's silence read as a complete answer.
+            //
+            // It runs for those TUs ALONE. The scan is exact for the
+            // overwhelming majority, and paying a preprocess per object
+            // would hand back the time per-TU derivations exist to save.
+            //
+            // The fallback's polarity is deliberate: if gcc itself fails
+            // here, keep the scan's answer and let the TASK fail loudly.
+            // Substituting an empty or partial set on a failed preprocess
+            // would turn a build error into a wrong artifact, which is the
+            // one outcome worse than the bug being fixed.
+            if incomplete {
+                match deps_infer::gcc_depfile::retrieve_c_includes(cmdline) {
+                    Ok(deps) => {
+                        // THE PREPROCESSOR ADDS TO THE SCAN, IT DOES NOT REPLACE IT.
+                        // `-MM` (include_system_headers: false) omits every header gcc
+                        // considers a SYSTEM header, and that is a property of the
+                        // FILE rather than of where it lives: gnulib writes
+                        // `#pragma GCC system_header` into the replacement headers it
+                        // GENERATES INTO THE BUILD DIRECTORY. So the depfile answer
+                        // silently drops build-dir files that must be materialized.
+                        // Measured 2026-08-24 on gnum4-1.4.21: `gcc -MM -I. quotearg.c`
+                        // declares 15 headers with lib/wchar.h and lib/limits.h absent,
+                        // `gcc -M` lists both, and the textual scan finds both. The
+                        // task then compiled against the SYSTEM wchar.h and died
+                        // `implicit declaration of function 'mbszero'` - a wrong-header
+                        // failure wearing a missing-prototype message, because an angle
+                        // include that was never materialized SUCCEEDS at finding the
+                        // wrong file.
+                        //
+                        // Neither answer is a superset of the other: the scan is blind
+                        // to computed includes (cmake's kwsys), the depfile is blind to
+                        // pragma-marked build-dir headers (every autotools package
+                        // carrying gnulib). Union them, scan order first. Over-declaring
+                        // is the pipeline's safe polarity - an extra input costs one
+                        // upload - while under-declaring is silent and ships the wrong
+                        // artifact.
+                        answer_source = "the scan and the preprocessor".to_string();
+                        let merged = merge_scan_and_preprocessor(scanned, deps);
+                        eprintln!(
+                            "nix-ninja: computed include unresolvable by scan; \
                              scan and preprocessor union to {} input(s)",
-                                merged.len()
-                            );
-                            merged
-                        }
-                        Err(e) => {
-                            answer_source = "the scan, the preprocessor having failed".to_string();
-                            eprintln!(
-                                "nix-ninja: computed include unresolvable by scan and the \
+                            merged.len()
+                        );
+                        merged
+                    }
+                    Err(e) => {
+                        answer_source = "the scan, the preprocessor having failed".to_string();
+                        eprintln!(
+                            "nix-ninja: computed include unresolvable by scan and the \
                              preprocessor fallback failed ({e}); keeping the scan's {} \
                              input(s), so the task fails loudly rather than silently \
                              building with the wrong ones",
-                                scanned.len()
-                            );
-                            scanned
-                        }
-                    }
-                } else {
-                    answer_source = "the scan".to_string();
-                    if explain {
-                        eprintln!(
-                            "nix-ninja: discovery {seed}: scanned {} include(s) from {} seed(s)",
-                            scanned.len(),
-                            files.len(),
+                            scanned.len()
                         );
+                        scanned
                     }
-                    scanned
                 }
+            } else {
+                answer_source = "the scan".to_string();
+                if explain {
+                    eprintln!(
+                        "nix-ninja: discovery {seed}: scanned {} include(s) from {} seed(s)",
+                        scanned.len(),
+                        files.len(),
+                    );
+                }
+                scanned
             }
-        };
+        }
+    };
     let c_include_count = c_includes.len();
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
