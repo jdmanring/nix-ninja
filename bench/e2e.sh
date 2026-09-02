@@ -11,6 +11,23 @@
 # driver's own phase breakdown, and the store paths, so a later run can be
 # diffed against it.
 #
+# WHY THE SCRAPED FIELDS CARRY NO BOUND, and it is a measurement rather than
+# an oversight. A log written by SEVERAL drivers on one fd splices lines: a
+# distribution round produced `WATCHDOG peak in-flight 5121`, which is
+# `... limit=512` welded to a true value of `1`, and an `rss_mib` sweep over
+# the same corpus returned 178830173011 MiB, a timestamp glued to a digit. A
+# splice is always LARGER than the truth, so it reads as a capacity finding
+# and never as noise.
+# This script cannot produce one: it drives ONE example through ONE driver, so
+# there is a single writer. The JSON path also fails closed, because a torn
+# blob fails `json.loads` and records None. Only the `rss (\d+) MiB` fallback
+# on the human line is structurally exposed, and it needs a second writer.
+# Measured over the records on disk: 28 scraped integer fields, none outside
+# what the reading can physically be. Add bounds here if this ever runs
+# concurrent drivers into one log, and prefer the DISTRIBUTION to the maximum
+# when reading a round - the true value is the mode and the maximum is the
+# artifact.
+#
 # Usage:  bench/e2e.sh example-hello [outfile.json]
 #
 # It does NOT clean the store first, so a record is only comparable with
