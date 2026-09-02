@@ -957,6 +957,29 @@ impl BuilderRpcClient {
                 .unwrap_or(0)
         }
         use std::sync::atomic::Ordering::Relaxed;
+        // WHAT THE WAIT IS FOR. A stall message naming only a duration and a
+        // count says the same thing every time it fires, so eleven timeouts
+        // across four packages in one round were indistinguishable from each
+        // other and from a hang with no subject. Named by the first path
+        // because a request carries one derivation's outputs in the common
+        // case; the count covers the rest without printing a store path per
+        // output at 16,000 tasks.
+        let waited_on = {
+            let first = paths
+                .first()
+                .map(|p| match p {
+                    SingleDerivedPath::Opaque(sp) => store_dir.display(sp).to_string(),
+                    SingleDerivedPath::Built { drv_path, output } => {
+                        format!("{}^{output}", store_dir.display(drv_path.as_ref()))
+                    }
+                })
+                .unwrap_or_else(|| "<nothing>".to_string());
+            if paths.len() > 1 {
+                format!("{first} (+{} more)", paths.len() - 1)
+            } else {
+                first
+            }
+        };
         let results = self.runtime.block_on(async {
             // Two counters, deliberately not one: with a shared budget,
             // COUNTS THIS CALL, NOT THIS RUN, and the message now says so.
@@ -1119,11 +1142,11 @@ impl BuilderRpcClient {
                             });
                         }
                         eprintln!(
-                            "nix-ninja: [{}] WATCHDOG timeout: no daemon reply in \
-                             {allowance_s}s, waited since [{started_wall}] ({others} \
-                             others in flight); dropped the wedged connection (frees \
-                             the stuck daemon child's locks) and retrying \
-                             (stalls this call {stall_attempts})",
+                            "nix-ninja: [{}] WATCHDOG timeout on {waited_on}: no \
+                             daemon reply in {allowance_s}s, waited since \
+                             [{started_wall}] ({others} others in flight); dropped \
+                             the wedged connection (frees the stuck daemon child's \
+                             locks) and retrying (stalls this call {stall_attempts})",
                             now_s(),
                         );
                     }
