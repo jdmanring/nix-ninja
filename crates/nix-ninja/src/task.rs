@@ -495,12 +495,7 @@ impl Runner {
             // an empty map enables nothing. Measured 2026-08-23 on alsa-lib:
             // same compiler, .text 637 kB through the drop-in against 702 kB
             // stock, and every earlier drop-in build carried the same gap.
-            if key.starts_with("NIX_CFLAGS_COMPILE")
-                || key.starts_with("NIX_LDFLAGS")
-                || key.starts_with("NIX_CC_WRAPPER")
-                || key.starts_with("NIX_BINTOOLS_WRAPPER")
-                || key.starts_with("NIX_HARDENING_ENABLE")
-            {
+            if forwarded_to_tasks(&key) {
                 wrapper_vars.insert(key, value);
             }
         }
@@ -2182,6 +2177,80 @@ impl Runner {
 pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> {
     crate::resolve_cache::flush()?;
     crate::resolve_cache::save_nar_stamps(&rpc_client.nar_stamps_snapshot())
+}
+
+/// Environment variables the outer build holds that a task cannot work
+/// without.
+///
+/// An allowlist, and the polarity is the one this tree has already paid for
+/// twice: it is safe where it gates something the build merely CARRIES and
+/// unsafe where it gates something required for CORRECTNESS. Every entry here
+/// is the second kind, so a missing name is a build failure rather than a
+/// slower build, and the failure names the tool rather than the variable.
+///
+/// Forwarding the whole environment is the obvious alternative and is wrong
+/// for a reason the NIX_LDFLAGS handling below spells out: the outer
+/// derivation's own `$out` rides in these values, moves with every edit to
+/// the outer derivation, and re-keys every task in the package.
+///
+/// XML_CATALOG_FILES redirects a DocBook URL to a local store path. Without
+/// it xsltproc does not fail; it falls through to fetching
+/// `docbook.sourceforge.net` over the network, which the sandbox refuses, so
+/// the diagnosis is a network error in a build that never meant to use the
+/// network (p11-kit, round 14). The value is store paths, so the existing
+/// wrapper-path extraction declares the catalogs as inputs and materializes
+/// them with no further work.
+///
+/// DEFER(a third non-NIX_ entry): at three, read the values instead of the
+/// names and forward what is entirely store paths.
+fn forwarded_to_tasks(key: &str) -> bool {
+    key.starts_with("NIX_CFLAGS_COMPILE")
+        || key.starts_with("NIX_LDFLAGS")
+        || key.starts_with("NIX_CC_WRAPPER")
+        || key.starts_with("NIX_BINTOOLS_WRAPPER")
+        || key.starts_with("NIX_HARDENING_ENABLE")
+        || key == "XML_CATALOG_FILES"
+}
+
+#[cfg(test)]
+mod forwarded_to_tasks_tests {
+    use super::forwarded_to_tasks;
+
+    #[test]
+    fn the_wrapper_variables_are_forwarded() {
+        for k in [
+            "NIX_CFLAGS_COMPILE",
+            "NIX_CFLAGS_COMPILE_FOR_TARGET",
+            "NIX_LDFLAGS",
+            "NIX_CC_WRAPPER_TARGET_HOST_x86_64_unknown_linux_gnu",
+            "NIX_BINTOOLS_WRAPPER_TARGET_HOST_x86_64_unknown_linux_gnu",
+            "NIX_HARDENING_ENABLE",
+        ] {
+            assert!(forwarded_to_tasks(k), "{k}");
+        }
+    }
+
+    /// p11-kit's: absent, xsltproc reaches for the network instead of failing.
+    #[test]
+    fn the_xml_catalog_is_forwarded() {
+        assert!(forwarded_to_tasks("XML_CATALOG_FILES"));
+    }
+
+    /// THE HALF THAT KEEPS THE KEY STILL. `out` and the outer derivation's
+    /// other variables move with every edit to it, and forwarding one re-keys
+    /// every task in the package on a source change anywhere.
+    #[test]
+    fn the_outer_derivations_own_variables_are_not() {
+        for k in [
+            "out",
+            "PATH",
+            "TMPDIR",
+            "NIX_BUILD_TOP",
+            "XML_CATALOG_FILES_EXTRA",
+        ] {
+            assert!(!forwarded_to_tasks(k), "{k}");
+        }
+    }
 }
 
 /// Whether this edge's real inputs have to be discovered rather than taken
