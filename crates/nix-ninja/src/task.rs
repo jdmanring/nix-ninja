@@ -73,12 +73,24 @@ pub struct Tools {
 /// paid for with the object-suffix allowlist, where an unrecognised suffix
 /// meant no dependency discovery and a task that could not compile.
 ///
-/// DEFER(a sixth member, or a build that pays for the closure): the set is
-/// the POSIX text filters a generated script reaches for, and it is a
-/// judgement rather than an enumeration, because the population is not
-/// bounded by any measurement taken so far. Each is a small store path and
-/// each is already in almost every build's closure. Resolution is optional,
-/// so a build without one loses nothing it was not already missing.
+/// TWO OF THESE ARE MEASURED AND THREE ARE JUDGEMENT. `sed` is p11-kit's,
+/// `xxd` is libvmaf's; `awk`, `grep` and `m4` are what a generated script
+/// reaches for next, and nothing has bounded that. Each is a small store
+/// path already in almost every build's closure.
+///
+/// HOW MANY OF THESE ACTUALLY RESOLVE IS A PROPERTY OF THE STDENV, NOT OF
+/// THIS LIST, so the length of the array is not a claim about the sandbox.
+/// Under this flake's own devShell, three resolve into the store (`sed` ->
+/// gnused, `awk` -> gawk, `grep` -> gnugrep) and `m4` and `xxd` fall through
+/// to the host, where `which_store_path` rejects them and they contribute
+/// neither a PATH entry nor an input. That is the mechanism working: a build
+/// gets what its own stdenv supplies.
+///
+/// DEFER(a round failure naming a tool absent from this list): the trigger
+/// is a failing task whose command execs something not here, because no
+/// measurement enumerates this population and only a build can report a
+/// member. A trigger phrased as "when someone notices the closure cost"
+/// would never fire.
 const SCRIPT_TOOLS: [&str; 5] = ["sed", "awk", "grep", "m4", "xxd"];
 
 impl Tools {
@@ -1405,6 +1417,10 @@ impl Runner {
 
         if let Some(cmdline) = &cmdline {
             let args = shell_words::split(cmdline)?;
+            // Read before the loop consumes `args`: see the `cmake -P` pass
+            // at the end of it.
+            let cmake_p_script = cmake_script_arg(&args).map(str::to_string);
+            let cmake_p_defs = cmake_definitions(&args);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -1838,6 +1854,44 @@ impl Runner {
                     },
                 };
                 input_set.insert(input.build_path.clone(), input);
+            }
+
+            // A `cmake -P` SCRIPT COMPOSES INPUT PATHS THE ARGUMENTS DO NOT
+            // NAME. The sweep above walks every token of the whole cmdline,
+            // `VAR=relpath` values included, and still cannot reach a path
+            // the script builds from two definitions plus a literal segment
+            // of its own - see cmake_script_referenced_paths for onetbb's,
+            // which is unreachable by any pairing of argument values.
+            //
+            // Read only, and only what exists: an unresolvable reference is
+            // dropped, and a composed path that is not a file on disk is
+            // ignored, so the worst case is an input nobody needed.
+            if let Some(script) = &cmake_p_script {
+                if let Ok(text) = std::fs::read_to_string(script) {
+                    for cand in cmake_script_referenced_paths(&text, &cmake_p_defs) {
+                        let rel = if cand.starts_with('/') {
+                            let p = Path::new(&cand);
+                            if p.starts_with(&self.config.store_dir)
+                                || !same_project_tree(&self.config.build_dir, p)
+                            {
+                                continue;
+                            }
+                            relative_from(p, &self.config.build_dir)
+                        } else {
+                            Some(rebase_post_cd(&cd_dir, &cand))
+                        };
+                        let Some(rel) = rel else { continue };
+                        if !self.config.build_dir.join(&rel).is_file() {
+                            continue;
+                        }
+                        for input in
+                            upload_referenced_file(&self.rpc_client, &self.config.build_dir, rel)?
+                        {
+                            self.add_derived_file(files, input.clone());
+                            input_set.insert(input.build_path.clone(), input);
+                        }
+                    }
+                }
             }
         }
 
@@ -4952,6 +5006,156 @@ fn lexical_join(base: &Path, rel: &Path) -> PathBuf {
     stack.iter().map(|c| c.as_os_str()).collect()
 }
 
+/// The `-D<NAME>=<VALUE>` definitions on a command line.
+///
+/// Both spellings, because CMake accepts the value joined to the flag and
+/// separated from it, and a build system writes whichever it likes.
+fn cmake_definitions(args: &[String]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut i = 0;
+    while i < args.len() {
+        let body = if args[i] == "-D" {
+            i += 1;
+            args.get(i).map(String::as_str)
+        } else {
+            args[i].strip_prefix("-D")
+        };
+        if let Some((name, value)) = body.and_then(|b| b.split_once('=')) {
+            // `-DNAME:TYPE=VALUE` is legal and the type is not part of the
+            // name; a script referring to ${NAME} would otherwise never match.
+            let name = name.split_once(':').map_or(name, |(n, _)| n);
+            out.insert(name.to_string(), value.to_string());
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The script named by `-P`, which is the one CMake will EXECUTE.
+fn cmake_script_arg(args: &[String]) -> Option<&str> {
+    args.iter()
+        .position(|a| a == "-P")
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+/// Paths a `cmake -P` script COMPOSES from its own `-D` definitions.
+///
+/// THE FILE IS NAMED BY NO ARGUMENT, WHICH IS WHY THE ARGUMENT SWEEP CANNOT
+/// FIND IT. onetbb's edge creates library symlinks and chains a script after
+/// `&&`; the script reads a template it builds out of two definitions and a
+/// literal segment of its own:
+///
+/// ```text
+///     -DSOURCE_DIR=/build/source -DVARS_TEMPLATE=linux/env/vars.sh.in
+///     set(INPUT_FILE "${SOURCE_DIR}/integration/${VARS_TEMPLATE}")
+/// ```
+///
+/// So no token names `integration/linux/env/vars.sh.in`, and JOINING THE TWO
+/// DEFINITIONS DOES NOT PRODUCE IT EITHER - the `integration/` segment exists
+/// only inside the script. `configure_file` then fails on a path that is
+/// present in the real tree and was staged by nothing. An argument-level
+/// heuristic that appeared to work here would be fitting the package.
+///
+/// DELIBERATELY NOT A CMAKE INTERPRETER. It reads `set(NAME VALUE)` and
+/// substitutes `${NAME}` from the definitions and from names set earlier in
+/// the same file. Anything it cannot resolve is dropped rather than guessed
+/// at, and the caller uploads only what exists on disk - so a wrong answer
+/// costs an input that is not needed, never a wrong file. A script whose
+/// paths come from a `foreach` or a function is beyond this and stays beyond
+/// it until a package needs it.
+fn cmake_script_referenced_paths(
+    script_text: &str,
+    definitions: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut vars = definitions.clone();
+    let mut out = Vec::new();
+    for (name, raw) in cmake_set_calls(script_text) {
+        let Some(value) = expand_cmake_vars(&raw, &vars) else {
+            continue;
+        };
+        // Only a value that looks like a path is a candidate; a version
+        // string or a flag list is not something to stat.
+        if value.contains('/') && !out.contains(&value) {
+            out.push(value.clone());
+        }
+        vars.insert(name, value);
+    }
+    out
+}
+
+/// `set(NAME VALUE)` calls, in file order, as (name, unexpanded value).
+///
+/// Quotes are stripped from the value because `set(A "${B}/c")` and
+/// `set(A ${B}/c)` mean the same thing. A call with more than two arguments
+/// (list assignment, `CACHE`, `PARENT_SCOPE`) yields its FIRST value only,
+/// which is what a composed path looks like.
+fn cmake_set_calls(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = find_set_call(rest) {
+        rest = &rest[pos..];
+        let Some(open) = rest.find('(') else { break };
+        let Some(close) = rest[open..].find(')') else {
+            break;
+        };
+        let body = &rest[open + 1..open + close];
+        rest = &rest[open + close..];
+        let mut toks = body.split_whitespace();
+        let (Some(name), Some(value)) = (toks.next(), toks.next()) else {
+            continue;
+        };
+        out.push((
+            name.to_string(),
+            value.trim_matches('"').trim_matches('\'').to_string(),
+        ));
+    }
+    out
+}
+
+/// Offset of the next `set` that begins a CALL rather than sitting inside a
+/// longer identifier - `unset(`, `file(SET`, a comment mentioning it.
+fn find_set_call(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find("set") {
+        let at = from + rel;
+        let before_ok = at == 0 || !is_cmake_ident_byte(bytes[at - 1]);
+        let after = text[at + 3..].trim_start();
+        if before_ok && after.starts_with('(') && !line_is_comment(text, at) {
+            return Some(at);
+        }
+        from = at + 3;
+    }
+    None
+}
+
+fn is_cmake_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+fn line_is_comment(text: &str, at: usize) -> bool {
+    let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    text[line_start..at].trim_start().starts_with('#')
+}
+
+/// Substitute `${NAME}` from `vars`. `None` when any reference is unknown:
+/// a half-expanded path names nothing, and stating that is better than
+/// stat-ing a string with a `${` still in it.
+fn expand_cmake_vars(raw: &str, vars: &HashMap<String, String>) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let end = rest[start..].find('}')? + start;
+        let name = &rest[start + 2..end];
+        out.push_str(vars.get(name)?);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
 /// Upload one referenced source file, plus - for a python script - its
 /// same-directory .py siblings (gcc_link_wrapper.py imports
 /// wrapper_utils.py; python resolves sibling imports from the script's
@@ -5001,6 +5205,116 @@ fn parent_dir_or_here(path: &Path) -> PathBuf {
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
+    }
+}
+
+#[cfg(test)]
+mod cmake_script_reference_tests {
+    use super::{
+        cmake_definitions, cmake_script_arg, cmake_script_referenced_paths, expand_cmake_vars,
+    };
+    use std::collections::HashMap;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    /// ONETBB'S OWN SHAPE, taken from the failing edge and the script it
+    /// runs rather than from a reduction. The composed path is what no
+    /// argument names and no pairing of argument values produces, because
+    /// `integration/` exists only inside the script.
+    #[test]
+    fn the_composed_template_path_is_recovered() {
+        let a = args(
+            "cmake -DBINARY_DIR=/build/source/build/src/tbb -DSOURCE_DIR=/build/source \
+             -DVARS_TEMPLATE=linux/env/vars.sh.in -DVARS_NAME=vars.sh \
+             -P /build/source/integration/cmake/generate_vars.cmake",
+        );
+        assert_eq!(
+            cmake_script_arg(&a),
+            Some("/build/source/integration/cmake/generate_vars.cmake")
+        );
+        let script = r#"
+            # generate_vars.cmake
+            set(INPUT_FILE "${SOURCE_DIR}/integration/${VARS_TEMPLATE}")
+            set(OUTPUT_FILE "${BINARY_DIR}/${VARS_NAME}")
+            configure_file(${INPUT_FILE} ${OUTPUT_FILE} @ONLY)
+        "#;
+        let got = cmake_script_referenced_paths(script, &cmake_definitions(&a));
+        assert!(
+            got.contains(&"/build/source/integration/linux/env/vars.sh.in".to_string()),
+            "the template the sweep cannot reach: {got:?}"
+        );
+        // AND THE PAIRING THAT LOOKS LIKE IT WOULD WORK DOES NOT, which is
+        // why this needs the script at all.
+        assert!(!got.contains(&"/build/source/linux/env/vars.sh.in".to_string()));
+    }
+
+    /// An unresolvable reference is DROPPED, never half-expanded. A path
+    /// with a `${` still in it names nothing and stat-ing it is noise.
+    #[test]
+    fn an_unknown_reference_yields_nothing_rather_than_a_partial_path() {
+        let vars = HashMap::from([("A".to_string(), "/x".to_string())]);
+        assert_eq!(
+            expand_cmake_vars("${A}/lit/${B}", &vars),
+            None,
+            "half of a path is not a path"
+        );
+        assert_eq!(
+            expand_cmake_vars("${A}/lit", &vars),
+            Some("/x/lit".to_string())
+        );
+        // No references at all is still a value.
+        assert_eq!(expand_cmake_vars("plain/x", &vars), Some("plain/x".into()));
+    }
+
+    /// Both `-D` spellings, and the `:TYPE` a cache entry carries - a script
+    /// referring to ${NAME} would never match a key called `NAME:PATH`.
+    #[test]
+    fn definitions_are_read_in_every_spelling_cmake_accepts() {
+        let d = cmake_definitions(&args("cmake -DA=1 -D B=2 -DC:PATH=/p -DD= -P s.cmake"));
+        assert_eq!(d.get("A").map(String::as_str), Some("1"));
+        assert_eq!(d.get("B").map(String::as_str), Some("2"));
+        assert_eq!(d.get("C").map(String::as_str), Some("/p"));
+        assert_eq!(d.get("D").map(String::as_str), Some(""));
+    }
+
+    /// `set` INSIDE ANOTHER WORD IS NOT A CALL. `unset(` and `offset(` both
+    /// end in the same three letters, and a comment naming set() is prose.
+    /// Reading either as an assignment invents a variable and can only
+    /// mislead the expansion that follows.
+    #[test]
+    fn only_real_set_calls_are_read() {
+        let script = r#"
+            # set(NOTE "${A}/from-a-comment")
+            unset(A)
+            set(REAL "${A}/kept")
+        "#;
+        let defs = HashMap::from([("A".to_string(), "/a".to_string())]);
+        assert_eq!(
+            cmake_script_referenced_paths(script, &defs),
+            vec!["/a/kept".to_string()]
+        );
+    }
+
+    /// A value set EARLIER in the file is available to a later one, which is
+    /// how a script builds a path in two steps.
+    #[test]
+    fn a_name_set_by_the_script_feeds_the_next_one() {
+        let script = "set(ROOT \"${SRC}/integration\")\nset(F \"${ROOT}/env/vars.in\")\n";
+        let defs = HashMap::from([("SRC".to_string(), "/b/s".to_string())]);
+        let got = cmake_script_referenced_paths(script, &defs);
+        assert!(
+            got.contains(&"/b/s/integration/env/vars.in".to_string()),
+            "{got:?}"
+        );
+    }
+
+    /// A value that is not path-shaped is not a candidate to stat.
+    #[test]
+    fn a_non_path_value_is_not_offered() {
+        let got = cmake_script_referenced_paths("set(V \"1.2.3\")\n", &HashMap::new());
+        assert!(got.is_empty(), "{got:?}");
     }
 }
 
