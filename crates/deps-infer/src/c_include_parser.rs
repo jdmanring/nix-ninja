@@ -731,6 +731,15 @@ pub fn extract_includes(
 /// Resolution failures are skipped rather than reported: a directory that
 /// cannot be derived leaves the caller exactly where it was, while refusing
 /// here would fail a build over a diagnostic aid.
+///
+/// DEFER(a seed parse shows up in a profile): this runs on every discovering
+/// task even when the depfile read-back made the walk unnecessary, so a
+/// rebuild parses one file per task instead of none. Measured by
+/// `local/second-run.sh`: four parses on the first run against one on the
+/// second, so the walk is still skipped and only the seed is not. The upgrade
+/// is to persist the derived directories beside the collected depfile and
+/// read them back with it, which is the same shape upstream #17 already uses
+/// for the dependency list.
 pub fn seed_dotdot_dirs(
     cmdline: &str,
     files: &[PathBuf],
