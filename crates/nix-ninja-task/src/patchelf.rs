@@ -121,18 +121,40 @@ fn get_raw_rpath(elf_path: &Path) -> Result<String> {
 
 /// The entries of an existing RPATH that survive into the rewritten one.
 ///
-/// Empty entries go, because an empty element means the current directory and
+/// Empty entries go, because an empty element means the CURRENT DIRECTORY and
 /// this function's output is written into a store binary - see parse_rpath.
-/// `$ORIGIN` entries go because the rewrite resolves them to store paths.
+///
+/// `$ORIGIN` ENTRIES STAY, AND DROPPING THEM COST A PACKAGE. The two look
+/// like one rule and are opposites: an empty entry names wherever the process
+/// happens to be, which is a library search nobody controls, while `$ORIGIN`
+/// names the binary's OWN directory, which in a store output is exactly the
+/// store path and is how a shared library is meant to find its siblings.
+/// Removing it is neither safe nor redundant.
+///
+/// It is also the entry CMake keeps as its RECORD. `file(RPATH_CHANGE)`
+/// locates its old RPATH as an entry sequence inside the file and refuses
+/// outright when it is absent, so a library we rewrote could not be installed:
+///
+/// ```text
+/// file RPATH_CHANGE could not write new RPATH: $ORIGIN
+/// The current RUNPATH is: <glibc>/lib <gcc-lib>/lib <task output>/absl/base
+/// which does not contain: $ORIGIN
+/// ```
+///
+/// That is the same shape as the trailing-empty-entry refusal this file
+/// already carries, on a different entry: the failure is always that the
+/// rewrite removed something CMake recorded, and the fix is never to restore
+/// an entry that is unsafe in a store output. An empty one is; `$ORIGIN` is
+/// not.
 ///
 /// Pulled out of compute_new_rpath so the rule is testable: that function
 /// shells out to patchelf against a real ELF, so nothing asserted on its
-/// output, which is where preserving one is a search of the current
-/// directory baked into a store path.
+/// output, which is where preserving an empty entry is a search of the
+/// current directory baked into a store path.
 fn retained_entries(current_rpath: &[String]) -> Vec<String> {
     current_rpath
         .iter()
-        .filter(|p| !p.is_empty() && !p.contains("$ORIGIN"))
+        .filter(|p| !p.is_empty())
         .cloned()
         .collect()
 }
@@ -335,10 +357,32 @@ mod tests {
         assert!(retained_entries(&parse_rpath(":")).is_empty());
     }
 
+    /// THIS TEST ASSERTED THE DEFECT. It read that `$ORIGIN` is dropped
+    /// "because the rewrite resolves them", which is true of the resolution
+    /// and false as a reason to remove the entry: the resolved store
+    /// directory is APPENDED, and the original entry is what CMake keeps as
+    /// its record. abseil-cpp could not install a library we had rewritten,
+    /// because `file(RPATH_CHANGE)` looks for `$ORIGIN` as an entry sequence
+    /// and refuses when it is gone.
+    ///
+    /// The empty entry beside it is the opposite and stays dropped: it names
+    /// wherever the process happens to be, `$ORIGIN` names the binary's own
+    /// directory. One rule cannot cover both.
     #[test]
-    fn origin_entries_are_dropped_because_the_rewrite_resolves_them() {
+    fn origin_survives_because_cmake_records_it_and_it_is_safe_in_a_store_path() {
         let parsed = parse_rpath("$ORIGIN/../lib:/nix/store/a/lib");
-        assert_eq!(retained_entries(&parsed), vec!["/nix/store/a/lib"]);
+        assert_eq!(
+            retained_entries(&parsed),
+            vec!["$ORIGIN/../lib", "/nix/store/a/lib"]
+        );
+        // A bare `$ORIGIN`, which is abseil's own spelling.
+        assert_eq!(retained_entries(&parse_rpath("$ORIGIN")), vec!["$ORIGIN"]);
+        // And the distinction that makes this safe: an empty entry beside an
+        // `$ORIGIN` one keeps going.
+        assert_eq!(
+            retained_entries(&parse_rpath("$ORIGIN::/nix/store/a/lib")),
+            vec!["$ORIGIN", "/nix/store/a/lib"]
+        );
     }
 
     #[test]
