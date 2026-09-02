@@ -7884,7 +7884,7 @@ pub fn discover_c_includes(
     let seed_count = files.len();
     // Every branch below assigns exactly once, so this carries no initial
     // value to go stale.
-    let answer_source;
+    let answer_source: String;
     // A DEPFILE UNDERSTATES A COMPILE THAT USES A PRECOMPILED HEADER, so the
     // read-back must not speak for one. gcc does not open a header already
     // present in the PCH - the include-guard optimization - so the depfile
@@ -7916,7 +7916,15 @@ pub fn discover_c_includes(
     let c_includes =
         match depfile_read_back(build_dir, AsRef::<Path>::as_ref(store_dir), depfile, &files) {
             Some(deps) => {
-                answer_source = "a depfile read-back";
+                // NAMING THE FILE, because "a read-back happened" leaves the
+                // next question unanswerable: nothing in this driver writes a
+                // depfile into the build directory before the end of a run,
+                // so one that is readable during resolution came from outside
+                // it and the path is the only clue to what.
+                answer_source = format!(
+                    "a depfile read-back of {}",
+                    depfile.map(|d| d.display().to_string()).unwrap_or_default()
+                );
                 if explain {
                     eprintln!(
                         "nix-ninja: discovery {seed}: read back {} include(s) from {}",
@@ -7981,7 +7989,7 @@ pub fn discover_c_includes(
                             // is the pipeline's safe polarity - an extra input costs one
                             // upload - while under-declaring is silent and ships the wrong
                             // artifact.
-                            answer_source = "the scan and the preprocessor";
+                            answer_source = "the scan and the preprocessor".to_string();
                             let merged = merge_scan_and_preprocessor(scanned, deps);
                             eprintln!(
                                 "nix-ninja: computed include unresolvable by scan; \
@@ -7991,7 +7999,7 @@ pub fn discover_c_includes(
                             merged
                         }
                         Err(e) => {
-                            answer_source = "the scan, the preprocessor having failed";
+                            answer_source = "the scan, the preprocessor having failed".to_string();
                             eprintln!(
                                 "nix-ninja: computed include unresolvable by scan and the \
                              preprocessor fallback failed ({e}); keeping the scan's {} \
@@ -8003,7 +8011,7 @@ pub fn discover_c_includes(
                         }
                     }
                 } else {
-                    answer_source = "the scan";
+                    answer_source = "the scan".to_string();
                     if explain {
                         eprintln!(
                             "nix-ninja: discovery {seed}: scanned {} include(s) from {} seed(s)",
