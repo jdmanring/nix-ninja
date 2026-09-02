@@ -454,25 +454,6 @@ pub fn run() -> Result<()> {
                 ),
             }
         }
-
-        // CMake records the RPATH it linked with, empty trailing entry and
-        // all, and checks for it at install time. We remove that entry when
-        // we append sibling-derivation library directories, so the record has
-        // to be reconciled or `file(RPATH_CHANGE)` refuses and takes the
-        // package down. Runs here because the install has not happened yet
-        // and this is the last point the build directory is ours.
-        match local::reconcile_cmake_install_rpaths(&build_dir) {
-            Ok(0) => {}
-            Ok(n) => eprintln!(
-                "nix-ninja: reconciled the install-time RPATH record in {n} \
-                 generated cmake_install.cmake file(s)"
-            ),
-            Err(e) => eprintln!(
-                "nix-ninja: could not reconcile the install-time RPATH record \
-                 ({e}); a CMake install may refuse with \"RPATH_CHANGE could not \
-                 write new RPATH\""
-            ),
-        }
     }
     Ok(())
 }

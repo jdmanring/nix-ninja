@@ -75,23 +75,12 @@ fn fix_rpath(store_dir: &Path, elf_path: &Path) -> Result<()> {
 
 /// Split a raw RPATH on ':', PRESERVING empty entries.
 ///
-/// Faithful on the READ side so callers can see what the binary actually
-/// carries. `compute_new_rpath` then drops empties when it rebuilds, and that
-/// asymmetry is the whole point.
-///
 /// An empty element in `DT_RPATH`/`DT_RUNPATH` means the current directory,
-/// exactly as it does in `PATH`. In a build tree that is a decision the build
-/// made about its own layout. In a STORE OUTPUT it is a search of whatever
-/// directory the user happens to be standing in when they run the binary,
-/// ahead of the store paths we just resolved - nondeterministic, and a route
-/// to loading a library nobody intended.
-///
-/// This function exists to rewrite build-time paths into store paths, so a
-/// build-directory decision is precisely the thing that must not survive it.
-/// `f8bb3bd` argued the opposite - that the trailing empty entry was
-/// "meaningful" and should be re-appended - and that reasoning was wrong in a
-/// way that put a cwd search into every patched output. The original splitter
-/// dropped every empty entry, and on the write side it was right to.
+/// exactly as it does in `PATH`, and for a long time this crate read that as
+/// reason enough to drop it when rebuilding. See `assemble_rpath` for why a
+/// run of them is CMake's space reservation rather than a library search, and
+/// why removing them broke the install of every CMake package whose install
+/// RPATH is longer than its build-tree one.
 fn parse_rpath(raw: &str) -> Vec<String> {
     if raw.is_empty() {
         // "".split(':') yields one empty entry, which would invent an RPATH
@@ -119,59 +108,49 @@ fn get_raw_rpath(elf_path: &Path) -> Result<String> {
         .to_string())
 }
 
-/// The entries of an existing RPATH that survive into the rewritten one.
-///
-/// Empty entries go, because an empty element means the CURRENT DIRECTORY and
-/// this function's output is written into a store binary - see parse_rpath.
-///
-/// `$ORIGIN` ENTRIES STAY, AND DROPPING THEM COST A PACKAGE. The two look
-/// like one rule and are opposites: an empty entry names wherever the process
-/// happens to be, which is a library search nobody controls, while `$ORIGIN`
-/// names the binary's OWN directory, which in a store output is exactly the
-/// store path and is how a shared library is meant to find its siblings.
-/// Removing it is neither safe nor redundant.
-///
-/// It is also the entry CMake keeps as its RECORD. `file(RPATH_CHANGE)`
-/// locates its old RPATH as an entry sequence inside the file and refuses
-/// outright when it is absent, so a library we rewrote could not be installed:
-///
-/// ```text
-/// file RPATH_CHANGE could not write new RPATH: $ORIGIN
-/// The current RUNPATH is: <glibc>/lib <gcc-lib>/lib <task output>/absl/base
-/// which does not contain: $ORIGIN
-/// ```
-///
-/// That is the same shape as the trailing-empty-entry refusal this file
-/// already carries, on a different entry: the failure is always that the
-/// rewrite removed something CMake recorded, and the fix is never to restore
-/// an entry that is unsafe in a store output. An empty one is; `$ORIGIN` is
-/// not.
-///
-/// Pulled out of compute_new_rpath so the rule is testable: that function
-/// shells out to patchelf against a real ELF, so nothing asserted on its
-/// output, which is where preserving an empty entry is a search of the
-/// current directory baked into a store path.
-fn retained_entries(current_rpath: &[String]) -> Vec<String> {
-    current_rpath
-        .iter()
-        .filter(|p| !p.is_empty())
-        .cloned()
-        .collect()
-}
-
 /// The RPATH a rewritten output should carry, from what it had and the store
 /// directories its NEEDED libraries resolved to. `None` means nothing was
 /// added and the binary should be left alone.
 ///
-/// PURE, AND SEPARATE FROM THE ELF READING, so the retention rule can be
-/// pinned where it is actually applied. Nine tests covered `retained_entries`
-/// in isolation and NOTHING covered the fact that this function calls it: a
-/// mutation replacing the call with `current_rpath.to_vec()` left the whole
-/// suite green while restoring the defect `f8bb3bd` fixed - an empty RPATH
-/// element, which the loader reads as the CURRENT DIRECTORY, written into a
-/// store output. The build succeeds and the artifact is wrong.
+/// PURE, AND SEPARATE FROM THE ELF READING, so the rule can be pinned where
+/// it is actually applied: `compute_new_rpath` shells out to patchelf against
+/// a real ELF, and for as long as the retention rule lived in a helper of its
+/// own, nine tests covered the helper and nothing covered the fact that this
+/// function called it.
+///
+/// THE FILTER THAT USED TO STAND HERE IS THE DEFECT NOW, which is the reverse
+/// of what this comment said for a week. It dropped empty entries to keep a
+/// current-directory search out of a store output, and empty entries are also
+/// how CMake reserves space for its own install-time rewrite.
 pub fn assemble_rpath(current_rpath: &[String], needed_dirs: &[String]) -> Option<Vec<String>> {
-    let mut new_rpath = retained_entries(current_rpath);
+    // EVERY ENTRY THE BINARY CARRIED SURVIVES, EMPTY ONES INCLUDED, and the
+    // empty ones are the reason this is not a filter.
+    //
+    // CMake reserves room for its install-time rewrite by padding the
+    // build-time RPATH with a run of EMPTY entries sized to the install
+    // value, and `file(RPATH_CHANGE)` records the padding as part of
+    // `OLD_RPATH`. It edits the string in place, so that reservation IS the
+    // allocation: drop the padding and the install refuses, either because
+    // the recorded sequence is no longer in the file or because the
+    // replacement no longer fits. Measured, one CMake project, three arms:
+    //
+    //     untouched                          install succeeds
+    //     padding stripped, store dir added   RPATH_CHANGE refuses
+    //     padding kept,     store dir added   install succeeds
+    //
+    // A dropped run of colons took openexr and libjpeg-turbo out of a
+    // distribution round, and CMake sizes the reservation to the byte - 78
+    // reserved against 77 needed in openexr's case - so there is no slack to
+    // spend anywhere.
+    //
+    // What that costs: an empty entry means the current directory, and this
+    // output goes to the store, so a binary CMake never rewrites ships a cwd
+    // library search. That case is not silent - such a binary also keeps its
+    // build-tree entry, which is what nixpkgs' forbidden-reference audit
+    // refuses - so the failure is loud and names the package. A predicate
+    // telling CMake's padding from a build's own empty entry is the third
+    // rule over this one string, and the previous two both shipped defects.
+    let mut new_rpath = current_rpath.to_vec();
     let mut path_added = false;
     for lib_str in needed_dirs {
         if !new_rpath.contains(lib_str) {
@@ -226,10 +205,9 @@ fn resolve_rpath(rpath: &[String], elf_path: &Path) -> Result<Vec<PathBuf>> {
         .to_string_lossy();
 
     for entry in rpath {
-        // An empty entry is the runtime marker for the current directory. It
-        // is dropped from the rebuilt RPATH by `retained_entries`, and it is
-        // not a directory a needed library can be resolved against here
-        // either.
+        // An empty entry is the runtime marker for the current directory,
+        // and CMake's padding is a run of them. Either way it is not a
+        // directory a needed library can be resolved against.
         if entry.is_empty() {
             continue;
         }
@@ -308,7 +286,7 @@ fn apply_rpath(elf_path: &Path, new_paths: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_rpath, retained_entries};
+    use super::{assemble_rpath, parse_rpath};
 
     // This file had no tests, which is why f8bb3bd shipped fixing one of the
     // three spellings of its own bug. These are the three.
@@ -338,50 +316,75 @@ mod tests {
         assert_eq!(parse_rpath(":"), vec!["", ""]);
     }
 
-    // The WRITE side. parse_rpath keeps empty entries so a caller can see
-    // them; these assert they never reach a patched binary.
+    // The WRITE side. Every entry survives, and each of these records WHY,
+    // because two of them assert the opposite of what this file asserted
+    // before and a bare expectation leaves the next reader unable to tell a
+    // deliberate reversal from a regression.
 
+    /// CMAKE'S PADDING, AND THE CASE THAT TOOK TWO PACKAGES OUT OF A ROUND.
+    /// The run of empty entries is sized to the install-time value and
+    /// `file(RPATH_CHANGE)` records it as part of `OLD_RPATH`; dropping it
+    /// removes the allocation the rewrite is edited into.
     #[test]
-    fn an_empty_entry_never_survives_into_a_store_binary() {
-        // ":/a" means "search the current directory, then /a". Preserving
-        // that in a store output is a cwd search in somebody else's process.
+    fn cmake_padding_survives_because_it_is_the_space_the_install_rewrite_needs() {
+        let parsed = parse_rpath("/build/source/build/src/lib/Iex:::::");
+        let got = assemble_rpath(&parsed, &["/nix/store/a/lib".to_string()]).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                "/build/source/build/src/lib/Iex",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "/nix/store/a/lib"
+            ],
+            "the padding is CMake's byte reservation, not a library search"
+        );
+        // The appended directory goes AFTER the padding, so the recorded
+        // sequence is still present with a colon after it - which is the
+        // boundary CMake requires.
+        let raw = got.join(":");
+        assert!(raw.starts_with("/build/source/build/src/lib/Iex:::::"));
+    }
+
+    /// The cost of the rule above, stated rather than hidden. An empty entry
+    /// means the current directory, so a binary CMake never rewrites carries
+    /// a cwd search into the store. It is accepted because such a binary also
+    /// keeps its build-tree entry, which nixpkgs' own audit refuses by name.
+    #[test]
+    fn a_lone_empty_entry_survives_too_and_that_is_the_accepted_cost() {
         let parsed = parse_rpath(":/a:/b");
-        assert_eq!(parsed, vec!["", "/a", "/b"], "read side stays faithful");
-        assert_eq!(retained_entries(&parsed), vec!["/a", "/b"]);
+        assert_eq!(
+            assemble_rpath(&parsed, &["/nix/store/a/lib".to_string()]).unwrap(),
+            vec!["", "/a", "/b", "/nix/store/a/lib"]
+        );
     }
 
-    #[test]
-    fn trailing_and_interior_empties_go_too() {
-        assert_eq!(retained_entries(&parse_rpath("/a:/b:")), vec!["/a", "/b"]);
-        assert_eq!(retained_entries(&parse_rpath("/a::/b")), vec!["/a", "/b"]);
-        assert!(retained_entries(&parse_rpath(":")).is_empty());
-    }
-
-    /// THIS TEST ASSERTED THE DEFECT. It read that `$ORIGIN` is dropped
-    /// "because the rewrite resolves them", which is true of the resolution
-    /// and false as a reason to remove the entry: the resolved store
-    /// directory is APPENDED, and the original entry is what CMake keeps as
-    /// its record. abseil-cpp could not install a library we had rewritten,
-    /// because `file(RPATH_CHANGE)` looks for `$ORIGIN` as an entry sequence
-    /// and refuses when it is gone.
-    ///
-    /// The empty entry beside it is the opposite and stays dropped: it names
-    /// wherever the process happens to be, `$ORIGIN` names the binary's own
-    /// directory. One rule cannot cover both.
+    /// `$ORIGIN` STAYS, and for a different reason than the empties: it names
+    /// the binary's own directory, which in a store output is the store path,
+    /// and it is what CMake keeps as its record. abseil-cpp could not install
+    /// a library we had rewritten because `file(RPATH_CHANGE)` looks for
+    /// `$ORIGIN` as an entry sequence and refuses when it is gone.
     #[test]
     fn origin_survives_because_cmake_records_it_and_it_is_safe_in_a_store_path() {
         let parsed = parse_rpath("$ORIGIN/../lib:/nix/store/a/lib");
         assert_eq!(
-            retained_entries(&parsed),
-            vec!["$ORIGIN/../lib", "/nix/store/a/lib"]
+            assemble_rpath(&parsed, &["/nix/store/b/lib".to_string()]).unwrap(),
+            vec!["$ORIGIN/../lib", "/nix/store/a/lib", "/nix/store/b/lib"]
         );
-        // A bare `$ORIGIN`, which is abseil's own spelling.
-        assert_eq!(retained_entries(&parse_rpath("$ORIGIN")), vec!["$ORIGIN"]);
-        // And the distinction that makes this safe: an empty entry beside an
-        // `$ORIGIN` one keeps going.
+    }
+
+    /// Nothing to add means the binary is left alone rather than rewritten
+    /// with the same entries, which is what keeps a needless patchelf run off
+    /// every output of every task.
+    #[test]
+    fn nothing_new_means_no_rewrite() {
+        let parsed = parse_rpath("/nix/store/a/lib:");
         assert_eq!(
-            retained_entries(&parse_rpath("$ORIGIN::/nix/store/a/lib")),
-            vec!["$ORIGIN", "/nix/store/a/lib"]
+            assemble_rpath(&parsed, &["/nix/store/a/lib".to_string()]),
+            None
         );
     }
 
