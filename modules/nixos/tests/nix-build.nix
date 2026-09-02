@@ -13,6 +13,14 @@
 , cmdline
 # Expected stdout from the binary it builds.
 , expectedStdout
+# Store paths to cache in the VM that are NOT reachable through any
+# *BuildInputs list. `inputsFrom` is walked for those four attributes only, so
+# an input that reaches a derivation as a store path inside a string - CMake's
+# dispatch script arrives through `cmakeFlags` - is invisible to it and the VM
+# has to build it offline. These are cached as PATHS rather than added to an
+# input list: a `writeShellScript` output is a FILE, and stdenv SOURCES a
+# non-directory input as a setup hook, which runs it.
+, extraCachedPaths ? [ ]
 }:
 
 { self, pkgs, lib, ... }:
@@ -75,7 +83,7 @@ in {
       # derivation.
       additionalPaths = [
         inputsClosure
-      ] ++ (builtins.attrValues self.inputs);
+      ] ++ extraCachedPaths ++ (builtins.attrValues self.inputs);
     };
 
     environment.systemPackages = with pkgs; [

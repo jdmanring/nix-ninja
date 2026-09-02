@@ -93,6 +93,15 @@ let
 
     passthru = {
       target = builtins.outputOf ninjaDrv.outPath normalizedTarget;
+      # THE DISPATCH SCRIPT IS AN INPUT NOTHING ENUMERATES. It reaches the
+      # derivation as a store path inside `cmakeFlags`, so it is a real input
+      # but appears in none of the *BuildInputs lists - and the NixOS test
+      # harness caches closures by walking exactly those lists. Without this
+      # the test VM has to BUILD the script, which needs stdenv, which needs
+      # a python it cannot download. Exposed rather than moved into
+      # nativeBuildInputs because passthru is not part of the derivation and
+      # moving it would re-key every package.
+      inherit dispatchNinja;
     };
   });
 

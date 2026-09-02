@@ -10,5 +10,11 @@
     # every input exists before the build starts; this one does not, which is
     # the case three separate defects hid in.
     nixosTests.nix-build-generated-header = import ./tests/nix-build-generated-header.nix;
+    # THE CMAKE ROUTE HAD NO GATE, which is how three CMake defects reached a
+    # distribution round in one day: example-cmake-hello had been unbuildable
+    # on main for some time and nothing ran it. This covers the route AND the
+    # order-only generated-header shape on it.
+    nixosTests.nix-build-cmake-order-only-header =
+      import ./tests/nix-build-cmake-order-only-header.nix;
   };
 }
