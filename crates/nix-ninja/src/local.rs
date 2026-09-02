@@ -188,6 +188,24 @@ fn refresh_placed_mtimes(prefix: &Path, store_dir: &StoreDir, files: &[DerivedFi
         if !dest.is_symlink() {
             continue;
         }
+        // A SYMLINK IS SOMETIMES A NAME RATHER THAN A PRODUCT, and replacing
+        // one with content changes what the file MEANS. A versioned shared
+        // library is the case that matters: `libfoo.so` and `libfoo.so.1` are
+        // aliases of `libfoo.so.1.2.3` pointing at a SIBLING, and turning them
+        // into three real files loses the soname relationship, freezes each
+        // copy at the bytes it had when the copy was taken, and makes CMake's
+        // install-time RPATH rewrite skip them because CMake believes it
+        // created a link there.
+        //
+        // Only a link that RESOLVES TO THE FILE ABOUT TO BE COPIED is one
+        // this function placed, and only those are what the mtime problem is
+        // about: an object `make` will stat against its source. Asking where
+        // the link actually points, rather than trusting the caller's list,
+        // makes converting an alias structurally impossible rather than
+        // merely unlikely. An alias resolves to a sibling and is skipped.
+        if !placement_is_ours(&dest, &src) {
+            continue;
+        }
         let tmp = unique_sibling(&dest);
         if clone_or_copy(&src, &tmp).is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -201,6 +219,27 @@ fn refresh_placed_mtimes(prefix: &Path, store_dir: &StoreDir, files: &[DerivedFi
         if std::fs::rename(&tmp, &dest).is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
+    }
+}
+
+/// This symlink is the one this placement created, rather than a name the
+/// build put there.
+///
+/// A versioned shared library is the case that makes the distinction real:
+/// `libfoo.so` and `libfoo.so.1` are aliases of `libfoo.so.1.2.3` pointing at
+/// a SIBLING. Replacing those with content loses the soname relationship,
+/// freezes each copy at the bytes it held when the copy was taken, and makes
+/// CMake's install-time RPATH rewrite skip them, because CMake believes it
+/// created a link there and a link has no RPATH of its own to rewrite. Three
+/// real files of identical size where there should be one file and two links
+/// is the signature.
+///
+/// So the target is asked where it actually points rather than the caller's
+/// list being trusted. An alias resolves to a sibling and is left alone.
+fn placement_is_ours(dest: &Path, src: &Path) -> bool {
+    match (std::fs::canonicalize(dest), std::fs::canonicalize(src)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -742,7 +781,46 @@ mod cmake_install_rpath_tests {
 
 #[cfg(test)]
 mod placed_mtime_tests {
-    use super::{clone_or_copy, unique_sibling};
+    use super::{clone_or_copy, placement_is_ours, unique_sibling};
+
+    /// THE ALIAS CASE, which is a regression this guard exists to prevent.
+    /// Without it every versioned shared library in a placed tree becomes
+    /// three real files, and the two that should be links keep whatever RPATH
+    /// they had before the install rewrite.
+    #[test]
+    fn a_soname_alias_is_not_ours_and_a_placed_product_is() {
+        use std::path::Path;
+        let dir = std::env::temp_dir().join(format!("nn-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The alias: libfoo.so -> libfoo.so.1.2.3, a SIBLING.
+        let real = dir.join("libfoo.so.1.2.3");
+        std::fs::write(&real, b"elf").unwrap();
+        let alias = dir.join("libfoo.so");
+        std::os::unix::fs::symlink("libfoo.so.1.2.3", &alias).unwrap();
+        // `src` is the store object this placement would have copied, and it
+        // is NOT what the alias points at.
+        let store_obj = dir.join("store-object.o");
+        std::fs::write(&store_obj, b"obj").unwrap();
+        assert!(
+            !placement_is_ours(&alias, &store_obj),
+            "an alias pointing at a sibling must be left alone"
+        );
+
+        // The product: a link this placement made, pointing at the store file.
+        let placed = dir.join("a.o");
+        std::os::unix::fs::symlink(&store_obj, &placed).unwrap();
+        assert!(placement_is_ours(&placed, &store_obj));
+
+        // A dangling link answers no rather than panicking.
+        let dangling = dir.join("gone.o");
+        std::os::unix::fs::symlink(dir.join("nothing-here"), &dangling).unwrap();
+        assert!(!placement_is_ours(&dangling, &store_obj));
+        assert!(!placement_is_ours(Path::new("/nonexistent/x"), &store_obj));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A placed product must not read as older than a source, and the check
     /// is `stat` rather than `lstat` because that is what `make` calls.
