@@ -3622,7 +3622,9 @@ fn lto_needs_make(cmdline: &str, cc_dir: Option<&Path>) -> bool {
         .map(|d| d.join("nix-support/cc-cflags-before"))
         .and_then(|f| std::fs::read_to_string(f).ok())
         .is_some_and(|flags| {
-            flags.split_whitespace().any(|t| t == "-flto" || t.starts_with("-flto="))
+            flags
+                .split_whitespace()
+                .any(|t| t == "-flto" || t.starts_with("-flto="))
         })
 }
 
@@ -3637,7 +3639,10 @@ mod lto_make_gate_tests {
         assert!(lto_needs_make("gcc -flto=8 a.o -o t", None));
         assert!(lto_needs_make("gcc -flto=auto a.o -o t", None));
         assert!(lto_needs_make("gcc -flto=jobserver a.o -o t", None));
-        assert!(lto_needs_make("gcc -O2 -flto=24 -march=znver4 a.o -o t", None));
+        assert!(lto_needs_make(
+            "gcc -O2 -flto=24 -march=znver4 a.o -o t",
+            None
+        ));
         assert!(lto_needs_make(r#"gcc "-flto=8" a.o -o t"#, None));
     }
 
@@ -3675,7 +3680,10 @@ mod lto_make_gate_tests {
         std::fs::write(ns.join("cc-cflags-before"), "-O3 -march=znver4\n").unwrap();
         assert!(!lto_needs_make("gcc -o t a.o b.o", Some(dir.as_path())));
         // ... but an explicit flag on the command line still wins.
-        assert!(lto_needs_make("gcc -flto=auto -o t a.o", Some(dir.as_path())));
+        assert!(lto_needs_make(
+            "gcc -flto=auto -o t a.o",
+            Some(dir.as_path())
+        ));
 
         // No such file, and no cc at all, must both be handled rather than panic.
         std::fs::remove_file(ns.join("cc-cflags-before")).unwrap();
@@ -4815,7 +4823,10 @@ mod script_dir_tests {
 
     #[test]
     fn a_relative_name_keeps_its_directory() {
-        assert_eq!(script_dir(Path::new("tools/gen.py")), PathBuf::from("tools"));
+        assert_eq!(
+            script_dir(Path::new("tools/gen.py")),
+            PathBuf::from("tools")
+        );
     }
 
     #[test]

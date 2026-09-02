@@ -567,7 +567,6 @@ mod unique_sibling_tests {
         let p = Path::new("/b/a.o");
         assert_ne!(unique_sibling(p), unique_sibling(p));
     }
-
 }
 
 #[cfg(test)]
@@ -611,10 +610,7 @@ mod cmake_install_rpath_tests {
         );
         // NEW_RPATH is CMake's output, not its expectation, and an empty one
         // is the normal install case. Touching it would be a real defect.
-        assert_eq!(
-            rewritten_old_rpath_line("         NEW_RPATH \"\"\n"),
-            None
-        );
+        assert_eq!(rewritten_old_rpath_line("         NEW_RPATH \"\"\n"), None);
         assert_eq!(rewritten_old_rpath_line("file(INSTALL ...)\n"), None);
         assert_eq!(
             rewritten_old_rpath_line("         OLD_RPATH \"/build/x/lib\"\n"),
@@ -643,7 +639,10 @@ mod cmake_install_rpath_tests {
         std::fs::write(&bystander, bystander_text).unwrap();
 
         let edited = reconcile_cmake_install_rpaths(&dir).unwrap();
-        assert_eq!(edited, 1, "one generated file carried a trailing empty entry");
+        assert_eq!(
+            edited, 1,
+            "one generated file carried a trailing empty entry"
+        );
 
         let got = std::fs::read_to_string(&target).unwrap();
         assert!(got.contains("OLD_RPATH \"/build/c/build/lib\""));
@@ -658,4 +657,3 @@ mod cmake_install_rpath_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
-
