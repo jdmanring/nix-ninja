@@ -120,7 +120,8 @@ pub fn symlink_derived_files(
             symlink_files.push(df.clone());
         }
     }
-    create_symlinks(prefix, store_dir, symlink_files, true)?;
+    create_symlinks(prefix, store_dir, symlink_files.clone(), true)?;
+    refresh_placed_mtimes(prefix, store_dir, &symlink_files);
 
     Ok(())
 }
@@ -139,6 +140,87 @@ fn write_restored(tmp: &Path, data: &[u8], target: &Path) -> std::io::Result<()>
         let mode = md.permissions().mode() | 0o200;
         let _ = std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(mode));
     }
+    Ok(())
+}
+
+/// Give every placed build product a plausible mtime, because `make` stats
+/// THROUGH the symlink and nix gives every store file mtime 1.
+///
+/// A symlink into the store is right for IDENTITY and wrong for anything
+/// `make` will stat: the object reads as older than every source, so the
+/// whole tree is out of date on every pass. Measured across one round -
+/// guile 135 objects compiled ONCE, gnutar 199 compiled TWICE, bison 166
+/// compiled FOUR times, uniform within each package and tracking how many
+/// passes that package's build makes. guile is the control: a package walked
+/// once shows no repetition.
+///
+/// It is not only wasted work. A target that reads out of date is RELINKED
+/// during `installcheck`, so at `-j24` two jobs link it at once and something
+/// execs it mid-write - ETXTBSY - while at `-j1` the testsuite runs against a
+/// tree `make` is still rebuilding and fails broadly with a perfectly good
+/// binary. One cause at two widths.
+///
+/// SETTING THE SYMLINK'S OWN TIME CANNOT WORK, which is the obvious cheaper
+/// fix: `utimensat` with `AT_SYMLINK_NOFOLLOW` sets the link, and `stat`
+/// follows. Measured - `lstat` reads the new time and `stat` still reads 1.
+///
+/// So the bytes are placed instead, by REFLINK where the filesystem supports
+/// it: copy-on-write costs no data blocks and lands with a fresh mtime, and
+/// the store path stays the identity per-TU resumability rests on. Falls back
+/// to a real copy across devices (`EXDEV`) or on a filesystem without it.
+///
+/// The time must be NOW rather than a sentinel. A sentinel above 1 satisfies
+/// the comparison against store sources at mtime 1 and fails against a
+/// GENERATED source carrying a real time; `make`'s treatment of equal
+/// timestamps also varies, so a fix that lands equal rather than newer takes
+/// four passes to two and reads as a partial success. The acceptance test is
+/// bison reaching ONE, with guile as the floor.
+///
+/// Best effort per file: a failure here costs a redundant compile, which is
+/// the behavior that has always been in force.
+fn refresh_placed_mtimes(prefix: &Path, store_dir: &StoreDir, files: &[DerivedFile]) {
+    for df in files {
+        let src = df.absolute_path(store_dir);
+        if src.is_dir() {
+            continue;
+        }
+        let dest = prefix.join(&df.build_path);
+        if !dest.is_symlink() {
+            continue;
+        }
+        let tmp = unique_sibling(&dest);
+        if clone_or_copy(&src, &tmp).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            continue;
+        }
+        if let Ok(md) = std::fs::metadata(&src) {
+            let mut perm = md.permissions();
+            perm.set_mode(perm.mode() | 0o200);
+            let _ = std::fs::set_permissions(&tmp, perm);
+        }
+        if std::fs::rename(&tmp, &dest).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// Reflink `src` to `dest`, falling back to a byte copy.
+///
+/// `FICLONE` is the same ioctl `cp --reflink` uses. It fails with `EXDEV`
+/// across devices and `EOPNOTSUPP` on a filesystem without copy-on-write,
+/// and both are ordinary rather than exceptional - the fallback is a plain
+/// copy, which is correct and only costs the bytes.
+fn clone_or_copy(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+    let sf = std::fs::File::open(src)?;
+    let df = std::fs::File::create(dest)?;
+    let rc = unsafe { libc::ioctl(df.as_raw_fd(), FICLONE, sf.as_raw_fd()) };
+    if rc == 0 {
+        return Ok(());
+    }
+    drop(df);
+    std::fs::copy(src, dest)?;
     Ok(())
 }
 
@@ -655,5 +737,57 @@ mod cmake_install_rpath_tests {
         assert_eq!(reconcile_cmake_install_rpaths(&dir).unwrap(), 0);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod placed_mtime_tests {
+    use super::{clone_or_copy, unique_sibling};
+
+    /// A placed product must not read as older than a source, and the check
+    /// is `stat` rather than `lstat` because that is what `make` calls.
+    /// Pinning the SYMLINK case too: setting the link's own time leaves
+    /// `stat` reading 1, so a fix that only touched the placement would pass
+    /// an `lstat` assertion and change nothing about the rebuild.
+    #[test]
+    fn placed_product_is_newer_than_a_store_source() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("nn-mtime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store_file = dir.join("obj.o");
+        std::fs::write(&store_file, b"object bytes").unwrap();
+        // What nix gives every store file.
+        let one = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        filetime_set(&store_file, one);
+        assert_eq!(std::fs::metadata(&store_file).unwrap().mtime(), 1);
+
+        let dest = dir.join("placed.o");
+        std::os::unix::fs::symlink(&store_file, &dest).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().mtime(),
+            1,
+            "a symlink into the store reads as mtime 1 through stat"
+        );
+
+        let tmp = unique_sibling(&dest);
+        clone_or_copy(&store_file, &tmp).unwrap();
+        std::fs::rename(&tmp, &dest).unwrap();
+
+        assert!(
+            !dest.is_symlink(),
+            "the placed product must not be a symlink"
+        );
+        assert!(
+            std::fs::metadata(&dest).unwrap().mtime() > 1,
+            "a placed product must be NEWER than a store source, not equal"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"object bytes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn filetime_set(p: &std::path::Path, t: std::time::SystemTime) {
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(t))
+            .unwrap();
     }
 }
