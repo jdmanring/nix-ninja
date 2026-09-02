@@ -28,6 +28,7 @@
       pkgs.example-fortran-c-interface-recursive;
     packages.example-dotdot-source-include =
       pkgs.example-dotdot-source-include;
+    packages.example-svt-av1-enc-handle = pkgs.example-svt-av1-enc-handle;
 
     # The examples are dynamic derivations, which can only be instantiated
     # when the `dynamic-derivations` experimental feature is enabled (probed

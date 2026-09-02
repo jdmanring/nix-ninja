@@ -316,6 +316,20 @@
         '';
       };
 
+      # SVT-AV1'S FAILING TRANSLATION UNIT, on the consumer's configuration.
+      # Every earlier attempt at this class was built under builder-rpc-v0,
+      # which is not the route the failure was reported from, and a
+      # reduction on the wrong configuration is what this tree spent a day
+      # learning to distrust. Local mode also removes the output-naming
+      # problem that stopped an object being a target at all.
+      example-svt-av1-enc-handle = self.mkRecursivePackage {
+        name = "example-svt-av1-enc-handle";
+        src = self.svt-av1.src;
+        target = "Source/Lib/Globals/CMakeFiles/GLOBALS.dir/enc_handle.c.o";
+        nativeBuildInputs = [ self.nasm ];
+        install = "mkdir -p $out && cp Source/Lib/Globals/CMakeFiles/GLOBALS.dir/enc_handle.c.o $out/";
+      };
+
       example-nix = self.callPackage ./examples/nix { src = inputs.nix; };
     };
 
