@@ -85,6 +85,72 @@ pub enum Error {
     },
 }
 
+/// The OTHER failures in the same batch, named.
+///
+/// A realise is a batch and the scheduler keeps going, so a task reporting
+/// "1 dependency failed" is usually accompanied in the same reply by the
+/// result that says WHICH one. Reporting only the target's own message
+/// discarded that, leaving a failure whose cause is named nowhere and no
+/// derivation to run `nix log` against (libssh and onetbb, round 14).
+///
+/// Capped, because a wide batch can fail widely; the count says what the cap
+/// hid, so a truncated list never reads as a complete one.
+fn co_failure_summary(failures: &[String], own: &str) -> String {
+    const SHOWN: usize = 5;
+    let rest: Vec<&String> = failures.iter().filter(|f| !f.starts_with(own)).collect();
+    if rest.is_empty() {
+        return String::new();
+    }
+    let head: Vec<String> = rest.iter().take(SHOWN).map(|f| f.to_string()).collect();
+    let more = rest.len().saturating_sub(head.len());
+    let tail = if more > 0 {
+        format!(" (and {more} more in the same batch)")
+    } else {
+        String::new()
+    };
+    format!("; also failed in this batch: {}{tail}", head.join(" | "))
+}
+
+#[cfg(test)]
+mod co_failure_summary_tests {
+    use super::co_failure_summary;
+
+    /// THE CASE IT EXISTS FOR. The target says only that a dependency failed;
+    /// the dependency's own result is in the same reply and names itself.
+    #[test]
+    fn a_siblings_failure_is_named() {
+        let f = vec![
+            "/nix/store/aaa-target.drv: 1 dependency failed".to_string(),
+            "/nix/store/bbb-dep.drv: builder failed with exit code 1".to_string(),
+        ];
+        let s = co_failure_summary(&f, "/nix/store/aaa-target.drv");
+        assert!(s.contains("bbb-dep.drv"), "{s}");
+        assert!(!s.contains("aaa-target.drv"), "{s}");
+    }
+
+    /// A lone failure adds nothing, so a task that simply failed reads exactly
+    /// as it did before.
+    #[test]
+    fn the_only_failure_produces_no_tail() {
+        let f = vec!["/nix/store/aaa-target.drv: boom".to_string()];
+        assert_eq!(co_failure_summary(&f, "/nix/store/aaa-target.drv"), "");
+        assert_eq!(co_failure_summary(&[], "/nix/store/aaa-target.drv"), "");
+    }
+
+    /// THE CAP MUST ANNOUNCE ITSELF. A truncated list that does not say it was
+    /// truncated is read as the whole set, which is the shape that has
+    /// produced a wrong count in this project more than once.
+    #[test]
+    fn truncation_states_the_remainder() {
+        let f: Vec<String> = (0..9)
+            .map(|i| format!("/nix/store/d{i}.drv: boom"))
+            .collect();
+        let s = co_failure_summary(&f, "/nix/store/none");
+        assert!(s.contains("and 4 more in the same batch"), "{s}");
+        assert_eq!(s.matches(".drv").count(), 5, "{s}");
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Watchdog allowance for the Nth stall retry: 300s, 1200s, 4800s, then
@@ -1166,6 +1232,13 @@ impl BuilderRpcClient {
         // single slot names one of them nondeterministically, and the
         // missing-result classification below needs to know whether ANY
         // failure occurred, not which arrived last.
+        //
+        // EACH ONE CARRIES THE PATH THAT FAILED, and dropping it is what ends
+        // a diagnosis. A realise is a BATCH, so when a task dies of
+        // "1 dependency failed" the dependency's own result is usually in this
+        // same reply; keeping only the message reported the target that
+        // depended on the failure and never the derivation that produced it,
+        // leaving nothing to run `nix log` against.
         let mut failures: Vec<String> = Vec::new();
         for r in results {
             if let Some(success) = r.result.success() {
@@ -1173,7 +1246,13 @@ impl BuilderRpcClient {
                     out_pool.insert(name.clone(), realisation.out_path.clone());
                 }
             } else if let BuildResultInner::Failure(f) = &r.result.inner {
-                failures.push(String::from_utf8_lossy(&f.error_msg).into_owned());
+                let who = match &r.path {
+                    DerivedPath::Opaque(path) => store_dir.display(path).to_string(),
+                    DerivedPath::Built { drv_path, .. } => {
+                        store_dir.display(drv_path.as_ref()).to_string()
+                    }
+                };
+                failures.push(format!("{who}: {}", String::from_utf8_lossy(&f.error_msg)));
             }
             let key = match &r.path {
                 DerivedPath::Opaque(path) => path.to_string(),
@@ -1183,6 +1262,8 @@ impl BuilderRpcClient {
             };
             by_key.insert(key, r.result);
         }
+        let others = |own: &str| co_failure_summary(&failures, own);
+
         paths
             .iter()
             .map(|single| {
@@ -1199,14 +1280,16 @@ impl BuilderRpcClient {
                         // no-op; failures still surface below.
                         match by_key.get(&key) {
                             Some(result) if result.success().is_none() => {
+                                let own = match &result.inner {
+                                    BuildResultInner::Failure(f) => {
+                                        String::from_utf8_lossy(&f.error_msg).into_owned()
+                                    }
+                                    _ => String::new(),
+                                };
+                                let extra = others(&display);
                                 Err(Error::BuildFailed {
                                     path: display,
-                                    error_msg: match &result.inner {
-                                        BuildResultInner::Failure(f) => {
-                                            String::from_utf8_lossy(&f.error_msg).into_owned()
-                                        }
-                                        _ => String::new(),
-                                    },
+                                    error_msg: format!("{own}{extra}"),
                                 })
                             }
                             _ => Ok(path.clone()),
@@ -1215,14 +1298,16 @@ impl BuilderRpcClient {
                     SingleDerivedPath::Built { output, .. } => {
                         if let Some(result) = by_key.get(&key) {
                             if result.success().is_none() {
+                                let own = match &result.inner {
+                                    BuildResultInner::Failure(f) => {
+                                        String::from_utf8_lossy(&f.error_msg).into_owned()
+                                    }
+                                    _ => String::new(),
+                                };
+                                let extra = others(&display);
                                 return Err(Error::BuildFailed {
                                     path: display,
-                                    error_msg: match &result.inner {
-                                        BuildResultInner::Failure(f) => {
-                                            String::from_utf8_lossy(&f.error_msg).into_owned()
-                                        }
-                                        _ => String::new(),
-                                    },
+                                    error_msg: format!("{own}{extra}"),
                                 });
                             }
                         }
