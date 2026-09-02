@@ -16,5 +16,9 @@
     # order-only generated-header shape on it.
     nixosTests.nix-build-cmake-order-only-header =
       import ./tests/nix-build-cmake-order-only-header.nix;
+    nixosTests.nix-build-fortran-module-recursive =
+      import ./tests/nix-build-fortran-module-recursive.nix;
+    nixosTests.nix-build-dotdot-source-include =
+      import ./tests/nix-build-dotdot-source-include.nix;
   };
 }

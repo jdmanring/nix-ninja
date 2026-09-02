@@ -2204,9 +2204,45 @@ pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> 
 /// dynamic gate read `deps` alone, so an edge could be scanned and never given
 /// anything to scan.
 fn wants_dependency_discovery(task: &Task) -> bool {
-    (object_shaped_outputs(task.outputs.iter().filter_map(|p| p.to_str()))
+    (!link_shaped_outputs(task.outputs.iter().filter_map(|p| p.to_str()))
         && (task.deps.as_deref() == Some("gcc") || task.depfile.is_some()))
         || consumes_preprocessed_fortran(task)
+}
+
+/// Every declared output is plainly a LINK product.
+///
+/// THE POLARITY IS THE WHOLE POINT AND GETTING IT BACKWARDS SHIPPED A
+/// REGRESSION. `is_compile_task` may safely ask "is this provably a compile",
+/// because an unrecognised output there merely keeps the wider input set.
+/// Discovery is the opposite: an unrecognised output that answers "not a
+/// compile" runs NO discovery, declares no headers, and the task dies on the
+/// first include. So this asks whether the output is provably a LINK, and
+/// anything unfamiliar falls to the side that still discovers.
+///
+/// The allowlist version of this asked for `.o`, `.obj`, `.lo`, `.gch` and
+/// `.pch`, and libaio compiles to `io_queue_init.ol` while keyutils uses
+/// `.os`. Both built at the previous revision and failed at this one with a
+/// single declared input and no headers, which is what "discovery did not
+/// run" looks like from outside.
+fn link_shaped_outputs<'a>(mut outs: impl Iterator<Item = &'a str>) -> bool {
+    let link_shaped = |n: &str| {
+        // A versioned shared library is `libfoo.so.1.2.3`, so the suffix
+        // test alone misses it; `.so.` catches those without matching a
+        // source called `x.solver.c`.
+        n.ends_with(".so")
+            || n.contains(".so.")
+            || n.ends_with(".a")
+            || n.ends_with(".dylib")
+            || n.ends_with(".dll")
+            || n.ends_with(".exe")
+            // An executable usually has no extension at all, which is the
+            // shape `mkCMakePackage`'s targets take.
+            || !n.rsplit('/').next().unwrap_or(n).contains('.')
+    };
+    match outs.next() {
+        None => false,
+        Some(first) => link_shaped(first) && outs.all(link_shaped),
+    }
 }
 
 /// A COMPILER OPENS A FILE THE GRAPH NEVER DECLARED, and this is the edge
@@ -6457,6 +6493,54 @@ fn object_shaped_outputs<'a>(mut outs: impl Iterator<Item = &'a str>) -> bool {
     match outs.next() {
         None => false,
         Some(first) => object_shaped(first) && outs.all(object_shaped),
+    }
+}
+
+#[cfg(test)]
+mod link_shaped_tests {
+    use super::link_shaped_outputs;
+
+    /// THE REGRESSION. libaio compiles to `.ol` and keyutils to `.os`;
+    /// neither is in any object allowlist, and both packages died with one
+    /// declared input after discovery was gated on being provably a compile.
+    #[test]
+    fn an_unfamiliar_object_suffix_is_not_a_link() {
+        assert!(!link_shaped_outputs(["io_queue_init.ol"].into_iter()));
+        assert!(!link_shaped_outputs(["keyutils.os"].into_iter()));
+        assert!(!link_shaped_outputs(["a.o"].into_iter()));
+        assert!(!link_shaped_outputs(["a.obj", "b.o"].into_iter()));
+    }
+
+    /// THE CASE THE GATE EXISTS FOR. CMake writes a depfile on its linker
+    /// rules, so a link reaching discovery is what routed every CMake target
+    /// through the dynamic path and named its output `out`.
+    #[test]
+    fn a_library_or_executable_is_a_link() {
+        assert!(link_shaped_outputs(["libZXing.so.3.1.1"].into_iter()));
+        assert!(link_shaped_outputs(["libfoo.so"].into_iter()));
+        assert!(link_shaped_outputs(["libfoo.a"].into_iter()));
+        assert!(link_shaped_outputs(["hello"].into_iter()));
+        assert!(link_shaped_outputs(["build/bin/app"].into_iter()));
+    }
+
+    /// A DOT IN A DIRECTORY IS NOT AN EXTENSION. `build.dir/app` is an
+    /// executable, and testing the whole path for a dot calls it a compile.
+    #[test]
+    fn a_dot_in_a_parent_directory_does_not_make_it_an_object() {
+        assert!(link_shaped_outputs(["CMakeFiles/x.dir/app"].into_iter()));
+    }
+
+    /// MIXED OUTPUTS ARE NOT A LINK, so a rule emitting an object beside
+    /// anything else still discovers.
+    #[test]
+    fn a_mixed_output_set_is_not_a_link() {
+        assert!(!link_shaped_outputs(["libfoo.so", "foo.o"].into_iter()));
+    }
+
+    /// No outputs is not a link, and must not switch discovery off.
+    #[test]
+    fn no_outputs_is_not_a_link() {
+        assert!(!link_shaped_outputs(std::iter::empty()));
     }
 }
 
