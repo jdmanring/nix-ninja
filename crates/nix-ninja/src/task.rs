@@ -6223,7 +6223,19 @@ fn walk_dir_capped_uncached(
     // Upload only after the whole walk fits the cap, so an over-cap dir
     // costs a directory scan and zero store writes. Batched adds: a
     // node_modules tree is thousands of files at one round trip each.
-    let out = new_opaque_files(rpc_client, build_dir, paths)?;
+    // NAMED, for the same reason the include-scan upload is. Both paths end
+    // in the same `canonicalize <path>` failure, and the chain is the only
+    // thing that says which one produced it: a file the WALK found is a
+    // different defect from a file DISCOVERY resolved, in different code. The
+    // scan side gained this after svt-av1 died with a chain that could not be
+    // attributed; this is its sibling, and it had none.
+    let count = paths.len();
+    let out = new_opaque_files(rpc_client, build_dir, paths).with_context(|| {
+        format!(
+            "uploading {count} file(s) found by the build-directory walk of {}",
+            dir.display()
+        )
+    })?;
     Ok(Some(out))
 }
 
