@@ -118,21 +118,40 @@ in {
     # string. Running successfully on the build machine is exactly what a
     # wrong RPATH does.
     #
-    # Three properties, each a defect this project has actually shipped or
+    # Two properties, each a defect this project has actually shipped or
     # nearly shipped:
     #   - no empty element      an empty entry means `.` to the loader
-    #   - no $ORIGIN            relative to the OUTPUT, which moved into the
-    #                           store; it resolved somewhere else at link time
-    #   - every entry in /nix/store  a surviving /build/... entry means the
+    #   - every entry in /nix/store, or $ORIGIN-relative
+    #                           a surviving /build/... entry means the
     #                           rewrite did not happen at all
+    #
+    # THIS ASSERTED "no $ORIGIN" AND THAT WAS CHANGED ON EVIDENCE, so the
+    # reason is here rather than in a commit nobody will find. The old rule
+    # was that $ORIGIN is relative to an output which moves into the store,
+    # so it resolved somewhere else at link time. That is true and does not
+    # make removing it safe: the entry is what CMake keeps as its RECORD, and
+    # `file(RPATH_CHANGE)` looks for it as an entry sequence and REFUSES the
+    # install outright when it is gone. abseil-cpp, openexr and libjpeg-turbo
+    # all failed to install libraries this project had rewritten. A stale
+    # relative entry inside our own output is inert; a missing record is
+    # fatal, and CMake's own install rewrite is what removes the entry
+    # properly.
+    #
+    # An empty element stays FORBIDDEN and is not the same case. CMake pads
+    # its build RPATH with empty entries to reserve space for that rewrite,
+    # so they exist in a build tree - but the rewrite consumes the whole
+    # reservation, and a package with no such rewrite never had padding. So a
+    # DELIVERED artifact has none either way, and one here means a
+    # current-directory search was shipped.
     rpath = machine.execute(f"patchelf --print-rpath {binary}")
     if rpath[0] == 0:
         entries = [e for e in rpath[1].strip().split(":") if e != ""]
         raw = rpath[1].strip()
         if raw:
             assert "" not in raw.split(":"), f"empty RPATH element (a cwd search): {raw!r}"
-            assert "$ORIGIN" not in raw, f"unresolved $ORIGIN in RPATH: {raw!r}"
             for e in entries:
-                assert e.startswith("/nix/store"), f"RPATH entry outside the store: {e!r} in {raw!r}"
+                assert e.startswith("/nix/store") or e.startswith(
+                    "$ORIGIN"
+                ), f"RPATH entry neither in the store nor $ORIGIN-relative: {e!r} in {raw!r}"
   '';
 }
