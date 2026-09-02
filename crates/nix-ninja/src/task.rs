@@ -2214,7 +2214,13 @@ fn wants_dependency_discovery(task: &Task) -> bool {
 /// single declared input and no headers, which is what "discovery did not
 /// run" looks like from outside.
 fn link_shaped_outputs<'a>(mut outs: impl Iterator<Item = &'a str>) -> bool {
-    let link_shaped = |n: &str| {
+    let link_shaped = |path: &str| {
+        // THE FILE NAME, NEVER THE PATH. meson puts a shared library's
+        // objects in `<target>.so.p/`, so `libword1.so.p/word1lib.c.o`
+        // contains `.so.` in a DIRECTORY component while being an object -
+        // testing the whole path called every object under every shared
+        // library a link and switched discovery off for it.
+        let n = path.rsplit('/').next().unwrap_or(path);
         // A versioned shared library is `libfoo.so.1.2.3`, so the suffix
         // test alone misses it; `.so.` catches those without matching a
         // source called `x.solver.c`.
@@ -2226,7 +2232,7 @@ fn link_shaped_outputs<'a>(mut outs: impl Iterator<Item = &'a str>) -> bool {
             || n.ends_with(".exe")
             // An executable usually has no extension at all, which is the
             // shape `mkCMakePackage`'s targets take.
-            || !n.rsplit('/').next().unwrap_or(n).contains('.')
+            || !n.contains('.')
     };
     match outs.next() {
         None => false,
@@ -6596,6 +6602,22 @@ mod link_shaped_tests {
     #[test]
     fn a_dot_in_a_parent_directory_does_not_make_it_an_object() {
         assert!(link_shaped_outputs(["CMakeFiles/x.dir/app"].into_iter()));
+    }
+
+    /// AND THE SAME MISTAKE IN THE OTHER DIRECTION, which shipped: meson
+    /// puts a shared library's objects under `<target>.so.p/`, so the path
+    /// carries `.so.` in a directory component while the file is an object.
+    /// Testing the whole path switched discovery off for every object of
+    /// every shared library, and `example-shared-lib` died on its own
+    /// header.
+    #[test]
+    fn a_shared_library_object_directory_does_not_make_an_object_a_link() {
+        assert!(!link_shaped_outputs(
+            ["libword1.so.p/word1lib.c.o"].into_iter()
+        ));
+        assert!(!link_shaped_outputs(["foo.so.p/bar.c.o"].into_iter()));
+        // The library itself, in the same tree, still is one.
+        assert!(link_shaped_outputs(["libword1.so.1.2.3"].into_iter()));
     }
 
     /// MIXED OUTPUTS ARE NOT A LINK, so a rule emitting an object beside
