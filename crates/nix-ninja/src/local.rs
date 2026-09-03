@@ -353,11 +353,10 @@ mod refresh_tree_mtimes_tests {
         std::fs::write(store.join("moc_a.cpp"), b"generated").unwrap();
         std::fs::write(store.join("sub/moc_b.cpp"), b"generated deeper").unwrap();
         // BOTH NEGATIVES MUST LIE INSIDE THE STORE TREE, because that is what
-        // the walk reads. Put only in the build tree - as the first version
-        // of this test did - they are unreachable and their assertions hold
-        // whatever the guard does: mutating the guard to `true` left it
-        // green. Fifth inert test in this tree, and written the day after
-        // the fourth.
+        // the walk reads. Placed only in the build tree they are unreachable
+        // and their assertions hold whatever the guard does: mutating the
+        // guard to `true` leaves them green, so a negative outside the walked
+        // tree asserts nothing about the guard it is written for.
         std::fs::write(store.join("kept.cpp"), b"the store's copy").unwrap();
         std::os::unix::fs::symlink("moc_a.cpp", store.join("alias.cpp")).unwrap();
         std::fs::create_dir_all(build.join("sub")).unwrap();

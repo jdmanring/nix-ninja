@@ -211,8 +211,8 @@ fn a_consumer_may_take_a_dangling_alias_as_an_input() {
 /// them was covered by a test that RUNS it: the guard that refused a dangling
 /// alias, and the duplicate check that called an alias a conflict with itself.
 /// Both passed every predicate test in this file while the function was
-/// broken, which is the "pin the wiring, not only the rule" entry in this
-/// project's own notes, ignored twice by the author of these tests.
+/// broken. A predicate test states what a rule answers; only a test that
+/// calls the function states that anything asks it.
 ///
 /// The shape is gtest's, from a live round: an edge declares the versioned
 /// library and its unversioned alias, the driver's co-output expansion hands a

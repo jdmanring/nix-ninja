@@ -76,6 +76,12 @@ pub struct Cli {
     /// what `-k` asks for, and it was reachable only through the
     /// environment. ninja's default is 1 - stop after the first failure -
     /// so any other value means keep going.
+    ///
+    /// DEFER(a caller that passes -k N for N greater than 1): the COUNT is
+    /// not honoured. ninja stops after N failures; `build.rs` reads one
+    /// boolean, so every N other than 1 behaves as `-k 0`. The observed
+    /// callers pass 0, and a driver that keeps going too long fails no build
+    /// that would otherwise pass - it only reports more of them.
     #[arg(short = 'k', default_value = "1", hide = true)]
     pub keep_going: usize,
 

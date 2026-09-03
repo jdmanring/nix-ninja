@@ -41,9 +41,16 @@ fn the_compatibility_flags_parse() {
     }
 }
 
-/// `-k` IS WIRED, NOT IGNORED, so its value has to be readable.
-/// ninja's default is 1, meaning stop after the first failure; any other
-/// value asks to keep going, and 0 means never stop.
+/// `-k`'s VALUE, which is the half this file can reach. ninja's default is
+/// 1, meaning stop after the first failure; any other value asks to keep
+/// going, and 0 means never stop.
+///
+/// WHAT THIS DOES NOT PIN: that anything READS the value. The bridge to
+/// `NIX_NINJA_KEEP_GOING` sits inside `run`, past a daemon connection, so
+/// deleting it leaves this test green - the shape this tree has shipped five
+/// times. The wire belongs to `local/gates/ninja-flag-surface.sh`, which
+/// drives the binary; asserting it here would need `run` split for the test's
+/// benefit, which this project's notes refuse for a one-line decision.
 #[test]
 fn keep_going_carries_ninjas_semantics() {
     let default = Cli::try_parse_from(["nix-ninja", "t"]).unwrap();

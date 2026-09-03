@@ -157,7 +157,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// WHAT THE CALL IS FOR and cannot be read off the paths.
 ///
 /// The escalating schedule exists for work a build cannot proceed without: a
-/// task's inputs are worth 105 minutes of retry because the alternative is a
+/// task's inputs are worth 185 minutes of retry because the alternative is a
 /// failed build. A pass whose documented failure mode is "the next run scans
 /// as before" is not, and it was getting the same schedule - measured in a
 /// live round, where the best-effort depfile collection held libcbor and
@@ -213,7 +213,7 @@ mod watchdog_policy_tests {
     /// The polarity that motivated `Patience`: a best-effort call must not
     /// be entitled to the escalation an essential one gets. Asserted as the
     /// TOTAL each is willing to wait, because that is the number the round
-    /// pays - 105 minutes against 5.
+    /// pays - 185 minutes against 5.
     #[test]
     fn a_best_effort_call_gets_one_allowance() {
         use super::{patience_limit, stall_allowance_s, Patience};
