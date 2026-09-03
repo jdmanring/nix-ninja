@@ -209,7 +209,23 @@ pub fn create_symlinks(
             })?;
         }
 
-        if !source_path.exists() {
+        // AN ALIAS OUTPUT IS DANGLING IN ITS OWN STORE PATH, AND THAT IS THE
+        // CORRECT STATE RATHER THAN A BROKEN INPUT. `exists()` follows the
+        // link, so it answers no about exactly the object `alias_link_target`
+        // stores: a relative link naming a sibling that lives in a DIFFERENT
+        // store object, because each declared output of an edge is its own.
+        //     ninja-build-lib-libgtest.so/lib/libgtest.so -> libgtest.so.1.17.0
+        // The placement below recreates that TEXT, and the sibling is placed
+        // beside it because the driver expands an edge's co-outputs into any
+        // consumer's inputs, so the link resolves in the build directory.
+        // Asking `symlink_metadata` asks whether the LINK is there, which is
+        // the question this guard means.
+        //
+        // Two gtest tasks died here in a live round on `symlink source does
+        // not exist`. brotli, the package the alias fix was written for, is
+        // consumed by nothing, so its alias is never placed as an input and
+        // the case could not appear there.
+        if !source_path.exists() && fs::symlink_metadata(&source_path).is_err() {
             return Err(anyhow!(
                 "nix-ninja-task: symlink source does not exist: {:?}",
                 source_path

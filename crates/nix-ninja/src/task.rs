@@ -4127,7 +4127,9 @@ fn new_opaque_files(
 /// it returns the store FILE, whose `file_name` already carries a hash, and
 /// uploading under that name mints a second hash over it:
 ///
-///     syw437nm...-2j9lfgwk...-sgtts2.f.o
+/// ```text
+/// syw437nm...-2j9lfgwk...-sgtts2.f.o
+/// ```
 ///
 /// Census over this store: 32,411 such paths, 30,444 of them objects, against
 /// 47,560 singly-named objects, and the nesting compounds past two.

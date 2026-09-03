@@ -150,3 +150,57 @@ fn the_alias_resolves_after_a_store_and_place_round_trip() {
 
     std::fs::remove_dir_all(&d).ok();
 }
+
+/// THE REGRESSION THE ALIAS FIX SHIPPED, and it is a class rather than a case.
+///
+/// Every declared output of an edge becomes its OWN store object, so an alias
+/// stored as its link text is DANGLING when read in the store: the sibling it
+/// names lives in a different store path. That is the correct state - the link
+/// resolves once both are placed in a build directory - but `create_symlinks`
+/// guarded its placement with `exists()`, which FOLLOWS the link and therefore
+/// answers no about exactly the object the fix stores.
+///
+/// The producing package never sees it. brotli's own alias is consumed by
+/// nothing within brotli, so brotli builds and the round-trip test passes;
+/// the failure needs a CONSUMER that takes the alias as an input. In a live
+/// round this took out fmt, gtest, json-c, lz4, snappy and libbrotlicommon
+/// itself - the fix written for brotli made brotli's alias unusable
+/// downstream.
+///
+/// The sibling is placed beside it because the driver expands an edge's
+/// co-outputs into any consumer's inputs (`task.rs`, `co_outputs`), so the
+/// recreated text resolves where the task runs.
+#[test]
+fn a_consumer_may_take_a_dangling_alias_as_an_input() {
+    let d = std::env::temp_dir().join(format!("nn-alias-consumer-{}", std::process::id()));
+    let store = d.join("store-libfoo.so");
+    std::fs::create_dir_all(&store).unwrap();
+
+    // The alias output exactly as it lands in the store: one entry, a
+    // relative link to a sibling that is NOT in this store path.
+    std::os::unix::fs::symlink("libfoo.so.1.2.3", store.join("libfoo.so")).unwrap();
+    let alias = store.join("libfoo.so");
+
+    assert!(
+        !alias.exists(),
+        "the guard's own predicate: exists() follows the link and says no"
+    );
+    assert!(
+        std::fs::symlink_metadata(&alias).is_ok(),
+        "while the LINK is plainly there, which is what the guard means to ask"
+    );
+
+    // What placement then produces, given the co-output is present.
+    let out = d.join("build");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("libfoo.so.1.2.3"), b"ELF-LIBRARY").unwrap();
+    std::os::unix::fs::symlink(placement_link_text(&alias), out.join("libfoo.so")).unwrap();
+
+    assert_eq!(
+        std::fs::read(out.join("libfoo.so")).unwrap(),
+        b"ELF-LIBRARY",
+        "placed beside its co-output, the alias resolves"
+    );
+
+    std::fs::remove_dir_all(&d).ok();
+}
