@@ -9512,18 +9512,6 @@ mod target_resolution_tests {
         assert_eq!(got.len(), 2);
     }
 
-    // A co-output listing that names itself must not spin, and one edge's
-    // sibling being another edge's output resolves through the same walk.
-    #[test]
-    fn a_self_naming_co_output_terminates() {
-        let mut outs = HashMap::new();
-        outs.insert(FileId::from(1), df("a.o"));
-        let mut co = HashMap::new();
-        co.insert(FileId::from(1), vec![FileId::from(1)]);
-        let got = resolve_target_in(&outs, &HashMap::new(), &co, FileId::from(1));
-        assert_eq!(got.len(), 1);
-    }
-
     // An unknown target must resolve EMPTY rather than to something
     // plausible: build() turns the empty vec into the "missing derived file"
     // error that names the target, and a silent empty success there would

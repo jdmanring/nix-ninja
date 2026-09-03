@@ -181,10 +181,20 @@ fn write_restored(tmp: &Path, data: &[u8], target: &Path) -> std::io::Result<()>
 fn refresh_placed_mtimes(prefix: &Path, store_dir: &StoreDir, files: &[DerivedFile]) {
     for df in files {
         let src = df.absolute_path(store_dir);
+        let dest = prefix.join(&df.build_path);
+        // A TREE IS PLACED FILE BY FILE, SO IT IS REFRESHED FILE BY FILE.
+        // `create_symlinks` links a directory input's CONTENTS rather than
+        // the directory, and each of those links is a placement with the
+        // same mtime 1 that every other placement has. Skipping the whole
+        // input here left an autogen or syncqt tree reading as older than
+        // every source, which is the rebuild-every-pass defect this
+        // function exists for. Reachable from a plain target since target
+        // resolution began expanding an edge's co-outputs; before that it
+        // needed NIX_NINJA_MATERIALIZE_ALL.
         if src.is_dir() {
+            refresh_tree_mtimes(&src, &dest);
             continue;
         }
-        let dest = prefix.join(&df.build_path);
         if !dest.is_symlink() {
             continue;
         }
@@ -206,18 +216,47 @@ fn refresh_placed_mtimes(prefix: &Path, store_dir: &StoreDir, files: &[DerivedFi
         if !placement_is_ours(&dest, &src) {
             continue;
         }
-        let tmp = unique_sibling(&dest);
-        if clone_or_copy(&src, &tmp).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            continue;
-        }
-        if let Ok(md) = std::fs::metadata(&src) {
-            let mut perm = md.permissions();
-            perm.set_mode(perm.mode() | 0o200);
-            let _ = std::fs::set_permissions(&tmp, perm);
-        }
-        if std::fs::rename(&tmp, &dest).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        refresh_one(&dest, &src);
+    }
+}
+
+/// Replace one placed symlink with the bytes it points at, carrying a fresh
+/// mtime and the store mode plus owner write. Best effort: a failure costs a
+/// redundant compile, which is the behavior that has always been in force.
+fn refresh_one(dest: &Path, src: &Path) {
+    let tmp = unique_sibling(dest);
+    if clone_or_copy(src, &tmp).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if let Ok(md) = std::fs::metadata(src) {
+        let mut perm = md.permissions();
+        perm.set_mode(perm.mode() | 0o200);
+        let _ = std::fs::set_permissions(&tmp, perm);
+    }
+    if std::fs::rename(&tmp, dest).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Every file placed under a directory input, walked in step with the
+/// per-file links `create_symlinks` wrote for it.
+///
+/// The links point into the store object, so each one answers
+/// `placement_is_ours` on its own; a file the BUILD TREE already held was
+/// skipped at placement and is a real file rather than a link, so it is
+/// skipped here too and keeps the time it has.
+fn refresh_tree_mtimes(src: &Path, dest: &Path) {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if from.is_dir() {
+            refresh_tree_mtimes(&from, &to);
+        } else if to.is_symlink() && placement_is_ours(&to, &from) {
+            refresh_one(&to, &from);
         }
     }
 }
@@ -275,6 +314,81 @@ fn clone_or_copy(src: &Path, dest: &Path) -> std::io::Result<()> {
     drop(df);
     std::fs::copy(src, dest)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod refresh_tree_mtimes_tests {
+    use super::refresh_placed_mtimes;
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::DerivedFile;
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("nn-rtm-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A placed TREE gets the same treatment as a placed file, and nothing
+    /// else in the directory does.
+    ///
+    /// `make` stats THROUGH a symlink and every store file reads as mtime 1,
+    /// so a link left under an autogen tree is older than every source and
+    /// the tree rebuilds on every pass. The two things that must NOT be
+    /// touched are in the same directory: a file the build tree already held
+    /// (a real file, never a placement) and a link the build itself made to a
+    /// sibling, which is a NAME rather than a product.
+    #[test]
+    fn a_placed_tree_is_refreshed_and_the_build_s_own_files_are_not() {
+        // THROUGH refresh_placed_mtimes, NOT through the tree walk it calls.
+        // Written the direct way first, this passed with the call site
+        // deleted - the fourth inert test in this tree, and the rule that
+        // keeps being relearned is to pin the WIRING.
+        let d = dir("tree");
+        let store_root = d.join("store");
+        let hash = "1ccccccccccccccccccccccccccccccc";
+        let store = store_root.join(format!("{hash}-ninja-build-gen"));
+        let build = d.join("build/gen");
+        std::fs::create_dir_all(store.join("sub")).unwrap();
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(store.join("moc_a.cpp"), b"generated").unwrap();
+        std::fs::write(store.join("sub/moc_b.cpp"), b"generated deeper").unwrap();
+        std::fs::create_dir_all(build.join("sub")).unwrap();
+
+        // What create_symlinks would have written for the tree.
+        std::os::unix::fs::symlink(store.join("moc_a.cpp"), build.join("moc_a.cpp")).unwrap();
+        std::os::unix::fs::symlink(store.join("sub/moc_b.cpp"), build.join("sub/moc_b.cpp"))
+            .unwrap();
+        // The build tree's own file, and the build's own alias to a sibling.
+        std::fs::write(build.join("kept.cpp"), b"the build tree's").unwrap();
+        std::os::unix::fs::symlink("kept.cpp", build.join("alias.cpp")).unwrap();
+
+        let store_dir = StoreDir::new(&store_root).unwrap();
+        let df =
+            DerivedFile::from_encoded(&store_dir, &format!("{}:gen:", store.display())).unwrap();
+        refresh_placed_mtimes(&d.join("build"), &store_dir, &[df]);
+
+        for placed in ["moc_a.cpp", "sub/moc_b.cpp"] {
+            assert!(
+                !build.join(placed).is_symlink(),
+                "{placed} was placed by us and must become bytes with a real mtime"
+            );
+        }
+        assert_eq!(
+            std::fs::read(build.join("moc_a.cpp")).unwrap(),
+            b"generated",
+            "and the bytes are the ones the link pointed at"
+        );
+        assert!(
+            build.join("alias.cpp").is_symlink(),
+            "a link the build made to a sibling is a NAME and stays a link"
+        );
+        assert_eq!(
+            std::fs::read(build.join("kept.cpp")).unwrap(),
+            b"the build tree's",
+            "and a real file the build tree already held is untouched"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
 }
 
 #[cfg(test)]

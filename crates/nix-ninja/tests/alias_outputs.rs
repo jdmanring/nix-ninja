@@ -386,10 +386,12 @@ fn two_different_aliases_on_one_build_path_still_abort() {
 ///
 /// Target resolution expands an edge's co-outputs, and one of the two
 /// populations recorded in that map is the synthetic id of a DIRECTORY
-/// output (a Qt `_autogen` tree, the syncqt include tree). Those ids
-/// previously reached input assembly only; a target naming a real output of
-/// the same rule now places the tree into the outer build directory, which
-/// already holds the configure-time content.
+/// output (a Qt `_autogen` tree, the syncqt include tree). A tree already
+/// reached the outer build directory under `NIX_NINJA_MATERIALIZE_ALL`,
+/// which hands every built file to the placement - `create_symlinks`'s
+/// EISDIR case was measured there. What is new is that a PLAIN TARGET
+/// reaches one, so the path no longer sits behind an environment variable
+/// and lands on a directory holding cmake's configure-time content.
 ///
 /// What must hold there is that the placement adds and never replaces: a
 /// file the build tree already has is the authority, and the tree carries a
