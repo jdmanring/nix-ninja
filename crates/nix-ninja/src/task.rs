@@ -3349,6 +3349,49 @@ fn build_task_derivation(
             // Unresolved: the link still succeeds, serially, exactly as it
             // does today. This is a throughput fix, never a correctness one.
         }
+        // THE THIRD MEMBER OF THE BARE-NAME CLASS, AND THE FIRST WHOSE
+        // ABSENCE IS FATAL RATHER THAN SLOW. meson archives a static library
+        // with `gcc-ar`, which the execve trace over a LINK could not see
+        // because the tool is execed by a command the trace never runs:
+        //
+        //     /bin/sh -c "rm -f x.a && gcc-ar csrDT x.a x.a.p/t.S.o"
+        //     /bin/sh: gcc-ar: not found
+        //
+        // `make` unresolved degrades to a serial link; this one takes the
+        // task. Gated on the command NAMING the tool for the same reason
+        // `make` is: the PATH is emitted, so an unconditional entry re-keys
+        // every derivation this driver emits.
+        //
+        // RESOLVED FROM THE cc's OWN PACKAGE, and PATH cannot answer for it.
+        // The wrapper ships `ar` and not `gcc-ar`, which lives in the
+        // unwrapped gcc, so a `which` under a stdenv finds nothing. The
+        // wrapper names its compiler in `nix-support/orig-cc`, and that
+        // package's `bin` holds all three of these. Read off a real wrapper
+        // in this store rather than assumed: `gcc-wrapper-15.3.0` carries
+        // `orig-cc` naming `gcc-15.3.0`, whose `bin` holds `gcc-ar`,
+        // `gcc-nm` and `gcc-ranlib`, and whose own `bin` holds none of them.
+        //
+        // The RESOLUTION here is covered by no test - a fixture would need a
+        // wrapper layout and a store - while the GATE beside it is. A
+        // package with a static library and a gcc is what exercises it.
+        for tool in gcc_toolchain_tools_named(cmdline) {
+            let Some(cc_dir) = cc_dir.as_deref() else {
+                break;
+            };
+            let Ok(orig) = std::fs::read_to_string(cc_dir.join("nix-support/orig-cc")) else {
+                break;
+            };
+            let orig = PathBuf::from(orig.trim());
+            if !orig.join("bin").join(tool).is_file() {
+                continue;
+            }
+            let Some(dir) = orig.to_str() else { continue };
+            let Ok(sp) = task.store_dir.parse(dir) else {
+                continue;
+            };
+            path.push(format!("{}/bin", task.store_dir.display(&sp)));
+            drv.inputs.insert(SingleDerivedPath::Opaque(sp));
+        }
         drv.env
             .insert(b"PATH"[..].into(), path.join(":").into_bytes().into());
     }
@@ -3841,6 +3884,30 @@ pub fn which_store_path(store_dir: &StoreDir, binary_name: &str) -> Result<Store
 
 /// Like [`which_store_path`], but returns `None` for a binary that resolves
 /// outside the Nix store (e.g. a script in the source tree).
+/// The gcc toolchain wrappers a command names by BARE NAME.
+///
+/// `gcc-ar`, `gcc-nm` and `gcc-ranlib` are thin wrappers that load the LTO
+/// plugin, and meson names them unqualified in an archive command. They are
+/// the only three: the compiler drivers and the binutils themselves resolve
+/// through the wrapper's own `-B` search path, which never consults PATH.
+///
+/// A name is taken only as a WHOLE token, so a path ending in the same
+/// characters is not a match and does not put a directory on the emitted
+/// PATH for a command that names no such tool.
+fn gcc_toolchain_tools_named(cmdline: &str) -> Vec<&'static str> {
+    const TOOLS: [&str; 3] = ["gcc-ar", "gcc-nm", "gcc-ranlib"];
+    let mut out = Vec::new();
+    for tool in TOOLS {
+        if cmdline
+            .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+            .any(|tok| tok == tool)
+        {
+            out.push(tool);
+        }
+    }
+    out
+}
+
 fn which_store_path_opt(store_dir: &StoreDir, binary_name: &str) -> Result<Option<StorePath>> {
     let binary_path =
         which(binary_name).map_err(|err| anyhow!("Failed to find {}: {}", binary_name, err))?;
@@ -10941,5 +11008,48 @@ mod xinclude_reader_tests {
         let got = xinclude_closure(&d, &[std::path::PathBuf::from("main.xml")], 4096);
         assert!(got.is_empty(), "expected nothing to upload, got {got:?}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod gcc_toolchain_tool_tests {
+    use super::gcc_toolchain_tools_named;
+
+    /// dtc's own command, and it is the shape that matters: the tool is
+    /// execed by a shell command after `&&`, which is why an execve trace
+    /// over a link could not enumerate it.
+    #[test]
+    fn an_archive_command_names_gcc_ar() {
+        let got = gcc_toolchain_tools_named(
+            "/bin/sh -c \"rm -f tests/libtrees.a && \
+             gcc-ar csrDT tests/libtrees.a tests/libtrees.a.p/trees.S.o\"",
+        );
+        assert_eq!(got, vec!["gcc-ar"]);
+    }
+
+    /// THE GATE IS WHAT KEEPS THIS FREE. The emitted PATH is part of every
+    /// derivation's key, so a command naming none of these must add no
+    /// entry - an unconditional one re-keys every task there is.
+    #[test]
+    fn an_ordinary_compile_names_none() {
+        assert!(gcc_toolchain_tools_named("gcc -c a.c -o a.o").is_empty());
+        assert!(gcc_toolchain_tools_named("ar rcs libx.a a.o").is_empty());
+    }
+
+    /// A WHOLE TOKEN, never a substring. A path that ends in the tool's name
+    /// is already resolved and needs no PATH entry, and matching it would
+    /// re-key the task that carries it for nothing.
+    #[test]
+    fn a_path_ending_in_the_name_is_not_a_bare_name() {
+        assert!(gcc_toolchain_tools_named("/nix/store/x/bin/gcc-ar rcs libx.a a.o").is_empty());
+        assert!(gcc_toolchain_tools_named("gcc -o gcc-arch a.o").is_empty());
+    }
+
+    /// All three are the same wrapper family and a package using one may use
+    /// the others in the same command.
+    #[test]
+    fn the_family_is_three() {
+        let got = gcc_toolchain_tools_named("sh -c \"gcc-ranlib x.a && gcc-nm x.a\"");
+        assert_eq!(got, vec!["gcc-nm", "gcc-ranlib"]);
     }
 }
