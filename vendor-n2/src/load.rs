@@ -67,6 +67,16 @@ pub struct Loader {
     builddir: Option<String>,
 }
 
+/// The scope an edge is evaluated in: the innermost bindings first, then
+/// the files that pulled this one in. Built per statement rather than held,
+/// because the borrows are of parsers on the recursion stack.
+fn chain<'a>(front: &[&'a dyn eval::Env], rest: &[&'a dyn eval::Env]) -> Vec<&'a dyn eval::Env> {
+    let mut envs: Vec<&'a dyn eval::Env> = Vec::with_capacity(front.len() + rest.len());
+    envs.extend_from_slice(front);
+    envs.extend_from_slice(rest);
+    envs
+}
+
 impl Loader {
     pub fn new() -> Self {
         let mut loader = Loader::default();
@@ -103,18 +113,18 @@ impl Loader {
     fn add_build(
         &mut self,
         filename: std::rc::Rc<PathBuf>,
-        env: &eval::Vars,
+        env: &[&dyn eval::Env],
         b: parse::Build,
     ) -> anyhow::Result<()> {
         let ins = graph::BuildIns {
-            ids: self.evaluate_paths(b.ins, &[&b.vars, env]),
+            ids: self.evaluate_paths(b.ins, &chain(&[&b.vars], env)),
             explicit: b.explicit_ins,
             implicit: b.implicit_ins,
             order_only: b.order_only_ins,
             // validation is implied by the other counts
         };
         let outs = graph::BuildOuts {
-            ids: self.evaluate_paths(b.outs, &[&b.vars, env]),
+            ids: self.evaluate_paths(b.outs, &chain(&[&b.vars], env)),
             explicit: b.explicit_outs,
         };
         let mut build = graph::Build::new(
@@ -142,8 +152,10 @@ impl Loader {
         let build_vars = &b.vars;
         let pre_lookup = |key: &str| -> Option<String> {
             Some(match build_vars.get(key) {
-                Some(val) => val.evaluate(&[env]),
-                None => rule.get(key)?.evaluate(&[&pre_vars, build_vars, env]),
+                Some(val) => val.evaluate(env),
+                None => rule
+                    .get(key)?
+                    .evaluate(&chain(&[&pre_vars, build_vars], env)),
             })
         };
         let rspfile_path_early = pre_lookup("rspfile");
@@ -158,8 +170,10 @@ impl Loader {
             // Look up `key = ...` binding in build and rule block.
             // See "Variable scope" in the design notes.
             Some(match build_vars.get(key) {
-                Some(val) => val.evaluate(&[env]),
-                None => rule.get(key)?.evaluate(&[&implicit_vars, build_vars, env]),
+                Some(val) => val.evaluate(env),
+                None => rule
+                    .get(key)?
+                    .evaluate(&chain(&[&implicit_vars, build_vars], env)),
             })
         };
 
@@ -199,13 +213,13 @@ impl Loader {
         self.graph.add_build(build)
     }
 
-    fn read_file(&mut self, id: FileId) -> anyhow::Result<()> {
+    fn read_file(&mut self, id: FileId, inherited: &[&dyn eval::Env]) -> anyhow::Result<()> {
         let path = self.graph.file(id).path().to_path_buf();
         let bytes = match trace::scope("read file", || scanner::read_file_with_nul(&path)) {
             Ok(b) => b,
             Err(e) => bail!("read {}: {}", path.display(), e),
         };
-        self.parse(path, &bytes)
+        self.parse_with(path, &bytes, inherited)
     }
 
     fn evaluate_and_read_file(
@@ -214,10 +228,42 @@ impl Loader {
         envs: &[&dyn eval::Env],
     ) -> anyhow::Result<()> {
         let evaluated = self.evaluate_path(file, envs);
-        self.read_file(evaluated)
+        self.read_file(evaluated, envs)
     }
 
     pub fn parse(&mut self, path: PathBuf, bytes: &[u8]) -> anyhow::Result<()> {
+        self.parse_with(path, bytes, &[])
+    }
+
+    /// AN EDGE COULD NOT SEE A VARIABLE DEFINED IN ANOTHER FILE, and it is
+    /// the file holding the BUILD STATEMENT that decides rather than the
+    /// keyword that pulled the file in. Each included file was parsed by a
+    /// fresh `Parser` whose vars start empty, so gyp - which keeps `cc = ...`
+    /// in the root and emits a subninja per target - expanded `$cc` to
+    /// nothing in every compile edge, and the empty argv[0] surfaced as
+    /// `Failed to find -MMD: cannot find binary path`, 513 times in one
+    /// package. CMake is untouched by the same defect only because it keeps
+    /// its build statements in the root file.
+    ///
+    /// `inherited` is the enclosing files' bindings, innermost first. The
+    /// child's own vars are consulted before them, so a child rebinding a
+    /// name wins inside itself, which is what both of ninja's scopes do.
+    ///
+    /// DEFER(a package needs a value defined inside an `include`): the
+    /// reverse direction is not implemented. Ninja's `include` shares the
+    /// parent's scope outright, so a binding made in the included file is
+    /// visible to the parent afterwards, while `subninja` gets a copy whose
+    /// definitions do not leak back. Writing a child's bindings back needs
+    /// them to outlive the child's buffer, which is upstream's own
+    /// "keep the contents of all included files in memory" TODO; the
+    /// forward direction needs no such storage. Nothing measured needs the
+    /// reverse: the failing shape is a child reading the root's compiler.
+    pub fn parse_with(
+        &mut self,
+        path: PathBuf,
+        bytes: &[u8],
+        inherited: &[&dyn eval::Env],
+    ) -> anyhow::Result<()> {
         let filename = std::rc::Rc::new(path);
 
         let mut parser = parse::Parser::new(&bytes);
@@ -231,15 +277,17 @@ impl Loader {
                 Some(s) => s,
             };
             match stmt {
-                Statement::Include(id) => trace::scope("include", || {
-                    self.evaluate_and_read_file(id, &[&parser.vars])
-                })?,
-                // TODO: implement scoping for subninja
-                Statement::Subninja(id) => trace::scope("subninja", || {
-                    self.evaluate_and_read_file(id, &[&parser.vars])
-                })?,
+                Statement::Include(id) => {
+                    let envs = chain(&[&parser.vars], inherited);
+                    trace::scope("include", || self.evaluate_and_read_file(id, &envs))?
+                }
+                Statement::Subninja(id) => {
+                    let envs = chain(&[&parser.vars], inherited);
+                    trace::scope("subninja", || self.evaluate_and_read_file(id, &envs))?
+                }
                 Statement::Default(defaults) => {
-                    let evaluated = self.evaluate_paths(defaults, &[&parser.vars]);
+                    let evaluated =
+                        self.evaluate_paths(defaults, &chain(&[&parser.vars], inherited));
                     self.default.extend(evaluated);
                 }
                 Statement::Rule(rule) => {
@@ -252,7 +300,10 @@ impl Loader {
                     }
                     self.rules.insert(rule.name.to_owned(), vars);
                 }
-                Statement::Build(build) => self.add_build(filename.clone(), &parser.vars, build)?,
+                Statement::Build(build) => {
+                    let envs = chain(&[&parser.vars], inherited);
+                    self.add_build(filename.clone(), &envs, build)?
+                }
                 Statement::Pool(pool) => {
                     self.pools.insert(pool.name.to_string(), pool.depth);
                 }
@@ -280,7 +331,7 @@ pub fn read(build_filename: &str) -> anyhow::Result<State> {
             .graph
             .files
             .id_from_canonical(to_owned_canon_path(build_filename));
-        loader.read_file(id)
+        loader.read_file(id, &[])
     })?;
     let mut hashes = graph::Hashes::default();
     let db = trace::scope("db::open", || {
