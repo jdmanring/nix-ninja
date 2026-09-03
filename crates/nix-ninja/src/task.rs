@@ -4069,7 +4069,18 @@ fn wl_file_candidates(group: &str) -> Vec<&str> {
             }
             continue;
         }
-        let cand = val.unwrap_or(el);
+        // A PATH INSIDE A -Wl GROUP MAY ARRIVE QUOTED, and the quotes are
+        // ours to remove because this string is never shell-split. `cmdline`
+        // here is the raw ninja text, so a project spelling the flag as
+        // `"-Wl,--version-script,\"${MAP_PATH}\""` - libssh's
+        // src/CMakeLists.txt does - reaches this loop with the double quotes
+        // still attached to the candidate. `is_file` then answers no about a
+        // name no file ever has, the map is declared by nothing, and the link
+        // dies on `cannot open linker script file` with the file present in
+        // the outer tree. Silent, because a skipped candidate is how this
+        // loop correctly ignores every non-path token.
+        // Stripped BEFORE the `-` test so a quoted flag is still skipped.
+        let cand = val.unwrap_or(el).trim_matches(|c| c == '"' || c == '\'');
         if !cand.is_empty() && !cand.starts_with('-') {
             out.push(cand);
         }
@@ -7905,6 +7916,83 @@ mod new_built_file_tests {
             super::wl_file_candidates("--dependency-file=x/link.d,-Bsymbolic-functions"),
             Vec::<&str>::new()
         );
+    }
+
+    /// libssh-0.12.2, and the token arrives with its quotes attached.
+    ///
+    /// `target_link_libraries(ssh PRIVATE "-Wl,--version-script,\\"${MAP_PATH}\\"")`
+    /// puts literal double quotes inside LINK_LIBRARIES, so build.ninja
+    /// carries them and this parser sees them - the cmdline at that call site
+    /// is raw ninja text and is never shell-split. The map is named ONCE in
+    /// the whole ninja file, inside that flag, so nothing else can declare it.
+    ///
+    /// The failure names a file that is present the whole time:
+    /// `ld.bfd: cannot open linker script file
+    /// /build/libssh-0.12.2/src/libssh.map: No such file or directory`,
+    /// with the map 14,965 bytes in the outer tree and absent from the task's
+    /// 98 declared inputs.
+    ///
+    /// THE CONTROL SAYS QUOTES AND NOT PLACEMENT. Twenty unquoted links in
+    /// the same round succeeded, one of them
+    /// `-Wl,--version-script,/build/source/p11-kit/p11-module.map`, which is
+    /// also a source-root file outside the build directory. Across 425,031
+    /// log lines there is exactly one `cannot open linker script`.
+    #[test]
+    fn a_quoted_wl_path_is_still_a_candidate() {
+        assert_eq!(
+            super::wl_file_candidates("--version-script,\"/build/libssh-0.12.2/src/libssh.map\""),
+            vec!["/build/libssh-0.12.2/src/libssh.map"],
+            "quotes belong to the ninja text, not to the file name"
+        );
+        assert_eq!(
+            super::wl_file_candidates("--version-script=\"/src/json-c.sym\""),
+            vec!["/src/json-c.sym"]
+        );
+        assert_eq!(
+            super::wl_file_candidates("--version-script,'/src/json-c.sym'"),
+            vec!["/src/json-c.sym"]
+        );
+        // Stripping happens BEFORE the leading-dash test, so a quoted flag is
+        // still not a candidate. Without that ordering this widening would
+        // hand every quoted linker option to an existence check.
+        assert_eq!(
+            super::wl_file_candidates("\"-Bsymbolic-functions\""),
+            Vec::<&str>::new(),
+            "a quoted FLAG is not a path"
+        );
+    }
+
+    /// krb5-1.22.2 through the compiler shim, and the fork's own test for
+    /// this class covers a spelling the shim does not emit.
+    ///
+    /// The rule `.c.so:` compiles as `gcc ... -c $< -o $*.so.o`, so the edge
+    /// output is `threads.so.o` and not `threads.so`. Both contain `.so.`,
+    /// so `link_shaped_outputs` calls each a link and switches header
+    /// discovery off - the task then declared exactly `threads.c` and died on
+    /// `threads.c:28:10: fatal error: k5-platform.h: No such file or
+    /// directory`. Its driver line reads `nar 1/1 sent, scan 0/0 parsed`, and
+    /// of 6,227 stats lines in that round exactly three read `scan 0/0`.
+    ///
+    /// So the rescue rests entirely on `command_is_compile` finding the `-c`,
+    /// which is what this pins. The existing test asserts `-o threads.so`;
+    /// the shape that actually failed is asserted here.
+    #[test]
+    fn the_shims_object_suffix_is_still_a_compile() {
+        let cmd = "/nix/store/aaaa-gcc/bin/gcc -fPIC -DPIC -I../../include \
+             -c threads.c -o threads.so.o";
+        assert!(
+            super::command_is_compile(Some(cmd)),
+            "the -c is what tells a .so.o compile from a link"
+        );
+        // The negative side of the same predicate: a real link carries none.
+        assert!(!super::command_is_compile(Some(
+            "/nix/store/aaaa-gcc/bin/gcc -shared -o libssh.so.4 a.o b.o"
+        )));
+        // And a shell's own -c must never count, or every shell-wrapped LINK
+        // reads as a compile - the regression 618a686 exists for.
+        assert!(!super::command_is_compile(Some(
+            "/bin/sh -c \"gcc -shared -o libssh.so.4 a.o\""
+        )));
     }
 
     #[test]
