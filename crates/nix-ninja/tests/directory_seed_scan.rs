@@ -10,7 +10,12 @@
 //! 185 task failures across llvm-tblgen and rdma-core in one round, and
 //! every edition needs clang.
 //!
-//! WHAT THESE TESTS ESTABLISH IS A BOUND, NOT A CLOSURE. Both routes a
+//! WHAT THESE TESTS ESTABLISH, NOW THAT THE PAIRING IS GUARDED: each of
+//! the three routes is refused by resolution rather than reaching the read,
+//! and the third is the pairing the round took. The history below is kept
+//! because the bound is what identified the route.
+//!
+//! WHAT THEY ESTABLISHED WHILE THE PAIRING WAS LIVE. Both routes a
 //! reduction can construct - a directory in the SEED SET, and a directory
 //! reached through the VIRTUAL PATH map - are refused at HEAD, and each is
 //! refused with `Required file not found` rather than the round's EISDIR.
@@ -97,16 +102,19 @@ fn a_directory_in_the_seed_set_is_refused_before_the_read() {
 /// value afterwards, and this test is what turned that reading into a
 /// measurement.
 ///
-/// AND IT IS ALSO THE POST-FIX RESIDUAL, MEASURED RATHER THAN ARGUED, which
-/// is not what it was written for. Its configuration is exactly what
-/// `scan_seeds` leaves behind: the directory is NOT a seed here, its virtual
-/// entry IS present, and a source includes it by name. So this is what a
-/// task looks like after the fix if any source reaches that directory
-/// directly - and the refusal it asserts is `?`-propagated, so the task
-/// dies. The residual was described as reasoning when a passing test had
-/// already measured it.
+/// AND IT IS WHAT MEASURED THE RESIDUAL AWAY, which is not what it was
+/// written for either. Its configuration is exactly what the driver-side
+/// seed filter leaves behind: the directory is NOT a seed, its virtual
+/// entry IS present, and a source includes it by name. Before the guard on
+/// the virtual hit, that resolved to the directory and the downstream check
+/// refused it with a `?`-propagated `Required file not found` - a hard
+/// error that fails the task. With the guard the hit answers None, the
+/// include search falls through exactly as the compiler's does over a
+/// directory on its include path, and the scan is CLEAN. So the residual
+/// predicted for this route does not exist once the root fix is in, and
+/// this arm is the measurement of that rather than an argument for it.
 #[test]
-fn a_virtual_path_resolving_to_a_directory_is_also_refused() {
+fn a_virtual_path_resolving_to_a_directory_falls_through_clean() {
     let d = std::env::temp_dir().join(format!(
         "nn-dirvirt-{}-{}",
         std::process::id(),
@@ -129,19 +137,12 @@ fn a_virtual_path_resolving_to_a_directory_is_also_refused() {
         vec![tu.clone()],
         Some(virtual_paths),
     );
-    match got {
-        Ok(_) => panic!("a directory must not scan clean through the virtual map"),
-        Err(e) => {
-            let err = format!("{e:#}");
-            assert!(
-                err.contains("Required file not found"),
-                "expected refusal by resolution, got: {err}"
-            );
-            assert!(
-                !err.contains("os error 21"),
-                "reaching the read means class 21's route is live here: {err}"
-            );
-        }
+    // The DISCRIMINATOR is which failure is absent. A clean scan here is
+    // only meaningful because the same call errors when either probe loses
+    // its guard: EISDIR if the walk reads the directory, `Required file not
+    // found` if the resolved directory reaches the downstream check.
+    if let Err(e) = got {
+        panic!("a directory include must fall through, got: {e:#}");
     }
 
     let _ = fs::remove_dir_all(&d);
@@ -168,19 +169,16 @@ fn a_virtual_path_resolving_to_a_directory_is_also_refused() {
 ///
 /// both at pin 6015510, which has the guard: `4e591a0` is its ancestor.
 ///
-/// THIS ARM ASSERTS THE DEFECT AND IS POINTED AT THE ROOT CAUSE, NOT AT THE
-/// FIX. `scan_seeds` stops the driver from SEEDING a directory; it does not
-/// stop `canonicalize_cached` handing one back, which is what this
-/// exercises. So this stays green with the fix in, and it goes RED the day
-/// someone guards the virtual hit itself - the two-line change in
-/// `crates/deps-infer` that is declined today on cost.
-/// IF THIS FAILS, READ IT AS THE ROOT CAUSE HAVING BEEN FIXED and delete
-/// the arm deliberately. Do not repair it. An arm asserting a live defect
-/// is the only thing that makes such a fix impossible to land silently,
-/// and the failure mode of the pattern is a later author quietly deleting
-/// a test they read as broken.
+/// THE ARM WAS WRITTEN ASSERTING THE DEFECT AND IS RETARGETED AT THE FIX,
+/// which is the deliberate moment its own note asked for. It asserted the
+/// round's EISDIR while `scan_seeds` covered only the SEED half; the guard
+/// on the virtual hit covers the pairing at the resolution point, so the
+/// same configuration is now refused before the read. Retargeted rather
+/// than deleted because it is the only arm that reaches the guard through
+/// the pairing: reverting either probe's refusal returns the EISDIR here
+/// while every other test in this file stays green.
 #[test]
-fn a_directory_that_is_both_seed_and_virtual_key_reaches_the_read() {
+fn a_directory_that_is_both_seed_and_virtual_key_is_refused_at_the_hit() {
     let d = std::env::temp_dir().join(format!(
         "nn-dirboth-{}-{}",
         std::process::id(),
@@ -207,18 +205,71 @@ fn a_directory_that_is_both_seed_and_virtual_key_reaches_the_read() {
         Some(built_paths),
     );
     match got {
-        Ok(_) => panic!("expected the directory output to reach the read"),
+        Ok(_) => panic!("expected the directory output to be refused"),
         Err(e) => {
             let err = format!("{e:#}");
-            // Printed, not only asserted: this is the one arm that claims to
-            // reproduce a round, and a reader should see the text rather
-            // than trust a substring match on it.
-            println!("reproduced: {err}");
+            // Printed, not only asserted: this arm carries the round's own
+            // configuration, and a reader should see the text rather than
+            // trust a substring match on it.
+            println!("refused: {err}");
             assert!(
-                err.contains("Is a directory") || err.contains("os error 21"),
-                "expected the round's EISDIR, got: {err}"
+                !err.contains("Is a directory") && !err.contains("os error 21"),
+                "the round's EISDIR is back, so a virtual probe lost its guard: {err}"
+            );
+            assert!(
+                err.contains("Required file not found"),
+                "expected refusal by resolution, got: {err}"
             );
         }
+    }
+
+    let _ = fs::remove_dir_all(&d);
+}
+
+/// THE SECOND BYPASS, WHICH THE THREE ARMS ABOVE CANNOT REACH.
+///
+/// `canonicalize_cached` probes the virtual map TWICE: verbatim, then
+/// lexically normalized, because a quoted include arrives as the spelling
+/// the source wrote (`<dir>/sub/../include/kernel-abi`) while the graph
+/// declares the normalized path. Guarding only the first probe leaves the
+/// second handing a directory back, and every arm above takes the verbatim
+/// hit - measured, by reverting each guard alone: the first revert fails
+/// two arms, the second fails none.
+///
+/// So this arm is the only thing that can see half the fix go missing, and
+/// it is why "both bypasses" is stated rather than "the virtual hit".
+#[test]
+fn a_directory_reached_through_the_normalized_probe_is_refused_too() {
+    let d = std::env::temp_dir().join(format!(
+        "nn-dirnorm-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store_out = d.join("ninja-build-include-kernel-abi/include/kernel-abi");
+    fs::create_dir_all(&store_out).unwrap();
+    fs::create_dir_all(d.join("build/sub")).unwrap();
+    let tu = d.join("build/sub/tu.c");
+    // The dotdot spelling is what makes the verbatim probe MISS, which is
+    // the whole point of the arm: without it the first guard covers this.
+    fs::write(
+        &tu,
+        b"#include \"../include/kernel-abi\"\nint main(void){return 0;}\n",
+    )
+    .unwrap();
+
+    let mut virtual_paths = std::collections::HashMap::new();
+    virtual_paths.insert(d.join("build/include/kernel-abi"), store_out.clone());
+
+    let got = deps_infer::c_include_parser::retrieve_c_includes_checked(
+        &format!("gcc -c {} -o tu.o", tu.display()),
+        vec![tu.clone()],
+        Some(virtual_paths),
+    );
+    if let Err(e) = got {
+        panic!("the normalized probe must refuse the directory, got: {e:#}");
     }
 
     let _ = fs::remove_dir_all(&d);

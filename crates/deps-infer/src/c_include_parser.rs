@@ -977,6 +977,20 @@ where
     PathBuf: Borrow<P>,
     P: Hash + Eq,
 {
+    // A VIRTUAL HIT BYPASSES THE DIRECTORY GUARD BELOW, AND BOTH PROBES DO
+    // IT. The guard at the filesystem lookup refuses a directory so the
+    // include search falls through as the compiler's does; a path answered
+    // from the virtual map never reaches it. A materialized store output
+    // whose interior is a directory therefore resolved, and the walk read
+    // it: `Is a directory (os error 21)`, 189 task failures over rdma-core
+    // and llvm-tblgen in one round. Filtering the seed set in the driver
+    // covers the route where the directory is also a seed; a source naming
+    // the directory in an include still arrives here, which is why the
+    // refusal belongs at the resolution point rather than only at the seed.
+    fn virtual_hit(actual_path: &Path) -> Option<PathBuf> {
+        (!actual_path.is_dir()).then(|| actual_path.to_path_buf())
+    }
+
     // Check virtual paths first if provided. Keyed lookup, not a pairwise
     // scan: PathBuf's Hash agrees with the Eq the scan used, and the map
     // grows with every materialized output, so the scan made each include
@@ -985,7 +999,7 @@ where
     if let Some(virtual_paths) = virtual_paths {
         let key: &Path = path.as_ref();
         if let Some(actual_path) = virtual_paths.get::<Path>(key) {
-            return Ok(Some(actual_path.clone()));
+            return Ok(virtual_hit(actual_path));
         }
         // THE KEY IS A SPELLING AND THE MAP HOLDS GRAPH PATHS, so probing it
         // verbatim asks a question the map cannot answer. `#include
@@ -1005,7 +1019,7 @@ where
         let normalized = lexical_normalize(key);
         if normalized != key {
             if let Some(actual_path) = virtual_paths.get::<Path>(normalized.as_path()) {
-                return Ok(Some(actual_path.clone()));
+                return Ok(virtual_hit(actual_path));
             }
         }
     }
