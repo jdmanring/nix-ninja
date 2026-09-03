@@ -5820,8 +5820,11 @@ fn upload_python_closure_uncached(
             })
             .collect();
         {
-            let parent_buf = parent_dir_or_here(&dir);
-            let parent = parent_buf.as_path();
+            // A PLAIN SCOPE. This was `if let Some(parent) = dir.parent()`,
+            // whose binding both halves below have stopped using: the sibling
+            // listing resolves its own root, and the ancestors walk seeds from
+            // the caller's parent. The guard was never the point - it admitted
+            // an empty parent and handed it to a directory read.
             if !unsatisfied.is_empty() {
                 // Uncles: a directory beside this one holding <name>.py
                 // (common/ holds models.py) or BEING the named package
@@ -5846,7 +5849,22 @@ fn upload_python_closure_uncached(
                 // hit per name; the deep scan runs only when the cheap
                 // probes miss, and only over third_party.
                 for name in &unsatisfied {
-                    let mut anc = parent.to_path_buf();
+                    // SEEDED FROM THE CALLER'S OWN PARENT, NOT THE RESOLVED
+                    // ROOT, which is the same read-from-root spell-from-caller
+                    // split the sibling listing takes. Resolving a
+                    // one-component relative directory's empty parent to `.`
+                    // gives the loop one more level to walk: `.` has parent
+                    // `""` where `""` has none, so a walk that used to break
+                    // immediately would probe the BUILD ROOT for every
+                    // unsatisfied import and upload up to 8192 files the
+                    // previous code never looked at.
+                    // That widening only ever ADDS inputs, so it makes tasks
+                    // fatter and re-key more often rather than failing, which
+                    // is the direction nothing reports. It was an accident of
+                    // repairing the read below it and is kept out
+                    // deliberately; widening the probed set is its own change
+                    // with its own measurement.
+                    let mut anc = dir.parent().unwrap_or(Path::new("")).to_path_buf();
                     'levels: for _ in 0..4 {
                         let Some(up) = anc.parent() else { break };
                         anc = up.to_path_buf();
