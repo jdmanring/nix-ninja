@@ -68,6 +68,48 @@ pub struct Cli {
     #[arg(short = 'l', default_value = "0.0", hide = true)]
     pub load_average: f64,
 
+    /// Keep going until N jobs fail (0 means never stop)
+    ///
+    /// NOT accept-and-ignore: this is ninja's spelling of a capability the
+    /// driver already has. `NIX_NINJA_KEEP_GOING=1` abandons a failed task's
+    /// dependents while every independent subtree drains, which is exactly
+    /// what `-k` asks for, and it was reachable only through the
+    /// environment. ninja's default is 1 - stop after the first failure -
+    /// so any other value means keep going.
+    #[arg(short = 'k', default_value = "1", hide = true)]
+    pub keep_going: usize,
+
+    /// Do not show progress status
+    ///
+    /// ACCEPTED AND IGNORED, deliberately. Every line this driver prints on
+    /// a build is already on stderr and the progress tick is one line per
+    /// 500 tasks, so honouring it would save almost nothing; rejecting it
+    /// exits 2 having built nothing, which is worse than being louder than
+    /// asked. The direction matters: a consumer that passes `--quiet` and
+    /// receives output is inconvenienced, one that receives rc=2 and an
+    /// empty build is misinformed.
+    #[arg(long = "quiet", hide = true)]
+    pub quiet: bool,
+
+    /// Enable debugging (use `-d list` to list modes)
+    ///
+    /// ACCEPTED AND IGNORED: none of ninja's debug modes exist here, and
+    /// this tree's own diagnostics are behind env vars. Same direction as
+    /// `--quiet`.
+    #[arg(short = 'd', hide = true)]
+    pub debug_mode: Option<String>,
+
+    /// Adjust warnings
+    ///
+    /// ACCEPTED AND IGNORED, and this one is not cosmetic: `-w dupbuild=err`
+    /// asks for duplicate build statements to be an ERROR, so ignoring it
+    /// leaves this driver more permissive than the ninja the caller thinks
+    /// it is running. That is the safe direction - a build that would have
+    /// been refused proceeds - but it is a real difference and it is here in
+    /// writing rather than in nobody's head.
+    #[arg(short = 'w', hide = true)]
+    pub warn_flag: Option<String>,
+
     /// Show all command lines while building
     ///
     /// A build tool that accepts this has promised a generator something.
@@ -347,6 +389,16 @@ pub fn run() -> Result<()> {
             .with_context(|| format!("set_current_dir({})", dir.display()))?;
     }
     let build_dir = std::env::current_dir().context("current_dir")?;
+
+    // `-k` REACHES THE EXISTING MECHANISM RATHER THAN A NEW ONE. The builder
+    // reads NIX_NINJA_KEEP_GOING, whose comment already says it is ninja's
+    // -k; setting it here is the smallest honest bridge and keeps ONE place
+    // deciding what keep-going means. ninja's default is 1 - stop after the
+    // first failure - so only another value asks to continue.
+    // Single-threaded at this point, before any builder starts.
+    if cli.keep_going != 1 {
+        std::env::set_var("NIX_NINJA_KEEP_GOING", "1");
+    }
 
     // Handle subtool if specified
     if let Some(tool) = cli.tool.clone() {
