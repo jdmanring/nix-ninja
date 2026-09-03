@@ -283,8 +283,16 @@ fn jobs_from(dash_j: usize, env_cores: Option<std::ffi::OsString>) -> usize {
 /// stale in the first place.
 const MAX_DAEMON_CONNECTIONS: usize = 6;
 
-fn resolved_connections(cli: &Cli) -> usize {
-    resolved_jobs(cli).clamp(1, connection_ceiling(crate::task::available_gib()))
+/// THE CEILING IS A PARAMETER BECAUSE READING IT INSIDE MADE THE TEST
+/// ASSERT ABOUT THE MACHINE'S FREE MEMORY AT THE MOMENT IT RAN. With the
+/// live read here, `connections_are_capped_independently_of_admission`
+/// compared 3 against 6 on a host whose `MemAvailable` had dropped below the
+/// constant - which is exactly what a corpus run during a build does, so the
+/// test failed for one reader and passed for another and neither reading was
+/// about the code. A guard whose subject cannot be faked cannot be tested;
+/// the single production call site passes the live figure.
+fn resolved_connections(cli: &Cli, avail_gib: u64) -> usize {
+    resolved_jobs(cli).clamp(1, connection_ceiling(avail_gib))
 }
 
 /// The pool ceiling for the machine this is actually running on.
@@ -412,7 +420,7 @@ pub fn run() -> Result<()> {
     }
 
     let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
-        resolved_connections(&cli),
+        resolved_connections(&cli, crate::task::available_gib()),
     ))?);
     let derived_files = build(&cli, &build_dir, &rpc_client)?;
     if cli.is_output_derivation {
@@ -622,7 +630,7 @@ fn subtool(
         "drv" => {
             let cli = Cli::parse();
             let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
-                resolved_connections(&cli),
+                resolved_connections(&cli, crate::task::available_gib()),
             ))?);
             let derived_files = build(&cli, build_dir, &rpc_client)?;
             // `drv` prints ONE derivation. Same reasoning as above: refusing
@@ -701,6 +709,10 @@ mod tests {
         Cli::parse_from(v)
     }
 
+    /// Memory the ceiling cannot bind at, so these assertions are about the
+    /// CAP and not about the host they run on.
+    const ROOMY_GIB: u64 = 64;
+
     /// `-j` sizes ADMISSION, and admission is meant to go wide.
     #[test]
     fn resolved_jobs_follows_dash_j() {
@@ -724,28 +736,32 @@ mod tests {
         // The number itself is defended by the arithmetic at its definition,
         // which a literal here cannot restate and would only duplicate.
         assert_eq!(
-            resolved_connections(&cli_with(&["-j", "24"])),
+            resolved_connections(&cli_with(&["-j", "24"]), ROOMY_GIB),
             MAX_DAEMON_CONNECTIONS
         );
         assert_eq!(
-            resolved_connections(&cli_with(&["-j", "64"])),
+            resolved_connections(&cli_with(&["-j", "64"]), ROOMY_GIB),
             MAX_DAEMON_CONNECTIONS
         );
         // Below the cap the request still wins: a deliberate -j1 must not be
         // silently widened to the full connection pool.
-        assert_eq!(resolved_connections(&cli_with(&["-j", "1"])), 1);
-        assert_eq!(resolved_connections(&cli_with(&["-j", "2"])), 2);
+        assert_eq!(resolved_connections(&cli_with(&["-j", "1"]), ROOMY_GIB), 1);
+        assert_eq!(resolved_connections(&cli_with(&["-j", "2"]), ROOMY_GIB), 2);
+        // AND A SMALL MACHINE IS CAPPED BY ITS MEMORY RATHER THAN BY THE
+        // CONSTANT, which is the case the live read used to produce by
+        // accident on a loaded host and could never produce on purpose.
+        assert_eq!(resolved_connections(&cli_with(&["-j", "24"]), 2), 2);
         // AND THE CAP MUST ACTUALLY BIND, which the two assertions above stop
         // proving once they read the constant: with a bug that ignored the cap
         // entirely, `resolved_connections(-j 64)` would return 64 and the
         // comparison would still be against MAX_DAEMON_CONNECTIONS only if the
         // constant were 64. This pins the relationship instead.
         assert!(
-            resolved_connections(&cli_with(&["-j", "64"])) < 64,
+            resolved_connections(&cli_with(&["-j", "64"]), ROOMY_GIB) < 64,
             "a -j far above the cap must be capped, not passed through"
         );
         // And never zero, which would be a pool that can never serve.
-        assert!(resolved_connections(&cli_with(&["-j", "0"])) >= 1);
+        assert!(resolved_connections(&cli_with(&["-j", "0"]), ROOMY_GIB) >= 1);
     }
 
     /// `-j 0` means "auto", never "unbounded". An unbounded runner is what
