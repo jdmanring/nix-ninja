@@ -1427,6 +1427,7 @@ impl Runner {
             let cmake_p_script = cmake_script_arg(&args).map(str::to_string);
             let cmake_p_defs = cmake_definitions(&args);
             let tablegen = tablegen_invocation(&args);
+            let xinclude_docs = xinclude_invocation(&args);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -1883,6 +1884,15 @@ impl Runner {
             if let Some((seed, include_dirs)) = &tablegen {
                 let root = self.config.build_dir.join(&cd_dir);
                 for p in tablegen_include_closure(&root, seed, include_dirs, 8192) {
+                    referenced.push(p.to_string_lossy().into_owned());
+                }
+            }
+            // AN XInclude HREF NAMES A DOCUMENT PART FROM INSIDE THE
+            // DOCUMENT, so nothing on the command line declares it. Same
+            // family and same reader placement as the two around it.
+            if let Some(docs) = &xinclude_docs {
+                let root = self.config.build_dir.join(&cd_dir);
+                for p in xinclude_closure(&root, docs, 4096) {
                     referenced.push(p.to_string_lossy().into_owned());
                 }
             }
@@ -5145,6 +5155,105 @@ fn cmake_definitions(args: &[String]) -> HashMap<String, String> {
 }
 
 /// The script named by `-P`, which is the one CMake will EXECUTE.
+/// Every document an XInclude-processing command pulls in, to fixpoint.
+///
+/// `xsltproc --nonet --xinclude` is handed one document and reads the ones
+/// its `xi:include` elements name. Nothing declares those: they are named
+/// inside the document rather than on the command line, so a task sandbox
+/// holds the document and none of its parts and the run dies on
+/// `failed to load external entity "../doc/adg/pam_start.xml"`. linux-pam
+/// pulls about twenty that way, and it owns fourteen of one round's
+/// cascade failures - the login path, the privilege-escalation path and a
+/// greeter's PAM stack.
+///
+/// STATICALLY REACHABLE, which is what makes a reader the right answer here
+/// rather than a design change: `--xinclude` on the command line is an
+/// announcement that the document pulls in others, and the hrefs sit inside
+/// a document the command NAMES. Stronger than the `cmake -P` case, where
+/// the script's worth had to be inferred.
+///
+/// An href is relative to the DOCUMENT THAT CARRIES IT, which is XML's base
+/// URI rule and is why this walks from each document's own directory rather
+/// than from one root. Transitive, because an included part may include
+/// more; a part that cannot be resolved is dropped and the walk continues.
+/// Fragment-only and absolute-URI hrefs are skipped - neither names a file
+/// to upload.
+fn xinclude_closure(root: &Path, seeds: &[PathBuf], cap: usize) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut queue: Vec<PathBuf> = seeds.iter().map(|p| root.join(p)).collect();
+    while let Some(path) = queue.pop() {
+        if !seen.insert(path.clone()) || seen.len() > cap {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(dir) = path.parent() else { continue };
+        for href in xinclude_hrefs(&text) {
+            let cand = dir.join(&href);
+            if !cand.is_file() {
+                continue;
+            }
+            if !seen.contains(&cand) {
+                queue.push(cand.clone());
+            }
+            found.push(cand);
+        }
+    }
+    found
+}
+
+/// The `href` of every `xi:include` element in a document.
+///
+/// Deliberately not an XML parser. The element name is matched with its
+/// namespace prefix or without one, and the first `href="..."` after it is
+/// taken. A wrong answer costs an input nobody needed; the caller uploads
+/// only what exists on disk.
+fn xinclude_hrefs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("<xi:include").or_else(|| rest.find("<include")) {
+        rest = &rest[i..];
+        let end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..end];
+        if let Some(h) = tag.find("href=\"") {
+            let after = &tag[h + 6..];
+            if let Some(q) = after.find('"') {
+                let href = &after[..q];
+                let skip = href.is_empty()
+                    || href.starts_with('#')
+                    || href.contains("://")
+                    || href.starts_with('/');
+                if !skip {
+                    out.push(href.to_string());
+                }
+            }
+        }
+        rest = &rest[end.min(rest.len())..];
+    }
+    out
+}
+
+/// The documents an XInclude-processing command names, or None when the
+/// command does not ask for XInclude processing at all.
+///
+/// KEYED ON `--xinclude`, which is the flag that makes the parts load.
+/// Without it xsltproc reads the one document and the parts are not inputs,
+/// so a broader key would upload files no run opens.
+fn xinclude_invocation(args: &[String]) -> Option<Vec<PathBuf>> {
+    if !args.iter().any(|a| a == "--xinclude") {
+        return None;
+    }
+    let docs: Vec<PathBuf> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-') && a.ends_with(".xml"))
+        .map(PathBuf::from)
+        .collect();
+    (!docs.is_empty()).then_some(docs)
+}
+
 /// The `.td` seed and include directories of a TableGen invocation, or None
 /// for any other command.
 ///
@@ -10746,5 +10855,91 @@ mod tablegen_reader_tests {
             got.1,
             vec!["/b/llvm/include".to_string(), "foo".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod xinclude_reader_tests {
+    use super::{xinclude_closure, xinclude_invocation};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "nn-xinc-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// AN HREF IS RELATIVE TO THE DOCUMENT CARRYING IT, and the second level
+    /// is what says so: the part lives in a different directory from the
+    /// seed and names its own sibling, so a reader resolving everything
+    /// against the seed's directory finds the first and loses the second.
+    /// linux-pam's own hrefs climb out of the document's directory, which is
+    /// the arrangement this fixture has.
+    #[test]
+    fn the_xinclude_closure_is_transitive_and_per_document() {
+        let d = scratch("closure");
+        std::fs::create_dir_all(d.join("doc/adg")).unwrap();
+        std::fs::create_dir_all(d.join("doc/man")).unwrap();
+        std::fs::write(
+            d.join("doc/adg/main.xml"),
+            "<book><xi:include href=\"../man/pam_start.xml\"/></book>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("doc/man/pam_start.xml"),
+            "<refentry><xi:include href=\"desc.xml\"/></refentry>\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("doc/man/desc.xml"), "<para/>\n").unwrap();
+
+        let got = xinclude_closure(&d, &[std::path::PathBuf::from("doc/adg/main.xml")], 4096);
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "pam_start.xml"),
+            "the direct part is missing: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "desc.xml"),
+            "the transitive part is missing, resolved against the wrong directory: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The key is `--xinclude`. Without it xsltproc reads the one document
+    /// and its parts are not inputs, so uploading them would be work for a
+    /// run that never opens them.
+    #[test]
+    fn only_an_xinclude_command_is_read() {
+        let mk = |s: &str| shell_words::split(s).unwrap();
+        assert!(xinclude_invocation(&mk("xsltproc --nonet style.xsl doc.xml")).is_none());
+        assert!(xinclude_invocation(&mk("cp a.xml b.xml")).is_none());
+        let got = xinclude_invocation(&mk("xsltproc --nonet --xinclude style.xsl doc.xml"))
+            .expect("an xinclude run must be recognised");
+        assert_eq!(got, vec![std::path::PathBuf::from("doc.xml")]);
+    }
+
+    /// A fragment reference and an absolute URI name no file to upload, and
+    /// a reader that joined them to a directory would probe nonsense paths.
+    #[test]
+    fn a_fragment_or_a_url_is_not_a_file() {
+        let d = scratch("skip");
+        std::fs::write(
+            d.join("main.xml"),
+            "<book>\n<xi:include href=\"#frag\"/>\n\
+             <xi:include href=\"https://example.invalid/x.xml\"/>\n</book>\n",
+        )
+        .unwrap();
+        let got = xinclude_closure(&d, &[std::path::PathBuf::from("main.xml")], 4096);
+        assert!(got.is_empty(), "expected nothing to upload, got {got:?}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
