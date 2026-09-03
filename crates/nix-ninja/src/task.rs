@@ -7155,12 +7155,29 @@ fn walk_dir_capped_uncached(
     Ok(Some(out))
 }
 
+/// THE REFUSAL WAS UNREACHABLE FOR THE SHAPE THE DRIVER PASSES, and two
+/// tests hid that by passing a RELATIVE build directory. `relative_from`
+/// hands an absolute path straight back when the base is relative, which is
+/// what produced the error they assert; with the absolute build directory
+/// production uses, every absolute output relativizes to a climbing path and
+/// is accepted. `/etc/passwd` declared as an output was silently relocated
+/// under `.nn-up`, which is the behaviour the refusal exists to prevent.
+///
+/// AND THE OBVIOUS REPAIR IS THE ONE THIS TREE ALREADY REJECTED: refusing a
+/// path that climbs would refuse openfec, whose link edge legitimately
+/// writes `../bin/Release/libopenfec.so.1.4.2` and for which the `.nn-up`
+/// mapping was built. Climbing is not the discriminator.
+///
+/// Leaving the package's own tree is. An output under the build directory's
+/// top-level ancestor is the package's, however many levels it climbs;
+/// `/etc` and `/nix/store` are not, and this is the same test the referenced
+/// -path admission uses on the input side.
 fn normalize_build_path(build_dir: &Path, p: PathBuf) -> Result<PathBuf> {
     if p.is_relative() {
         return Ok(p);
     }
     match relative_from(&p, build_dir) {
-        Some(rel) if rel.is_relative() => Ok(rel),
+        Some(rel) if rel.is_relative() && same_project_tree(build_dir, &p) => Ok(rel),
         _ => Err(anyhow!(
             "absolute path {} does not resolve under build dir {}; refusing to relocate it silently",
             p.display(),
@@ -7394,6 +7411,27 @@ mod normalized_task_outputs_tests {
         )
     }
 
+    /// AN OUTPUT ABOVE THE BUILD DIRECTORY IS THE FEATURE, NOT THE DEFECT,
+    /// and refusing a climbing path - the obvious repair - refuses the
+    /// package the `.nn-up` mapping was written for. openfec's link edge
+    /// declares its library in a SIBLING of the build directory, so this
+    /// must be accepted while `/etc/passwd` above is not.
+    #[test]
+    fn an_output_in_a_sibling_of_the_build_directory_is_kept() {
+        let got = normalized_task_outputs(
+            Path::new("/build/source/build"),
+            &["/build/source/bin/Release/libopenfec.so.1.4.2".to_string()],
+            &drv(),
+            "libopenfec",
+        )
+        .expect("an output in the package's own tree must be accepted");
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].build_path,
+            Path::new("../bin/Release/libopenfec.so.1.4.2")
+        );
+    }
+
     #[test]
     fn ordinary_outputs_all_come_back() {
         let got = normalized_task_outputs(
@@ -7410,13 +7448,18 @@ mod normalized_task_outputs_tests {
     /// directory used to be logged and SKIPPED, so the task reported success
     /// with that output missing from its DerivedFiles and every consumer of
     /// it resolved against nothing.
-    /// The shape that actually fails: `relative_from` hands an absolute path
-    /// straight back when the base is relative, so it never becomes relative
-    /// to the build dir and normalizing it would silently relocate it.
+    ///
+    /// THE BUILD DIRECTORY IS ABSOLUTE HERE BECAUSE THE DRIVER'S IS, and
+    /// this arm asserted the refusal against a RELATIVE one for as long as
+    /// it existed. `relative_from` hands an absolute path straight back when
+    /// the base is relative, so the fixture reached the error by a route no
+    /// task takes; with the real shape the output relativized to a climbing
+    /// path and was accepted. The arm passed, the guard did not fire, and
+    /// nothing in between said so.
     #[test]
     fn an_output_that_cannot_be_placed_fails_the_whole_task() {
         let err = normalized_task_outputs(
-            Path::new("build"),
+            Path::new("/build/source/build"),
             &["src/a.o".to_string(), "/etc/passwd".to_string()],
             &drv(),
             "src/a.o",
@@ -7439,7 +7482,7 @@ mod normalized_task_outputs_tests {
     #[test]
     fn no_partial_output_set_is_returned() {
         assert!(normalized_task_outputs(
-            Path::new("build"),
+            Path::new("/build/source/build"),
             &["src/a.o".to_string(), "/etc/passwd".to_string()],
             &drv(),
             "t",

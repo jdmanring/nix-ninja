@@ -199,53 +199,6 @@ pub fn parse_dyndep(bytes: &[u8]) -> Result<HashMap<String, DyndepEntry>> {
 /// graph can be joined on. Returns an empty map for the overwhelmingly
 /// common case of a project with no dyndep at all, and the caller is
 /// expected to skip the whole second pass then - see `mentions_dyndep`.
-// Called by scan_bindings_from_file's tests rather than by the file-reading
-// wrapper itself, which is what dead_code is reporting. It is the byte-slice
-// half of the pair and the only one the tests can drive without a file, so it
-// stays.
-#[allow(dead_code)]
-pub fn scan_bindings(bytes: &[u8]) -> Result<HashMap<String, String>> {
-    let buf = with_nul(bytes);
-    let mut parser = Parser::new(&buf);
-    let mut out = HashMap::new();
-
-    while let Some(stmt) = parser.read().map_err(|e| anyhow!("{e:?}"))? {
-        let build = match stmt {
-            Statement::Build(b) => b,
-            _ => continue,
-        };
-        let Some(binding) = build.vars.get("dyndep") else {
-            continue;
-        };
-        // Evaluated with an EMPTY scope, which resolves a literal path and
-        // nothing else. CMake, which is the only generator known to emit
-        // dyndep, writes a literal. A binding that references a variable
-        // would silently evaluate to a path with holes in it, and a wrong
-        // path here reproduces exactly the bug this module exists to fix,
-        // so refuse instead: a build that stops with this message is a
-        // request to implement rule-scope evaluation, not a mystery.
-        let path = binding.evaluate(&[]);
-        if path.is_empty() || path.contains("//") {
-            bail!(
-                "line {}: dyndep binding did not resolve to a literal path \
-                 (got {path:?}); rule- or variable-scoped dyndep bindings are \
-                 not implemented",
-                build.line
-            );
-        }
-        if build.explicit_outs == 0 {
-            bail!(
-                "line {}: edge with a dyndep binding has no output",
-                build.line
-            );
-        }
-        let key = build.outs[0].evaluate(&[]);
-        out.insert(key, path);
-    }
-
-    Ok(out)
-}
-
 /// Walk a ninja file and everything it pulls in, collecting dyndep
 /// bindings.
 ///
@@ -290,7 +243,14 @@ pub fn scan_bindings_from_file(root: &Path) -> Result<HashMap<String, String>> {
                         continue;
                     };
                     let dd = binding.evaluate(&[]);
-                    if dd.is_empty() {
+                    // `//` IS A HOLE WHERE A VARIABLE WAS. This refusal
+                    // lived only in a byte-slice copy of this scanner that
+                    // the tests drove and nothing called, so the arm
+                    // asserting it passed while the shipping scanner
+                    // accepted the path and read a dyndep file from a
+                    // spelling with a segment missing. The two copies are
+                    // one function now.
+                    if dd.is_empty() || dd.contains("//") {
                         bail!(
                             "{}:{}: dyndep binding did not resolve to a literal path; \
                              rule- or variable-scoped bindings are not implemented",
@@ -490,6 +450,53 @@ build CMakeFiles/FortranCInterface.dir/call_mod.f90.o: dyndep | my_module.mod my
         assert_eq!(e["my obj.o"].implicit_ins, vec!["my mod.mod"]);
     }
 
+    /// Writes `files` into a scratch directory and scans through the
+    /// PRODUCTION entry point. The tests drove a byte-slice copy of this
+    /// scanner for as long as it existed, so the file queue that follows
+    /// `include` and `subninja` - the whole reason the file-reading form
+    /// exists - was covered by nothing, and the two copies had already
+    /// diverged on a refusal.
+    fn scan_files(files: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        let (dir, root) = write_files(files);
+        let got = scan_bindings_from_file(&root);
+        let _ = std::fs::remove_dir_all(&dir);
+        got.unwrap()
+    }
+
+    /// The same, into a directory the caller already made, so a fixture can
+    /// name that directory inside the files it writes.
+    fn scan_files_in(
+        dir: &Path,
+        files: &[(&str, &str)],
+    ) -> std::collections::HashMap<String, String> {
+        for (name, body) in files {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        let got = scan_bindings_from_file(&dir.join(files[0].0));
+        let _ = std::fs::remove_dir_all(dir);
+        got.unwrap()
+    }
+
+    fn write_files(files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "nn-dyndep-{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, body) in files {
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+        // The scanner resolves an included path against the WORKING
+        // DIRECTORY, matching n2's loader, so the scan has to run in the
+        // fixture's directory rather than name it.
+        (dir.clone(), dir.join(files[0].0))
+    }
+
     #[test]
     fn bindings_are_recovered_from_a_build_statement() {
         // Shaped like the real cmake output: the dyndep file is also an
@@ -502,7 +509,7 @@ rule cc
 build CMakeFiles/myfort.dir/mymodule.f90.o: cc mymodule.f90 || CMakeFiles/myfort.dir/Fortran.dd
   dyndep = CMakeFiles/myfort.dir/Fortran.dd
 ";
-        let b = scan_bindings(ninja.as_bytes()).unwrap();
+        let b = scan_files(&[("build.ninja", ninja)]);
         assert_eq!(
             b["CMakeFiles/myfort.dir/mymodule.f90.o"],
             "CMakeFiles/myfort.dir/Fortran.dd"
@@ -517,7 +524,7 @@ rule cc
 
 build a.o: cc a.c
 ";
-        assert!(scan_bindings(ninja.as_bytes()).unwrap().is_empty());
+        assert!(scan_files(&[("build.ninja", ninja)]).is_empty());
     }
 
     /// The two-edge shape the whole feature exists for: one Fortran
@@ -660,6 +667,74 @@ build a.o: cc a.c b.h || order.stamp
         assert!(apply_entry(&mut g, b, &e).is_err());
     }
 
+    /// THE QUEUE IS THE WHOLE REASON THE FILE-READING FORM EXISTS, and it
+    /// was driven by no test. GN and gyp keep every build statement in a
+    /// subninja, so a scan that reads only the root finds nothing and reads
+    /// as "this project has no dyndep" - the reassuring direction. Class 22
+    /// is the same file-scope shape one layer down.
+    ///
+    /// THE INCLUDED PATH IS SPELLED ABSOLUTELY HERE, and the reason is a
+    /// property of the scanner rather than convenience: it resolves an
+    /// included path against the PROCESS WORKING DIRECTORY, matching n2's
+    /// loader, so a relative spelling in a scratch directory resolves
+    /// against wherever the test binary happens to run. Production is
+    /// correct because the driver's working directory is the build
+    /// directory. Making the fixture chdir would put a process-global
+    /// change in a test binary that runs its arms in parallel.
+    #[test]
+    fn a_binding_in_a_subninja_is_found() {
+        let dir = std::env::temp_dir().join(format!(
+            "nn-dyndep-sub-{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let got = scan_files_in(
+            &dir,
+            &[
+                (
+                    "build.ninja",
+                    &format!("subninja {}/sub.ninja\n", dir.display()),
+                ),
+                (
+                    "sub.ninja",
+                    "rule cc\n  command = gcc -c $in -o $out\n\
+                     build a.o: cc a.c || a.dd\n  dyndep = a.dd\n",
+                ),
+            ],
+        );
+        assert_eq!(got.get("a.o").map(String::as_str), Some("a.dd"));
+    }
+
+    /// A ROOT THAT MENTIONS NEITHER `dyndep` NOR AN INCLUDE IS SKIPPED
+    /// WHOLE, which is what makes the feature free for projects that have
+    /// none - and it must not skip a root whose only content is the include
+    /// that leads to one.
+    #[test]
+    fn a_root_with_no_dyndep_and_no_include_is_free() {
+        assert!(scan_files(&[("build.ninja", "build a.o: cc a.c\n")]).is_empty());
+    }
+
+    /// A BINDING WITH A HOLE IN IT IS REFUSED. `//` is where a variable
+    /// failed to expand, and reading a dyndep file from that spelling is
+    /// the defect this module exists to fix. The refusal lived only in the
+    /// copy the tests drove.
+    #[test]
+    fn a_binding_with_an_unexpanded_segment_is_refused() {
+        let (dir, root) = write_files(&[(
+            "build.ninja",
+            "rule cc\n  command = gcc -c $in -o $out\n\
+             build a.o: cc a.c || x//y.dd\n  dyndep = x//y.dd\n",
+        )]);
+        let got = scan_bindings_from_file(&root);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(got.is_err(), "a binding with a hole must be refused");
+    }
+
     #[test]
     fn the_cheap_precheck_agrees_with_the_scan() {
         // The precheck is what makes this feature free for every package
@@ -669,7 +744,7 @@ build a.o: cc a.c b.h || order.stamp
         let without = "build a.o: cc a.c\n";
         assert!(mentions_dyndep(with.as_bytes()));
         assert!(!mentions_dyndep(without.as_bytes()));
-        assert!(!scan_bindings(with.as_bytes()).unwrap().is_empty());
-        assert!(scan_bindings(without.as_bytes()).unwrap().is_empty());
+        assert!(!scan_files(&[("build.ninja", with)]).is_empty());
+        assert!(scan_files(&[("build.ninja", without)]).is_empty());
     }
 }
