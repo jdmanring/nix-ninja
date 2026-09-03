@@ -1120,7 +1120,12 @@ impl Runner {
     /// ninja permits the file to declare one, so it is reachable input, not a
     /// defensive flourish.
     pub fn resolve_target(&self, fid: FileId) -> Vec<DerivedFile> {
-        resolve_target_in(&self.derived_files, &self.phony_aliases, fid)
+        resolve_target_in(
+            &self.derived_files,
+            &self.phony_aliases,
+            &self.co_outputs,
+            fid,
+        )
     }
 
     /// Whether a target is a phony alias. A header-only CMake project emits
@@ -9230,6 +9235,7 @@ fn lib_shaped(name: &str) -> bool {
 fn resolve_target_in(
     derived_files: &HashMap<FileId, DerivedFile>,
     phony_aliases: &HashMap<FileId, Vec<FileId>>,
+    co_outputs: &HashMap<FileId, Vec<FileId>>,
     fid: FileId,
 ) -> Vec<DerivedFile> {
     let mut out = Vec::new();
@@ -9244,6 +9250,21 @@ fn resolve_target_in(
         // thing a caller asked for.
         if let Some(df) = derived_files.get(&next) {
             out.push(df.clone());
+            // AN EDGE'S OTHER DECLARED OUTPUTS COME WITH IT. Each output of
+            // one edge is its own store object, so materializing only the
+            // one a target names leaves the rest in the store. Under real
+            // ninja every output of a run edge is written into the tree, and
+            // a package's install step reads them: openfec's link edge
+            // declares `libopenfec.so.1.4.2` with `libopenfec.so.1` and
+            // `libopenfec.so` beside it, `all` names only the versioned
+            // file, and `install` failed on a name that had been built and
+            // never placed. The failure lands a PHASE LATER and names
+            // cmake's install rather than anything here.
+            // Siblings go through the same walk, so an alias that is itself
+            // an alias resolves, and the seen-set stops the cycle.
+            if let Some(sibs) = co_outputs.get(&next) {
+                worklist.extend(sibs.iter().copied());
+            }
             continue;
         }
         if let Some(alias_ins) = phony_aliases.get(&next) {
@@ -9375,7 +9396,7 @@ mod target_resolution_tests {
     fn concrete_target_resolves_to_itself() {
         let mut outs = HashMap::new();
         outs.insert(FileId::from(1), df("a.o"));
-        let got = resolve_target_in(&outs, &HashMap::new(), FileId::from(1));
+        let got = resolve_target_in(&outs, &HashMap::new(), &HashMap::new(), FileId::from(1));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].build_path, PathBuf::from("a.o"));
     }
@@ -9392,7 +9413,7 @@ mod target_resolution_tests {
         let mut phony = HashMap::new();
         phony.insert(FileId::from(9), vec![FileId::from(1), FileId::from(2)]);
 
-        let mut got = resolve_target_in(&outs, &phony, FileId::from(9));
+        let mut got = resolve_target_in(&outs, &phony, &HashMap::new(), FileId::from(9));
         got.sort();
         assert_eq!(
             got.iter().map(|d| d.build_path.clone()).collect::<Vec<_>>(),
@@ -9408,7 +9429,7 @@ mod target_resolution_tests {
         phony.insert(FileId::from(8), vec![FileId::from(1)]);
         phony.insert(FileId::from(9), vec![FileId::from(8)]);
 
-        let got = resolve_target_in(&outs, &phony, FileId::from(9));
+        let got = resolve_target_in(&outs, &phony, &HashMap::new(), FileId::from(9));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].build_path, PathBuf::from("a.o"));
     }
@@ -9421,8 +9442,86 @@ mod target_resolution_tests {
         let mut phony = HashMap::new();
         phony.insert(FileId::from(1), vec![FileId::from(2)]);
         phony.insert(FileId::from(2), vec![FileId::from(1)]);
-        let got = resolve_target_in(&HashMap::new(), &phony, FileId::from(1));
+        let got = resolve_target_in(&HashMap::new(), &phony, &HashMap::new(), FileId::from(1));
         assert!(got.is_empty());
+    }
+
+    // openfec's shape, which is the reason the co-output map is consulted
+    // here at all. The link edge declares three names; `all` reaches only
+    // the versioned file, and the two aliases were built into their own
+    // store objects and never placed. `install` then failed one phase
+    // later on a file the build had produced.
+    #[test]
+    fn a_target_pulls_the_other_outputs_of_its_own_edge() {
+        // The store NAME is normalized (`normalize_output`); the build_path
+        // keeps the climb, which is what the placement joins onto the build
+        // directory.
+        let named = |store: &str, build: &str| DerivedFile {
+            build_path: PathBuf::from(build),
+            ..df(store)
+        };
+        let mut outs = HashMap::new();
+        outs.insert(
+            FileId::from(1),
+            named("libopenfec.so.1.4.2", "../bin/Release/libopenfec.so.1.4.2"),
+        );
+        outs.insert(
+            FileId::from(2),
+            named("libopenfec.so.1", "../bin/Release/libopenfec.so.1"),
+        );
+        outs.insert(
+            FileId::from(3),
+            named("libopenfec.so", "../bin/Release/libopenfec.so"),
+        );
+        let mut co = HashMap::new();
+        let edge = vec![FileId::from(1), FileId::from(2), FileId::from(3)];
+        for f in &edge {
+            co.insert(*f, edge.clone());
+        }
+        let mut phony = HashMap::new();
+        phony.insert(FileId::from(9), vec![FileId::from(1)]);
+
+        let mut got = resolve_target_in(&outs, &phony, &co, FileId::from(9));
+        got.sort();
+        assert_eq!(
+            got.iter().map(|d| d.build_path.clone()).collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("../bin/Release/libopenfec.so"),
+                PathBuf::from("../bin/Release/libopenfec.so.1"),
+                PathBuf::from("../bin/Release/libopenfec.so.1.4.2"),
+            ],
+            "naming one output of an edge must place every output of that edge"
+        );
+    }
+
+    // The requested file stays FIRST. build.rs's dyndep path reads
+    // `derived[0]` as the file it asked for, so an expansion that reordered
+    // the vec would hand it a sibling's bytes to parse.
+    #[test]
+    fn the_requested_output_comes_first() {
+        let mut outs = HashMap::new();
+        outs.insert(FileId::from(1), df("a.dd"));
+        outs.insert(FileId::from(2), df("b.stamp"));
+        let mut co = HashMap::new();
+        let edge = vec![FileId::from(1), FileId::from(2)];
+        for f in &edge {
+            co.insert(*f, edge.clone());
+        }
+        let got = resolve_target_in(&outs, &HashMap::new(), &co, FileId::from(1));
+        assert_eq!(got[0].build_path, PathBuf::from("a.dd"));
+        assert_eq!(got.len(), 2);
+    }
+
+    // A co-output listing that names itself must not spin, and one edge's
+    // sibling being another edge's output resolves through the same walk.
+    #[test]
+    fn a_self_naming_co_output_terminates() {
+        let mut outs = HashMap::new();
+        outs.insert(FileId::from(1), df("a.o"));
+        let mut co = HashMap::new();
+        co.insert(FileId::from(1), vec![FileId::from(1)]);
+        let got = resolve_target_in(&outs, &HashMap::new(), &co, FileId::from(1));
+        assert_eq!(got.len(), 1);
     }
 
     // An unknown target must resolve EMPTY rather than to something
@@ -9431,7 +9530,12 @@ mod target_resolution_tests {
     // report a build that never happened.
     #[test]
     fn unknown_target_resolves_empty() {
-        let got = resolve_target_in(&HashMap::new(), &HashMap::new(), FileId::from(7));
+        let got = resolve_target_in(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            FileId::from(7),
+        );
         assert!(got.is_empty());
     }
 }
