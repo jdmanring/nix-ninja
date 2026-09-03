@@ -405,8 +405,15 @@ pub fn run() -> Result<()> {
         // not matter to it.
         let verbose_logs = task::take_collected_verbose_logs();
         if !verbose_logs.is_empty() {
-            match local::copy_derived_files(&rpc_client, &cli.store_dir, &build_dir, &verbose_logs)
-            {
+            // ESCALATING: a generator PARSES this output. An empty transcript is
+            // not a slower next run, it is a wrongly configured project.
+            match local::copy_derived_files(
+                &rpc_client,
+                &cli.store_dir,
+                &build_dir,
+                &verbose_logs,
+                nix_builder_rpc_client::Patience::Escalating,
+            ) {
                 Ok(_) => {
                     for log in &verbose_logs {
                         let path = build_dir.join(&log.build_path);
@@ -443,7 +450,15 @@ pub fn run() -> Result<()> {
         let depfiles = task::take_collected_depfiles();
         if !depfiles.is_empty() {
             let n = depfiles.len();
-            match local::copy_derived_files(&rpc_client, &cli.store_dir, &build_dir, &depfiles) {
+            // SINGLE: a depfile that does not arrive costs a scan on the next
+            // run, which is the behavior that has always been in force.
+            match local::copy_derived_files(
+                &rpc_client,
+                &cli.store_dir,
+                &build_dir,
+                &depfiles,
+                nix_builder_rpc_client::Patience::Single,
+            ) {
                 Ok(copied) => eprintln!(
                     "nix-ninja: collected {copied}/{n} depfile(s) into the build \
                      directory; a rebuild reads them instead of scanning"

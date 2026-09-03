@@ -1226,10 +1226,16 @@ impl BuilderRpcClient {
                         }
                         drop(guard);
                         stall_attempts += 1;
-                        // A BEST-EFFORT CALL GETS ONE ALLOWANCE. Its caller
-                        // treats failure as a cache miss, so retrying spends
-                        // the package's wall clock on work nobody waits for.
-                        if stall_attempts > patience_limit(patience) {
+                        // PATIENCE DOES NOT GATE THIS ARM, and gating it
+                        // was a defect. A mid-execute connection error is
+                        // not a stalled daemon: the common cause is a
+                        // SIBLING's watchdog dropping a wedged connection,
+                        // which this call recovers from by reconnecting and
+                        // which costs no wall clock. Sharing `stall_attempts`
+                        // with the timeout arm spent a best-effort call's one
+                        // allowance on an event where nothing had waited, and
+                        // reported it as DaemonStalled with attempts: 1.
+                        if stall_attempts > 3 {
                             break Err(Error::DaemonStalled {
                                 attempts: stall_attempts,
                                 connect_failures,

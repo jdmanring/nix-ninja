@@ -352,13 +352,25 @@ mod refresh_tree_mtimes_tests {
         std::fs::create_dir_all(&build).unwrap();
         std::fs::write(store.join("moc_a.cpp"), b"generated").unwrap();
         std::fs::write(store.join("sub/moc_b.cpp"), b"generated deeper").unwrap();
+        // BOTH NEGATIVES MUST LIE INSIDE THE STORE TREE, because that is what
+        // the walk reads. Put only in the build tree - as the first version
+        // of this test did - they are unreachable and their assertions hold
+        // whatever the guard does: mutating the guard to `true` left it
+        // green. Fifth inert test in this tree, and written the day after
+        // the fourth.
+        std::fs::write(store.join("kept.cpp"), b"the store's copy").unwrap();
+        std::os::unix::fs::symlink("moc_a.cpp", store.join("alias.cpp")).unwrap();
         std::fs::create_dir_all(build.join("sub")).unwrap();
 
         // What create_symlinks would have written for the tree.
         std::os::unix::fs::symlink(store.join("moc_a.cpp"), build.join("moc_a.cpp")).unwrap();
         std::os::unix::fs::symlink(store.join("sub/moc_b.cpp"), build.join("sub/moc_b.cpp"))
             .unwrap();
-        // The build tree's own file, and the build's own alias to a sibling.
+        // The build tree's own file, which link_tree skipped at placement
+        // because it was already there, so it is a REAL FILE rather than a
+        // placement and must not be overwritten by the store's copy. And the
+        // build's own alias to a sibling, which is a NAME rather than a
+        // product: `placement_is_ours` must refuse it.
         std::fs::write(build.join("kept.cpp"), b"the build tree's").unwrap();
         std::os::unix::fs::symlink("kept.cpp", build.join("alias.cpp")).unwrap();
 
@@ -458,24 +470,24 @@ pub fn copy_derived_files(
     store_dir: &StoreDir,
     prefix: &Path,
     derived_files: &[DerivedFile],
+    patience: Patience,
 ) -> Result<usize> {
     let derived_paths: Vec<_> = derived_files
         .iter()
         .map(|df| df.derived_path.clone())
         .collect();
-    // UNPINNED BY ANY TEST, deliberately and stated rather than faked. The
-    // constants below are pinned in the client; that this call site passes
-    // `Single` is not, because reproducing it needs a daemon that stalls on
-    // demand. A test asserting the choice by reading this file back would
-    // pass whatever the code did, which is the inert-test shape this tree
-    // has shipped four times.
-    // SINGLE ALLOWANCE, because both callers treat failure as a cache miss.
-    // The depfile pass buys a rebuild that skips inference and the transcript
-    // pass buys `-v` output; neither is worth holding a package while the
-    // daemon works through something else. Measured in a live round: this
-    // call stalled on libcbor at 180 paths and svt-av1 at 264, each spending
-    // 300 s and then 1200 s, with 4800 s still owed under the old schedule.
-    let store_paths = rpc_client.build_paths(store_dir, &derived_paths, Patience::Single)?;
+    // PATIENCE IS THE CALLER'S TO CHOOSE AND THE TWO CALLERS DIFFER, which
+    // one Single here got wrong. The depfile pass is best effort by its own
+    // contract - a miss costs a rescan. The `-v` transcript is NOT: CMake's
+    // compiler ABI detection PARSES it for CMAKE_<LANG>_IMPLICIT_LINK_
+    // LIBRARIES, so an empty one configures a project that records an empty
+    // implicit-link list and every later Fortran link fails, three steps
+    // from the cause. That is this tree's liblapack blocker 4, and giving
+    // the transcript one allowance re-armed it.
+    // UNPINNED BY ANY TEST, said rather than faked: which patience each call
+    // site passes needs a daemon that stalls on demand to exercise, and a
+    // test reading the source back would pass whatever the code did.
+    let store_paths = rpc_client.build_paths(store_dir, &derived_paths, patience)?;
 
     let mut copied = 0usize;
     for (df, store_path) in derived_files.iter().zip(store_paths.iter()) {
