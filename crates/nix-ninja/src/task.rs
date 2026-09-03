@@ -4120,6 +4120,38 @@ fn new_opaque_files(
     Ok(out)
 }
 
+/// The store name for an opaque upload, taken from the SOURCE SPELLING.
+///
+/// Naming from the CANONICAL path is what mints a double-named store object.
+/// A materialized build product is a symlink into the store, so canonicalizing
+/// it returns the store FILE, whose `file_name` already carries a hash, and
+/// uploading under that name mints a second hash over it:
+///
+///     syw437nm...-2j9lfgwk...-sgtts2.f.o
+///
+/// Census over this store: 32,411 such paths, 30,444 of them objects, against
+/// 47,560 singly-named objects, and the nesting compounds past two.
+///
+/// MOST OF THEM SUCCEED, so the class is a MULTIPLIER rather than a failure.
+/// A builder-rpc client bind-mounts every DISTINCT path it adds into the
+/// derivation's mount namespace, deduped per goal, so a re-add under a fresh
+/// name takes a fresh mount. openblas accumulated an estimated ~99,000 of them
+/// against `fs/mount-max` and its install pass died on what reads as a disk
+/// error and is not one - `bind mount ... failed: No space left on device`,
+/// which is `move_mount(2)` reporting the per-namespace mount count, on a host
+/// with 876 G free and 26 mounts. The store add itself SUCCEEDED, so no count
+/// of failed adds could ever have found this.
+///
+/// Naming from the source spelling makes a re-add of the same file resolve to
+/// the same store path, so the daemon dedupes it and takes no second mount.
+fn opaque_upload_name(source_spelling: &str, canonical_path: &Path) -> String {
+    Path::new(source_spelling)
+        .file_name()
+        .or_else(|| canonical_path.file_name())
+        .map(|n| normalize_output(&n.to_string_lossy()))
+        .unwrap_or_else(|| "source".to_string())
+}
+
 fn new_opaque_file(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &std::path::Path,
@@ -4142,10 +4174,9 @@ fn new_opaque_file(
     // character outside the store-name grammar (e.g. `@`) is refused by
     // AddToStore. See normalize_output for the grammar and why the lossy
     // map is sound.
-    let name = canonical_path
-        .file_name()
-        .map(|n| normalize_output(&n.to_string_lossy()))
-        .unwrap_or_else(|| "source".to_string());
+    // See `opaque_upload_name`: the name comes from the path we were asked
+    // about, never from where a symlink resolved to.
+    let name = opaque_upload_name(&path, &canonical_path);
     // An executable whose shebang is `#!/usr/bin/env <prog>` cannot be
     // EXEC'd inside the task sandbox, which has no /usr/bin/env: protoc
     // execs protoc-gen-ts_proto.py as a plugin and reports "not found
@@ -7993,6 +8024,63 @@ mod new_built_file_tests {
         assert!(!super::command_is_compile(Some(
             "/bin/sh -c \"gcc -shared -o libssh.so.4 a.o\""
         )));
+    }
+
+    /// THE DOUBLE-NAMED STORE PATH, pinned at the line that mints it.
+    ///
+    /// openblas' installPhase died on
+    /// `add_to_store of "2j9lfgwk...-sgtts2.f.o"`, and the name in that
+    /// message is the diagnosis: a materialized build product is a symlink
+    /// into the store, so canonicalizing it yields the store FILE, whose
+    /// basename already carries a hash.
+    ///
+    /// The daemon-side half is why this matters beyond tidiness. Every
+    /// DISTINCT path a builder-rpc client adds is bind-mounted into the
+    /// derivation's mount namespace and deduped per goal, so a re-add under a
+    /// fresh name takes a fresh mount, and the ENOSPC openblas reported was
+    /// `move_mount(2)` hitting `fs/mount-max` rather than a full disk.
+    #[test]
+    fn an_upload_is_named_for_the_path_asked_about() {
+        let canonical =
+            std::path::Path::new("/nix/store/syw437nmaaaaaaaaaaaaaaaaaaaaaaaa-sgtts2.f.o");
+        assert_eq!(
+            super::opaque_upload_name("lapack-netlib/TESTING/sgtts2.f.o", canonical),
+            "sgtts2.f.o",
+            "naming from the canonical path is what nests a second hash"
+        );
+    }
+
+    /// The fallback is not decorative: a spelling with no file name at all
+    /// must still yield a legal store name rather than an empty one.
+    ///
+    /// AND IT STILL CARRIES THE HASH, which is asserted rather than fixed.
+    /// The fallback reaches for the canonical basename, so on a store file it
+    /// reproduces exactly the double name this change exists to stop. That is
+    /// acceptable only because it fires when the source spelling has NO file
+    /// name - `..` or the empty string - which no caller produces for a
+    /// materialized build product. Asserted so that if a caller ever does,
+    /// this reads as the known ceiling rather than as the fix having failed.
+    /// DEFER(a caller reaches this with a store path): strip a leading store
+    /// hash in the fallback.
+    #[test]
+    fn a_nameless_spelling_falls_back_to_the_resolved_file() {
+        let canonical = std::path::Path::new("/nix/store/aaaa-libfoo.so.1");
+        assert_eq!(
+            super::opaque_upload_name("..", canonical),
+            "aaaa-libfoo.so.1",
+            "the fallback keeps the resolved basename, hash and all"
+        );
+        assert_eq!(super::opaque_upload_name("", canonical), "aaaa-libfoo.so.1");
+    }
+
+    /// An ordinary source file is unaffected, which is the regression this
+    /// widening could plausibly cause: the two spellings agree, so every
+    /// upload that was already correct keeps the name it had and the banked
+    /// objects that depend on it do not move.
+    #[test]
+    fn an_ordinary_file_keeps_the_name_it_had() {
+        let canonical = std::path::Path::new("/build/source/src/util.c");
+        assert_eq!(super::opaque_upload_name("src/util.c", canonical), "util.c");
     }
 
     #[test]
