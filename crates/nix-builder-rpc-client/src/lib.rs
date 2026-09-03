@@ -153,9 +153,35 @@ mod co_failure_summary_tests {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// How long a caller keeps retrying a stalled realise, which is a property of
+/// WHAT THE CALL IS FOR and cannot be read off the paths.
+///
+/// The escalating schedule exists for work a build cannot proceed without: a
+/// task's inputs are worth 105 minutes of retry because the alternative is a
+/// failed build. A pass whose documented failure mode is "the next run scans
+/// as before" is not, and it was getting the same schedule - measured in a
+/// live round, where the best-effort depfile collection held libcbor and
+/// svt-av1 through a 300 s and a 1200 s allowance each, with 4800 s still to
+/// come, to buy a cache whose absence costs a rescan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Patience {
+    /// Essential work: 300s, 1200s, 4800s, then give up.
+    Escalating,
+    /// Best effort: one allowance, then report and move on.
+    Single,
+}
+
 /// Watchdog allowance for the Nth stall retry: 300s, 1200s, 4800s, then
 /// 4800s again for the final attempt. The `.min(2)` cap is load-bearing:
 /// without it a large attempt count shifts past the u64 width.
+/// Stalls a caller tolerates before the realise is abandoned.
+fn patience_limit(patience: Patience) -> u32 {
+    match patience {
+        Patience::Escalating => 3,
+        Patience::Single => 0,
+    }
+}
+
 fn stall_allowance_s(stall_attempts: u32) -> u64 {
     300u64 << (2 * stall_attempts.min(2))
 }
@@ -182,6 +208,21 @@ mod watchdog_policy_tests {
             "monitor grep would miss: {line}"
         );
         assert!(line.contains("daemon-side wedge"));
+    }
+
+    /// The polarity that motivated `Patience`: a best-effort call must not
+    /// be entitled to the escalation an essential one gets. Asserted as the
+    /// TOTAL each is willing to wait, because that is the number the round
+    /// pays - 105 minutes against 5.
+    #[test]
+    fn a_best_effort_call_gets_one_allowance() {
+        use super::{patience_limit, stall_allowance_s, Patience};
+        assert_eq!(patience_limit(Patience::Single), 0);
+        assert_eq!(patience_limit(Patience::Escalating), 3);
+
+        let total = |p| (0..=patience_limit(p)).map(stall_allowance_s).sum::<u64>();
+        assert_eq!(total(Patience::Single), 300);
+        assert_eq!(total(Patience::Escalating), 300 + 1200 + 4800 + 4800);
     }
 
     #[test]
@@ -764,6 +805,7 @@ impl BuilderRpcClient {
         &self,
         store_dir: &StoreDir,
         paths: &[SingleDerivedPath],
+        patience: Patience,
     ) -> Result<Vec<StorePath>> {
         // THE HIT PATH WAS O(PATHS ASKED) IN SYSCALLS, UNDER A GLOBAL LOCK.
         //
@@ -868,7 +910,7 @@ impl BuilderRpcClient {
             return Ok(out.into_iter().map(|o| o.expect("all hits")).collect());
         }
 
-        let built = self.build_paths_uncached(store_dir, &misses)?;
+        let built = self.build_paths_uncached(store_dir, &misses, patience)?;
         {
             let mut cache = self.realised.lock().unwrap();
             for (&slot, sp) in miss_slots.iter().zip(built.iter()) {
@@ -884,6 +926,7 @@ impl BuilderRpcClient {
         &self,
         store_dir: &StoreDir,
         paths: &[SingleDerivedPath],
+        patience: Patience,
     ) -> Result<Vec<StorePath>> {
         let _realise_timer = RealiseTimer {
             started: std::time::Instant::now(),
@@ -1183,7 +1226,10 @@ impl BuilderRpcClient {
                         }
                         drop(guard);
                         stall_attempts += 1;
-                        if stall_attempts > 3 {
+                        // A BEST-EFFORT CALL GETS ONE ALLOWANCE. Its caller
+                        // treats failure as a cache miss, so retrying spends
+                        // the package's wall clock on work nobody waits for.
+                        if stall_attempts > patience_limit(patience) {
                             break Err(Error::DaemonStalled {
                                 attempts: stall_attempts,
                                 connect_failures,
@@ -1200,7 +1246,10 @@ impl BuilderRpcClient {
                     Err(_elapsed) => {
                         drop(guard);
                         stall_attempts += 1;
-                        if stall_attempts > 3 {
+                        // A BEST-EFFORT CALL GETS ONE ALLOWANCE. Its caller
+                        // treats failure as a cache miss, so retrying spends
+                        // the package's wall clock on work nobody waits for.
+                        if stall_attempts > patience_limit(patience) {
                             break Err(Error::DaemonStalled {
                                 attempts: stall_attempts,
                                 connect_failures,

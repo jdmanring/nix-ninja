@@ -1,7 +1,7 @@
 use anyhow::Result;
 use harmonia_store_derivation::derived_path::SingleDerivedPath;
 use harmonia_store_path::StoreDir;
-use nix_builder_rpc_client::BuilderRpcClient;
+use nix_builder_rpc_client::{BuilderRpcClient, Patience};
 use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -18,7 +18,7 @@ pub fn build_derived_files(
         .collect();
 
     // Build derived paths so the Nix store paths exist on the host.
-    let store_paths = rpc_client.build_paths(store_dir, &derived_paths)?;
+    let store_paths = rpc_client.build_paths(store_dir, &derived_paths, Patience::Escalating)?;
 
     // Create mapping from build_path to actual store path
     let built_paths: HashMap<PathBuf, PathBuf> = derived_files
@@ -47,7 +47,7 @@ pub fn symlink_derived_files(
         .iter()
         .map(|df| df.derived_path.clone())
         .collect();
-    let store_paths = rpc_client.build_paths(store_dir, &derived_paths)?;
+    let store_paths = rpc_client.build_paths(store_dir, &derived_paths, Patience::Escalating)?;
 
     // Create new DerivedFiles with opaque store paths instead of placeholders
     let opaque_files: Vec<DerivedFile> = derived_files
@@ -463,7 +463,19 @@ pub fn copy_derived_files(
         .iter()
         .map(|df| df.derived_path.clone())
         .collect();
-    let store_paths = rpc_client.build_paths(store_dir, &derived_paths)?;
+    // UNPINNED BY ANY TEST, deliberately and stated rather than faked. The
+    // constants below are pinned in the client; that this call site passes
+    // `Single` is not, because reproducing it needs a daemon that stalls on
+    // demand. A test asserting the choice by reading this file back would
+    // pass whatever the code did, which is the inert-test shape this tree
+    // has shipped four times.
+    // SINGLE ALLOWANCE, because both callers treat failure as a cache miss.
+    // The depfile pass buys a rebuild that skips inference and the transcript
+    // pass buys `-v` output; neither is worth holding a package while the
+    // daemon works through something else. Measured in a live round: this
+    // call stalled on libcbor at 180 paths and svt-av1 at 264, each spending
+    // 300 s and then 1200 s, with 4800 s still owed under the old schedule.
+    let store_paths = rpc_client.build_paths(store_dir, &derived_paths, Patience::Single)?;
 
     let mut copied = 0usize;
     for (df, store_path) in derived_files.iter().zip(store_paths.iter()) {
