@@ -381,3 +381,59 @@ fn two_different_aliases_on_one_build_path_still_abort() {
     );
     std::fs::remove_dir_all(&d).ok();
 }
+
+/// A TREE CO-OUTPUT REACHING THE OUTER BUILD DIRECTORY IS ADDITIVE.
+///
+/// Target resolution expands an edge's co-outputs, and one of the two
+/// populations recorded in that map is the synthetic id of a DIRECTORY
+/// output (a Qt `_autogen` tree, the syncqt include tree). Those ids
+/// previously reached input assembly only; a target naming a real output of
+/// the same rule now places the tree into the outer build directory, which
+/// already holds the configure-time content.
+///
+/// What must hold there is that the placement adds and never replaces: a
+/// file the build tree already has is the authority, and the tree carries a
+/// copy of every forwarding header. `link_tree` skips an existing entry and
+/// has no abort path, so a directory input cannot produce the conflict a
+/// file input can - asserted here rather than read, because the overwrite
+/// guard three lines above it excludes directories for a different reason.
+#[test]
+fn a_tree_placed_over_a_populated_build_dir_adds_without_replacing() {
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
+
+    let d = dir("tree-outer");
+    let store_root = d.join("store");
+    let build = d.join("build");
+    let hash = "1ccccccccccccccccccccccccccccccc";
+
+    let tree = store_root.join(format!("{hash}-ninja-build-gen"));
+    std::fs::create_dir_all(tree.join("gen")).unwrap();
+    std::fs::write(tree.join("gen/kept.h"), b"from the store").unwrap();
+    std::fs::write(tree.join("gen/new.h"), b"from the store").unwrap();
+
+    // The build tree's own copy, which must survive.
+    std::fs::create_dir_all(build.join("gen")).unwrap();
+    std::fs::write(build.join("gen/kept.h"), b"from the build tree").unwrap();
+
+    let store_dir = StoreDir::new(&store_root).unwrap();
+    let df = DerivedFile::from_encoded(
+        &store_dir,
+        &format!("{}/{hash}-ninja-build-gen:gen:gen", store_root.display()),
+    )
+    .unwrap();
+
+    create_symlinks(&build, &store_dir, vec![df], true)
+        .expect("a directory co-output places file by file rather than aborting");
+
+    assert_eq!(
+        std::fs::read(build.join("gen/kept.h")).unwrap(),
+        b"from the build tree",
+        "an entry the build tree already holds is the authority"
+    );
+    assert!(
+        build.join("gen/new.h").exists(),
+        "and the entries it does not hold are placed"
+    );
+    std::fs::remove_dir_all(&d).ok();
+}
