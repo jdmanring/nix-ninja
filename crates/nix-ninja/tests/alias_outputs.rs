@@ -279,3 +279,105 @@ fn placing_one_alias_by_two_routes_is_a_duplicate_not_a_conflict() {
 
     std::fs::remove_dir_all(&d).ok();
 }
+
+/// `overwrite = true` IS A SECOND CALLER AND NOTHING EXERCISED IT.
+///
+/// The driver's local placement passes `overwrite=true`; the task binary
+/// passes false into a fresh sandbox. Only the second was covered, and the
+/// defect lived in the first: the branch asked `dest_path.exists()`, which
+/// FOLLOWS the link, so a stale placement that dangles was skipped instead of
+/// replaced and then reported as a conflict with the input replacing it.
+///
+/// The shape is an ordinary version bump: the alias text moves from
+/// `libfoo.so.1.2.3` to `libfoo.so.1.2.4` and the old sibling is gone.
+#[test]
+fn a_stale_dangling_placement_is_replaced_rather_than_refused() {
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
+
+    let d = dir("overwrite");
+    let store_root = d.join("store");
+    let build = d.join("build");
+    std::fs::create_dir_all(&build).unwrap();
+
+    let h = "1ccccccccccccccccccccccccccccccc";
+    let alias = store_root.join(format!("{h}-ninja-build-libfoo.so"));
+    std::fs::create_dir_all(&alias).unwrap();
+    std::os::unix::fs::symlink("libfoo.so.1.2.4", alias.join("libfoo.so")).unwrap();
+
+    // What the previous run left: the OLD text, whose sibling is gone.
+    std::os::unix::fs::symlink("libfoo.so.1.2.3", build.join("libfoo.so")).unwrap();
+    assert!(
+        !build.join("libfoo.so").exists(),
+        "the stale placement dangles, which is what made the branch skip it"
+    );
+    std::fs::write(build.join("libfoo.so.1.2.4"), b"NEW-LIBRARY").unwrap();
+
+    let store_dir = StoreDir::new(&store_root).unwrap();
+    let df = DerivedFile::from_encoded(
+        &store_dir,
+        &format!(
+            "{}/{h}-ninja-build-libfoo.so:libfoo.so:libfoo.so",
+            store_root.display()
+        ),
+    )
+    .unwrap();
+
+    create_symlinks(&build, &store_dir, vec![df], true)
+        .expect("a stale dangling placement must be replaced, not called a conflict");
+
+    assert_eq!(
+        std::fs::read(build.join("libfoo.so")).unwrap(),
+        b"NEW-LIBRARY",
+        "and the replacement must point at the new sibling"
+    );
+    std::fs::remove_dir_all(&d).ok();
+}
+
+/// THE NEGATIVE CASE THE WIDENING NEEDS, absent until an audit asked for it.
+///
+/// Reading one alias arriving twice as a duplicate is only safe if two
+/// GENUINELY different objects still abort. Without this, a mutation widening
+/// the comparison to "any symlink source is a duplicate" passes every other
+/// test in this file, and the result is a silently wrong build rather than a
+/// failed one.
+#[test]
+fn two_different_aliases_on_one_build_path_still_abort() {
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
+
+    let d = dir("conflict");
+    let store_root = d.join("store");
+    let build = d.join("build");
+    std::fs::create_dir_all(&build).unwrap();
+
+    let (h1, h2) = (
+        "1ddddddddddddddddddddddddddddddd",
+        "1fffffffffffffffffffffffffffffff",
+    );
+    for (h, target) in [(h1, "libfoo.so.1"), (h2, "libfoo.so.2")] {
+        let p = store_root.join(format!("{h}-ninja-build-libfoo.so"));
+        std::fs::create_dir_all(&p).unwrap();
+        std::os::unix::fs::symlink(target, p.join("libfoo.so")).unwrap();
+    }
+
+    let store_dir = StoreDir::new(&store_root).unwrap();
+    let enc = |h: &str| {
+        DerivedFile::from_encoded(
+            &store_dir,
+            &format!(
+                "{}/{h}-ninja-build-libfoo.so:libfoo.so:libfoo.so",
+                store_root.display()
+            ),
+        )
+        .unwrap()
+    };
+
+    let err = create_symlinks(&build, &store_dir, vec![enc(h1), enc(h2)], false)
+        .expect_err("two different aliases claiming one build path is a real conflict");
+    assert!(
+        err.to_string().contains("claim one build path"),
+        "and it must abort with the conflict message, not something else: {err}"
+    );
+    std::fs::remove_dir_all(&d).ok();
+}

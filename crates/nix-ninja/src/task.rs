@@ -4386,10 +4386,12 @@ fn new_opaque_file_raw(
         .to_owned();
     canon::canonicalize_path(&mut path);
     let canonical_path = fs::canonicalize(&path).with_context(|| format!("canonicalize {path}"))?;
-    let name = canonical_path
-        .file_name()
-        .map(|n| normalize_output(&n.to_string_lossy()))
-        .unwrap_or_else(|| "source".to_string());
+    // THE SECOND MINTING SITE, and it was left behind when the first was
+    // fixed. This is the LTO raw re-upload path, so a rewritten input that is
+    // a placed symlink gets the same double name `opaque_upload_name` exists
+    // to prevent. Found by sweeping for siblings of a defect rather than by a
+    // failure, which is the only way a second site of one class is ever found.
+    let name = opaque_upload_name(&path, &canonical_path);
     let upload_src = patched_env_shebang(&canonical_path)?;
     let store_path =
         rpc_client.add_to_store_nar(&name, upload_src.as_deref().unwrap_or(&canonical_path))?;

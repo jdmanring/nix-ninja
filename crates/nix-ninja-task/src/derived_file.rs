@@ -237,7 +237,13 @@ pub fn create_symlinks(
         // build dir that is CMake's configure-time content), and the
         // per-file links inside overwrite on their own. `remove_file` on
         // it is EISDIR (materialize-all, qtsvg, 2026-08-23).
-        if overwrite && dest_path.exists() && !source_path.is_dir() {
+        // `exists()` FOLLOWS THE LINK, SO A DANGLING PLACEMENT IS INVISIBLE
+        // HERE. Before aliases were stored as link text nothing placed could
+        // dangle, so this read correctly; now an alias whose sibling is
+        // absent is skipped rather than replaced, and the stale link falls
+        // through to the duplicate check to be reported as a conflict. The
+        // idiom is `local.rs`'s own, six lines above its call: ask both.
+        if overwrite && (dest_path.exists() || dest_path.is_symlink()) && !source_path.is_dir() {
             fs::remove_file(&dest_path)
                 .map_err(|e| anyhow::anyhow!("remove_file({}): {e}", dest_path.display()))?;
         }
@@ -288,8 +294,15 @@ pub fn create_symlinks(
         // differ too.
         if dest_path.is_symlink() {
             match fs::read_link(&dest_path) {
+                // ONE ARM, DELIBERATELY. `placement_link_text` returns
+                // `source_path` unchanged for any source that is not a
+                // symlink, so this already covers every legitimate case. A
+                // second arm comparing the raw `source_path` would uniquely
+                // accept one thing: a placement left by a driver that pointed
+                // AT the alias store object, which is a link to a link to
+                // nothing. That is the broken shape, and blessing it would
+                // carry it silently across an upgrade.
                 Ok(existing) if existing == placement_link_text(&source_path) => continue,
-                Ok(existing) if existing == source_path => continue,
                 Ok(existing) => {
                     return Err(anyhow!(
                         "nix-ninja-task: {} is already a symlink to {}, and a \
