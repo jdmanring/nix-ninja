@@ -1426,6 +1426,7 @@ impl Runner {
             // at the end of it.
             let cmake_p_script = cmake_script_arg(&args).map(str::to_string);
             let cmake_p_defs = cmake_definitions(&args);
+            let tablegen = tablegen_invocation(&args);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -1871,9 +1872,28 @@ impl Runner {
             // Read only, and only what exists: an unresolvable reference is
             // dropped, and a composed path that is not a file on disk is
             // ignored, so the worst case is an input nobody needed.
+            // A TABLEGEN RUN'S INCLUDES ARE DISCOVERED FROM A DEPFILE IT
+            // WRITES ITSELF, so a first build declares none of them and the
+            // run dies at the first one. Same family as the two readers
+            // around it and the same discipline: the names are statically
+            // reachable, inside the document the command names, and an
+            // unresolvable one is dropped. `tablegen_include_closure` has
+            // the resolution order and why it is transitive.
+            let mut referenced: Vec<String> = Vec::new();
+            if let Some((seed, include_dirs)) = &tablegen {
+                let root = self.config.build_dir.join(&cd_dir);
+                for p in tablegen_include_closure(&root, seed, include_dirs, 8192) {
+                    referenced.push(p.to_string_lossy().into_owned());
+                }
+            }
             if let Some(script) = &cmake_p_script {
                 if let Ok(text) = std::fs::read_to_string(script) {
-                    for cand in cmake_script_referenced_paths(&text, &cmake_p_defs) {
+                    referenced.extend(cmake_script_referenced_paths(&text, &cmake_p_defs));
+                }
+            }
+            {
+                {
+                    for cand in referenced {
                         let rel = if cand.starts_with('/') {
                             let p = Path::new(&cand);
                             if p.starts_with(&self.config.store_dir)
@@ -5125,6 +5145,136 @@ fn cmake_definitions(args: &[String]) -> HashMap<String, String> {
 }
 
 /// The script named by `-P`, which is the one CMake will EXECUTE.
+/// The `.td` seed and include directories of a TableGen invocation, or None
+/// for any other command.
+///
+/// KEYED ON THE TOOL, not on the `.td` extension. A tblgen command line also
+/// carries `-d IntrinsicImpl.inc.d` and its output, so a key that matched
+/// any `.td`-shaped token would have every edge in the graph reading files.
+/// The tool is what makes the include language readable, exactly as `-P`
+/// and `--xinclude` are for the two readers beside this one.
+fn tablegen_invocation(args: &[String]) -> Option<(String, Vec<String>)> {
+    let argv0 = args.iter().find(|a| !a.contains('='))?;
+    let name = Path::new(argv0.as_str()).file_name()?.to_str()?;
+    if !name.contains("tblgen") {
+        return None;
+    }
+    let mut include_dirs = Vec::new();
+    let mut seed = None;
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if let Some(rest) = a.strip_prefix("-I") {
+            if rest.is_empty() {
+                if let Some(dir) = it.next() {
+                    include_dirs.push(dir.clone());
+                }
+            } else {
+                include_dirs.push(rest.to_string());
+            }
+        } else if a.ends_with(".td") && !a.starts_with('-') && seed.is_none() {
+            seed = Some(a.clone());
+        }
+    }
+    Some((seed?, include_dirs))
+}
+
+/// Every `.td` file a TableGen run reads, to fixpoint.
+///
+/// TableGen's includes are discovered from a DEPFILE that the run itself
+/// writes (`-d IntrinsicImpl.inc.d`), so on a first build nothing declares
+/// them and the sandbox holds only the seed. llvm-tblgen then dies with
+/// `could not find include file 'llvm/CodeGen/ValueTypes.td'` against a file
+/// that is present in the source output and absent from the task's build
+/// directory: 3654 failing edges in one round, and every edition needs
+/// clang.
+///
+/// TRANSITIVE, AND THAT IS THE WHOLE DIFFICULTY. TableGen aborts at the
+/// first include it cannot open, so the failure names ONE file however many
+/// are missing: `Intrinsics.td` includes `ValueTypes.td` on line 13 and
+/// `SDNodeProperties.td` on line 14, and the second name appears nowhere in
+/// a round's log because nothing got past the first. A reader that resolved
+/// one level would move the same failure one file along and report nothing.
+///
+/// RESOLUTION ORDER IS TABLEGEN'S, read from `SourceMgr::OpenIncludeFile`
+/// rather than assumed: the filename is tried VERBATIM against the working
+/// directory first, then each `-I` directory in the order given. The
+/// INCLUDING FILE'S OWN DIRECTORY IS NOT SEARCHED, which is the opposite of
+/// the C preprocessor's rule for a quoted include and would have been the
+/// natural guess.
+///
+/// NOT PINNED BY ANY TEST: that the emission path CALLS this. The three
+/// tests below cover the closure and the resolution order, and deleting the
+/// call site leaves all three green - the same gap `scan_seeds` has, and the
+/// same answer, which is a package driven through a real tblgen edge.
+///
+/// Unresolvable includes are dropped and the walk continues, the same
+/// discipline as the `cmake -P` reader: a name this cannot resolve is one
+/// the caller declares nothing for, never a wrong file.
+fn tablegen_include_closure(
+    root: &Path,
+    seed: &str,
+    include_dirs: &[String],
+    cap: usize,
+) -> Vec<PathBuf> {
+    let resolve = |name: &str| -> Option<PathBuf> {
+        let direct = root.join(name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        include_dirs.iter().find_map(|dir| {
+            let cand = root.join(dir).join(name);
+            cand.is_file().then_some(cand)
+        })
+    };
+
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut queue: Vec<PathBuf> = Vec::new();
+    if let Some(p) = resolve(seed) {
+        queue.push(p);
+    }
+    while let Some(path) = queue.pop() {
+        if !seen.insert(path.clone()) || seen.len() > cap {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for name in tablegen_include_names(&text) {
+            if let Some(p) = resolve(&name) {
+                if !seen.contains(&p) {
+                    queue.push(p.clone());
+                }
+                found.push(p);
+            }
+        }
+    }
+    found
+}
+
+/// The names an `include "..."` directive on its own line names.
+///
+/// Deliberately not a TableGen lexer. A directive is the first token of a
+/// line, its argument is a double-quoted string, and everything else on the
+/// line is ignored; a `//` comment line is skipped so a commented-out
+/// include does not become an input. The cost of a wrong answer is an input
+/// nobody needed.
+fn tablegen_include_names(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let rest = line.strip_prefix("include")?;
+            if !rest.starts_with(char::is_whitespace) {
+                return None;
+            }
+            let rest = rest.trim_start();
+            let inner = rest.strip_prefix('"')?;
+            let end = inner.find('"')?;
+            Some(inner[..end].to_string())
+        })
+        .collect()
+}
+
 fn cmake_script_arg(args: &[String]) -> Option<&str> {
     args.iter()
         .position(|a| a == "-P")
@@ -10495,5 +10645,106 @@ mod build_dir_disposition_tests {
         assert_eq!(*find("sub"), BuildDirDisposition::Skip);
 
         std::fs::remove_dir_all(&d).ok();
+    }
+}
+
+#[cfg(test)]
+mod tablegen_reader_tests {
+    use super::{tablegen_include_closure, tablegen_invocation};
+
+    /// THE CLOSURE IS THE DELIVERABLE, NOT THE SEED'S DIRECT INCLUDES.
+    /// TableGen aborts at the first include it cannot open, so a round's log
+    /// names one missing file however many are missing - llvm's second one
+    /// appears zero times in 208M of log because nothing got past the first.
+    /// A one-level reader therefore moves the failure one file along and
+    /// looks like a fix. This fixture is two levels deep and the second
+    /// level is named by no command line, which is the only arrangement
+    /// that can tell the two apart.
+    #[test]
+    fn the_tablegen_closure_is_transitive() {
+        let d = std::env::temp_dir().join(format!(
+            "nn-tdclose-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(d.join("inc/llvm/CodeGen")).unwrap();
+        std::fs::create_dir_all(d.join("inc/llvm/IR")).unwrap();
+        std::fs::write(
+            d.join("inc/llvm/IR/Intrinsics.td"),
+            "include \"llvm/CodeGen/ValueTypes.td\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("inc/llvm/CodeGen/ValueTypes.td"),
+            "// a comment\ninclude \"llvm/CodeGen/SDNodeProperties.td\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("inc/llvm/CodeGen/SDNodeProperties.td"), "class P;\n").unwrap();
+
+        let got = tablegen_include_closure(&d, "llvm/IR/Intrinsics.td", &["inc".to_string()], 8192);
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "ValueTypes.td"),
+            "the direct include is missing: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "SDNodeProperties.td"),
+            "the TRANSITIVE include is missing, which is the whole defect: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// THE RESOLUTION ORDER IS TABLEGEN'S AND IT IS NOT THE PREPROCESSOR'S.
+    /// `SourceMgr::OpenIncludeFile` tries the name verbatim against the
+    /// working directory, then each `-I` directory. The INCLUDING FILE'S OWN
+    /// DIRECTORY IS NEVER SEARCHED, so a sibling named without its directory
+    /// must NOT resolve - reading it as a C quoted include would declare a
+    /// file the tool cannot open and hide the real absence.
+    #[test]
+    fn a_sibling_named_bare_does_not_resolve() {
+        let d = std::env::temp_dir().join(format!(
+            "nn-tdsib-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(d.join("inc/pkg")).unwrap();
+        std::fs::write(d.join("inc/pkg/seed.td"), "include \"sibling.td\"\n").unwrap();
+        std::fs::write(d.join("inc/pkg/sibling.td"), "class S;\n").unwrap();
+
+        let got = tablegen_include_closure(&d, "pkg/seed.td", &["inc".to_string()], 8192);
+        assert!(
+            got.is_empty(),
+            "the includer's own directory was searched, which TableGen does not do: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The key is the TOOL. A command carrying a `.td` argument that is not
+    /// a tblgen run reads nothing, because a broad key would have every edge
+    /// in a graph opening files.
+    #[test]
+    fn only_a_tblgen_command_is_read() {
+        let mk = |s: &str| shell_words::split(s).unwrap();
+        assert!(tablegen_invocation(&mk("cp a.td b.td")).is_none());
+        assert!(tablegen_invocation(&mk("gcc -c x.c -o x.o")).is_none());
+        let got = tablegen_invocation(&mk(
+            "/nix/store/x/bin/llvm-min-tblgen -I /b/llvm/include -Ifoo \
+             /b/llvm/include/llvm/IR/Intrinsics.td -o out.inc -d out.inc.d",
+        ))
+        .expect("a tblgen run must be recognised");
+        assert_eq!(got.0, "/b/llvm/include/llvm/IR/Intrinsics.td");
+        assert_eq!(
+            got.1,
+            vec!["/b/llvm/include".to_string(), "foo".to_string()]
+        );
     }
 }
