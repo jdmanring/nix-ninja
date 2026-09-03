@@ -2300,8 +2300,22 @@ pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> 
 /// wrapper-path extraction declares the catalogs as inputs and materializes
 /// them with no further work.
 ///
-/// DEFER(a third non-NIX_ entry): at three, read the values instead of the
-/// names and forward what is entirely store paths.
+/// PYTHONPATH carries the store paths of the python modules a generator
+/// imports. mesa's generators import mako and yaml, which nixpkgs supplies
+/// through the outer derivation's nativeBuildInputs, and without it 658
+/// tasks in one round died on ModuleNotFoundError. The task PREPENDS its own
+/// directories and appends whatever the variable already held, so the
+/// printed value ending at the graph's own relative entry with nothing after
+/// it is the evidence that nothing arrived: the prepend was never the
+/// defect.
+///
+/// DEFER(a fourth non-NIX_ entry): at four, read the values instead of the
+/// names and forward what is entirely store paths. The trigger was written
+/// at three and reached at three; it is moved rather than discharged because
+/// the value-reading form has a hazard the name form does not, which is that
+/// a python path is likelier than a catalog path to carry an element under
+/// the BUILD DIRECTORY, declared by nothing and failing later and elsewhere.
+/// Two entries decided by their values would settle whether that is real.
 fn forwarded_to_tasks(key: &str) -> bool {
     key.starts_with("NIX_CFLAGS_COMPILE")
         || key.starts_with("NIX_LDFLAGS")
@@ -2309,6 +2323,7 @@ fn forwarded_to_tasks(key: &str) -> bool {
         || key.starts_with("NIX_BINTOOLS_WRAPPER")
         || key.starts_with("NIX_HARDENING_ENABLE")
         || key == "XML_CATALOG_FILES"
+        || key == "PYTHONPATH"
 }
 
 #[cfg(test)]
@@ -2335,6 +2350,17 @@ mod forwarded_to_tasks_tests {
         assert!(forwarded_to_tasks("XML_CATALOG_FILES"));
     }
 
+    /// mesa's: absent, every generator importing a packaged module dies.
+    ///
+    /// EXACT MATCH AND NOT A PREFIX, which is what the negative case below
+    /// pins. A `starts_with` here would admit PYTHONPATH_EXTRA and anything
+    /// else a stdenv hook invents, and the entries above are prefixes only
+    /// because the wrapper variables are genuinely target-suffixed.
+    #[test]
+    fn the_python_path_is_forwarded() {
+        assert!(forwarded_to_tasks("PYTHONPATH"));
+    }
+
     /// THE HALF THAT KEEPS THE KEY STILL. `out` and the outer derivation's
     /// other variables move with every edit to it, and forwarding one re-keys
     /// every task in the package on a source change anywhere.
@@ -2346,6 +2372,7 @@ mod forwarded_to_tasks_tests {
             "TMPDIR",
             "NIX_BUILD_TOP",
             "XML_CATALOG_FILES_EXTRA",
+            "PYTHONPATH_EXTRA",
         ] {
             assert!(!forwarded_to_tasks(k), "{k}");
         }
