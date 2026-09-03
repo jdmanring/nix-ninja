@@ -3374,23 +3374,24 @@ fn build_task_derivation(
         // The RESOLUTION here is covered by no test - a fixture would need a
         // wrapper layout and a store - while the GATE beside it is. A
         // package with a static library and a gcc is what exercises it.
-        for tool in gcc_toolchain_tools_named(cmdline) {
-            let Some(cc_dir) = cc_dir.as_deref() else {
-                break;
-            };
-            let Ok(orig) = std::fs::read_to_string(cc_dir.join("nix-support/orig-cc")) else {
-                break;
-            };
-            let orig = PathBuf::from(orig.trim());
-            if !orig.join("bin").join(tool).is_file() {
-                continue;
+        // ONE ENTRY HOWEVER MANY TOOLS ARE NAMED. All three live in the
+        // same package, so pushing per tool put its `bin` on the emitted
+        // PATH twice for a command naming two of them - and the PATH is in
+        // the derivation key, so two commands differing only in how many
+        // they name would emit different keys for identical behaviour.
+        let tools = gcc_toolchain_tools_named(cmdline);
+        if !tools.is_empty() {
+            if let Some(cc_dir) = cc_dir.as_deref() {
+                if let Ok(orig) = std::fs::read_to_string(cc_dir.join("nix-support/orig-cc")) {
+                    let orig = PathBuf::from(orig.trim());
+                    if tools.iter().any(|t| orig.join("bin").join(t).is_file()) {
+                        if let Some(sp) = orig.to_str().and_then(|d| task.store_dir.parse(d).ok()) {
+                            path.push(format!("{}/bin", task.store_dir.display(&sp)));
+                            drv.inputs.insert(SingleDerivedPath::Opaque(sp));
+                        }
+                    }
+                }
             }
-            let Some(dir) = orig.to_str() else { continue };
-            let Ok(sp) = task.store_dir.parse(dir) else {
-                continue;
-            };
-            path.push(format!("{}/bin", task.store_dir.display(&sp)));
-            drv.inputs.insert(SingleDerivedPath::Opaque(sp));
         }
         drv.env
             .insert(b"PATH"[..].into(), path.join(":").into_bytes().into());
@@ -5246,12 +5247,13 @@ fn cmake_definitions(args: &[String]) -> HashMap<String, String> {
 /// Fragment-only and absolute-URI hrefs are skipped - neither names a file
 /// to upload.
 fn xinclude_closure(root: &Path, seeds: &[PathBuf], cap: usize) -> Vec<PathBuf> {
+    // Marked at push, for the reason `tablegen_include_closure` records.
     let mut found: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut queue: Vec<PathBuf> = seeds.iter().map(|p| root.join(p)).collect();
+    let mut seen: HashSet<PathBuf> = queue.iter().cloned().collect();
     while let Some(path) = queue.pop() {
-        if !seen.insert(path.clone()) || seen.len() > cap {
-            continue;
+        if seen.len() > cap {
+            break;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
@@ -5262,10 +5264,13 @@ fn xinclude_closure(root: &Path, seeds: &[PathBuf], cap: usize) -> Vec<PathBuf> 
             if !cand.is_file() {
                 continue;
             }
-            if !seen.contains(&cand) {
+            // One entry per file: see the same guard in
+            // `tablegen_include_closure` for what a per-occurrence push
+            // costs in the task's mount namespace.
+            if seen.insert(cand.clone()) {
                 queue.push(cand.clone());
+                found.push(cand);
             }
-            found.push(cand);
         }
     }
     found
@@ -5278,28 +5283,60 @@ fn xinclude_closure(root: &Path, seeds: &[PathBuf], cap: usize) -> Vec<PathBuf> 
 /// taken. A wrong answer costs an input nobody needed; the caller uploads
 /// only what exists on disk.
 fn xinclude_hrefs(text: &str) -> Vec<String> {
+    // ONE SCAN, IN DOCUMENT ORDER. Asking for `<xi:include` and falling
+    // back to `<include` skips every plain spelling that PRECEDES a
+    // prefixed one, because the fallback only fires when no prefixed tag
+    // remains anywhere ahead. A mixed document then under-declares, which
+    // is the failure this reader exists to fix.
     let mut out = Vec::new();
     let mut rest = text;
-    while let Some(i) = rest.find("<xi:include").or_else(|| rest.find("<include")) {
-        rest = &rest[i..];
-        let end = rest.find('>').unwrap_or(rest.len());
-        let tag = &rest[..end];
-        if let Some(h) = tag.find("href=\"") {
-            let after = &tag[h + 6..];
-            if let Some(q) = after.find('"') {
-                let href = &after[..q];
-                let skip = href.is_empty()
-                    || href.starts_with('#')
-                    || href.contains("://")
-                    || href.starts_with('/');
-                if !skip {
-                    out.push(href.to_string());
-                }
+    while let Some(i) = rest.find("<include").or_else(|| rest.find("<xi:include")) {
+        // Both spellings end in `include`, so anchoring on that and then
+        // checking what precedes it finds them in one pass. `<includes>`
+        // and `<includeme` are other elements: the name must END here.
+        let (i, tag_start) = match rest[i..].starts_with("<include") {
+            true => (i, i + "<include".len()),
+            false => (i, i + "<xi:include".len()),
+        };
+        let after_name = rest[tag_start..].chars().next();
+        let end = rest[i..].find('>').map(|e| i + e).unwrap_or(rest.len());
+        if matches!(after_name, Some(c) if c.is_whitespace() || c == '/' || c == '>') {
+            if let Some(href) = xinclude_href_of(&rest[i..end]) {
+                out.push(href);
             }
         }
         rest = &rest[end.min(rest.len())..];
+        if rest.is_empty() {
+            break;
+        }
+        rest = &rest[1.min(rest.len())..];
     }
     out
+}
+
+/// The `href` of one `xi:include` tag, or None when it names nothing this
+/// caller can upload.
+///
+/// Single quotes are accepted because XML permits them and a document using
+/// them would otherwise be silently under-declared. A fragment, an absolute
+/// URI and an absolute path are each refused HERE rather than left to the
+/// caller's `is_file` check: the first two would join to a nonsense path
+/// that happens not to exist, so relying on the caller makes the refusal
+/// untestable, and an ABSOLUTE href joins to a real file and would be
+/// uploaded.
+fn xinclude_href_of(tag: &str) -> Option<String> {
+    let h = tag.find("href=")?;
+    let after = &tag[h + 5..];
+    let quote = after.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let inner = &after[1..];
+    let end = inner.find(quote)?;
+    let href = &inner[..end];
+    let refused =
+        href.is_empty() || href.starts_with('#') || href.contains("://") || href.starts_with('/');
+    (!refused).then(|| href.to_string())
 }
 
 /// The documents an XInclude-processing command names, or None when the
@@ -5330,14 +5367,30 @@ fn xinclude_invocation(args: &[String]) -> Option<Vec<PathBuf>> {
 /// The tool is what makes the include language readable, exactly as `-P`
 /// and `--xinclude` are for the two readers beside this one.
 fn tablegen_invocation(args: &[String]) -> Option<(String, Vec<String>)> {
-    let argv0 = args.iter().find(|a| !a.contains('='))?;
-    let name = Path::new(argv0.as_str()).file_name()?.to_str()?;
-    if !name.contains("tblgen") {
-        return None;
-    }
+    // THE TOOL IS NOT args[0], AND READING IT THERE MADE THIS INERT ON THE
+    // PACKAGE IT WAS WRITTEN FOR. CMake emits its custom commands as
+    // `cd <subdir> && <tool> ...`, which this file already handles when it
+    // resolves a binary, and llvm's tblgen edges are custom commands. A
+    // positional read answers `cd`, whose name holds no `tblgen`, so the
+    // reader declined every real invocation while its own fixture - written
+    // without the prefix - passed. The two readers beside this one scan all
+    // arguments for their key and never had the defect.
+    //
+    // LIMIT, stated because it is reachable: a command wrapped as
+    // `/bin/sh -c "..."` carries the whole script in ONE argument, so no
+    // token is the tool and this declines. No tblgen edge observed takes
+    // that shape; dtc's archive command does, which is why the limit is
+    // worth naming rather than assuming away.
+    let idx = args.iter().position(|a| {
+        !a.starts_with('-')
+            && Path::new(a.as_str())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("tblgen"))
+    })?;
     let mut include_dirs = Vec::new();
     let mut seed = None;
-    let mut it = args.iter().skip(1);
+    let mut it = args.iter().skip(idx + 1);
     while let Some(a) = it.next() {
         if let Some(rest) = a.strip_prefix("-I") {
             if rest.is_empty() {
@@ -5403,25 +5456,37 @@ fn tablegen_include_closure(
         })
     };
 
+    // `seen` is the QUEUED set, marked at push rather than at pop. Marking
+    // at pop and deduping at push at once means a file is marked before its
+    // children are queued and then refused when it is read, which silently
+    // costs the whole transitive level below it.
     let mut found: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut queue: Vec<PathBuf> = Vec::new();
     if let Some(p) = resolve(seed) {
+        seen.insert(p.clone());
         queue.push(p);
     }
     while let Some(path) = queue.pop() {
-        if !seen.insert(path.clone()) || seen.len() > cap {
-            continue;
+        if seen.len() > cap {
+            break;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
         for name in tablegen_include_names(&text) {
             if let Some(p) = resolve(&name) {
-                if !seen.contains(&p) {
+                // ONE ENTRY PER FILE, NOT PER OCCURRENCE. A header included
+                // by dozens of files was pushed dozens of times, and each
+                // entry is a separate upload through `new_opaque_file`:
+                // `input_set` dedupes the RESULT and not the add, and a
+                // re-add takes a fresh bind mount in the task's namespace.
+                // That is failure class 18's multiplier, which exhausted
+                // `fs/mount-max` once already.
+                if seen.insert(p.clone()) {
                     queue.push(p.clone());
+                    found.push(p);
                 }
-                found.push(p);
             }
         }
     }
@@ -10876,6 +10941,46 @@ mod tablegen_reader_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// ONE ENTRY PER FILE, NOT PER OCCURRENCE, and the fixture is a diamond
+    /// because that is the shape llvm has: two files including one third.
+    /// Every entry becomes its own upload, and a re-add of one path takes a
+    /// fresh bind mount in the task's namespace - failure class 18's
+    /// multiplier, which exhausted `fs/mount-max` once already. A set at
+    /// the caller dedupes the RESULT and not the add.
+    #[test]
+    fn a_file_included_twice_is_declared_once() {
+        let d = std::env::temp_dir().join(format!(
+            "nn-tddiamond-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(d.join("inc")).unwrap();
+        std::fs::write(
+            d.join("inc/seed.td"),
+            "include \"a.td\"\ninclude \"b.td\"\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("inc/a.td"), "include \"common.td\"\n").unwrap();
+        std::fs::write(d.join("inc/b.td"), "include \"common.td\"\n").unwrap();
+        std::fs::write(d.join("inc/common.td"), "class C;\n").unwrap();
+
+        let got = tablegen_include_closure(&d, "seed.td", &["inc".to_string()], 8192);
+        let commons = got
+            .iter()
+            .filter(|p| p.file_name().unwrap() == "common.td")
+            .count();
+        assert_eq!(commons, 1, "common.td declared {commons} times: {got:?}");
+        assert_eq!(
+            got.len(),
+            3,
+            "expected a.td, b.td, common.td once each: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// THE RESOLUTION ORDER IS TABLEGEN'S AND IT IS NOT THE PREPROCESSOR'S.
     /// `SourceMgr::OpenIncludeFile` tries the name verbatim against the
     /// working directory, then each `-I` directory. The INCLUDING FILE'S OWN
@@ -10902,6 +11007,22 @@ mod tablegen_reader_tests {
             "the includer's own directory was searched, which TableGen does not do: {got:?}"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// THE TOOL IS NOT THE FIRST TOKEN, and reading it there made the
+    /// reader decline every real invocation. CMake emits custom commands as
+    /// `cd <subdir> && <tool> ...` and llvm's tblgen edges are custom
+    /// commands, so a positional read answers `cd`. The fixture that
+    /// shipped with the reader had no prefix and could not see it.
+    #[test]
+    fn a_cd_prefixed_custom_command_is_still_recognised() {
+        let args = shell_words::split(
+            "cd /build/llvm/lib/Target/X86 && /nix/store/x/bin/llvm-tblgen              -I/build/llvm-src/llvm/include /build/llvm-src/llvm/lib/Target/X86/X86.td              -o X86GenInstrInfo.inc -d X86GenInstrInfo.inc.d",
+        )
+        .unwrap();
+        let got = tablegen_invocation(&args).expect("a cd-prefixed tblgen run must be recognised");
+        assert_eq!(got.0, "/build/llvm-src/llvm/lib/Target/X86/X86.td");
+        assert_eq!(got.1, vec!["/build/llvm-src/llvm/include".to_string()]);
     }
 
     /// The key is the TOOL. A command carrying a `.td` argument that is not
@@ -10994,8 +11115,58 @@ mod xinclude_reader_tests {
         assert_eq!(got, vec![std::path::PathBuf::from("doc.xml")]);
     }
 
-    /// A fragment reference and an absolute URI name no file to upload, and
-    /// a reader that joined them to a directory would probe nonsense paths.
+    /// THE REFUSALS ARE TESTED AT THE PARSER, BECAUSE AT THE CLOSURE THEY
+    /// ARE INERT. An earlier version of this arm ran the closure and
+    /// asserted nothing came back, which passes with the whole refusal
+    /// predicate deleted: `<dir>/#frag` and `<dir>/https:/...` do not
+    /// exist, so the caller's `is_file` check hides the parser's behaviour.
+    /// The one refusal that is NOT redundant there is the absolute path,
+    /// which joins to a real file and would be uploaded, and nothing
+    /// covered it.
+    #[test]
+    fn a_fragment_a_url_and_an_absolute_path_are_refused() {
+        use super::xinclude_hrefs;
+        let got = xinclude_hrefs(
+            "<book>\n<xi:include href=\"#frag\"/>\n\
+             <xi:include href=\"https://example.invalid/x.xml\"/>\n\
+             <xi:include href=\"/etc/passwd\"/>\n\
+             <xi:include href=\"real.xml\"/>\n</book>\n",
+        );
+        assert_eq!(
+            got,
+            vec!["real.xml".to_string()],
+            "refusals leaked: {got:?}"
+        );
+    }
+
+    /// A PLAIN `<include>` BEFORE A PREFIXED ONE, which the first version of
+    /// the scanner lost entirely: it asked for `<xi:include` and fell back
+    /// to `<include` only when no prefixed tag remained ahead, so the plain
+    /// one was skipped over. Under-declaration is the failure this reader
+    /// exists to fix, so losing a spelling reproduces it.
+    #[test]
+    fn a_plain_include_before_a_prefixed_one_is_kept() {
+        use super::xinclude_hrefs;
+        let got = xinclude_hrefs(
+            "<book>\n<include href=\"first.xml\"/>\n<xi:include href=\"second.xml\"/>\n</book>\n",
+        );
+        assert_eq!(got, vec!["first.xml".to_string(), "second.xml".to_string()]);
+    }
+
+    /// An element whose NAME merely begins with the token is a different
+    /// element, and a single-quoted href is valid XML.
+    #[test]
+    fn the_element_name_must_end_and_single_quotes_count() {
+        use super::xinclude_hrefs;
+        assert!(xinclude_hrefs("<includes href=\"x.xml\"/>").is_empty());
+        assert_eq!(
+            xinclude_hrefs("<xi:include href='y.xml'/>"),
+            vec!["y.xml".to_string()]
+        );
+    }
+
+    /// Retained from the closure side, but asserting the thing the closure
+    /// CAN see: that a refused href never reaches the walk at all.
     #[test]
     fn a_fragment_or_a_url_is_not_a_file() {
         let d = scratch("skip");
