@@ -5276,12 +5276,29 @@ fn parent_dir_or_here(path: &Path) -> PathBuf {
 /// second spelling. Every entry shares one parent here, so a file name
 /// identifies it exactly and no spelling can disagree.
 fn sibling_dirs_of(dir: &Path) -> Result<Vec<PathBuf>> {
+    // READ from the resolved root, SPELL from the caller's own parent, and
+    // the two differ only in the case this function exists for. A DirEntry's
+    // path is the read root joined to the name, so reading `.` returns
+    // `./gobject` where the caller said `gio` - a SECOND SPELLING of one
+    // directory. Two sites key on the exact path: the capped walk's memo and
+    // the closure's visited set, so a second spelling is a second full walk
+    // and a second set of entries reaching the placer, which is the cost the
+    // memo was built to remove.
+    //
+    // It is reachable inside this walk alone: `gio` yields `./gobject`, and
+    // processing that yields `./gio` back, which the file-name exclusion
+    // cannot catch because it is comparing against `gobject`.
+    //
+    // Joining onto an empty parent gives the bare name, and onto any real
+    // parent gives exactly what the entry's own path would have been.
     let root = parent_dir_or_here(dir);
+    let spell = dir.parent().unwrap_or_else(|| Path::new(""));
     let mut sibs: Vec<PathBuf> = fs::read_dir(&root)
         .map_err(|e| anyhow!("read_dir({}) for uncle modules: {e}", root.display()))?
         .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir() && p.file_name() != dir.file_name())
+        .filter(|e| e.path().is_dir())
+        .map(|e| spell.join(e.file_name()))
+        .filter(|p| p.file_name() != dir.file_name())
         .collect();
     sibs.sort();
     Ok(sibs)
@@ -10090,6 +10107,17 @@ mod create_symlink_undeclared_output_tests {
             !names.iter().any(|n| *n == "gio"),
             "a directory is not its own sibling, whatever the parent is \
              spelled as: {names:?}"
+        );
+
+        // THE SPELLING IS THE SECOND HALF, and it is the residual the first
+        // version of this fix shipped. A returned `./glib` is a second name
+        // for one directory; the capped walk's memo and the closure's visited
+        // set both key on the exact path, so one directory under two
+        // spellings is two full walks and two sets of entries at the placer.
+        assert_eq!(
+            got,
+            vec![std::path::PathBuf::from("glib")],
+            "a sibling of a bare name must be spelled as a bare name: {got:?}"
         );
         std::fs::remove_dir_all(&d).ok();
     }
