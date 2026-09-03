@@ -5291,6 +5291,18 @@ fn sibling_dirs_of(dir: &Path) -> Result<Vec<PathBuf>> {
     //
     // Joining onto an empty parent gives the bare name, and onto any real
     // parent gives exactly what the entry's own path would have been.
+    // A DIRECTORY WITH NO FILE NAME HAS NO IDENTIFIABLE SIBLINGS. `.`, `..`
+    // and `/` all answer None, and the closure is SEEDED with `.` whenever a
+    // command names a script with no directory component - openh264's shape,
+    // which is why this is reachable rather than theoretical. Reading the
+    // parent there answers a different question: the parent of `.` resolves
+    // to `.` itself, so every CHILD of the working directory comes back
+    // described as a sibling, under a spelling the walk's own listing does
+    // not use. The exclusion cannot catch it because there is no name to
+    // compare against, and both keyed sites then hold one directory twice.
+    let Some(name) = dir.file_name() else {
+        return Ok(Vec::new());
+    };
     let root = parent_dir_or_here(dir);
     let spell = dir.parent().unwrap_or_else(|| Path::new(""));
     let mut sibs: Vec<PathBuf> = fs::read_dir(&root)
@@ -5298,7 +5310,7 @@ fn sibling_dirs_of(dir: &Path) -> Result<Vec<PathBuf>> {
         .flatten()
         .filter(|e| e.path().is_dir())
         .map(|e| spell.join(e.file_name()))
-        .filter(|p| p.file_name() != dir.file_name())
+        .filter(|p| p.file_name() != Some(name))
         .collect();
     sibs.sort();
     Ok(sibs)
@@ -10118,6 +10130,21 @@ mod create_symlink_undeclared_output_tests {
             got,
             vec![std::path::PathBuf::from("glib")],
             "a sibling of a bare name must be spelled as a bare name: {got:?}"
+        );
+
+        // A DIRECTORY WITH NO NAME HAS NO SIBLINGS. The closure is seeded
+        // with `.` for a script named with no directory component, and
+        // reading the parent of `.` returns the working directory's own
+        // CHILDREN - described as siblings, spelled unlike the walk's own
+        // listing of the same directories, and excluded by nothing because
+        // there is no name to compare.
+        std::env::set_current_dir(&d).unwrap();
+        let dot = sibling_dirs_of(Path::new("."));
+        std::env::set_current_dir(std::env::temp_dir()).unwrap();
+        assert_eq!(
+            dot.expect("a nameless directory is not an error"),
+            Vec::<std::path::PathBuf>::new(),
+            "the children of the working directory are not its siblings"
         );
         std::fs::remove_dir_all(&d).ok();
     }
