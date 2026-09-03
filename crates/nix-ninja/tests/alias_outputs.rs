@@ -204,3 +204,78 @@ fn a_consumer_may_take_a_dangling_alias_as_an_input() {
 
     std::fs::remove_dir_all(&d).ok();
 }
+
+/// THE PLACEMENT ITSELF, CALLED, which every test above this line avoids.
+///
+/// Three defects have now been fixed inside `create_symlinks` and not one of
+/// them was covered by a test that RUNS it: the guard that refused a dangling
+/// alias, and the duplicate check that called an alias a conflict with itself.
+/// Both passed every predicate test in this file while the function was
+/// broken, which is the "pin the wiring, not only the rule" entry in this
+/// project's own notes, ignored twice by the author of these tests.
+///
+/// The shape is gtest's, from a live round: an edge declares the versioned
+/// library and its unversioned alias, the driver's co-output expansion hands a
+/// consumer BOTH, and the alias is then placed by two routes - once as its
+/// recreated link text and once as its own store object.
+#[test]
+fn placing_one_alias_by_two_routes_is_a_duplicate_not_a_conflict() {
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
+
+    let d = dir("wiring");
+    let store_root = d.join("store");
+    let build = d.join("build");
+    std::fs::create_dir_all(&build).unwrap();
+
+    // Two store objects, as an edge's two declared outputs really land.
+    let h_lib = "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let h_alias = "1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let lib = store_root.join(format!("{h_lib}-ninja-build-lib-libgtest_main.so.1.17.0"));
+    let alias = store_root.join(format!("{h_alias}-ninja-build-lib-libgtest_main.so"));
+    std::fs::create_dir_all(lib.join("lib")).unwrap();
+    std::fs::create_dir_all(alias.join("lib")).unwrap();
+    std::fs::write(lib.join("lib/libgtest_main.so.1.17.0"), b"ELF-LIBRARY").unwrap();
+    // The alias output: a relative link to a sibling in ANOTHER store object.
+    std::os::unix::fs::symlink(
+        "libgtest_main.so.1.17.0",
+        alias.join("lib/libgtest_main.so"),
+    )
+    .unwrap();
+
+    let store_dir = StoreDir::new(&store_root).unwrap();
+    let enc = |h: &str, name: &str, rel: &str| {
+        let sp = format!("{}/{h}-{name}", store_root.display());
+        DerivedFile::from_encoded(&store_dir, &format!("{sp}:{rel}:{rel}")).unwrap()
+    };
+    let inputs = vec![
+        enc(
+            h_lib,
+            "ninja-build-lib-libgtest_main.so.1.17.0",
+            "lib/libgtest_main.so.1.17.0",
+        ),
+        enc(
+            h_alias,
+            "ninja-build-lib-libgtest_main.so",
+            "lib/libgtest_main.so",
+        ),
+        // The SAME alias again, which is what the co-output expansion
+        // produces and what aborted the round.
+        enc(
+            h_alias,
+            "ninja-build-lib-libgtest_main.so",
+            "lib/libgtest_main.so",
+        ),
+    ];
+
+    create_symlinks(&build, &store_dir, inputs, false)
+        .expect("one alias reaching the placer twice is a duplicate, not two claimants");
+
+    assert_eq!(
+        std::fs::read(build.join("lib/libgtest_main.so")).unwrap(),
+        b"ELF-LIBRARY",
+        "and the placed alias resolves through to the library"
+    );
+
+    std::fs::remove_dir_all(&d).ok();
+}

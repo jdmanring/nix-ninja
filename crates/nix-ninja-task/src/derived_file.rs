@@ -271,8 +271,24 @@ pub fn create_symlinks(
             continue;
         }
 
+        // COMPARE AGAINST WHAT A PLACEMENT WOULD HAVE WRITTEN, NOT AGAINST
+        // THE STORE PATH. An alias output is placed as its link TEXT, so a
+        // second input naming the same alias object finds the destination
+        // pointing at `libfoo.so.1.2.3` while `source_path` is the store path
+        // - unequal, and the arm below then calls one object a conflict with
+        // itself:
+        //     /build/.../libgtest_main.so is already a symlink to
+        //     libgtest_main.so.1.17.0, and a second input wants it to point
+        //     at /nix/store/...-lib-libgtest_main.so/lib/libgtest_main.so
+        // The two routes are the co-output expansion handing a consumer both
+        // the versioned library and the alias, which is correct; placing the
+        // alias twice is idempotent and must read as a duplicate.
+        // A genuine collision - two DIFFERENT objects claiming one build path
+        // - still compares unequal and still aborts, because their texts
+        // differ too.
         if dest_path.is_symlink() {
             match fs::read_link(&dest_path) {
+                Ok(existing) if existing == placement_link_text(&source_path) => continue,
                 Ok(existing) if existing == source_path => continue,
                 Ok(existing) => {
                     return Err(anyhow!(
