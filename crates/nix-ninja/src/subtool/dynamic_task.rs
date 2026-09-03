@@ -116,6 +116,63 @@ fn prepare_build_environment(store_dir: &StoreDir) -> Result<(PathBuf, HashMap<P
     Ok((build_dir, built_paths))
 }
 
+/// The files the include scan is SEEDED with, drawn from a task's built
+/// inputs.
+///
+/// A DIRECTORY-SHAPED BUILT INPUT IS NOT A TRANSLATION UNIT, AND SEEDING ONE
+/// FAILS THE WHOLE TASK. An edge may declare a directory as its output -
+/// `ninja-build-include-kernel-abi`, whose interior `include/kernel-abi` is a
+/// directory - and every built input is seeded for the scan AND handed to it
+/// as the virtual map. That PAIRING is what defeats the directory guard:
+/// `canonicalize_cached` takes the virtual hit before reaching its own
+/// `is_dir` check, hands back the store path, and the walk reads it:
+///
+/// ```text
+/// Failed to read file <store>-ninja-build-include-kernel-abi/
+///   include/kernel-abi: Is a directory (os error 21)
+/// ```
+///
+/// 189 occurrences of the message in one round, 161 rdma-core and 28
+/// llvm-tblgen, counted by the consumer over round 19. That is a count of
+/// OCCURRENCES; CLAUDE.md's "185 task failures" is a count of TASKS and the
+/// two are not the same unit. The guard `4e591a0` added is an ancestor of
+/// that round's pin, which is verified here; that the round WAS pinned
+/// there is the consumer's reading of their own lock.
+/// Every edition needs clang.
+///
+/// The STORE side decides, because the map's value is what the walk reads.
+///
+/// ONLY THE SEED IS FILTERED, AND THE RESIDUAL IS NOT BENIGN. The virtual
+/// entry stays, so an include that RESOLVES to that directory still
+/// resolves; the downstream check then refuses it, and that refusal is
+/// `.ok_or(anyhow!("Required file not found ..."))?` - a hard error that
+/// fails the whole task, not a fall-through. So this covers the SEED route
+/// and a task whose source includes the directory by name still dies, with
+/// a different message. `#include <memory>` against a `memory/` directory
+/// is the shape, and this tree has met it once already.
+/// The seed route is what the round's 189 failures are.
+///
+/// THE ROOT FIX IS TWO LINES IN `canonicalize_cached` AND IS DECLINED ON
+/// COST, WHICH IS THE ONLY GOOD REASON. Checking the virtual hit for a
+/// directory at both bypasses - the direct probe and the lexically
+/// normalized one below it - covers every route at once. That file is
+/// `crates/deps-infer`, inside `nix-ninja-task`'s fileset, so it re-keys
+/// every banked PLAIN task derivation. Land it when a batch is already
+/// spending that. It would NOT break the generated-header class: a declared
+/// but not yet written header is not a directory, so the guard does not see
+/// it.
+///
+/// Extracted rather than written inline so a test can execute it. Three
+/// defects have been repaired in this tree's placement code and none was
+/// covered by a test that ran it.
+pub fn scan_seeds(built_paths: &HashMap<PathBuf, PathBuf>) -> Vec<PathBuf> {
+    built_paths
+        .iter()
+        .filter(|(_, store_path)| !store_path.is_dir())
+        .map(|(build_path, _)| build_path.clone())
+        .collect()
+}
+
 /// Stage 2: Discover dynamic dependencies by analyzing built files for includes
 pub fn discover_dynamic_dependencies(
     rpc_client: &Arc<BuilderRpcClient>,
@@ -130,7 +187,7 @@ pub fn discover_dynamic_dependencies(
         .ok_or_else(|| anyhow!("No command line found in derivation"))?;
     let cmdline = std::str::from_utf8(cmdline_bytes)?;
 
-    let files: Vec<PathBuf> = built_paths.keys().cloned().collect();
+    let files = scan_seeds(&built_paths);
 
     discover_c_includes(
         rpc_client,
@@ -228,4 +285,65 @@ fn copy_dir_all(src: PathBuf, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// THE FIX, EXECUTED. `directory_seed_scan.rs` pins WHY this filter must
+    /// exist, by reproducing the round's EISDIR through the scanner; this
+    /// runs the filter itself. Reverting it fails here while those stay
+    /// green either way, which is the contrast that says the coverage is
+    /// real - three defects have been repaired in this tree's placement code
+    /// and none was caught by a test that ran the code.
+    ///
+    /// INLINE RATHER THAN UNDER `tests/`, because `subtool` is a private
+    /// module and widening it to admit a test would ship a wider API than
+    /// the code needs. Same price either way: both are `crates/nix-ninja`.
+    ///
+    /// WHAT THIS DOES NOT PIN, said plainly because a green run reads like
+    /// more than it is: that `discover_dynamic_dependencies` calls
+    /// `scan_seeds` at all. Replacing that one call with
+    /// `built_paths.keys()` leaves this green. Covering it needs a task
+    /// driven through the dynamic path, which needs a daemon.
+    #[test]
+    fn scan_seeds_drops_a_directory_output_and_keeps_the_files() {
+        let d = std::env::temp_dir().join(format!(
+            "nn-seeds-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dir_out = d.join("ninja-build-include-kernel-abi/include/kernel-abi");
+        std::fs::create_dir_all(&dir_out).unwrap();
+        let file_out = d.join("ninja-build-verbs/verbs.h");
+        std::fs::create_dir_all(file_out.parent().unwrap()).unwrap();
+        std::fs::write(&file_out, b"#pragma once\n").unwrap();
+
+        // THE BUILD-SIDE PATHS ARE DELIBERATELY NOT CREATED ON DISK, and
+        // that is the test's sharpest property rather than an oversight.
+        // It is what makes a filter written on the WRONG SIDE fail here:
+        // `!build_path.is_dir()` keeps both entries, because neither build
+        // path exists. Creating them to make the fixture look realistic
+        // silently destroys that discrimination.
+        let mut built_paths = HashMap::new();
+        built_paths.insert(d.join("build/include/kernel-abi"), dir_out);
+        built_paths.insert(d.join("build/verbs.h"), file_out);
+
+        let seeds = scan_seeds(&built_paths);
+
+        // BOTH HALVES. Dropping everything would also drop the directory,
+        // and a scan seeded with nothing declares nothing - which is the
+        // silent failure this class produces one phase later.
+        assert_eq!(seeds.len(), 1, "exactly the file survives: {seeds:?}");
+        assert!(
+            seeds[0].ends_with("verbs.h"),
+            "the real header must be kept: {seeds:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

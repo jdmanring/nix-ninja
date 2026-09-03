@@ -2683,6 +2683,21 @@ fn build_task_derivation(
                     SingleDerivedPath::Built { .. } => None, // Will be filled in by dynamic task derivation
                 })
                 .chain(task.store_srcs.iter().cloned())
+                // A DIRECTORY IS NOT A TRANSLATION UNIT, AND THIS SITE IS
+                // THE SIBLING OF THE ONE IN `subtool/dynamic_task.rs`. The
+                // virtual map built just below is the IDENTITY, so a
+                // directory-shaped input is a seed AND a virtual key;
+                // `canonicalize_cached` answers the virtual hit before
+                // reaching its own directory check and the walk reads it.
+                // Found by sweeping for siblings after the dynamic site was
+                // fixed, which is the step that was owed and skipped at the
+                // first fix of this shape.
+                //
+                // A path that does not exist yet is KEPT: `is_dir` is false
+                // for it, and this map exists precisely so a generated input
+                // resolves before it is written. Failing toward the wider
+                // seed set is the polarity `is_compile_task` already uses.
+                .filter(|p| !p.is_dir())
                 .collect();
 
             // Static analysis virtual paths: map build paths of known
