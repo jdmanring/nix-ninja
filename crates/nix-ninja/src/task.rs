@@ -5259,6 +5259,34 @@ fn parent_dir_or_here(path: &Path) -> PathBuf {
     }
 }
 
+/// The directories BESIDE `dir`, sorted, with `dir` itself excluded.
+///
+/// THE FIFTH SITE OF THE EMPTY-PARENT CLASS, and the comment above listed
+/// four. This one asked `dir.parent()` directly, so a one-component relative
+/// directory yielded `Some("")`, `read_dir("")` answered ENOENT, and the `?`
+/// took the whole invocation down with a message naming no file:
+/// `read_dir() for uncle modules: No such file or directory`. glib reached it
+/// and twelve dependents stood behind glib. A shared helper does not cover a
+/// call site that does not call it, and nothing made the fifth site call it.
+///
+/// THE EXCLUSION COMPARES FILE NAMES RATHER THAN PATHS, and a path comparison
+/// is the repair that looks right. Resolving the empty parent to `.` changes
+/// every entry's spelling: `./gio` is not `gio`, so `*p != dir` stops
+/// excluding the directory from its own sibling list and re-queues it under a
+/// second spelling. Every entry shares one parent here, so a file name
+/// identifies it exactly and no spelling can disagree.
+fn sibling_dirs_of(dir: &Path) -> Result<Vec<PathBuf>> {
+    let root = parent_dir_or_here(dir);
+    let mut sibs: Vec<PathBuf> = fs::read_dir(&root)
+        .map_err(|e| anyhow!("read_dir({}) for uncle modules: {e}", root.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.file_name() != dir.file_name())
+        .collect();
+    sibs.sort();
+    Ok(sibs)
+}
+
 #[cfg(test)]
 mod cmake_script_reference_tests {
     use super::{
@@ -5762,7 +5790,9 @@ fn upload_python_closure_uncached(
                     && !dir.join(name).is_dir()
             })
             .collect();
-        if let Some(parent) = dir.parent() {
+        {
+            let parent_buf = parent_dir_or_here(&dir);
+            let parent = parent_buf.as_path();
             if !unsatisfied.is_empty() {
                 // Uncles: a directory beside this one holding <name>.py
                 // (common/ holds models.py) or BEING the named package
@@ -5770,14 +5800,7 @@ fn upload_python_closure_uncached(
                 // SORTED, like every other walk here: these are pushed onto
                 // the queue, so readdir order decided which uncle was
                 // reached first and therefore what the closure contained.
-                let mut uncles: Vec<PathBuf> = fs::read_dir(parent)
-                    .map_err(|e| anyhow!("read_dir({}) for uncle modules: {e}", parent.display()))?
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.is_dir() && *p != dir)
-                    .collect();
-                uncles.sort();
-                for uncle in uncles {
+                for uncle in sibling_dirs_of(&dir)? {
                     let hit = unsatisfied.iter().any(|n| {
                         uncle.join(format!("{n}.py")).is_file()
                             || (uncle.file_name().is_some_and(|f| f == n.as_str())
@@ -10024,6 +10047,52 @@ mod create_symlink_undeclared_output_tests {
 
     /// This test changes the process working directory, which is global.
     static CHDIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// glib, and the FIFTH member of the empty-parent class. A one-component
+    /// relative directory has parent `Some("")`, `read_dir("")` is ENOENT,
+    /// and the error propagates out of the closure walk, so the whole
+    /// invocation dies naming no file. Twelve dependents stood behind glib.
+    ///
+    /// CALLS THE LISTING RATHER THAN THE HELPER, because the helper was
+    /// already correct and already tested while this site did not ask it.
+    /// The assertion is the fourth site's shape: no input yields a path that
+    /// cannot be opened.
+    ///
+    /// The second assertion is the one the obvious repair fails. Resolving
+    /// the empty parent to `.` respells every entry, so a path comparison
+    /// stops recognising the directory as itself and re-queues it.
+    #[test]
+    fn a_one_component_relative_dir_lists_siblings_and_excludes_itself() {
+        let _g = CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // NOT KEYED ON THE PID ALONE: a name that recurs across runs makes a
+        // stale directory another run's fixture, which is a live flake in
+        // this repository's own suite.
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = std::env::temp_dir().join(format!("nn-uncle-{}-{uniq}", std::process::id()));
+        std::fs::create_dir_all(d.join("gio")).unwrap();
+        std::fs::create_dir_all(d.join("glib")).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&d).unwrap();
+        let got = sibling_dirs_of(Path::new("gio"));
+        std::env::set_current_dir(prev).unwrap();
+        let got = got.expect("a one-component relative dir must not read as ENOENT");
+
+        let names: Vec<_> = got.iter().filter_map(|p| p.file_name()).collect();
+        assert!(
+            names.iter().any(|n| *n == "glib"),
+            "the sibling beside it must be listed: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| *n == "gio"),
+            "a directory is not its own sibling, whatever the parent is \
+             spelled as: {names:?}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     // LIVES IN THIS CRATE ON PURPOSE, NOT IN deps-infer WHERE ITS SUBJECT IS.
     // nix-ninja-task's src fileset covers crates/deps-infer, so ANY edit
