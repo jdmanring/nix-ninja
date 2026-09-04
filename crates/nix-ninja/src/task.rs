@@ -8438,6 +8438,13 @@ mod python_import_names_tests {
         std::fs::create_dir_all(d.join("zzz/holder")).unwrap();
         std::fs::write(d.join("zzz/holder/wanted.py"), "x = 1\n").unwrap();
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // THE FIXTURE MUST BLOCK, or the arm exercises nothing: root reads a
+        // 0000 directory, the search never meets an error, and the test
+        // passes with the error handling deleted. Fail loudly instead.
+        assert!(
+            std::fs::read_dir(&blocked).is_err(),
+            "fixture does not block this uid (root?), the arm cannot discriminate"
+        );
 
         let got = super::find_module_below(&d, "wanted", 3);
 
@@ -10444,9 +10451,19 @@ mod self_rss_tests {
     fn reports_a_plausible_resident_size() {
         let mib = self_rss_mib();
         assert!(mib > 0, "self_rss_mib returned 0 for a live process");
-        // A test binary under 8 GiB: loose enough never to flake, tight
-        // enough to catch a unit error (pages read as bytes would be ~4000x).
-        assert!(mib < 8192, "implausible rss {mib} MiB - check the unit");
+        // AGAINST AN INDEPENDENT READING, not a band. `/proc/self/statm`'s
+        // second field is resident PAGES; the subject reads VmRSS from
+        // status. A band under 8 GiB passed a unit error of 4x and a stub
+        // returning 1, so the two readings are required to agree within
+        // a factor that only allocation between the two calls can move.
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+        let pages: u64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let independent = pages * page / (1024 * 1024);
+        assert!(
+            mib.abs_diff(independent) <= independent / 4 + 1,
+            "self_rss_mib {mib} MiB disagrees with statm {independent} MiB"
+        );
     }
 
     /// The point of the pair is that it MOVES with the live set while RSS
@@ -10542,7 +10559,9 @@ mod ninja_pool_tests {
             vars["NIX_CFLAGS_COMPILE"].as_str(),
             super::scan_lto_flags("gcc -O2 -c a.c", true)
         ));
-        // and the env-driven path with no baseline set in this process
+        // and the env-driven path with no baseline set in this process,
+        // under the lock every other env-mutating arm in this file takes
+        let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("NIX_NINJA_ASSUME_LTO");
         assert!(!super::task_is_lto("gcc -O2 -c a.c", &vars));
         vars.insert("NIX_CFLAGS_COMPILE".into(), "-O3 -flto=8".into());

@@ -590,6 +590,12 @@ mod copy_over_tests {
         let dest = d.join("old.d");
         std::fs::write(&dest, b"old\n").unwrap();
         std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // The fixture must refuse a plain write, or root passes this with
+        // the rename replaced by an in-place write.
+        assert!(
+            std::fs::write(&dest, b"probe").is_err(),
+            "0444 does not block this uid (root?), the arm cannot discriminate"
+        );
 
         copy_over(&src, &dest).expect("rename must replace a read-only file");
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new\n");
