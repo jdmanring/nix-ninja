@@ -160,7 +160,7 @@
     a fix against this entry, write a measurement.
 - [x] ~~The dynamic task copies the whole source tree~~ - RETIRED 2026-08-29,
   and the retirement is worth more than the entry was
-  - `copy_dir_all` at `dynamic_task.rs:201` really does copy the whole tree per
+  - `copy_dir_all` in `dynamic_task.rs` really does copy the whole tree per
     dynamic task, and the code is unchanged. But `realise 0/0 sent` on every
     resolved line of all three edition logs means no dynamic task was ever
     built in those runs, so it cost nothing there. Zero sent out of zero
@@ -172,7 +172,7 @@
     dynamic tasks, and it should be fixed when that path is next touched. It
     is not the cost anybody has measured.
 - [ ] #14 aarch64: the literal is fixed, the hardware is not
-  - `build.rs:47` stamped `"x86_64-linux"` into `drv.platform` of every
+  - `build.rs` stamped `"x86_64-linux"` into `drv.platform` of every
     emitted derivation. It now comes from the host, with `NIX_NINJA_SYSTEM`
     overriding, so anybody can reproduce the aarch64 emission path without an
     aarch64 machine. Two tests, one of which asserts the value is UNCHANGED on
@@ -211,7 +211,7 @@
     one content-addressed output, and replace `build_dir_inputs` with that
     single derived path.
   - The win is bigger than caching. `Runner::new_task` walks the build
-    directory and calls `new_opaque_file` PER FILE (`task.rs:598`), so every
+    directory and calls `new_opaque_file` PER FILE, so every
     configured artefact is its own NAR upload and its own map entry. One
     directory output replaces N uploads with one, for every package.
   - The hazard people assume - meson baking absolute paths into build.ninja -
