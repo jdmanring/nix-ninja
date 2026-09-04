@@ -665,14 +665,7 @@ impl BuilderRpcClient {
         }
         NAR_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sp = self.add_to_store_nar(name, path)?;
-        // Only cache what could be stamped: an unstattable key must stay a
-        // miss forever rather than be remembered under a stamp of zero.
-        if let Some((size, mtime)) = stamp {
-            self.nar_uploads
-                .lock()
-                .unwrap()
-                .insert(key.to_path_buf(), (size, mtime, sp.clone()));
-        }
+        remember_nar_stamp(&self.nar_uploads, key, stamp, &sp);
         Ok(sp)
     }
 
@@ -1784,8 +1777,59 @@ mod nar_upload_memo_tests {
     /// zero stamp would serve one file's store path for another's.
     #[test]
     fn an_unstattable_key_is_not_cacheable() {
-        let missing = std::path::Path::new("/nonexistent/nn-memo-probe");
-        assert!(std::fs::metadata(missing).is_err());
+        use super::remember_nar_stamp;
+        use harmonia_store_path::StoreDir;
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        let sd = StoreDir::new("/nix/store").unwrap();
+        let sp = sd
+            .parse("/nix/store/00000000000000000000000000000000-probe")
+            .unwrap();
+        let map: Mutex<HashMap<std::path::PathBuf, (u64, u128, _)>> = Mutex::new(HashMap::new());
+        let key = std::path::Path::new("/nonexistent/nn-memo-probe");
+
+        // The precondition, kept because it is what makes the case real:
+        // this is the stamp an unstattable key produces.
+        assert!(std::fs::metadata(key).is_err());
+
+        remember_nar_stamp(&map, key, None, &sp);
+        assert!(
+            map.lock().unwrap().is_empty(),
+            "an unstattable key was remembered; nar_stamps_snapshot would \
+             persist it and every later run would seed an entry no lookup \
+             can hit"
+        );
+
+        // And the positive half, so the arm cannot pass by never inserting.
+        remember_nar_stamp(&map, key, Some((7, 9)), &sp);
+        assert_eq!(map.lock().unwrap().len(), 1, "a stamped key must be kept");
+    }
+}
+
+/// Record an upload against its key, ONLY when the key could be stamped.
+///
+/// An unstattable key must stay a miss forever rather than be remembered
+/// under a stamp of zero. A zero-stamped entry can never be HIT - the hit
+/// path needs a stamp too - so the damage is not a wrong answer: it is that
+/// `nar_stamps_snapshot` persists the entry, the next run seeds it, and the
+/// cache carries a growing set of entries no lookup can ever use.
+///
+/// A free function taking the map rather than a method, because the
+/// enclosing upload needs a daemon and this decision does not. The arm that
+/// covered this asserted that `fs::metadata` of a nonexistent path is an
+/// error, which is a fact about the standard library: it called nothing in
+/// this crate, so the guard could be deleted with it green.
+fn remember_nar_stamp(
+    map: &Mutex<HashMap<PathBuf, (u64, u128, StorePath)>>,
+    key: &Path,
+    stamp: Option<(u64, u128)>,
+    sp: &StorePath,
+) {
+    if let Some((size, mtime)) = stamp {
+        map.lock()
+            .unwrap()
+            .insert(key.to_path_buf(), (size, mtime, sp.clone()));
     }
 }
 
