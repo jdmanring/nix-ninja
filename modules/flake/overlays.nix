@@ -241,7 +241,7 @@
       # flag, where that build IS permitted - measured in a distribution
       # round, where this same dyndep step succeeded and a sibling package
       # built 29 dyndep files. So this is a defect of the builder-rpc-v0
-      # path, NOT of Fortran, and not of the route ArtNix builds on.
+      # path, NOT of Fortran, and not of the route Saxum builds on.
       # Registered in legacyPackages and NOT as a NixOS VM test, so it does
       # not redden `nix flake check` while the defect stands.
       example-fortran-c-interface = self.mkCMakePackage {

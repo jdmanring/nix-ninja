@@ -16,7 +16,7 @@
 //! it would re-key the task binary a second time for coverage that runs in no
 //! build.
 //!
-//! valgrind spells its config header this way and is opted out of ArtNix for
+//! valgrind spells its config header this way and is opted out of Saxum for
 //! it; dav1d, p11-kit and svt-av1 are the same class one spelling out.
 
 use deps_infer::c_include_parser::canonicalize_cached;
