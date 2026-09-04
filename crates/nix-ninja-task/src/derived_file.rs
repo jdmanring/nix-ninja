@@ -463,6 +463,31 @@ mod link_tree_tests {
         assert!(!dst.join("shared.h").is_symlink());
     }
 
+    /// The skip guard has two halves, `exists()` and `is_symlink()`, and
+    /// the arm above pre-places a REGULAR file, which the first half alone
+    /// rejects. An alias output is placed as a DANGLING link, for which
+    /// `exists()` answers no; only `is_symlink()` keeps link_tree from
+    /// failing with EEXIST on top of it. Reverting that half fails here.
+    #[test]
+    fn a_dangling_link_already_at_the_destination_is_left_alone() {
+        let t = Tmp::new("dangling");
+        let src = t.path().join("src");
+        let dst = t.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("libfoo.so"), b"from the tree").unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink("libfoo.so.1.2.3", dst.join("libfoo.so")).unwrap();
+        assert!(!dst.join("libfoo.so").exists(), "the fixture must be DANGLING");
+
+        link_tree(&src, &dst).unwrap();
+
+        assert_eq!(
+            fs::read_link(dst.join("libfoo.so")).unwrap(),
+            Path::new("libfoo.so.1.2.3"),
+            "the placed alias must survive the tree walk"
+        );
+    }
+
     #[test]
     fn the_destination_is_created_when_it_does_not_exist() {
         let tmp = Tmp::new("mkdir");

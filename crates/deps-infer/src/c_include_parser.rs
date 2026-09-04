@@ -1421,6 +1421,40 @@ mod tests {
         assert_eq!(miss, None);
     }
 
+    /// A MISS SATISFIED BY ENOENT PROVES NOTHING ABOUT THE MAP: the arm
+    /// above's miss is `None` whether the map was consulted or not, because
+    /// nothing at that path exists on disk. Here the missed path EXISTS, so
+    /// the only correct answer is its canonical disk path - a map that
+    /// over-matched (answering `c.h` from the `b.h` entry) and a map that
+    /// swallowed every probe both fail this.
+    #[test]
+    fn a_map_miss_falls_through_to_the_disk() {
+        // NOT the pid-only scratch family this file already carries twelve
+        // of: a monotonic clock beside the pid, and `create_dir` rather than
+        // a blind clear, so a recurring name fails loudly instead of
+        // reusing whatever the last run left.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("nn-vmiss-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(root.join("gen/a")).unwrap();
+        std::fs::write(root.join("gen/a/c.h"), b"on disk").unwrap();
+        let mut vp = HashMap::new();
+        vp.insert(root.join("gen/a/b.h"), PathBuf::from("/store/x-b.h"));
+
+        let hit = canonicalize_cached(root.join("gen/a/b.h"), Some(&vp)).unwrap();
+        assert_eq!(hit, Some(PathBuf::from("/store/x-b.h")), "absent on disk, answered by the map");
+        let miss = canonicalize_cached(root.join("gen/a/c.h"), Some(&vp)).unwrap();
+        assert_eq!(
+            miss,
+            Some(root.join("gen/a/c.h").canonicalize().unwrap()),
+            "not in the map, answered by the disk"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     // Upstream PR 56 ships the regex widening with no test. An inference rule
     // with no test is how the eight input classes this fork carries were each
     // found the expensive way - as a resolved-derivation failure thousands of

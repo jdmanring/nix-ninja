@@ -736,6 +736,22 @@ mod producer_alias_tests {
         // an output that is not any alias target: nothing
         assert!(alias_closure(Path::new("orc"), "orcc", &aliases).is_empty());
     }
+
+    /// Each refusal reached ALONE. The arm above refuses `../out.so` and
+    /// `/nix/store/x.so` through the ONE test they share, `contains('/')`,
+    /// so the absolute-link and empty-target guards were exercised by
+    /// nothing and could be deleted with that arm green.
+    #[test]
+    fn each_refusal_is_the_only_reason_its_input_is_dropped() {
+        // control: the plain shape is admitted
+        assert_eq!(same_dir_aliases("orc/l.so=l.so.1").len(), 1);
+        // an ABSOLUTE link with a clean target: only `is_absolute` refuses it
+        assert!(same_dir_aliases("/abs/l.so=l.so.1").is_empty());
+        // an EMPTY target: only `is_empty` refuses it
+        assert!(same_dir_aliases("orc/l.so=").is_empty());
+        // a target with a separator: only `contains('/')` refuses it
+        assert!(same_dir_aliases("orc/l.so=sub/l.so.1").is_empty());
+    }
 }
 
 fn copy_outputs_to_placeholders(store_dir: &StoreDir, outputs: &[DerivedFile]) -> Result<()> {
@@ -1222,11 +1238,7 @@ fn rewrite_autogen_info(cmdline: &str, build_dir: &Path) -> Result<()> {
         // which reads as the rewrite not having happened at all.
         // The placeholder cannot occur in a path, so the second replace
         // cannot see the first's output.
-        const HOLD: &str = "\u{0}NN_BINDIR\u{0}";
-        let out = text
-            .replace(jb.as_str(), HOLD)
-            .replace(js.as_str(), actual_s.as_str())
-            .replace(HOLD, actual_b.as_str());
+        let out = rewrite_nested_roots(&text, &jb, &js, &actual_b, &actual_s);
         // The materialised input is a read-only store symlink; replace it.
         let _ = fs::remove_file(&path);
         fs::write(&path, &out).map_err(|e| anyhow::anyhow!("rewriting {}: {e}", path.display()))?;
@@ -1237,6 +1249,19 @@ fn rewrite_autogen_info(cmdline: &str, build_dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Replace the binary dir and the source dir in ONE pass through a
+/// placeholder. The source dir is a prefix of the binary dir and the
+/// binary dir's replacement contains the source dir's text, so two
+/// sequential replaces corrupt each other. The test calls THIS function,
+/// so inverting the order here fails it; a test that reimplemented the
+/// three replaces locally stayed green against any order in production.
+fn rewrite_nested_roots(text: &str, jb: &str, js: &str, actual_b: &str, actual_s: &str) -> String {
+    const HOLD: &str = "\u{0}NN_BINDIR\u{0}";
+    text.replace(jb, HOLD)
+        .replace(js, actual_s)
+        .replace(HOLD, actual_b)
 }
 
 /// The `../` chain and remainder from `base` to `path`, both absolute and
@@ -1369,7 +1394,7 @@ mod cd_prologue_tests {
 
 #[cfg(test)]
 mod autogen_rewrite_tests {
-    use super::{json_string_value, lexical_normalize, pathdiff_lexical};
+    use super::{json_string_value, lexical_normalize, pathdiff_lexical, rewrite_nested_roots};
 
     #[test]
     fn reads_a_key_and_maps_the_source_dir_across() {
@@ -1410,11 +1435,7 @@ mod autogen_rewrite_tests {
         let actual_s = "/build/source/build/src";
         let text = "\"/build/src/build/include/QtSvg/x.h\" \"/build/src/svg/y.cpp\"";
 
-        const HOLD: &str = "\u{0}NN_BINDIR\u{0}";
-        let out = text
-            .replace(jb, HOLD)
-            .replace(js, actual_s)
-            .replace(HOLD, actual_b);
+        let out = rewrite_nested_roots(text, jb, js, actual_b, actual_s);
         assert_eq!(
             out,
             "\"/build/source/build/src/build/include/QtSvg/x.h\" \"/build/source/build/src/svg/y.cpp\""
