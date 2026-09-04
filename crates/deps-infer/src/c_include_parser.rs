@@ -1077,10 +1077,8 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let p = std::env::temp_dir().join(format!(
-                "nn-{tag}-{}-{nanos}-{n}",
-                std::process::id()
-            ));
+            let p =
+                std::env::temp_dir().join(format!("nn-{tag}-{}-{nanos}-{n}", std::process::id()));
             std::fs::create_dir(&p).unwrap();
             Scratch(p)
         }
@@ -1468,7 +1466,11 @@ mod tests {
         vp.insert(root.join("gen/a/b.h"), PathBuf::from("/store/x-b.h"));
 
         let hit = canonicalize_cached(root.join("gen/a/b.h"), Some(&vp)).unwrap();
-        assert_eq!(hit, Some(PathBuf::from("/store/x-b.h")), "absent on disk, answered by the map");
+        assert_eq!(
+            hit,
+            Some(PathBuf::from("/store/x-b.h")),
+            "absent on disk, answered by the map"
+        );
         let miss = canonicalize_cached(root.join("gen/a/c.h"), Some(&vp)).unwrap();
         assert_eq!(
             miss,
