@@ -2057,8 +2057,32 @@ impl Runner {
         // per-TU resumability existed only as long as nothing changed.
         // Custom commands keep the blanket: they read configure files no
         // edge declares (the version-script step died without it).
+        // A PATH THE GRAPH DECLARES AS AN OUTPUT IS NOT A CONFIGURE FILE,
+        // and sweeping it in is what makes a task's key depend on WHEN it
+        // was emitted. The walk runs once per driver process, before
+        // anything is built, so a package's later phases (an install run,
+        // and any second invocation) walk a tree the earlier phase grew and
+        // hand every task a larger blanket. Measured by the consumer as
+        // ascending build_dir_inputs per package: fmt 26, 123, 187.
+        // The comment above states the blanket's purpose exactly - files NO
+        // EDGE DECLARES - so excluding declared outputs keeps it and drops
+        // only paths that already have a route in, through the edge that
+        // produces them.
+        // `File.input` and not "is there a DerivedFile yet": the first is
+        // the graph's own statement that an edge produces a node and is
+        // true before anything is scheduled, while the second is a claim
+        // about SCHEDULING ORDER and would vary an emitted input set for
+        // reasons the task cannot see.
+        // Filtered HERE and not in `read_build_dir`, because that map has a
+        // second reader: the cmdline path resolves a graph node through
+        // `build_dir_inputs` before falling back to a filesystem test that
+        // an unbuilt output fails. Shrinking the map at the walk would drop
+        // such an input from COMPILES too, which this gate excludes.
         if !is_gcc_task && self.build_dir_inputs.len() <= implicit_limit {
-            for input in self.build_dir_inputs.values() {
+            for (fid, input) in &self.build_dir_inputs {
+                if files.by_id[*fid].input.is_some() {
+                    continue;
+                }
                 input_set.insert(input.build_path.clone(), input.clone());
             }
         }
