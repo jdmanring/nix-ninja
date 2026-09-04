@@ -358,12 +358,34 @@ struct JobPermits {
     cap: usize,
     /// Ninja's `-l`: 0.0 disables, matching ninja.
     load_limit: f64,
-    /// Whether admission tracks live memory. A field rather than a constant
-    /// read inline so tests can disable it: with it live, a concurrency test
-    /// asserts on the machine's memory at that instant and fails on a busy
-    /// box for a reason unrelated to the semaphore. A flaky test about
-    /// backpressure is worse than none, because it gets muted.
-    memory_aware: bool,
+    /// The machine readings admission is computed from, or `None` to read
+    /// the host. Injectable rather than a boolean disable, and the
+    /// difference is the whole point: with a flag, every test turned the
+    /// memory branch OFF, so replacing that branch with `self.cap` - which
+    /// deletes the wiring of `budget_for_memory`, `budget_for_load`,
+    /// `available_gib` and `load_average` at once - left the suite green.
+    /// A governor with no test on its wiring. Fixed readings keep both
+    /// budget functions ON the path while making the answer deterministic,
+    /// which a live read cannot be: a concurrency test that consults the
+    /// machine's memory at that instant fails on a busy box for a reason
+    /// unrelated to the semaphore, and a flaky test about backpressure is
+    /// worse than none because it gets muted.
+    ///
+    /// The BOUNDS are injected too, not only the readings. `memory_bounds_gib`
+    /// derives them from the host's MemTotal, so injecting availability alone
+    /// would leave the expected budget a function of whichever machine ran
+    /// the test.
+    readings: Option<Readings>,
+}
+
+/// What admission reads about the machine. One struct so a test supplies the
+/// whole set and none of it is silently the host's.
+#[derive(Clone, Copy)]
+struct Readings {
+    avail_gib: u64,
+    load: f64,
+    reserve_gib: u64,
+    full_gib: u64,
 }
 
 struct JobPermit {
@@ -377,7 +399,7 @@ impl JobPermits {
             inner: Arc::new((Mutex::new(0), Condvar::new())),
             cap,
             load_limit: 0.0,
-            memory_aware: true,
+            readings: None,
         }
     }
 
@@ -387,14 +409,34 @@ impl JobPermits {
         self
     }
 
-    /// Same, with the memory gate disabled. Tests only.
+    /// Admission driven by fixed readings instead of the host. Tests only.
+    /// Both budget functions still run: pass roomy numbers for a test about
+    /// the semaphore, tight ones for a test about the governor.
     #[cfg(test)]
-    fn new_without_memory_gate(cap: usize) -> Self {
+    fn with_readings(cap: usize, readings: Readings) -> Self {
         JobPermits {
             load_limit: 0.0,
-            memory_aware: false,
+            readings: Some(readings),
             ..JobPermits::new(cap)
         }
+    }
+
+    /// Readings under which neither control throttles, so a test asserting on
+    /// the SEMAPHORE sees exactly `cap`. `full_gib` availability is what
+    /// `budget_for_memory` returns the full cap for, and a load limit of 0.0
+    /// disables `-l`, so this is the deterministic stand-in for the old
+    /// disable flag - with the branch still executing.
+    #[cfg(test)]
+    fn roomy(cap: usize) -> Self {
+        JobPermits::with_readings(
+            cap,
+            Readings {
+                avail_gib: 64,
+                load: 0.0,
+                reserve_gib: 6,
+                full_gib: 15,
+            },
+        )
     }
 
     /// Blocks until `weight` units free. Blocking in the scheduler's start()
@@ -412,17 +454,22 @@ impl JobPermits {
         let (lock, cvar) = &*self.inner;
         let mut count = lock.lock().unwrap();
         loop {
-            let budget =
-                if self.memory_aware {
-                    let (reserve, full) = memory_bounds_gib();
-                    // The tighter of the two controls wins. Memory is the one
-                    // that matters here; load is honoured because -l was asked
-                    // for, and its weakness is documented at budget_for_load.
-                    budget_for_memory(self.cap, available_gib(), reserve, full)
-                        .min(budget_for_load(self.cap, load_average(), self.load_limit))
-                } else {
-                    self.cap
-                };
+            let r = self.readings.unwrap_or_else(|| {
+                let (reserve_gib, full_gib) = memory_bounds_gib();
+                Readings {
+                    avail_gib: available_gib(),
+                    load: load_average(),
+                    reserve_gib,
+                    full_gib,
+                }
+            });
+            // The tighter of the two controls wins. Memory is the one that
+            // matters here; load is honoured because -l was asked for, and its
+            // weakness is documented at budget_for_load. Unconditional: there
+            // is no longer a branch that answers `self.cap` without consulting
+            // either, which is what nothing was pinning.
+            let budget = budget_for_memory(self.cap, r.avail_gib, r.reserve_gib, r.full_gib)
+                .min(budget_for_load(self.cap, r.load, self.load_limit));
             if *count == 0 || *count + weight <= budget {
                 break;
             }
@@ -7825,7 +7872,7 @@ mod job_permits_tests {
 
     #[test]
     fn concurrency_never_exceeds_cap() {
-        let permits = Arc::new(JobPermits::new_without_memory_gate(3));
+        let permits = Arc::new(JobPermits::roomy(3));
         let running = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
@@ -7952,14 +7999,115 @@ mod job_permits_tests {
     /// or a low-memory moment turns into a hang instead of a slowdown.
     #[test]
     fn an_oversized_task_still_runs_alone() {
-        let permits = std::sync::Arc::new(JobPermits::new_without_memory_gate(2));
+        let permits = std::sync::Arc::new(JobPermits::roomy(2));
         let _p = permits.acquire_weighted(usize::MAX);
         // Acquiring it at all proves the empty-pool escape hatch works.
     }
 
+    /// THE WIRING, which nothing pinned until this arm existed. Every other
+    /// concurrency arm here runs at readings under which neither control
+    /// throttles, so all of them stay green when the whole budget
+    /// computation is replaced by `self.cap` - deleting the reach of
+    /// `budget_for_memory`, `budget_for_load`, `available_gib` and
+    /// `load_average` in one edit, with a governor left connected to
+    /// nothing. Pinning the two curves is not the same as pinning that
+    /// admission consults them, which is this file's own "pin the WIRING,
+    /// not only the rule".
+    ///
+    /// Readings chosen so the expected number is arithmetic rather than a
+    /// property of the host: 10 GiB between a 6 GiB reserve and a 15 GiB
+    /// full point is four ninths of the way up an 8-slot cap, so the taper
+    /// answers 4. A test that read the machine could assert no such thing.
+    #[test]
+    fn admission_throttles_below_the_cap_when_memory_is_tight() {
+        let tight = super::Readings {
+            avail_gib: 10,
+            load: 0.0,
+            reserve_gib: 6,
+            full_gib: 15,
+        };
+        assert_eq!(
+            budget_for_memory(8, tight.avail_gib, tight.reserve_gib, tight.full_gib),
+            4,
+            "the fixture must sit BELOW the cap or this arm asserts nothing"
+        );
+
+        let permits = Arc::new(JobPermits::with_readings(8, tight));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..24 {
+            let (permits, running, peak) = (permits.clone(), running.clone(), peak.clone());
+            handles.push(std::thread::spawn(move || {
+                let _permit = permits.acquire_weighted(1);
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                running.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= 4,
+            "peak {peak} exceeded the memory budget of 4 under a cap of 8, \
+             so admission is not consulting budget_for_memory"
+        );
+        assert!(
+            peak >= 2,
+            "peak {peak} means this arm exercised no parallelism, so the \
+             ceiling above it was never tested"
+        );
+    }
+
+    /// The same for the OTHER control, because the two are combined with a
+    /// `min` and an arm that only tightens memory leaves the load half
+    /// reachable by nothing. Load at the limit throttles to 1, so the round
+    /// goes serial rather than stalling - the distinction budget_for_load's
+    /// own arm asserts on the number and not on admission.
+    #[test]
+    fn admission_goes_serial_when_the_load_limit_is_met() {
+        let permits = Arc::new(
+            JobPermits::with_readings(
+                8,
+                super::Readings {
+                    avail_gib: 64,
+                    load: 9.0,
+                    reserve_gib: 6,
+                    full_gib: 15,
+                },
+            )
+            .with_load_limit(8.0),
+        );
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let (permits, running, peak) = (permits.clone(), running.clone(), peak.clone());
+            handles.push(std::thread::spawn(move || {
+                let _permit = permits.acquire_weighted(1);
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                running.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let peak = peak.load(Ordering::SeqCst);
+        assert_eq!(
+            peak, 1,
+            "peak {peak} under a met load limit: admission is not consulting \
+             budget_for_load, or -l is not reaching it"
+        );
+    }
+
     #[test]
     fn permit_released_on_panic() {
-        let permits = Arc::new(JobPermits::new_without_memory_gate(1));
+        let permits = Arc::new(JobPermits::roomy(1));
         let p2 = permits.clone();
         let _ = std::thread::spawn(move || {
             let _permit = p2.acquire_weighted(1);
