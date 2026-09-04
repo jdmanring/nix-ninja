@@ -8244,6 +8244,24 @@ mod python_import_names_tests {
         );
     }
 
+    /// The walk STOPS above a shallow ancestor, and nothing ran that stop.
+    /// Both arms above terminate before it changes any output, so deleting
+    /// the `components().count() < 3` break leaves them green. A path under
+    /// a shallow ancestor is what it protects: `/work` is not mirrored into
+    /// the sandbox, so rewriting a token under it produces a climb to a
+    /// directory that does not exist - the same failure the bare-form
+    /// comment above records, one level further up.
+    #[test]
+    fn a_path_under_a_shallow_ancestor_is_left_alone() {
+        let bd = std::path::Path::new("/work/qt/build");
+        let raw = "cc -I/work/tools/gen -c /work/qt/build/a.c";
+        assert_eq!(
+            super::rewrite_ancestor_paths_ups(raw, bd, 3),
+            "cc -I/work/tools/gen -c ../../../a.c",
+            "only the build directory's own subtree may be rewritten"
+        );
+    }
+
     #[test]
     fn ancestor_rewrite_compensates_for_cd_depth() {
         use super::{rewrite_ancestor_paths, rewrite_ancestor_paths_ups};
@@ -8921,6 +8939,35 @@ mod normalize_output_tests {
             lexical_join(Path::new("gen/a"), Path::new("b/./c")),
             Path::new("gen/a/b/c")
         );
+    }
+
+    /// The context HARVEST, which the arm below cannot reach: its
+    /// `default_100_percent` is already in the seeded list, so deleting the
+    /// loop that reads `context="..."` out of the document leaves it green.
+    /// A context the seed does not carry is the only thing that runs it, and
+    /// a real .grd names one wherever the build defines its own scale.
+    #[test]
+    fn a_context_absent_from_the_seed_is_harvested_from_the_document() {
+        use super::grd_references;
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("grd-ctx-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let scaled = dir.join("custom_150_percent/flags_ui");
+        fs::create_dir_all(&scaled).unwrap();
+        fs::write(scaled.join("favicon.png"), b"png").unwrap();
+        let grd = dir.join("res.grd");
+        fs::write(
+            &grd,
+            r#"<grit><outputs><output context="custom_150_percent"/></outputs>
+               <structure type="chrome_scaled_image" file="flags_ui/favicon.png"/></grit>"#,
+        )
+        .unwrap();
+        let refs = grd_references(&grd).unwrap();
+        assert!(
+            refs.contains(&scaled.join("favicon.png")),
+            "a context named only by the document was not harvested: {refs:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -10279,17 +10326,11 @@ mod prune_gate_tests {
         let feed = concat!("USED_", "HEADERS.fetch_add");
 
         let lines: Vec<&str> = src.lines().collect();
-        let at = lines
-            .iter()
-            .position(|l| l.contains(filter))
-            .expect("the discovery filter moved - re-read discover_c_includes");
-        let branch = &lines[at..(at + 8).min(lines.len())];
-        let cont = branch
-            .iter()
-            .position(|l| l.trim() == "continue;")
-            .expect("the filter's taken branch no longer continues");
         assert!(
-            branch[..cont].iter().any(|l| l.contains(counter)),
+            counter_is_inside_taken_branch(&lines, filter, counter).expect(
+                "the discovery filter or its continue moved - re-read \
+                         discover_c_includes"
+            ),
             "the used counter is not inside the filter's taken branch: it is \
              counting a population the declared set cannot intersect"
         );
@@ -10330,18 +10371,41 @@ mod prune_gate_tests {
             "continue;",
             "used_declared.insert(x);",
         ];
-        let at = bad
-            .iter()
-            .position(|l| l.contains("contains(&include)"))
-            .unwrap();
-        let branch = &bad[at..];
-        let cont = branch.iter().position(|l| l.trim() == "continue;").unwrap();
-        assert!(
-            !branch[..cont]
-                .iter()
-                .any(|l| l.contains("used_declared.insert")),
+        assert_eq!(
+            counter_is_inside_taken_branch(
+                &bad,
+                concat!("contains(&", "include)"),
+                concat!("used_", "declared.insert")
+            ),
+            Ok(false),
             "the gate would accept a counter that can never run"
         );
+    }
+
+    /// The scan BOTH arms above run. It was written twice - once over
+    /// `task.rs` and once over a synthetic array inside the control - so the
+    /// control asserted about its own copy and stayed green however the real
+    /// scan drifted. One function, two callers, which is what makes the
+    /// control a control.
+    ///
+    /// `Err` distinguishes "the shape this reads is gone" from "the counter
+    /// is misplaced"; a bool alone reports a moved filter as a defect in the
+    /// code it can no longer find.
+    fn counter_is_inside_taken_branch(
+        lines: &[&str],
+        filter: &str,
+        counter: &str,
+    ) -> Result<bool, String> {
+        let at = lines
+            .iter()
+            .position(|l| l.contains(filter))
+            .ok_or_else(|| format!("no line contains {filter}"))?;
+        let branch = &lines[at..(at + 8).min(lines.len())];
+        let cont = branch
+            .iter()
+            .position(|l| l.trim() == "continue;")
+            .ok_or_else(|| "the filter's taken branch no longer continues".to_string())?;
+        Ok(branch[..cont].iter().any(|l| l.contains(counter)))
     }
 }
 
