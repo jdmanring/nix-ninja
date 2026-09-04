@@ -10449,6 +10449,10 @@ mod self_rss_tests {
     /// for deliberately, and the reason a test has to distinguish them.
     #[test]
     fn reports_a_plausible_resident_size() {
+        // A filtered test process is about 4 MiB resident, and at that size
+        // a relative tolerance admits a stub returning 1. Touch enough
+        // memory that no constant can sit within a quarter of the reading.
+        let ballast = vec![1u8; 16 << 20];
         let mib = self_rss_mib();
         assert!(mib > 0, "self_rss_mib returned 0 for a live process");
         // AGAINST AN INDEPENDENT READING, not a band. `/proc/self/statm`'s
@@ -10464,6 +10468,7 @@ mod self_rss_tests {
             mib.abs_diff(independent) <= independent / 4 + 1,
             "self_rss_mib {mib} MiB disagrees with statm {independent} MiB"
         );
+        std::hint::black_box(ballast);
     }
 
     /// The point of the pair is that it MOVES with the live set while RSS
