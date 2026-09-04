@@ -165,6 +165,58 @@ fn persistence_enabled(setting: Option<&str>, in_nix_build: bool) -> bool {
     }
 }
 
+/// Parse a persisted cache body, or `None` when its first line is not
+/// EXACTLY this driver's header.
+///
+/// Extracted from `init` so the staleness gate has somewhere to be tested.
+/// `init` runs behind a process-global `OnceLock`, so a test could not
+/// reach the predicate through it and the arm that covered this degenerated
+/// into asserting string properties of `header()` - green with the gate
+/// loosened to a prefix match, which is what a foreign driver's file
+/// satisfies. The equality is the gate: a file written by a different
+/// driver build carries a different `driver=` stamp, and anything short of
+/// whole-line equality replays memos computed by another scanner.
+fn parse_persisted(body: &str, expected: &str) -> Option<HashMap<(String, PathBuf), Entry>> {
+    let mut lines = body.lines();
+    if lines.next() != Some(expected) {
+        return None;
+    }
+    let mut unvalidated = HashMap::new();
+    for line in lines {
+        let mut f = line.split('\t');
+        let (Some(kind), Some(key), Some(dm), Some(n), Some(sz), Some(mm), Some(enc)) = (
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+            f.next(),
+        ) else {
+            continue;
+        };
+        let (Ok(dir_mtime_ns), Ok(count), Ok(sum_size), Ok(max_mtime_ns)) =
+            (dm.parse(), n.parse(), sz.parse(), mm.parse())
+        else {
+            continue;
+        };
+        // Last write wins, same as the in-memory memos.
+        unvalidated.insert(
+            (kind.to_string(), PathBuf::from(key)),
+            Entry {
+                fp: Fingerprint {
+                    dir_mtime_ns,
+                    count,
+                    sum_size,
+                    max_mtime_ns,
+                },
+                encoded: enc.split(SEP).map(str::to_string).collect(),
+            },
+        );
+    }
+    Some(unvalidated)
+}
+
 /// Call once from Runner::new. NIX_NINJA_RESOLVE_CACHE=0 disables;
 /// inside a nix sandbox (NIX_BUILD_TOP) persistence is off by default.
 pub fn init(store_dir: StoreDir, build_dir: PathBuf) {
@@ -179,63 +231,32 @@ pub fn init(store_dir: StoreDir, build_dir: PathBuf) {
         let path = build_dir.join(FILE_NAME);
         let mut unvalidated = HashMap::new();
         if let Ok(body) = fs::read_to_string(&path) {
-            let mut lines = body.lines();
-            if lines.next() == Some(header()) {
-                for line in lines {
-                    let mut f = line.split('\t');
-                    let (Some(kind), Some(key), Some(dm), Some(n), Some(sz), Some(mm), Some(enc)) = (
-                        f.next(),
-                        f.next(),
-                        f.next(),
-                        f.next(),
-                        f.next(),
-                        f.next(),
-                        f.next(),
-                    ) else {
-                        continue;
-                    };
-                    let (Ok(dir_mtime_ns), Ok(count), Ok(sum_size), Ok(max_mtime_ns)) =
-                        (dm.parse(), n.parse(), sz.parse(), mm.parse())
-                    else {
-                        continue;
-                    };
-                    // Last write wins, same as the in-memory memos.
-                    unvalidated.insert(
-                        (kind.to_string(), PathBuf::from(key)),
-                        Entry {
-                            fp: Fingerprint {
-                                dir_mtime_ns,
-                                count,
-                                sum_size,
-                                max_mtime_ns,
-                            },
-                            encoded: enc.split(SEP).map(str::to_string).collect(),
-                        },
-                    );
-                }
-            } else {
-                // Remove, don't just ignore: flush() writes the header only
-                // when the file is absent, so appending under a stale header
-                // strands every entry this run banks - measured round 71,
-                // which banked 11,000 tasks' memos that round 72 then threw
-                // away unread.
-                // AND SAY SO IF THE REMOVE FAILS, because the incident in
-                // the comment above is exactly what a failed remove
-                // re-enables, silently. stderr, not stdout: `-t drv` writes
-                // its derivation JSON to stdout and this runs on that path.
-                if let Err(e) = fs::remove_file(&path) {
-                    eprintln!(
-                        "nix-ninja: resolve cache {} has a stale header and could not be \
+            match parse_persisted(&body, header()) {
+                Some(m) => unvalidated = m,
+                None => {
+                    // Remove, don't just ignore: flush() writes the header only
+                    // when the file is absent, so appending under a stale header
+                    // strands every entry this run banks - measured round 71,
+                    // which banked 11,000 tasks' memos that round 72 then threw
+                    // away unread.
+                    // AND SAY SO IF THE REMOVE FAILS, because the incident in
+                    // the comment above is exactly what a failed remove
+                    // re-enables, silently. stderr, not stdout: `-t drv` writes
+                    // its derivation JSON to stdout and this runs on that path.
+                    if let Err(e) = fs::remove_file(&path) {
+                        eprintln!(
+                            "nix-ninja: resolve cache {} has a stale header and could not be \
                          removed ({e}); persistence is disabled for this run rather than \
                          appending under it",
+                            path.display()
+                        );
+                        return None;
+                    }
+                    eprintln!(
+                        "nix-ninja: resolve cache {} had a different version/cap header; removed",
                         path.display()
                     );
-                    return None;
                 }
-                eprintln!(
-                    "nix-ninja: resolve cache {} had a different version/cap header; removed",
-                    path.display()
-                );
             }
         }
         // ALWAYS, including zero. Zero is the state an operator most needs
@@ -524,13 +545,47 @@ mod tests {
         fs::remove_dir_all(&bd).unwrap();
     }
 
+    /// One well-formed entry line under the given first line.
+    fn body_with_header(h: &str) -> String {
+        format!("{h}\ndir\t/build/src\t1\t2\t3\t4\ta{SEP}b\n")
+    }
+
+    /// The gate is WHOLE-LINE EQUALITY, and these run it rather than
+    /// asserting properties of `header()`. Loosening the predicate to a
+    /// prefix match passes the arm above and fails both of these: an
+    /// unstamped file is a prefix of this driver's header, and a foreign
+    /// stamp extends it.
+    #[test]
+    fn a_body_under_this_drivers_header_loads() {
+        let got = parse_persisted(&body_with_header(header()), header())
+            .expect("the current header must load");
+        assert_eq!(got.len(), 1, "the entry line must survive the gate");
+    }
+
+    #[test]
+    fn an_unstamped_body_does_not_load() {
+        assert!(
+            parse_persisted(&body_with_header(HEADER_BASE), header()).is_none(),
+            "a file written before the driver stamp existed must be refused"
+        );
+    }
+
+    #[test]
+    fn a_body_whose_header_merely_extends_ours_does_not_load() {
+        let foreign = format!("{} extra", header());
+        assert!(
+            parse_persisted(&body_with_header(&foreign), header()).is_none(),
+            "a header this driver's own is a prefix of must still be refused"
+        );
+    }
+
     /// A cache file stamped by a DIFFERENT driver build must not load.
     /// The un-stamped base header is exactly what such a file's first
     /// line looks like relative to this driver's header(): the load
     /// predicate is a whole-line equality, so a mismatched (or absent)
-    /// driver stamp fails it and the file is recomputed. CACHE is a
-    /// process-global OnceLock consumed by the test above, so this
-    /// exercises the predicate rather than a second init.
+    /// driver stamp fails it and the file is recomputed. This arm asserts
+    /// the STAMP's own properties and does not reach the gate; the three
+    /// arms above run it.
     #[test]
     fn stale_driver_stamp_fails_the_header_predicate() {
         let h = header();
