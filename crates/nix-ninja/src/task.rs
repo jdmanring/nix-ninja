@@ -3307,21 +3307,8 @@ fn build_task_derivation(
         // directory name, which is a plausible binary name and would be
         // resolved in its place, so the failure would move rather than go
         // away.
-        let mut cmdline_toks = cmdline.split_whitespace();
-        let cmdline_binary = loop {
-            match cmdline_toks.next() {
-                None => return Err(anyhow!("No command found in cmdline")),
-                Some(":") | Some("&&") => continue,
-                Some("cd") => {
-                    cmdline_toks.next();
-                    continue;
-                }
-                // GN quotes interpreter paths ("…/python3.14"); the shell
-                // strips the quotes at exec time, so strip them here too or
-                // `which` is asked for a name with literal quote characters.
-                Some(tok) => break tok.trim_matches(|c| c == '"' || c == '\''),
-            }
-        };
+        let cmdline_binary =
+            command_program(cmdline).ok_or_else(|| anyhow!("No command found in cmdline"))?;
 
         // A command resolving outside the store (e.g. a `../gen.sh` script
         // from the source tree) is a task input handled by
@@ -9918,6 +9905,38 @@ fn generate_frandom_seed(cmdline: &str) -> String {
 /// store-path lib is already visible in every sandbox) or meson's SHSYM
 /// `.symbols` relink guard, the only edge-visible handle on the lib it
 /// certifies.
+/// The token a shell would exec for this command line. Skips CMake's
+/// `: &&` guards, a `cd DIR &&` prologue as a pair (the directory is a
+/// plausible binary name), and leading `VAR=value` assignments, which the
+/// shell applies to the program rather than running; asking `which` for one
+/// failed the task as a missing tool. GN quotes interpreter paths, and the
+/// shell strips those at exec time, so they are stripped here too.
+fn command_program(cmdline: &str) -> Option<&str> {
+    let mut toks = cmdline.split_whitespace();
+    loop {
+        match toks.next()? {
+            ":" | "&&" => continue,
+            "cd" => {
+                toks.next();
+            }
+            tok if is_shell_assignment(tok) => continue,
+            tok => return Some(tok.trim_matches(|c| c == '"' || c == '\'')),
+        }
+    }
+}
+
+/// `NAME=...` where NAME is a shell variable name.
+fn is_shell_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
 /// An absolute path candidate in a cmdline argument: the arg itself, or
 /// the value of a `VAR=/abs` token (CMake `-D INPUT_FILE=/...`). CMake
 /// CUSTOM_COMMAND edges reference source files by absolute path and may
@@ -11525,5 +11544,33 @@ mod gcc_toolchain_tool_tests {
     fn the_family_is_three() {
         let got = gcc_toolchain_tools_named("sh -c \"gcc-ranlib x.a && gcc-nm x.a\"");
         assert_eq!(got, vec!["gcc-nm", "gcc-ranlib"]);
+    }
+}
+
+#[cfg(test)]
+mod command_program_tests {
+    use super::command_program;
+
+    #[test]
+    fn every_shape_the_pick_steps_over() {
+        assert_eq!(command_program(": && gcc -c a.c && :"), Some("gcc"));
+        assert_eq!(command_program("cd sub && python3 gen.py"), Some("python3"));
+        assert_eq!(command_program("cd && ls"), Some("ls"));
+        assert_eq!(
+            command_program("\"/nix/store/x/bin/python3.14\" gen.py"),
+            Some("/nix/store/x/bin/python3.14")
+        );
+        assert_eq!(
+            command_program("PYTHONPATH=../src python3 -m rules.generator"),
+            Some("python3")
+        );
+        assert_eq!(command_program("A=1 B=two prog"), Some("prog"));
+        // Not assignments: a flag with a value, a path, a name a shell rejects.
+        assert_eq!(command_program("-DX=1 prog"), Some("-DX=1"));
+        assert_eq!(command_program("./a=b"), Some("./a=b"));
+        assert_eq!(command_program("1A=x prog"), Some("1A=x"));
+        assert_eq!(command_program("=x prog"), Some("=x"));
+        assert_eq!(command_program("   "), None);
+        assert_eq!(command_program("cd sub"), None);
     }
 }
