@@ -1569,6 +1569,7 @@ impl Runner {
             let cmake_p_defs = cmake_definitions(&args);
             let tablegen = tablegen_invocation(&args);
             let xinclude_docs = xinclude_invocation(&args);
+            let rst_docs = rst_invocation(&args);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -2053,6 +2054,12 @@ impl Runner {
             if let Some(docs) = &xinclude_docs {
                 let root = self.config.build_dir.join(&cd_dir);
                 for p in xinclude_closure(&root, docs, 4096) {
+                    referenced.push(p.to_string_lossy().into_owned());
+                }
+            }
+            if let Some(docs) = &rst_docs {
+                let root = self.config.build_dir.join(&cd_dir);
+                for p in rst_include_closure(&root, docs, 4096) {
                     referenced.push(p.to_string_lossy().into_owned());
                 }
             }
@@ -5649,6 +5656,71 @@ fn xinclude_href_of(tag: &str) -> Option<String> {
 /// KEYED ON `--xinclude`, which is the flag that makes the parts load.
 /// Without it xsltproc reads the one document and the parts are not inputs,
 /// so a broader key would upload files no run opens.
+/// A reStructuredText document handed to a docutils writer (`rst2man`,
+/// `rst2html`, rdma-core's `pandoc-prebuilt.py --rst`). Its `.. include::`
+/// directives name files the edge does not declare: rdma-core's man pages
+/// pull option fragments from `<build>/infiniband-diags/man/common/`, a
+/// directory of configure-time links into the source tree, and a build
+/// directory over the blanket's limit delivered none of them (configuration
+/// B, 2026-09-04, `InputError: No such file or directory: ...opt_G.rst`).
+fn rst_invocation(args: &[String]) -> Option<Vec<PathBuf>> {
+    if !args
+        .iter()
+        .any(|a| a.contains("rst2") || a.ends_with("pandoc-prebuilt.py"))
+    {
+        return None;
+    }
+    let docs: Vec<PathBuf> = args
+        .iter()
+        .filter(|a| !a.starts_with('-') && a.ends_with(".rst"))
+        .map(PathBuf::from)
+        .collect();
+    (!docs.is_empty()).then_some(docs)
+}
+
+/// Every file an rst document reaches through `.. include::`, transitively,
+/// each resolved against the including document's directory as docutils
+/// does. Missing files are reported as paths too: the caller's existence
+/// check decides, and a reader that silently drops them has no way to say
+/// so. Capped so a cycle terminates.
+fn rst_include_closure(root: &Path, docs: &[PathBuf], cap: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut queue: Vec<PathBuf> = docs
+        .iter()
+        .map(|d| {
+            if d.is_absolute() {
+                d.clone()
+            } else {
+                root.join(d)
+            }
+        })
+        .collect();
+    while let Some(doc) = queue.pop() {
+        if out.len() >= cap || !seen.insert(doc.clone()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&doc) else {
+            continue;
+        };
+        let dir = doc.parent().unwrap_or(root);
+        for line in text.lines() {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix(".. include::") else {
+                continue;
+            };
+            let name = rest.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let p = dir.join(name);
+            out.push(p.clone());
+            queue.push(p);
+        }
+    }
+    out
+}
+
 fn xinclude_invocation(args: &[String]) -> Option<Vec<PathBuf>> {
     if !args.iter().any(|a| a == "--xinclude") {
         return None;
@@ -11993,5 +12065,60 @@ mod python_module_tests {
                 "gen/emit/__init__.py"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod rst_reader_tests {
+    use super::{rst_include_closure, rst_invocation};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_docutils_writer_names_its_rst_and_the_includes_are_closed_over() {
+        let args: Vec<String> = "python3 /src/buildlib/pandoc-prebuilt.py --build /b --rst /nix/store/x/bin/rst2man /b/man/ibsysstat.8.rst /b/man/ibsysstat.8"
+            .split(' ')
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            rst_invocation(&args),
+            Some(vec![PathBuf::from("/b/man/ibsysstat.8.rst")])
+        );
+        let plain: Vec<String> = "gcc -c a.c -o a.o".split(' ').map(String::from).collect();
+        assert_eq!(rst_invocation(&plain), None);
+
+        let d = std::env::temp_dir().join(format!(
+            "nn-rst-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(d.join("build/man/common")).unwrap();
+        std::fs::write(
+            d.join("build/man/page.8.rst"),
+            "Title\n=====\n\n.. include:: ../../build/man/common/opt_G.rst\n.. include:: common/opt_C.rst\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("build/man/common/opt_G.rst"),
+            ".. include:: opt_inner.rst\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("build/man/common/opt_inner.rst"), "inner\n").unwrap();
+        let got = rst_include_closure(&d.join("build/man"), &[PathBuf::from("page.8.rst")], 64);
+        let mut names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["opt_C.rst", "opt_G.rst", "opt_inner.rst"],
+            "{got:?}"
+        );
+        // The missing one is still named: existence is the caller's check.
+        assert!(got.iter().any(|p| p.ends_with("common/opt_C.rst")));
+        std::fs::remove_dir_all(&d).ok();
     }
 }
