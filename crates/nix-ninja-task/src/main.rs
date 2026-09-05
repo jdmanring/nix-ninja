@@ -514,12 +514,24 @@ fn main() -> Result<()> {
     // output the loud error it must be: a compile whose .o is absent is a
     // broken build, and rule-of-polarity says only the stamp class may be
     // quietly satisfied.
+    let is_custom_target_stamp = |bp: &Path| {
+        bp.components().any(|c| c.as_os_str() == "CMakeFiles") && bp.extension().is_none()
+    };
+    // A CUSTOM TARGET'S BYPRODUCT IS ALSO ALLOWED TO BE ABSENT. cmake lists
+    // `BYPRODUCTS` as further outputs of the stamp's edge, and a script may
+    // decide at run time not to write one: doxygen's git_watcher.cmake
+    // writes generated_src/git_state only on a run that finds the
+    // previous run's gitversion.cpp, so a first run declares it and never
+    // writes it. Real ninja tolerates the absent file because the edge
+    // re-runs every build. The edge is recognised by its stamp; an
+    // `add_custom_command` OUTPUT has no stamp and stays the loud error
+    // (raptor2's turtle_parser.tab.c is a package defect and must fail).
+    let custom_target = outputs
+        .iter()
+        .any(|o| is_custom_target_stamp(&o.build_path));
     for output in &outputs {
         let bp = &output.build_path;
-        if !bp.exists()
-            && bp.components().any(|c| c.as_os_str() == "CMakeFiles")
-            && bp.extension().is_none()
-        {
+        if !bp.exists() && (is_custom_target_stamp(bp) || custom_target) {
             if let Some(parent) = bp.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -528,7 +540,12 @@ fn main() -> Result<()> {
             // declared output with no hint that the stamp was attempted.
             match fs::write(bp, b"") {
                 Ok(()) => println!(
-                    "nix-ninja-task: created empty custom-target stamp {}",
+                    "nix-ninja-task: created empty custom-target {} {}",
+                    if is_custom_target_stamp(bp) {
+                        "stamp"
+                    } else {
+                        "byproduct"
+                    },
                     bp.display()
                 ),
                 Err(e) => println!(

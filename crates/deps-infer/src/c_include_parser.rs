@@ -1419,13 +1419,9 @@ mod tests {
         std::os::unix::fs::symlink(d.join("ccan/str.h"), d.join("build/include/ccan/str.h"))
             .unwrap();
         std::fs::write(d.join("ccan/str.c"), "#include <ccan/str.h>\n").unwrap();
-        let got = bfs_parse_includes(
-            vec![d.join("ccan/str.c")],
-            &[d.join("build/include")],
-            None,
-        )
-        .unwrap()
-        .includes;
+        let got = bfs_parse_includes(vec![d.join("ccan/str.c")], &[d.join("build/include")], None)
+            .unwrap()
+            .includes;
         assert!(
             got.contains(&d.join("build/include/ccan/str.h")),
             "absolute spelled path missing: {got:?}"
