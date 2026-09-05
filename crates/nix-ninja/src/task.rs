@@ -10553,9 +10553,18 @@ pub fn discover_c_includes(
                 // THIS IS NOT THE WHOLE FIX FOR THAT PACKAGE. Excluding
                 // the path leaves the header unreachable, so the daemon
                 // rejection becomes an ordinary missing-include error.
-                // Carrying such a file as BYTES is the other half and is
-                // a pricing decision, since it keys the task on staged
-                // content. Recorded in local/pending/next-rekey-batch.md.
+                //
+                // Queuing the file for an opaque upload instead is NOT the
+                // other half, though it reads like a one-line change. An
+                // upload is staged at its path relative to the build
+                // directory, and a file under the outer output is not
+                // below it, so `relative_from` yields a `..` spelling and
+                // the header lands where nothing looks: the command's
+                // `-I` names the outer output absolutely, and no path the
+                // sandbox can offer answers to that name. Carrying it
+                // needs the include path rewritten to wherever the task
+                // stages it, which is a larger change than this guard.
+                // Recorded in local/pending/next-rekey-batch.md.
                 if outer_output_paths()
                     .iter()
                     .any(|o| full_path == Path::new(o))
