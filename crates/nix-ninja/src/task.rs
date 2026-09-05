@@ -5342,7 +5342,15 @@ fn alias_target_climbs_out(build_dir: &Path, link_abs: &Path) -> bool {
     let Some(parent) = link_abs.parent() else {
         return false;
     };
-    let mut resolved: Vec<std::ffi::OsString> = parent
+    // An absolute target starts over at the root; appending its components
+    // to the link's directory read every absolute link as in-tree
+    // (rdma-core's common rst fragments, carried as a link to nothing).
+    let base: &Path = if target.is_absolute() {
+        Path::new("/")
+    } else {
+        parent
+    };
+    let mut resolved: Vec<std::ffi::OsString> = base
         .components()
         .filter_map(|c| match c {
             std::path::Component::Normal(n) => Some(n.to_owned()),
@@ -11045,6 +11053,15 @@ mod alias_symlink_tests {
                 "include/ccan/str.h".to_string(),
                 "../../../ccan/str.h".to_string()
             ))
+        );
+        // And it climbs out, so the walk uploads the bytes as well.
+        assert!(super::alias_target_climbs_out(&hdr_build, &hdr));
+        assert_eq!(
+            super::build_dir_disposition(&hdr_build, true, false, &hdr),
+            super::BuildDirDisposition::AliasAndUpload(
+                "include/ccan/str.h".into(),
+                "../../../ccan/str.h".into()
+            )
         );
         std::fs::remove_dir_all(&hdr_root).ok();
 
