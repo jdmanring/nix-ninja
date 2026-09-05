@@ -4824,9 +4824,9 @@ fn patched_env_shebang(path: &Path) -> Result<Option<PathBuf>> {
 ///
 /// Every rewritten upload (shebang, outer placeholder, dependency info)
 /// is a file under the temp directory that only the `add_to_store` call
-/// reads. Left behind, one per input per driver run, they filled a 16 GiB
-/// tmpfs to 4.8 GiB over four days of rounds (20,087 files) and pushed
-/// the machine into swap.
+/// reads. Left behind, one per input per driver run, they were the bulk
+/// of 4.8 GiB of temp entries on a 16 GiB tmpfs (18,378 of them written
+/// by one day of Fortran drives) and pushed the machine into swap.
 fn upload_temp_done(upload_src: Option<PathBuf>) {
     if let Some(tmp) = upload_src {
         let _ = fs::remove_file(tmp);
