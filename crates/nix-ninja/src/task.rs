@@ -2103,6 +2103,7 @@ impl Runner {
             if let Some(script) = &cmake_p_script {
                 if let Ok(text) = std::fs::read_to_string(script) {
                     referenced.extend(cmake_script_referenced_paths(&text, &cmake_p_defs));
+                    referenced.extend(cmake_script_included_modules(Path::new(script), &text));
                 }
             }
             {
@@ -6078,41 +6079,84 @@ fn cmake_script_referenced_paths(
 /// (list assignment, `CACHE`, `PARENT_SCOPE`) yields its FIRST value only,
 /// which is what a composed path looks like.
 fn cmake_set_calls(text: &str) -> Vec<(String, String)> {
+    cmake_call_bodies(text, "set")
+        .into_iter()
+        .filter_map(|body| {
+            let mut toks = body.split_whitespace();
+            let (name, value) = (toks.next()?, toks.next()?);
+            Some((
+                name.to_string(),
+                value.trim_matches('"').trim_matches('\'').to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Modules a `cmake -P` script pulls in with `include(<Name>)`, resolved
+/// beside the script: `<script dir>/<Name>.cmake`.
+///
+/// LLVM's `GenerateVersionFromVCS.cmake` (the `VCSRevision.h` edge, and
+/// clang's copy of it) appends its own directory to `CMAKE_MODULE_PATH`
+/// and then `include(VersionFromVCS)`; the edge's DEPENDS names only the
+/// script, so the task carried the script and not the module, and cmake
+/// stopped with `include could not find requested file`. A name with a
+/// path separator or an unexpanded `${` is left alone: the first is
+/// reachable through `cmake_script_referenced_paths` when it is composed
+/// from a definition, the second names nothing. The caller keeps only
+/// what exists on disk, so a module cmake would find on its own search
+/// path costs nothing here.
+fn cmake_script_included_modules(script: &Path, text: &str) -> Vec<String> {
+    let Some(dir) = script.parent() else {
+        return Vec::new();
+    };
+    cmake_call_bodies(text, "include")
+        .into_iter()
+        .filter_map(|body| {
+            let name = body.split_whitespace().next()?.trim_matches('"');
+            if name.is_empty() || name.contains('/') || name.contains("${") {
+                return None;
+            }
+            // ponytail: one level; a module that includes another needs
+            // the same read over the module's text
+            let module = if name.ends_with(".cmake") {
+                name.to_string()
+            } else {
+                format!("{name}.cmake")
+            };
+            Some(dir.join(module).to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+/// The argument text of every `name(...)` call in file order, where the
+/// name begins a CALL rather than sitting inside a longer identifier
+/// (`unset(`, `file(SET`, a comment mentioning it).
+fn cmake_call_bodies(text: &str, name: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
-    while let Some(pos) = find_set_call(rest) {
+    while let Some(pos) = find_cmake_call(rest, name) {
         rest = &rest[pos..];
         let Some(open) = rest.find('(') else { break };
         let Some(close) = rest[open..].find(')') else {
             break;
         };
-        let body = &rest[open + 1..open + close];
+        out.push(rest[open + 1..open + close].to_string());
         rest = &rest[open + close..];
-        let mut toks = body.split_whitespace();
-        let (Some(name), Some(value)) = (toks.next(), toks.next()) else {
-            continue;
-        };
-        out.push((
-            name.to_string(),
-            value.trim_matches('"').trim_matches('\'').to_string(),
-        ));
     }
     out
 }
 
-/// Offset of the next `set` that begins a CALL rather than sitting inside a
-/// longer identifier - `unset(`, `file(SET`, a comment mentioning it.
-fn find_set_call(text: &str) -> Option<usize> {
+fn find_cmake_call(text: &str, name: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut from = 0usize;
-    while let Some(rel) = text[from..].find("set") {
+    while let Some(rel) = text[from..].find(name) {
         let at = from + rel;
         let before_ok = at == 0 || !is_cmake_ident_byte(bytes[at - 1]);
-        let after = text[at + 3..].trim_start();
+        let after = text[at + name.len()..].trim_start();
         if before_ok && after.starts_with('(') && !line_is_comment(text, at) {
             return Some(at);
         }
-        from = at + 3;
+        from = at + name.len();
     }
     None
 }
@@ -6255,9 +6299,11 @@ fn sibling_dirs_of(dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod cmake_script_reference_tests {
     use super::{
-        cmake_definitions, cmake_script_arg, cmake_script_referenced_paths, expand_cmake_vars,
+        cmake_definitions, cmake_script_arg, cmake_script_included_modules,
+        cmake_script_referenced_paths, expand_cmake_vars,
     };
     use std::collections::HashMap;
+    use std::path::Path;
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
@@ -6351,6 +6397,29 @@ mod cmake_script_reference_tests {
         assert!(
             got.contains(&"/b/s/integration/env/vars.in".to_string()),
             "{got:?}"
+        );
+    }
+
+    /// LLVM'S OWN SHAPE: `GenerateVersionFromVCS.cmake` puts its own
+    /// directory on the module path and includes a sibling by bare name.
+    /// The edge's DEPENDS names the script only.
+    #[test]
+    fn a_module_included_by_bare_name_resolves_beside_the_script() {
+        let script = r#"
+            get_filename_component(LLVM_CMAKE_DIR "${CMAKE_SCRIPT_MODE_FILE}" PATH)
+            list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+            include(VersionFromVCS)
+            # include(FromAComment)
+            include(${LLVM_CMAKE_DIR}/Composed.cmake)
+            set(ENV{TERM} "dumb")
+        "#;
+        let got = cmake_script_included_modules(
+            Path::new("/build/source/llvm/cmake/modules/GenerateVersionFromVCS.cmake"),
+            script,
+        );
+        assert_eq!(
+            got,
+            vec!["/build/source/llvm/cmake/modules/VersionFromVCS.cmake".to_string()]
         );
     }
 
