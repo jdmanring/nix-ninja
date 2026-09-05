@@ -2101,9 +2101,24 @@ impl Runner {
                 }
             }
             if let Some(script) = &cmake_p_script {
-                if let Ok(text) = std::fs::read_to_string(script) {
+                // THE `-P` PATH IS SPELLED RELATIVE TO THE cd TARGET, NOT TO
+                // THE BUILD ROOT THIS PROCESS RUNS IN. llvm's VCSRevision.h
+                // edge is `cd include/llvm/Support && cmake ... -P
+                // ../../../../cmake/modules/GenerateVersionFromVCS.cmake`;
+                // reading that spelling from the build root lands four
+                // directories above the script, the read fails, and both
+                // readers below it are skipped in silence. Rebasing first is
+                // what every other candidate here already does. The fixture
+                // that missed this cd'd to the build root, where depth is
+                // zero and the unrebased spelling happens to resolve.
+                let script_path = if script.starts_with('/') {
+                    PathBuf::from(script)
+                } else {
+                    self.config.build_dir.join(rebase_post_cd(&cd_dir, script))
+                };
+                if let Ok(text) = std::fs::read_to_string(&script_path) {
                     referenced.extend(cmake_script_referenced_paths(&text, &cmake_p_defs));
-                    referenced.extend(cmake_script_included_modules(Path::new(script), &text));
+                    referenced.extend(cmake_script_included_modules(&script_path, &text));
                 }
             }
             {
