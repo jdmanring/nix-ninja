@@ -1607,6 +1607,7 @@ impl Runner {
             let tablegen = tablegen_invocation(&args);
             let xinclude_docs = xinclude_invocation(&args);
             let rst_docs = rst_invocation(&args);
+            let gresource = gresource_invocation(&args);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -2097,6 +2098,15 @@ impl Runner {
             if let Some(docs) = &rst_docs {
                 let root = self.config.build_dir.join(&cd_dir);
                 for p in rst_include_closure(&root, docs, 4096) {
+                    referenced.push(p.to_string_lossy().into_owned());
+                }
+            }
+            // A GRESOURCE MANIFEST NAMES ITS INPUTS INSIDE THE DOCUMENT,
+            // resolved against `--sourcedir`. glib stages the XML and none
+            // of the files it lists.
+            if let Some((docs, dirs)) = &gresource {
+                let root = self.config.build_dir.join(&cd_dir);
+                for p in gresource_referenced_files(&root, docs, dirs) {
                     referenced.push(p.to_string_lossy().into_owned());
                 }
             }
@@ -5949,6 +5959,116 @@ fn rst_include_closure(root: &Path, docs: &[PathBuf], cap: usize) -> Vec<PathBuf
             out.push(p.clone());
             queue.push(p);
         }
+    }
+    out
+}
+
+/// The `.gresource.xml` manifests a `glib-compile-resources` run reads, and
+/// the `--sourcedir` directories it resolves their contents against.
+///
+/// KEYED ON THE TOOL, for the reason `tablegen_invocation` records: a
+/// `.xml` token names a document on many command lines and only this tool
+/// makes the file list inside it readable.
+fn gresource_invocation(args: &[String]) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    if !args
+        .iter()
+        .any(|a| a.rsplit('/').next() == Some("glib-compile-resources"))
+    {
+        return None;
+    }
+    let mut docs = Vec::new();
+    let mut dirs = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--sourcedir=") {
+            dirs.push(PathBuf::from(v));
+        } else if a == "--sourcedir" {
+            if let Some(v) = it.next() {
+                dirs.push(PathBuf::from(v));
+            }
+        } else if !a.starts_with('-') && a.ends_with(".gresource.xml") {
+            docs.push(PathBuf::from(a));
+        }
+    }
+    (!docs.is_empty()).then_some((docs, dirs))
+}
+
+/// Every file a gresource manifest lists, resolved as
+/// `glib-compile-resources` resolves it: against each `--sourcedir` in turn,
+/// and against the manifest's own directory, which is the tool's default.
+///
+/// THE INPUTS ARE INSIDE THE DOCUMENT, WHICH IS WHY THE ARGUMENT SWEEP
+/// CANNOT REACH THEM. glib's gio tests declare
+/// `<file>test1.txt</file>` and the edge stages the XML alone, so the tool
+/// exits `Failed to locate 'test1.txt' in any source directory`. Same family
+/// and same discipline as the readers around it: names are statically
+/// reachable inside the document the command names, every candidate is
+/// reported and the caller's existence check decides.
+///
+/// ponytail: `<file>` elements only. `<gresource>` has no include
+/// mechanism, so there is nothing to make transitive; a manifest that ever
+/// grows one needs the queue the rst and tablegen readers use.
+fn gresource_referenced_files(root: &Path, docs: &[PathBuf], dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for doc in docs {
+        let doc_path = if doc.is_absolute() {
+            doc.clone()
+        } else {
+            root.join(doc)
+        };
+        let Ok(text) = std::fs::read_to_string(&doc_path) else {
+            continue;
+        };
+        let mut bases: Vec<PathBuf> = dirs
+            .iter()
+            .map(|d| {
+                if d.is_absolute() {
+                    d.clone()
+                } else {
+                    root.join(d)
+                }
+            })
+            .collect();
+        if let Some(parent) = doc_path.parent() {
+            bases.push(parent.to_path_buf());
+        }
+        for name in gresource_file_names(&text) {
+            for base in &bases {
+                out.push(base.join(&name));
+            }
+        }
+    }
+    out
+}
+
+/// The text content of every `<file>` element in a gresource manifest, in
+/// file order. Attributes (`alias`, `compressed`, `preprocess`) name no
+/// input and are skipped with the rest of the tag.
+fn gresource_file_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("<file") {
+        rest = &rest[i + 5..];
+        // Only `<file>` and `<file attr=...>`, never `<fileset`.
+        let Some(close) = rest.find('>') else { break };
+        let after_tag = &rest[close + 1..];
+        let head = &rest[..close];
+        if !(head.is_empty() || head.starts_with(char::is_whitespace)) {
+            rest = after_tag;
+            continue;
+        }
+        if head.ends_with('/') {
+            rest = after_tag;
+            continue;
+        }
+        let Some(end) = after_tag.find("</file>") else {
+            break;
+        };
+        let name = after_tag[..end].trim();
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+        rest = &after_tag[end + 7..];
     }
     out
 }
@@ -12518,5 +12638,100 @@ mod rst_reader_tests {
         // The missing one is still named: existence is the caller's check.
         assert!(got.iter().any(|p| p.ends_with("common/opt_C.rst")));
         std::fs::remove_dir_all(&d).ok();
+    }
+}
+
+#[cfg(test)]
+mod gresource_tests {
+    use super::{gresource_file_names, gresource_invocation, gresource_referenced_files};
+    use std::path::{Path, PathBuf};
+
+    /// glib's own manifest, and the tag shapes a hand-written scan gets
+    /// wrong: a self-closing `<file/>`, an element whose name only STARTS
+    /// with "file", and attributes before the content.
+    #[test]
+    fn every_file_element_yields_its_content_and_nothing_else_does() {
+        let text = r#"<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/digit_test">
+    <file>test1.txt</file>
+    <file alias="two.txt" compressed="true">sub/test2.txt</file>
+    <file/>
+    <fileset>not-a-file.txt</fileset>
+  </gresource>
+</gresources>"#;
+        assert_eq!(
+            gresource_file_names(text),
+            vec!["test1.txt".to_string(), "sub/test2.txt".to_string()]
+        );
+    }
+
+    /// KEYED ON THE TOOL. A `.gresource.xml` token on any other command line
+    /// names a document nothing reads the interior of.
+    #[test]
+    fn only_the_tool_opens_the_manifest() {
+        let other: Vec<String> = ["cp", "a.gresource.xml", "b.gresource.xml"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(gresource_invocation(&other).is_none());
+
+        let args: Vec<String> = [
+            "/nix/store/x/bin/glib-compile-resources",
+            "--target=gio/tests/digit_test_resources.h",
+            "--sourcedir=/build/glib-2.88.3/gio/tests",
+            "--internal",
+            "--generate",
+            "--manual-register",
+            "../gio/tests/111_digit_test.gresource.xml",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (docs, dirs) = gresource_invocation(&args).expect("the tool is named");
+        assert_eq!(docs, vec![PathBuf::from("../gio/tests/111_digit_test.gresource.xml")]);
+        assert_eq!(dirs, vec![PathBuf::from("/build/glib-2.88.3/gio/tests")]);
+    }
+
+    /// The candidate set is every base crossed with every name: the caller's
+    /// existence check picks the one that is there, exactly as the tool's
+    /// own search does. The manifest's own directory is a base because that
+    /// is the tool's default when no `--sourcedir` is given.
+    #[test]
+    fn a_listed_file_is_offered_under_every_source_directory() {
+        let root = &std::env::temp_dir().join(format!("nn-gres-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(root);
+        std::fs::create_dir_all(root.join("gio/tests")).expect("mkdir");
+        std::fs::write(
+            root.join("gio/tests/d.gresource.xml"),
+            "<gresources><gresource><file>test1.txt</file></gresource></gresources>",
+        )
+        .expect("write");
+
+        let got = gresource_referenced_files(
+            root,
+            &[PathBuf::from("gio/tests/d.gresource.xml")],
+            &[PathBuf::from("/build/glib-2.88.3/gio/tests")],
+        );
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/build/glib-2.88.3/gio/tests/test1.txt"),
+                root.join("gio/tests/test1.txt"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An unreadable manifest is not an error here: the reader is one route
+    /// among several and a missing document means it has nothing to say.
+    #[test]
+    fn an_absent_manifest_yields_nothing() {
+        assert!(gresource_referenced_files(
+            Path::new("/nonexistent"),
+            &[PathBuf::from("gone.gresource.xml")],
+            &[]
+        )
+        .is_empty());
     }
 }
