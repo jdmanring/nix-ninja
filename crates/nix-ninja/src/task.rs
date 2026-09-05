@@ -10539,6 +10539,24 @@ pub fn discover_c_includes(
                 let full_path = AsRef::<Path>::as_ref(store_dir).join(hash_path);
                 let store_path: StorePath =
                     store_dir.parse(full_path.to_str().context("Path was not valid UTF-8")?)?;
+                // THE OUTER DERIVATION'S OWN OUTPUTS ARE NEVER INPUTS, on
+                // this route as well as `extract_store_paths`. An ordinary
+                // task never reaches here with one, because the command it
+                // was scanned from carries a placeholder that names no
+                // file; an LTO compile keeps the REAL outer paths (see
+                // `lto_raw`), so a `-I$out/include` resolves, the scan
+                // unions the outer output in, and the task tries to
+                // realise a path the daemon has not registered:
+                // "AddToStore: path '...-nss-3.112.5' is not valid"
+                // (nss 3.112.5, compiler route, 2026-09-05). The exclusion
+                // is here rather than on the input swap, which an LTO task
+                // needs for everything else.
+                if outer_output_paths()
+                    .iter()
+                    .any(|o| full_path == Path::new(o))
+                {
+                    continue;
+                }
                 discovered_store_paths.push(store_path);
                 continue;
             }
