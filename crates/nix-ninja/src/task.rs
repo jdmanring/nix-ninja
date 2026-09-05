@@ -829,6 +829,28 @@ impl Runner {
         if build.cmdline.is_none() {
             let ins: Vec<FileId> = build.ordering_ins().to_vec();
             for fid in build.outs() {
+                // A PHONY WITH NO INPUTS OVER AN EXISTING FILE MARKS THAT
+                // FILE, IT DOES NOT ALIAS NOTHING. ninja treats such an
+                // output as present, and meson emits one for every source
+                // file its regeneration edge reads (`build ../src/meson.build
+                // ../src/rules/base.xml ...: phony`). Recorded as an alias
+                // with no inputs, a task declaring that file as an input
+                // expanded it to the empty set and ran without it
+                // (xkeyboard-config: `depend_files` naming base.xml, and
+                // the generator opened a file no task carried). Left
+                // unrecorded, the input resolves as the source file it is.
+                // A phony over NO file (`build all: phony` in a header-only
+                // project) is still recorded, so the CLI boundary can tell
+                // a legitimate no-op from a target that failed to resolve.
+                if ins.is_empty()
+                    && self
+                        .config
+                        .build_dir
+                        .join(&files.by_id[*fid].name)
+                        .is_file()
+                {
+                    continue;
+                }
                 self.phony_aliases.insert(*fid, ins.clone());
             }
             tx.send(BuildResult {
