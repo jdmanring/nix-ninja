@@ -707,6 +707,15 @@ impl Runner {
                 entry.file_type().is_file(),
                 entry.path(),
             );
+            let rel = entry
+                .path()
+                .strip_prefix(&self.config.build_dir)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let produced = matches!(disposition, BuildDirDisposition::Upload)
+                && files
+                    .lookup(&rel)
+                    .is_some_and(|f| files.by_id[f].input.is_some());
             if std::env::var_os("NIX_NINJA_DIAG").is_some() {
                 let d = match &disposition {
                     BuildDirDisposition::Alias(l, t) => format!("alias {l} -> {t}"),
@@ -714,6 +723,7 @@ impl Runner {
                         format!("alias+upload {l} -> {t}")
                     }
                     BuildDirDisposition::Skip => "skip".into(),
+                    BuildDirDisposition::Upload if produced => "produced, not uploaded".into(),
                     BuildDirDisposition::Upload => "upload".into(),
                 };
                 eprintln!(
@@ -747,6 +757,27 @@ impl Runner {
                 }
                 BuildDirDisposition::Upload => entry.into_path(),
             };
+            // A FILE THE GRAPH PRODUCES IS NOT THIS WALK'S TO NAME, and
+            // not its to upload either. The walk runs before any task is
+            // created and `add_derived_file` keeps the first registration,
+            // so an output that already exists on disk (placed by an
+            // earlier driver pass in the same build directory and
+            // refreshed into a real file) was registered under the
+            // graph's own node as an opaque upload, the edge that produces
+            // it could never claim the node, and co-output expansion
+            // carried that upload's store path to the output's aliases:
+            // placed as links to a plain file, refreshed into copies,
+            // installed as three identical files (onetbb, configuration B,
+            // 2026-09-04). Keeping the upload in the walk's map, out of
+            // the node, still paid one store add per placed product per
+            // pass, consumed only by an edge naming its own output, which
+            // the choke point below drops anyway; and the map's LENGTH
+            // gates the blanket, so a tree grown by an earlier pass could
+            // switch the blanket off for every later task. The producing
+            // edge keeps the node and the walk pays nothing for it.
+            if produced {
+                continue;
+            }
             let derived_file =
                 match new_opaque_file(&self.rpc_client, &self.config.build_dir, path.clone()) {
                     Ok(d) => d,
@@ -758,30 +789,7 @@ impl Runner {
                     }
                     Err(e) => return Err(e),
                 };
-            // A FILE THE GRAPH PRODUCES IS NOT THIS WALK'S TO NAME. The walk
-            // runs before any task is created and `add_derived_file` keeps
-            // the first registration, so an output that already exists on
-            // disk (placed by an earlier driver pass in the same build
-            // directory and refreshed into a real file) was registered
-            // under the graph's own node as an opaque upload, the edge that
-            // produces it could never claim the node, and co-output
-            // expansion carried that upload's store path to the output's
-            // aliases: placed as links to a plain file, refreshed into
-            // copies, installed as three identical files (onetbb,
-            // configuration B, 2026-09-04). The upload stays in the walk's
-            // map, which the command-line reader consults after the task
-            // outputs, and the node keeps its producing edge.
-            let rel = path
-                .strip_prefix(&self.config.build_dir)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let produced = files
-                .lookup(&rel)
-                .filter(|f| files.by_id[*f].input.is_some());
-            let fid = match produced {
-                Some(f) => f,
-                None => self.add_derived_file(files, derived_file.clone()),
-            };
+            let fid = self.add_derived_file(files, derived_file.clone());
             self.build_dir_inputs.insert(fid, derived_file);
         }
         // Deterministic order: the encoded env value must be a function
@@ -2194,10 +2202,7 @@ impl Runner {
         // an unbuilt output fails. Shrinking the map at the walk would drop
         // such an input from COMPILES too, which this gate excludes.
         if !is_gcc_task && self.build_dir_inputs.len() <= implicit_limit {
-            for (fid, input) in &self.build_dir_inputs {
-                if files.by_id[*fid].input.is_some() {
-                    continue;
-                }
+            for input in self.build_dir_inputs.values() {
                 input_set.insert(input.build_path.clone(), input.clone());
             }
         }
@@ -5396,7 +5401,17 @@ fn build_dir_disposition(
             BuildDirDisposition::Skip
         };
     }
-    if entry_is_file {
+    // THE DRIVER'S OWN STATE IS NOT A BUILD INPUT. The resolve cache and
+    // the NAR stamp file are written into the build directory by a local
+    // drive (never inside a sandbox: persistence is off there), and the
+    // stamp file is rewritten as the run proceeds. Swept in, it re-keyed
+    // every blanket-taking task on every local pass, and two consumers of
+    // one edge emitted at different moments got different derivations for
+    // a byte-identical command (class 27, configuration A).
+    let own_state = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        n == crate::resolve_cache::FILE_NAME || n == crate::resolve_cache::NAR_FILE
+    });
+    if entry_is_file && !own_state {
         BuildDirDisposition::Upload
     } else {
         BuildDirDisposition::Skip
