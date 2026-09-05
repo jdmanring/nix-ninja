@@ -2499,6 +2499,24 @@ impl Runner {
             cmdline
         };
 
+        // A compile gets only the empty directories its command names as
+        // include directories: glib's gio objects carry
+        // `-Isubprojects/gvdb` for a build-tree directory nothing stages,
+        // and `-Werror=missing-include-dirs` makes the absence fatal rather
+        // than silent. Everything else keeps its closure lean, as before.
+        let empty_dirs = if is_gcc_task {
+            let named = cmdline
+                .as_deref()
+                .map(|c| include_dirs_named(c, &self.config.build_dir))
+                .unwrap_or_default();
+            self.empty_dirs
+                .iter()
+                .filter(|d| named.iter().any(|n| n == *d))
+                .cloned()
+                .collect()
+        } else {
+            self.empty_dirs.clone()
+        };
         let mut input_srcs = self.wrapper_store_paths.clone();
         if let Some(cmdline) = &cmdline {
             let found_store_paths =
@@ -2530,12 +2548,76 @@ impl Runner {
             store_srcs,
             outputs,
             alias_symlinks: self.alias_symlinks.clone(),
-            empty_dirs: if is_gcc_task {
-                Vec::new()
-            } else {
-                self.empty_dirs.clone()
-            },
+            empty_dirs,
         })
+    }
+}
+
+/// Include directories a compile command names, spelled relative to the
+/// build dir: `-I`, `-iquote`, `-isystem`, `-idirafter`, joined or as the
+/// next word. These are the flags `-Wmissing-include-dirs` checks. An
+/// absolute directory under the build dir (the exact mirror keeps them
+/// absolute) is relativised so it can match the walk's spelling; one
+/// outside it is dropped, since the walk cannot have listed it.
+fn include_dirs_named(cmdline: &str, build_dir: &Path) -> Vec<String> {
+    const FLAGS: [&str; 4] = ["-I", "-iquote", "-isystem", "-idirafter"];
+    let words: Vec<String> = shell_words::split(cmdline).unwrap_or_default();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = &words[i];
+        let dir = FLAGS.iter().find_map(|f| {
+            let rest = w.strip_prefix(f)?;
+            if rest.is_empty() {
+                i += 1;
+                words.get(i).cloned()
+            } else {
+                Some(rest.to_string())
+            }
+        });
+        i += 1;
+        let Some(dir) = dir else { continue };
+        let rel = if dir.starts_with('/') {
+            match Path::new(&dir).strip_prefix(build_dir) {
+                Ok(r) => r.to_string_lossy().into_owned(),
+                Err(_) => continue,
+            }
+        } else {
+            dir
+        };
+        let rel = rel.trim_end_matches('/').to_string();
+        if !rel.is_empty() && !out.contains(&rel) {
+            out.push(rel);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod include_dirs_named_tests {
+    use super::include_dirs_named;
+    use std::path::Path;
+
+    /// glib's gio shape: the build-tree twin of an in-tree subproject,
+    /// relative, beside the source-tree one that climbs out.
+    #[test]
+    fn every_spelling_gcc_checks_is_read_relative_to_the_build_dir() {
+        let bd = Path::new("/build/source/build");
+        let got = include_dirs_named(
+            "gcc -Isubprojects/gvdb -I../subprojects/gvdb -iquote . -isystem /build/source/build/gen/ \
+             -idirafter/nix/store/x-glibc/include -I /build/source/build/gio -c a.c -o a.o",
+            bd,
+        );
+        assert_eq!(
+            got,
+            vec![
+                "subprojects/gvdb".to_string(),
+                "../subprojects/gvdb".to_string(),
+                ".".to_string(),
+                "gen".to_string(),
+                "gio".to_string(),
+            ]
+        );
     }
 }
 
