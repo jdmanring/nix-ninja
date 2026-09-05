@@ -185,6 +185,40 @@ be missing inside the Nix sandbox. For that we're using a regex and scan
 through the evaluated `cmdline` to extract any `/nix/store` paths. Just check
 that the path exists before you add it to `inputSrc`.
 
+#### The outer derivation's own output
+
+The existence check above is not sufficient on its own. A package that
+installs headers into its own output during the build and then compiles
+against them puts that output on the command line:
+
+```
+gcc -I$out/private/nss -I$out/public/nss -c ../../lib/util/utf8.c -o utf8.o
+```
+
+`$out` exists on disk at that point, so it passes the check, but it is not a
+valid store path until the build that produces it finishes. Adding it as an
+`inputSrc` is refused:
+
+```
+AddToStore: remote error: path '/nix/store/...-nss-3.112.5' is not valid
+```
+
+Only the objects that actually open a header there fail, while every command
+in the build names the directory, which makes the failure look unrelated to
+the flag that causes it.
+
+Excluding the outer output is half an answer: the header then has no carrier
+and the compiler reports it missing. The files are instead copied out of the
+outer output and staged under `.nn-outer` at the output's own layout, and a
+matching search path is added to the command. Both halves belong in the
+driver, which runs in the outer build and can read those files. Dependency
+discovery cannot do it: for a compile, discovery runs inside the task
+sandbox, where the outer output does not exist.
+
+The search paths are derived from the command line before outer output paths
+are rewritten to placeholders. A command that names no directory inside its
+own output produces none, and its derivation is unchanged.
+
 ### Implicit /nix/store references
 
 Some references are to binaries like `g++` but meson generates them without
