@@ -696,10 +696,20 @@ impl Runner {
                 entry.file_type().is_file(),
                 entry.path(),
             );
+            let rel = entry
+                .path()
+                .strip_prefix(&self.config.build_dir)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let produced = matches!(disposition, BuildDirDisposition::Upload)
+                && files
+                    .lookup(&rel)
+                    .is_some_and(|f| files.by_id[f].input.is_some());
             if std::env::var_os("NIX_NINJA_DIAG").is_some() {
                 let d = match &disposition {
                     BuildDirDisposition::Alias(l, t) => format!("alias {l} -> {t}"),
                     BuildDirDisposition::Skip => "skip".into(),
+                    BuildDirDisposition::Upload if produced => "produced, not uploaded".into(),
                     BuildDirDisposition::Upload => "upload".into(),
                 };
                 eprintln!(
@@ -735,17 +745,7 @@ impl Runner {
             // gates the blanket, so a tree grown by an earlier pass could
             // switch the blanket off for every later task. The producing
             // edge keeps the node and the walk pays nothing for it.
-            let rel = path
-                .strip_prefix(&self.config.build_dir)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if files
-                .lookup(&rel)
-                .is_some_and(|f| files.by_id[f].input.is_some())
-            {
-                if std::env::var_os("NIX_NINJA_DIAG").is_some() {
-                    eprintln!("nix-ninja: DIAG walk {rel} is a produced node; not uploaded");
-                }
+            if produced {
                 continue;
             }
             let derived_file =
@@ -5312,7 +5312,17 @@ fn build_dir_disposition(
             BuildDirDisposition::Skip
         };
     }
-    if entry_is_file {
+    // THE DRIVER'S OWN STATE IS NOT A BUILD INPUT. The resolve cache and
+    // the NAR stamp file are written into the build directory by a local
+    // drive (never inside a sandbox: persistence is off there), and the
+    // stamp file is rewritten as the run proceeds. Swept in, it re-keyed
+    // every blanket-taking task on every local pass, and two consumers of
+    // one edge emitted at different moments got different derivations for
+    // a byte-identical command (class 27, configuration A).
+    let own_state = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        n == crate::resolve_cache::FILE_NAME || n == crate::resolve_cache::NAR_FILE
+    });
+    if entry_is_file && !own_state {
         BuildDirDisposition::Upload
     } else {
         BuildDirDisposition::Skip

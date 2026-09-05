@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-const FILE_NAME: &str = ".nix-ninja-resolve-cache.v1";
+pub(crate) const FILE_NAME: &str = ".nix-ninja-resolve-cache.v1";
 /// Bumped with task.rs's DIR_UPLOAD_CAP so cap changes invalidate, and
 /// with any change to what an upload CONTAINS: v2 discards entries
 /// recorded before env-shebang patching, whose store paths hold the
@@ -363,7 +363,7 @@ pub fn flush() -> Result<()> {
     Ok(())
 }
 
-const NAR_FILE: &str = ".nix-ninja-nar-stamps.v1";
+pub(crate) const NAR_FILE: &str = ".nix-ninja-nar-stamps.v1";
 const NAR_HEADER: &str = "nix-ninja-nar-stamps v1";
 
 /// The previous run's NAR stamp snapshot, filtered to store paths that
