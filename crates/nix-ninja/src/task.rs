@@ -5034,7 +5034,14 @@ fn rewrite_cmdline(cmdline: &str, build_dir: &Path) -> String {
     if let Some(after_cd) = cmdline.strip_prefix("cd ") {
         if let Some((dir, tail)) = after_cd.split_once(" && ") {
             let rel = rewrite_ancestor_paths(dir, build_dir);
-            if !rel.starts_with('/') && !rel.starts_with("../") {
+            // The build dir's own parent rewrites to a bare `..`, with no
+            // slash for the ancestor test below to see; shaderc's
+            // check-copyright target (WORKING_DIRECTORY is the source dir,
+            // configured at <src>/build) took the descent branch on it and
+            // ran `cd .. && python3 ../utils/add_copyright.py`, one
+            // directory too high.
+            let ancestor = rel == ".." || rel.starts_with("../");
+            if !rel.starts_with('/') && !ancestor {
                 let depth = Path::new(&rel)
                     .components()
                     .filter(|c| matches!(c, std::path::Component::Normal(_)))
@@ -8890,6 +8897,15 @@ mod python_import_names_tests {
         assert_eq!(
             rewrite_cmdline("cd /work/qt/src/svg && /nix/store/t/bin/tool", bd),
             "/nix/store/t/bin/tool"
+        );
+        // THE BUILD DIR'S OWN PARENT, shaderc's check-copyright: the cd
+        // target rewrites to a bare `..`, which is an ancestor too.
+        assert_eq!(
+            rewrite_cmdline(
+                "cd /work/qt && /nix/store/p/bin/python3 /work/qt/utils/add_copyright.py --check",
+                bd
+            ),
+            "/nix/store/p/bin/python3 ../utils/add_copyright.py --check"
         );
         // AND THE DESCENT CASE IS UNTOUCHED, which is what bounds this
         // change: its prologue stays and its tail keeps the depth
