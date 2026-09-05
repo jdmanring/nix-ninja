@@ -22,8 +22,21 @@ pub fn fix_rpaths(store_dir: &Path, outputs: &[DerivedFile]) -> Result<()> {
         if fs::symlink_metadata(&output.build_path).is_ok_and(|md| md.file_type().is_symlink()) {
             continue;
         }
-        let canonical_path = fs::canonicalize(&output.build_path)
-            .map_err(|e| anyhow::anyhow!("canonicalize({}): {e}", output.build_path.display()))?;
+        // A DECLARED OUTPUT THE COMMAND NEVER WROTE fails here first, and
+        // the message must say so: raptor2's CMake declares
+        // `turtle_parser.tab.c` as the OUTPUT of a bison rule whose command
+        // writes `turtle_parser.c`, and `canonicalize(...): No such file`
+        // read as a task-binary fault rather than the package's.
+        let canonical_path = fs::canonicalize(&output.build_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "declared output {} was not written by the command",
+                    output.build_path.display()
+                )
+            } else {
+                anyhow::anyhow!("canonicalize({}): {e}", output.build_path.display())
+            }
+        })?;
         if is_elf_dynamic(&canonical_path)? {
             fix_rpath(store_dir, &canonical_path)?;
             fixed += 1;
