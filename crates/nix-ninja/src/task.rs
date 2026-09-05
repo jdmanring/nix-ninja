@@ -2347,12 +2347,25 @@ impl Runner {
                         continue;
                     }
                     // A node an edge produces reaches the task through its
-                    // edge; what is on disk under that name is a placement.
-                    if files
-                        .lookup(cand)
-                        .is_some_and(|f| files.by_id[f].input.is_some())
-                    {
-                        continue;
+                    // edge, and what is on disk under that name is then a
+                    // placement. THAT IS ONLY TRUE WHEN THIS EDGE DECLARES
+                    // IT. compiler-rt's nsan library names its version
+                    // script inside -Wl and declares nothing, while another
+                    // edge in the same build writes it, so the skip dropped
+                    // the only reference there was and ld.bfd exited
+                    // `cannot open linker script file`. Prefer the producing
+                    // task's own output where it is resolved, and fall
+                    // through to the bytes where it is not.
+                    if let Some(fid) = files.lookup(cand) {
+                        if files.by_id[fid].input.is_some() {
+                            if let Some(df) = self.derived_files.get(&fid) {
+                                let df = df.clone();
+                                if !input_set.contains_key(&df.build_path) {
+                                    input_set.insert(df.build_path.clone(), df);
+                                }
+                                continue;
+                            }
+                        }
                     }
                     let up =
                         new_opaque_file(&self.rpc_client, &self.config.build_dir, p.to_path_buf())?;
