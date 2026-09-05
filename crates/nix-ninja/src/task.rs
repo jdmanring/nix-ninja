@@ -5321,23 +5321,45 @@ fn alias_symlink_entry(build_dir: &Path, link_abs: &Path) -> Option<(String, Str
         return None;
     }
     let rel_link = link_abs.strip_prefix(build_dir).ok()?;
-    // Lexical confinement: resolve `..` against the link's directory
-    // depth. A target climbing out of the build dir is not an alias to a
-    // build product and must not be recreated in a sandbox.
-    let link_depth = rel_link.components().count().saturating_sub(1);
-    let mut depth = link_depth as isize;
+    // Lexical confinement. The target is resolved against the link's own
+    // directory without touching the filesystem, and it may leave the
+    // build directory as long as it stays in the PROJECT tree: rdma-core
+    // configures `build/include/ccan -> ../../ccan`, a link to the source
+    // tree, and every `#include <ccan/...>` resolves through it; refusing
+    // any climb left the sandbox without the link while the headers it
+    // reaches were placed at `../ccan` (configuration B, 2026-09-04). A
+    // target leaving the project tree (`/etc`, `/nix/store`) is refused,
+    // the same test the output normaliser applies.
+    let mut resolved: Vec<std::ffi::OsString> = build_dir
+        .join(rel_link.parent().unwrap_or(Path::new("")))
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_owned()),
+            _ => None,
+        })
+        .collect();
     for c in target.components() {
         match c {
             std::path::Component::ParentDir => {
-                depth -= 1;
-                if depth < 0 {
-                    return None;
-                }
+                resolved.pop()?;
             }
-            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::Normal(n) => resolved.push(n.to_owned()),
             std::path::Component::CurDir => {}
             _ => return None,
         }
+    }
+    let resolved_abs: PathBuf = std::iter::once(std::ffi::OsString::from("/"))
+        .chain(resolved)
+        .collect();
+    // A climb out of the build directory is an alias only to a DIRECTORY in
+    // the project tree. A link to a FILE out there (x265's archives from a
+    // sibling build) is content the sandbox never receives any other way,
+    // so it stays an upload; a directory cannot be uploaded through a link
+    // at all, and what it holds is placed by discovery.
+    if !resolved_abs.starts_with(build_dir)
+        && !(same_project_tree(build_dir, &resolved_abs) && resolved_abs.is_dir())
+    {
+        return None;
     }
     let l = rel_link.to_str()?;
     let t = target.to_str()?;
@@ -10911,8 +10933,27 @@ mod alias_symlink_tests {
 
         // Negative controls, each refused for a different reason, because
         // an entry that accepts everything passes the positives above.
+        // Out of the build dir but inside the project tree and naming a
+        // DIRECTORY: carried, the rdma-core shape (`build/include/ccan ->
+        // ../../ccan`). Its own root, so the directory above the build dir
+        // is this test's and not the machine's. A file out there is x265's
+        // archive and stays an upload (its own test below).
+        let root = std::env::temp_dir().join(format!("nn-alias-climb-{}", std::process::id()));
+        let build = root.join("build");
+        std::fs::create_dir_all(build.join("include")).unwrap();
+        std::fs::create_dir_all(root.join("ccan")).unwrap();
+        let src = build.join("include/ccan");
+        symlink("../../ccan", &src).unwrap();
+        assert_eq!(
+            alias_symlink_entry(&build, &src),
+            Some(("include/ccan".to_string(), "../../ccan".to_string()))
+        );
+        std::fs::remove_dir_all(&root).ok();
+
+        // Past the project tree's root: refused. The build dir here is
+        // /tmp/<name>/, so four steps up leave `/tmp`.
         let esc = orc.join("escape");
-        symlink("../../etc/passwd", &esc).unwrap();
+        symlink("../../../../etc/passwd", &esc).unwrap();
         assert_eq!(alias_symlink_entry(&d, &esc), None, "escaping target");
 
         let abs = orc.join("absolute");
