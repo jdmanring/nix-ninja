@@ -715,6 +715,9 @@ impl Runner {
             if std::env::var_os("NIX_NINJA_DIAG").is_some() {
                 let d = match &disposition {
                     BuildDirDisposition::Alias(l, t) => format!("alias {l} -> {t}"),
+                    BuildDirDisposition::AliasAndUpload(l, t) => {
+                        format!("alias+upload {l} -> {t}")
+                    }
                     BuildDirDisposition::Skip => "skip".into(),
                     BuildDirDisposition::Upload => "upload".into(),
                 };
@@ -729,6 +732,10 @@ impl Runner {
                 BuildDirDisposition::Alias(link, target) => {
                     self.alias_symlinks.push((link, target));
                     continue;
+                }
+                BuildDirDisposition::AliasAndUpload(link, target) => {
+                    self.alias_symlinks.push((link, target));
+                    entry.into_path()
                 }
                 BuildDirDisposition::Skip => {
                     if entry.file_type().is_dir()
@@ -5276,6 +5283,12 @@ fn is_tree_path(p: &Path) -> bool {
 enum BuildDirDisposition {
     /// An in-tree symlink, recreated in the sandbox as a link.
     Alias(String, String),
+    /// A symlink to a FILE outside the build directory but inside the
+    /// project tree: recreated as a link, for a task that holds the target
+    /// (a compile whose discovery placed the header), AND uploaded as
+    /// bytes, for a task that never will (x265's link task and the archive
+    /// its sibling build made).
+    AliasAndUpload(String, String),
     /// Upload the bytes at this path.
     Upload,
     /// Not an input: a directory, a dangling link, or a special file.
@@ -5296,7 +5309,12 @@ fn build_dir_disposition(
 ) -> BuildDirDisposition {
     if entry_is_symlink {
         if let Some((link, target)) = alias_symlink_entry(build_dir, path) {
-            return BuildDirDisposition::Alias(link, target);
+            let climbs_out = alias_target_climbs_out(build_dir, path);
+            return if climbs_out && path.is_file() {
+                BuildDirDisposition::AliasAndUpload(link, target)
+            } else {
+                BuildDirDisposition::Alias(link, target)
+            };
         }
         // Not an in-tree alias, so nothing recreates it in a sandbox and
         // dropping it loses the file. x265 links its 10- and 12-bit archives
@@ -5313,6 +5331,37 @@ fn build_dir_disposition(
     } else {
         BuildDirDisposition::Skip
     }
+}
+
+/// Whether a symlink's target, resolved lexically against the link's own
+/// directory, lies outside `build_dir`.
+fn alias_target_climbs_out(build_dir: &Path, link_abs: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(link_abs) else {
+        return false;
+    };
+    let Some(parent) = link_abs.parent() else {
+        return false;
+    };
+    let mut resolved: Vec<std::ffi::OsString> = parent
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_owned()),
+            _ => None,
+        })
+        .collect();
+    for c in target.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::Normal(n) => resolved.push(n.to_owned()),
+            _ => {}
+        }
+    }
+    let abs: PathBuf = std::iter::once(std::ffi::OsString::from("/"))
+        .chain(resolved)
+        .collect();
+    !abs.starts_with(build_dir)
 }
 
 fn alias_symlink_entry(build_dir: &Path, link_abs: &Path) -> Option<(String, String)> {
@@ -5351,13 +5400,18 @@ fn alias_symlink_entry(build_dir: &Path, link_abs: &Path) -> Option<(String, Str
     let resolved_abs: PathBuf = std::iter::once(std::ffi::OsString::from("/"))
         .chain(resolved)
         .collect();
-    // A climb out of the build directory is an alias only to a DIRECTORY in
-    // the project tree. A link to a FILE out there (x265's archives from a
-    // sibling build) is content the sandbox never receives any other way,
-    // so it stays an upload; a directory cannot be uploaded through a link
-    // at all, and what it holds is placed by discovery.
+    // A climb out of the build directory stays an alias while the target
+    // is in the project tree. A link to a FILE out there is ALSO uploaded
+    // by the walk (`AliasAndUpload`): rdma-core links every public header
+    // into build/include from the source tree and a compile finds the
+    // header through the link once discovery has placed the target, while
+    // x265's archive from a sibling build reaches its link task only as
+    // bytes.
+    // In-tree links are carried even dangling (a soname alias before its
+    // library links); a climb-out is carried only to something that exists,
+    // so a link to a sibling build that was never made stays out.
     if !resolved_abs.starts_with(build_dir)
-        && !(same_project_tree(build_dir, &resolved_abs) && resolved_abs.is_dir())
+        && !(same_project_tree(build_dir, &resolved_abs) && resolved_abs.exists())
     {
         return None;
     }
@@ -10984,7 +11038,7 @@ mod alias_symlink_tests {
     // through the link, which is what the upload branch tests with
     // `is_file`.
     #[test]
-    fn an_escaping_symlink_to_a_real_file_is_no_alias_but_is_readable() {
+    fn a_climbing_symlink_to_a_real_file_is_an_alias_and_readable() {
         let d = std::env::temp_dir().join(format!("nn-x265-test-{}", std::process::id()));
         let build = d.join("build");
         let siblings = d.join("build-10bits");
@@ -10999,9 +11053,10 @@ mod alias_symlink_tests {
 
         assert_eq!(
             alias_symlink_entry(&build, &link),
-            None,
-            "target climbs out of the build dir, so it is not an alias"
+            Some(("libx265-10.a".into(), "../build-10bits/libx265.a".into())),
+            "in the project tree, so the link text is carried as well"
         );
+        assert!(super::alias_target_climbs_out(&build, &link));
         assert!(
             link.is_file(),
             "is_file follows the link, so the upload branch reaches the archive"
@@ -11437,7 +11492,13 @@ mod build_dir_disposition_tests {
 
         let find = |n: &str| got.iter().find(|(k, _)| k == n).map(|(_, v)| v).unwrap();
         // The regression: a link out of the tree carries real bytes.
-        assert_eq!(*find("libx265-10.a"), BuildDirDisposition::Upload);
+        assert_eq!(
+            *find("libx265-10.a"),
+            BuildDirDisposition::AliasAndUpload(
+                "libx265-10.a".into(),
+                "../build-10bits/libx265.a".into()
+            )
+        );
         // A link out of the tree with no target is not an input.
         assert_eq!(*find("libx265-12.a"), BuildDirDisposition::Skip);
         // An in-tree link stays a link rather than being uploaded twice.
