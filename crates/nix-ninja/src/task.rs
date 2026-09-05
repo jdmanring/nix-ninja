@@ -9866,10 +9866,13 @@ pub fn discover_c_includes(
     })
 }
 
-/// Removes -frandom-seed flag from a string of CFLAGS.
 /// Drop every `-rpath <path>` pair whose path names one of the OUTER
 /// derivation's outputs ($out, $dev, ... as the `outputs` env lists them).
-/// Other rpath entries (store libraries) are inputs and stay.
+/// Other rpath entries (store libraries) are inputs and stay. A link task
+/// that loses its own lib directory this way is left with the sibling's
+/// task-output directory that `assemble_rpath` appends, and CMake's install
+/// step does not put the lib directory back; measured on brotli under
+/// configuration B, open in the pending record.
 fn remove_outer_rpath(value: &str) -> String {
     let outer = outer_output_paths();
     let toks: Vec<&str> = value.split_whitespace().collect();
@@ -9894,6 +9897,7 @@ fn encoded_build_path(e: &str) -> &str {
     e.split(':').nth(1).unwrap_or(e)
 }
 
+/// Removes -frandom-seed flag from a string of CFLAGS.
 fn remove_frandom_seed(flags: &str) -> String {
     flags
         .split_whitespace()
