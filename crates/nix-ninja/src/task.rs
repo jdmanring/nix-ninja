@@ -2996,7 +2996,11 @@ fn build_task_derivation(
     // derivation's own output. Computed BEFORE the placeholder rewrite,
     // because the rewrite is what makes the outer path unrecognisable, and
     // empty for every command that names no such directory.
-    let outer_mirror = outer_include_mirror_flags(cmdline, &outer_output_paths());
+    let outer_stage = outer_include_stage_dirs(cmdline, &outer_output_paths());
+    let outer_mirror: Vec<String> = outer_stage
+        .iter()
+        .map(|(_, staged)| format!("-I{}", staged.display()))
+        .collect();
     let cmdline = &if lto_raw {
         cmdline.to_string()
     } else {
@@ -3274,6 +3278,31 @@ fn build_task_derivation(
             }
             input_set.insert(fresh.to_encoded(&task.store_dir));
             drv.inputs.insert(fresh.derived_path.clone());
+        }
+    }
+
+    // STAGE THE HEADERS THE COMMAND EXPECTS TO FIND INSIDE THE OUTER OUTPUT.
+    // This has to happen HERE, in the driver, and not in discovery: a
+    // compile's dependency discovery runs inside the task sandbox, where the
+    // outer derivation's output does not exist, so the files cannot be read
+    // there. Measured on configuration B, where the mirrored `-I` arrived on
+    // the command and the directory behind it was empty.
+    //
+    // The whole named directory is carried rather than the headers a scan
+    // picks, for the same reason: nothing here knows which of them the
+    // preprocessor will open.
+    for (real, staged) in &outer_stage {
+        let files = files_under(real, OUTER_STAGE_MAX_FILES);
+        for file in files {
+            let Ok(rel) = file.strip_prefix(real) else {
+                continue;
+            };
+            let mut derived = new_opaque_file(rpc_client, &task.build_dir, file.clone())?;
+            derived.build_path = staged.join(rel);
+            let encoded = derived.to_encoded(&task.store_dir);
+            if input_set.insert(encoded) {
+                drv.inputs.insert(derived.derived_path.clone());
+            }
         }
     }
 
@@ -10343,9 +10372,9 @@ mod dotdot_dirs_env_tests {
 /// Returns EMPTY for a command that names no outer output, which is every
 /// task of every package that does not do this. The emitted command line is
 /// then byte for byte what it was, so nothing else is re-keyed.
-fn outer_include_mirror_flags(cmdline: &str, outer: &[String]) -> Vec<String> {
+fn outer_include_stage_dirs(cmdline: &str, outer: &[String]) -> Vec<(PathBuf, PathBuf)> {
     const FLAGS: [&str; 4] = ["-I", "-iquote", "-isystem", "-idirafter"];
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
     let args: Vec<String> = shell_words::split(cmdline).unwrap_or_default();
     let mut i = 0;
     while i < args.len() {
@@ -10366,10 +10395,9 @@ fn outer_include_mirror_flags(cmdline: &str, outer: &[String]) -> Vec<String> {
         let Some(value) = value else { continue };
         for root in outer {
             if let Ok(rest) = Path::new(&value).strip_prefix(root) {
-                let mirrored = Path::new(OUTER_STAGE_DIR).join(rest);
-                let flag = format!("-I{}", mirrored.display());
-                if !out.contains(&flag) {
-                    out.push(flag);
+                let pair = (PathBuf::from(&value), Path::new(OUTER_STAGE_DIR).join(rest));
+                if !out.contains(&pair) {
+                    out.push(pair);
                 }
             }
         }
@@ -10387,7 +10415,7 @@ mod outer_include_mirror_tests {
     #[test]
     fn a_command_naming_no_outer_directory_gets_no_flags() {
         let outer = vec![OUT.to_string()];
-        let f = super::outer_include_mirror_flags(
+        let f = super::outer_include_stage_dirs(
             "gcc -I/nix/store/aaa-nspr-dev/include -Ibuild/include -c a.c -o a.o",
             &outer,
         );
@@ -10400,17 +10428,13 @@ mod outer_include_mirror_tests {
     #[test]
     fn an_include_inside_the_outer_output_is_mirrored() {
         let outer = vec![OUT.to_string()];
-        let f = super::outer_include_mirror_flags(
+        let f = super::outer_include_stage_dirs(
             &format!("gcc -I{OUT}/private/nss -c a.c -o a.o"),
             &outer,
         );
-        assert_eq!(
-            f,
-            vec![".nn-outer/private/nss"]
-                .iter()
-                .map(|d| format!("-I{d}"))
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].1, std::path::Path::new(".nn-outer/private/nss"));
+        assert_eq!(f[0].0, std::path::Path::new(OUT).join("private/nss"));
     }
 
     /// `-I dir` as two words, which is the spelling a hand-written rule
@@ -10418,19 +10442,53 @@ mod outer_include_mirror_tests {
     #[test]
     fn the_separated_spelling_is_read_too() {
         let outer = vec![OUT.to_string()];
-        let f = super::outer_include_mirror_flags(
+        let f = super::outer_include_stage_dirs(
             &format!("gcc -I {OUT}/public/nss -c a.c -o a.o"),
             &outer,
         );
-        assert_eq!(f, vec!["-I.nn-outer/public/nss".to_string()]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].1, std::path::Path::new(".nn-outer/public/nss"));
     }
 
     /// Outside a build there are no outer outputs at all, so nothing fires.
     #[test]
     fn no_outer_outputs_means_no_flags() {
-        let f = super::outer_include_mirror_flags(&format!("gcc -I{OUT}/private/nss -c a.c"), &[]);
+        let f = super::outer_include_stage_dirs(&format!("gcc -I{OUT}/private/nss -c a.c"), &[]);
         assert!(f.is_empty(), "{f:?}");
     }
+}
+
+/// How many files are carried out of one include directory inside the outer
+/// output. A package stages headers there, not a tree, and a bound keeps a
+/// mistaken match (a directory that is the outer output itself, say) from
+/// uploading a whole output one file at a time. Exceeding it carries
+/// nothing, because a partial carry fails later and further away.
+const OUTER_STAGE_MAX_FILES: usize = 4096;
+
+/// Regular files under `dir`, recursively, or empty past `cap`.
+fn files_under(dir: &Path, cap: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(p),
+                Ok(t) if t.is_file() => {
+                    if out.len() >= cap {
+                        return Vec::new();
+                    }
+                    out.push(p);
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Where a header copied out of the outer derivation's own output is staged
