@@ -5365,11 +5365,37 @@ fn alias_target_climbs_out(build_dir: &Path, link_abs: &Path) -> bool {
 }
 
 fn alias_symlink_entry(build_dir: &Path, link_abs: &Path) -> Option<(String, String)> {
-    let target = std::fs::read_link(link_abs).ok()?;
-    if target.is_absolute() {
-        return None;
-    }
+    let mut target = std::fs::read_link(link_abs).ok()?;
     let rel_link = link_abs.strip_prefix(build_dir).ok()?;
+    // AN ABSOLUTE TARGET INSIDE THE PROJECT TREE IS RESPELLED RELATIVE TO
+    // THE LINK. rdma-core publishes every header as
+    // `build/include/<dir>/<h> -> ${CMAKE_CURRENT_SOURCE_DIR}/<h>`, an
+    // absolute path into the source tree; the sandbox holds that tree at
+    // the same relative offset (`../<dir>/<h>`, placed by discovery) and
+    // nowhere near the absolute path, so the text that resolves there is
+    // the relative one. A target outside the project tree stays refused.
+    if target.is_absolute() {
+        if !same_project_tree(build_dir, &target) || !target.exists() {
+            return None;
+        }
+        let from = link_abs.parent()?;
+        let (mut a, mut b): (Vec<_>, Vec<_>) = (
+            from.components().collect::<Vec<_>>(),
+            target.components().collect::<Vec<_>>(),
+        );
+        while !a.is_empty() && !b.is_empty() && a[0] == b[0] {
+            a.remove(0);
+            b.remove(0);
+        }
+        let mut rel = PathBuf::new();
+        for _ in &a {
+            rel.push("..");
+        }
+        for c in b {
+            rel.push(c.as_os_str());
+        }
+        target = rel;
+    }
     // Lexical confinement. The target is resolved against the link's own
     // directory without touching the filesystem, and it may leave the
     // build directory as long as it stays in the PROJECT tree: rdma-core
@@ -11003,6 +11029,24 @@ mod alias_symlink_tests {
             Some(("include/ccan".to_string(), "../../ccan".to_string()))
         );
         std::fs::remove_dir_all(&root).ok();
+
+        // An ABSOLUTE target inside the project tree is respelled relative
+        // to the link: rdma-core's published headers.
+        let hdr_root = std::env::temp_dir().join(format!("nn-alias-abs-{}", std::process::id()));
+        let hdr_build = hdr_root.join("build");
+        std::fs::create_dir_all(hdr_build.join("include/ccan")).unwrap();
+        std::fs::create_dir_all(hdr_root.join("ccan")).unwrap();
+        std::fs::write(hdr_root.join("ccan/str.h"), b"").unwrap();
+        let hdr = hdr_build.join("include/ccan/str.h");
+        symlink(hdr_root.join("ccan/str.h"), &hdr).unwrap();
+        assert_eq!(
+            alias_symlink_entry(&hdr_build, &hdr),
+            Some((
+                "include/ccan/str.h".to_string(),
+                "../../../ccan/str.h".to_string()
+            ))
+        );
+        std::fs::remove_dir_all(&hdr_root).ok();
 
         // Past the project tree's root: refused. The build dir here is
         // /tmp/<name>/, so four steps up leave `/tmp`.
