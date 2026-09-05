@@ -165,6 +165,9 @@ struct Task {
     // Configure-time relative symlinks to recreate in the sandbox; see
     // Runner::alias_symlinks.
     alias_symlinks: Vec<(String, String)>,
+    // Directories that exist EMPTY in the build tree, recreated in the
+    // sandbox of every non-compile task; see Runner::empty_dirs.
+    empty_dirs: Vec<String>,
 }
 
 impl Deref for Task {
@@ -550,6 +553,16 @@ pub struct Runner {
     /// whatever the task actually materialized (orc, thirteenth class,
     /// 2026-08-23).
     alias_symlinks: Vec<(String, String)>,
+    /// A DIRECTORY THAT IS EMPTY AT CONFIGURE TIME UPLOADS NOTHING, and a
+    /// generator that writes a side product into it dies with ENOENT in
+    /// the sandbox: rdma-core's pandoc-prebuilt.py copies each man page
+    /// into `<build>/pandoc-prebuilt/<sha1>`, a cache directory CMake
+    /// makes at configure (configuration B, 2026-09-04). The walk records
+    /// every empty directory under the build tree and every non-compile
+    /// task recreates them before its command runs. Compile tasks never
+    /// carry them: the blanket's own gate, and a compile writes nothing
+    /// beside its object.
+    empty_dirs: Vec<String>,
 
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
@@ -649,6 +662,7 @@ impl Runner {
             derived_files: HashMap::new(),
             build_dir_inputs: HashMap::new(),
             alias_symlinks: Vec::new(),
+            empty_dirs: Vec::new(),
             phony_aliases: HashMap::new(),
             stamp_inputs: HashMap::new(),
             stamp_input_files: HashMap::new(),
@@ -716,7 +730,19 @@ impl Runner {
                     self.alias_symlinks.push((link, target));
                     continue;
                 }
-                BuildDirDisposition::Skip => continue,
+                BuildDirDisposition::Skip => {
+                    if entry.file_type().is_dir()
+                        && std::fs::read_dir(entry.path()).is_ok_and(|mut d| d.next().is_none())
+                    {
+                        if let Ok(rel) = entry.path().strip_prefix(&self.config.build_dir) {
+                            let rel = rel.to_string_lossy();
+                            if !rel.is_empty() && !rel.contains(' ') {
+                                self.empty_dirs.push(rel.into_owned());
+                            }
+                        }
+                    }
+                    continue;
+                }
                 BuildDirDisposition::Upload => entry.into_path(),
             };
             let derived_file =
@@ -761,6 +787,8 @@ impl Runner {
         // task derivation.
         self.alias_symlinks.sort();
         self.alias_symlinks.dedup();
+        self.empty_dirs.sort();
+        self.empty_dirs.dedup();
         Ok(())
     }
 
@@ -2453,6 +2481,11 @@ impl Runner {
             store_srcs,
             outputs,
             alias_symlinks: self.alias_symlinks.clone(),
+            empty_dirs: if is_gcc_task {
+                Vec::new()
+            } else {
+                self.empty_dirs.clone()
+            },
         })
     }
 }
@@ -3149,6 +3182,15 @@ fn build_task_derivation(
         drv.env.insert(
             b"NIX_NINJA_ALIASES"[..].into(),
             encoded.join(" ").into_bytes().into(),
+        );
+    }
+    // Empty build-tree directories (see Runner::empty_dirs), space-separated
+    // relative paths; the walk refused any carrying a space. Inserted only
+    // when non-empty, for the same hash-stability reason as the aliases.
+    if !task.empty_dirs.is_empty() {
+        drv.env.insert(
+            b"NIX_NINJA_EMPTY_DIRS"[..].into(),
+            task.empty_dirs.join(" ").into_bytes().into(),
         );
     }
 

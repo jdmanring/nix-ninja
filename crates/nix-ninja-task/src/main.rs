@@ -184,6 +184,22 @@ fn main() -> Result<()> {
     // a dangling one is harmless, exactly as it is in a real build dir
     // before the library links. Encoding is `link=target`,
     // space-separated; the driver refused any path carrying ' ' or '='.
+    // Directories that exist empty in the build tree; a generator may write
+    // a side product into one (rdma-core's pandoc-prebuilt cache) and a
+    // directory with nothing in it is otherwise absent here. Relative and
+    // confined, as the driver emits them; anything else is refused.
+    if let Ok(raw) = env::var("NIX_NINJA_EMPTY_DIRS") {
+        for d in raw.split_whitespace() {
+            let p = std::path::Path::new(d);
+            if p.is_absolute()
+                || p.components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                continue;
+            }
+            let _ = fs::create_dir_all(p);
+        }
+    }
     if let Ok(raw) = env::var("NIX_NINJA_ALIASES") {
         for pair in raw.split_whitespace() {
             let Some((link, target)) = pair.split_once('=') else {
