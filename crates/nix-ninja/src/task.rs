@@ -692,12 +692,26 @@ impl Runner {
                 }
                 Err(e) => return Err(e.into()),
             };
-            let path = match build_dir_disposition(
+            let disposition = build_dir_disposition(
                 &self.config.build_dir,
                 entry.file_type().is_symlink(),
                 entry.file_type().is_file(),
                 entry.path(),
-            ) {
+            );
+            if std::env::var_os("NIX_NINJA_DIAG").is_some() {
+                let d = match &disposition {
+                    BuildDirDisposition::Alias(l, t) => format!("alias {l} -> {t}"),
+                    BuildDirDisposition::Skip => "skip".into(),
+                    BuildDirDisposition::Upload => "upload".into(),
+                };
+                eprintln!(
+                    "nix-ninja: DIAG walk {} symlink={} file={} -> {d}",
+                    entry.path().display(),
+                    entry.file_type().is_symlink(),
+                    entry.file_type().is_file()
+                );
+            }
+            let path = match disposition {
                 BuildDirDisposition::Alias(link, target) => {
                     self.alias_symlinks.push((link, target));
                     continue;
@@ -716,7 +730,30 @@ impl Runner {
                     }
                     Err(e) => return Err(e),
                 };
-            let fid = self.add_derived_file(files, derived_file.clone());
+            // A FILE THE GRAPH PRODUCES IS NOT THIS WALK'S TO NAME. The walk
+            // runs before any task is created and `add_derived_file` keeps
+            // the first registration, so an output that already exists on
+            // disk (placed by an earlier driver pass in the same build
+            // directory and refreshed into a real file) was registered
+            // under the graph's own node as an opaque upload, the edge that
+            // produces it could never claim the node, and co-output
+            // expansion carried that upload's store path to the output's
+            // aliases: placed as links to a plain file, refreshed into
+            // copies, installed as three identical files (onetbb,
+            // configuration B, 2026-09-04). The upload stays in the walk's
+            // map, which the command-line reader consults after the task
+            // outputs, and the node keeps its producing edge.
+            let rel = path
+                .strip_prefix(&self.config.build_dir)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let produced = files
+                .lookup(&rel)
+                .filter(|f| files.by_id[*f].input.is_some());
+            let fid = match produced {
+                Some(f) => f,
+                None => self.add_derived_file(files, derived_file.clone()),
+            };
             self.build_dir_inputs.insert(fid, derived_file);
         }
         // Deterministic order: the encoded env value must be a function
@@ -1099,6 +1136,7 @@ impl Runner {
         Ok((result.bid, true))
     }
 
+    #[track_caller]
     fn add_derived_file(
         &mut self,
         files: &mut graph::GraphFiles,
@@ -1148,6 +1186,23 @@ impl Runner {
             }
         };
 
+        // NIX_NINJA_DIAG: an OPAQUE registration for a node an edge produces
+        // is the shape every placed-copy defect has had: something uploaded
+        // a file the graph builds and won the node before its task did.
+        if std::env::var_os("NIX_NINJA_DIAG").is_some()
+            && matches!(derived_file.derived_path, SingleDerivedPath::Opaque(_))
+            && files.by_id[fid].input.is_some()
+            && !self.derived_files.contains_key(&fid)
+        {
+            let site = std::panic::Location::caller();
+            eprintln!(
+                "nix-ninja: DIAG opaque registration wins produced node {} -> {} (from {}:{})",
+                derived_file.build_path.display(),
+                self.config.store_dir.display(&derived_file.derived_path),
+                site.file(),
+                site.line()
+            );
+        }
         self.derived_files.entry(fid).or_insert(derived_file);
 
         fid
@@ -1901,7 +1956,18 @@ impl Runner {
                             // source file, it is a task input (the silent
                             // `continue` here dropped gcc_link_wrapper.py
                             // whenever another rule declared it as a node).
-                            if !arg.starts_with('-')
+                            // A NODE AN EDGE PRODUCES IS NEVER A SOURCE
+                            // FILE, whatever the disk holds: what is there
+                            // is a placement from an earlier driver pass.
+                            // Uploading it registered the upload under the
+                            // node before the producing task reported, and
+                            // an alias link resolved through the placed
+                            // library, so its node took the library's
+                            // bytes and the alias was installed as a copy
+                            // (onetbb, configuration B, 2026-09-04, read
+                            // from the registration diagnostics).
+                            if files.by_id[fid].input.is_none()
+                                && !arg.starts_with('-')
                                 && !arg.starts_with('/')
                                 && arg.contains('/')
                                 && Path::new(&arg).is_file()
@@ -2176,6 +2242,14 @@ impl Runner {
                 for cand in wl_file_candidates(group) {
                     let p = Path::new(cand);
                     if !p.is_file() {
+                        continue;
+                    }
+                    // A node an edge produces reaches the task through its
+                    // edge; what is on disk under that name is a placement.
+                    if files
+                        .lookup(cand)
+                        .is_some_and(|f| files.by_id[f].input.is_some())
+                    {
                         continue;
                     }
                     let up =
@@ -4268,6 +4342,13 @@ fn outer_output_paths() -> Vec<String> {
 /// existence check. `--flag=value` and `--flag,value` both parse.
 fn wl_file_candidates(group: &str) -> Vec<&str> {
     const OUTPUT_FLAGS: [&str; 4] = ["--dependency-file", "-Map", "--Map", "--out-implib"];
+    // A SONAME IS A NAME, NOT A FILE. `-soname,libx.so.1` names the library's
+    // own alias, and the alias exists on disk in any driver pass after the
+    // one that placed it, so "the existence check rejects it" held only for
+    // a first pass: in a second pass the alias was uploaded through its link
+    // and registered under the alias's own node before the producing task
+    // reported (brotli, configuration B, 2026-09-04).
+    const NAME_FLAGS: [&str; 3] = ["-soname", "--soname", "-h"];
     let mut out = Vec::new();
     let mut skip_next = false;
     for el in group.split(',') {
@@ -4279,7 +4360,7 @@ fn wl_file_candidates(group: &str) -> Vec<&str> {
             Some((f, v)) => (f, Some(v)),
             None => (el, None),
         };
-        if OUTPUT_FLAGS.contains(&flag) {
+        if OUTPUT_FLAGS.contains(&flag) || NAME_FLAGS.contains(&flag) {
             if val.is_none() {
                 skip_next = true;
             }
@@ -8681,8 +8762,9 @@ mod new_built_file_tests {
     fn wl_groups_yield_files_and_skip_output_flags() {
         // json-c, 2026-08-23: the version script travels inside a -Wl
         // group. Both spellings parse; output-taking flags' values are
-        // never candidates in either spelling; -soname's value IS a
-        // candidate (the caller's existence check rejects it).
+        // never candidates in either spelling; a soname's value is a NAME
+        // and never a candidate (a file of that name exists in any pass
+        // after the alias is placed, so an existence check cannot reject it).
         assert_eq!(
             super::wl_file_candidates("--version-script,/src/json-c.sym"),
             vec!["/src/json-c.sym"]
@@ -8693,7 +8775,11 @@ mod new_built_file_tests {
         );
         assert_eq!(
             super::wl_file_candidates("--dependency-file,x/link.d,-soname,libx.so.5"),
-            vec!["libx.so.5"]
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            super::wl_file_candidates("-soname=libx.so.5,--version-script,/s/x.map"),
+            vec!["/s/x.map"]
         );
         assert_eq!(
             super::wl_file_candidates("--dependency-file=x/link.d,-Bsymbolic-functions"),

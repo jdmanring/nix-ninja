@@ -164,6 +164,18 @@ pub fn symlink_derived_files(
     // output on the output-derivation path, and this code read as though the
     // restore covered it. It needs a design answer, not a patch.
     let restore = crate::task::outer_restore_map();
+    // NIX_NINJA_DIAG: where each placement comes from. The question a
+    // wrong placement raises is which registration won the node, and the
+    // build log is the only place a sandboxed run can answer it.
+    if std::env::var_os("NIX_NINJA_DIAG").is_some() {
+        for df in &opaque_files {
+            eprintln!(
+                "nix-ninja: DIAG placing {} from {}",
+                df.build_path.display(),
+                df.absolute_path(store_dir).display()
+            );
+        }
+    }
     let mut symlink_files: Vec<DerivedFile> = Vec::new();
     for (df, store_path) in opaque_files.iter().zip(store_paths.iter()) {
         let target = store_path.to_absolute_path(store_dir);
@@ -299,6 +311,13 @@ fn refresh_placed_mtimes(prefix: &Path, store_dir: &StoreDir, files: &[DerivedFi
 /// mtime and the store mode plus owner write. Best effort: a failure costs a
 /// redundant compile, which is the behavior that has always been in force.
 fn refresh_one(dest: &Path, src: &Path) {
+    if std::env::var_os("NIX_NINJA_DIAG").is_some() {
+        eprintln!(
+            "nix-ninja: DIAG refresh copies {} from {}",
+            dest.display(),
+            src.display()
+        );
+    }
     let tmp = unique_sibling(dest);
     if clone_or_copy(src, &tmp).is_err() {
         let _ = std::fs::remove_file(&tmp);
