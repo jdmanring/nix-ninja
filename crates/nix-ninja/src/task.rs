@@ -9907,9 +9907,11 @@ fn generate_frandom_seed(cmdline: &str) -> String {
 /// certifies.
 /// The token a shell would exec for this command line. Skips CMake's
 /// `: &&` guards, a `cd DIR &&` prologue as a pair (the directory is a
-/// plausible binary name), and leading `VAR=value` assignments, which the
-/// shell applies to the program rather than running; asking `which` for one
-/// failed the task as a missing tool. GN quotes interpreter paths, and the
+/// plausible binary name), leading `VAR=value` assignments, which the
+/// shell applies to the program rather than running, and `env` with its
+/// assignments, which execs the program that follows; asking `which` for an
+/// assignment failed the task as a missing tool, and resolving `env` left
+/// the real program off the sandbox PATH. GN quotes interpreter paths, and the
 /// shell strips those at exec time, so they are stripped here too.
 fn command_program(cmdline: &str) -> Option<&str> {
     let mut toks = cmdline.split_whitespace();
@@ -9919,6 +9921,9 @@ fn command_program(cmdline: &str) -> Option<&str> {
             "cd" => {
                 toks.next();
             }
+            // `env VAR=value prog`: env is coreutils and always on the
+            // sandbox PATH; the program it execs is what needs resolving.
+            "env" => continue,
             tok if is_shell_assignment(tok) => continue,
             tok => return Some(tok.trim_matches(|c| c == '"' || c == '\'')),
         }
@@ -11565,6 +11570,12 @@ mod command_program_tests {
             Some("python3")
         );
         assert_eq!(command_program("A=1 B=two prog"), Some("prog"));
+        assert_eq!(
+            command_program("env PYTHONPATH=../src python3 -m gen.emit gen.h"),
+            Some("python3")
+        );
+        assert_eq!(command_program("env python3 x.py"), Some("python3"));
+        assert_eq!(command_program("env"), None);
         // Not assignments: a flag with a value, a path, a name a shell rejects.
         assert_eq!(command_program("-DX=1 prog"), Some("-DX=1"));
         assert_eq!(command_program("./a=b"), Some("./a=b"));
