@@ -10,7 +10,6 @@ use harmonia_store_derivation::derived_path::{OutputName, SingleDerivedPath};
 use harmonia_store_path::StoreDir;
 use nix_builder_rpc_client::{aterm, BuilderRpcClient};
 use nix_ninja_task::derived_file::DerivedFile;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::{
     env,
@@ -423,7 +422,7 @@ pub fn run() -> Result<()> {
     let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
         resolved_connections(&cli, crate::task::available_gib()),
     ))?);
-    let (derived_files, all_outputs) = build(&cli, &build_dir, &rpc_client)?;
+    let derived_files = build(&cli, &build_dir, &rpc_client)?;
     if cli.is_output_derivation {
         // One output derivation, by construction: $out is a single path, so
         // several targets have nowhere to go. Refuse rather than silently
@@ -437,13 +436,7 @@ pub fn run() -> Result<()> {
         };
         submit_outer_output(&cli.store_dir, derived_file, &rpc_client)?;
     } else {
-        local::symlink_derived_files(
-            &rpc_client,
-            &cli.store_dir,
-            &build_dir,
-            &derived_files,
-            &all_outputs,
-        )?;
+        local::symlink_derived_files(&rpc_client, &cli.store_dir, &build_dir, &derived_files)?;
 
         // UPSTREAM #17, STEPS TWO AND THREE. Step one made the depfile a
         // declared content-addressed output of each task; this puts those
@@ -585,7 +578,7 @@ fn build(
     cli: &Cli,
     build_dir: &Path,
     rpc_client: &Arc<BuilderRpcClient>,
-) -> Result<(Vec<DerivedFile>, HashMap<PathBuf, DerivedFile>)> {
+) -> Result<Vec<DerivedFile>> {
     let config = BuildConfig {
         build_dir: build_dir.to_path_buf(),
         store_dir: cli.store_dir.clone(),
@@ -639,7 +632,7 @@ fn subtool(
             let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
                 resolved_connections(&cli, crate::task::available_gib()),
             ))?);
-            let (derived_files, _all_outputs) = build(&cli, build_dir, &rpc_client)?;
+            let derived_files = build(&cli, build_dir, &rpc_client)?;
             // `drv` prints ONE derivation. Same reasoning as above: refusing
             // is the only honest answer to several targets here.
             let [derived_file] = &derived_files[..] else {

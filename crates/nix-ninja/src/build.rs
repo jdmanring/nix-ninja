@@ -82,7 +82,7 @@ pub fn build(
     targets: Vec<String>,
     config: BuildConfig,
     rpc_client: &Arc<BuilderRpcClient>,
-) -> Result<(Vec<DerivedFile>, HashMap<PathBuf, DerivedFile>)> {
+) -> Result<Vec<DerivedFile>> {
     if targets.is_empty() {
         return Err(anyhow!("at least one target is required"));
     }
@@ -243,18 +243,7 @@ pub fn build(
     }
     outputs.sort();
 
-    // Every task output by build path, for the placement step: a placed
-    // output that is a LINK to a sibling (a versioned library's alias) is
-    // useless without the sibling, and the sibling is not a requested
-    // target when only the alias is (openfec: `all` names the alias phony,
-    // the installer copies through it, and the library it pointed at was
-    // never placed; configuration B, 2026-09-04).
-    let all: HashMap<PathBuf, DerivedFile> = runner
-        .derived_files
-        .values()
-        .map(|df| (df.build_path.clone(), df.clone()))
-        .collect();
-    Ok((outputs, all))
+    Ok(outputs)
 }
 
 pub(crate) fn load_file(build_filename: &str) -> Result<load::Loader> {

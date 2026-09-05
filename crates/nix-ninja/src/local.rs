@@ -37,102 +37,27 @@ pub fn build_derived_files(
     Ok(built_paths)
 }
 
-fn opaque_twin(df: &DerivedFile, store_path: &harmonia_store_path::StorePath) -> DerivedFile {
-    DerivedFile {
-        derived_path: SingleDerivedPath::Opaque(store_path.clone()),
-        build_path: df.build_path.clone(),
-        rel_path: df.rel_path.clone(),
-    }
-}
-
-/// The outputs a set of placed links point at and nobody asked for. A
-/// versioned library's aliases are stored as their link text (a sibling
-/// name); when only an alias reaches the placement set, the library it
-/// names must come too or the placed link dangles. One step: the caller
-/// realises what this returns and asks again, so a chain of aliases
-/// resolves one link per round.
-pub fn link_targets_to_place(
-    realised: &[DerivedFile],
-    store_dir: &StoreDir,
-    all_outputs: &HashMap<PathBuf, DerivedFile>,
-    have: &std::collections::HashSet<PathBuf>,
-) -> Vec<DerivedFile> {
-    let mut out = Vec::new();
-    let mut added = std::collections::HashSet::new();
-    for df in realised {
-        let object = df.absolute_path(store_dir);
-        let Ok(target) = std::fs::read_link(&object) else {
-            continue;
-        };
-        if target.is_absolute() || target.components().count() != 1 {
-            continue;
-        }
-        let sibling = match df.build_path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.join(&target),
-            _ => target.clone(),
-        };
-        if have.contains(&sibling) || !added.insert(sibling.clone()) {
-            continue;
-        }
-        if let Some(t) = all_outputs.get(&sibling) {
-            out.push(t.clone());
-        }
-    }
-    out
-}
-
 pub fn symlink_derived_files(
     rpc_client: &BuilderRpcClient,
     store_dir: &StoreDir,
     prefix: &Path,
     derived_files: &[DerivedFile],
-    all_outputs: &HashMap<PathBuf, DerivedFile>,
 ) -> Result<()> {
-    let mut derived_files: Vec<DerivedFile> = derived_files.to_vec();
-    let mut store_paths = Vec::new();
-    let mut scanned = 0;
-    // A placed link needs its target beside it, and the target may be an
-    // output nobody requested (openfec: `all` names the alias phony, the
-    // installer copies through it, and the library it pointed at was never
-    // placed; configuration B, 2026-09-04). Realise, read the links, add
-    // their targets, and go round until nothing new appears.
-    loop {
-        let derived_paths: Vec<_> = derived_files[scanned..]
-            .iter()
-            .map(|df| df.derived_path.clone())
-            .collect();
-        store_paths.extend(rpc_client.build_paths(
-            store_dir,
-            &derived_paths,
-            Patience::Escalating,
-        )?);
-        let have: std::collections::HashSet<PathBuf> = derived_files
-            .iter()
-            .map(|df| df.build_path.clone())
-            .collect();
-        let realised: Vec<DerivedFile> = derived_files[scanned..]
-            .iter()
-            .zip(store_paths[scanned..].iter())
-            .map(|(df, sp)| opaque_twin(df, sp))
-            .collect();
-        scanned = derived_files.len();
-        let extra = link_targets_to_place(&realised, store_dir, all_outputs, &have);
-        if extra.is_empty() {
-            break;
-        }
-        eprintln!(
-            "nix-ninja: placing {} link target(s) beside the requested outputs",
-            extra.len()
-        );
-        derived_files.extend(extra);
-    }
-    let derived_files = &derived_files;
+    let derived_paths: Vec<_> = derived_files
+        .iter()
+        .map(|df| df.derived_path.clone())
+        .collect();
+    let store_paths = rpc_client.build_paths(store_dir, &derived_paths, Patience::Escalating)?;
 
     // Create new DerivedFiles with opaque store paths instead of placeholders
     let opaque_files: Vec<DerivedFile> = derived_files
         .iter()
         .zip(store_paths.iter())
-        .map(|(df, store_path)| opaque_twin(df, store_path))
+        .map(|(df, store_path)| DerivedFile {
+            derived_path: SingleDerivedPath::Opaque(store_path.clone()),
+            build_path: df.build_path.clone(),
+            rel_path: df.rel_path.clone(),
+        })
         .collect();
 
     // PLACEHOLDER -> REAL OUTER PATH, by COPY, and NEVER exposed as the
