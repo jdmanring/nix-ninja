@@ -165,6 +165,9 @@ struct Task {
     // Configure-time relative symlinks to recreate in the sandbox; see
     // Runner::alias_symlinks.
     alias_symlinks: Vec<(String, String)>,
+    // Directories that exist EMPTY in the build tree, recreated in the
+    // sandbox of every non-compile task; see Runner::empty_dirs.
+    empty_dirs: Vec<String>,
 }
 
 impl Deref for Task {
@@ -550,6 +553,16 @@ pub struct Runner {
     /// whatever the task actually materialized (orc, thirteenth class,
     /// 2026-08-23).
     alias_symlinks: Vec<(String, String)>,
+    /// A DIRECTORY THAT IS EMPTY AT CONFIGURE TIME UPLOADS NOTHING, and a
+    /// generator that writes a side product into it dies with ENOENT in
+    /// the sandbox: rdma-core's pandoc-prebuilt.py copies each man page
+    /// into `<build>/pandoc-prebuilt/<sha1>`, a cache directory CMake
+    /// makes at configure (configuration B, 2026-09-04). The walk records
+    /// every empty directory under the build tree and every non-compile
+    /// task recreates them before its command runs. Compile tasks never
+    /// carry them: the blanket's own gate, and a compile writes nothing
+    /// beside its object.
+    empty_dirs: Vec<String>,
 
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
@@ -646,6 +659,7 @@ impl Runner {
             derived_files: HashMap::new(),
             build_dir_inputs: HashMap::new(),
             alias_symlinks: Vec::new(),
+            empty_dirs: Vec::new(),
             phony_aliases: HashMap::new(),
             stamp_inputs: HashMap::new(),
             stamp_input_files: HashMap::new(),
@@ -698,6 +712,9 @@ impl Runner {
             if std::env::var_os("NIX_NINJA_DIAG").is_some() {
                 let d = match &disposition {
                     BuildDirDisposition::Alias(l, t) => format!("alias {l} -> {t}"),
+                    BuildDirDisposition::AliasAndUpload(l, t) => {
+                        format!("alias+upload {l} -> {t}")
+                    }
                     BuildDirDisposition::Skip => "skip".into(),
                     BuildDirDisposition::Upload => "upload".into(),
                 };
@@ -713,7 +730,23 @@ impl Runner {
                     self.alias_symlinks.push((link, target));
                     continue;
                 }
-                BuildDirDisposition::Skip => continue,
+                BuildDirDisposition::AliasAndUpload(link, target) => {
+                    self.alias_symlinks.push((link, target));
+                    entry.into_path()
+                }
+                BuildDirDisposition::Skip => {
+                    if entry.file_type().is_dir()
+                        && std::fs::read_dir(entry.path()).is_ok_and(|mut d| d.next().is_none())
+                    {
+                        if let Ok(rel) = entry.path().strip_prefix(&self.config.build_dir) {
+                            let rel = rel.to_string_lossy();
+                            if !rel.is_empty() && !rel.contains(' ') {
+                                self.empty_dirs.push(rel.into_owned());
+                            }
+                        }
+                    }
+                    continue;
+                }
                 BuildDirDisposition::Upload => entry.into_path(),
             };
             let derived_file =
@@ -758,6 +791,8 @@ impl Runner {
         // task derivation.
         self.alias_symlinks.sort();
         self.alias_symlinks.dedup();
+        self.empty_dirs.sort();
+        self.empty_dirs.dedup();
         Ok(())
     }
 
@@ -1531,6 +1566,7 @@ impl Runner {
             let cmake_p_defs = cmake_definitions(&args);
             let tablegen = tablegen_invocation(&args);
             let xinclude_docs = xinclude_invocation(&args);
+            let rst_docs = rst_invocation(&args);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -2018,6 +2054,12 @@ impl Runner {
                     referenced.push(p.to_string_lossy().into_owned());
                 }
             }
+            if let Some(docs) = &rst_docs {
+                let root = self.config.build_dir.join(&cd_dir);
+                for p in rst_include_closure(&root, docs, 4096) {
+                    referenced.push(p.to_string_lossy().into_owned());
+                }
+            }
             if let Some(script) = &cmake_p_script {
                 if let Ok(text) = std::fs::read_to_string(script) {
                     referenced.extend(cmake_script_referenced_paths(&text, &cmake_p_defs));
@@ -2450,6 +2492,11 @@ impl Runner {
             store_srcs,
             outputs,
             alias_symlinks: self.alias_symlinks.clone(),
+            empty_dirs: if is_gcc_task {
+                Vec::new()
+            } else {
+                self.empty_dirs.clone()
+            },
         })
     }
 }
@@ -3146,6 +3193,15 @@ fn build_task_derivation(
         drv.env.insert(
             b"NIX_NINJA_ALIASES"[..].into(),
             encoded.join(" ").into_bytes().into(),
+        );
+    }
+    // Empty build-tree directories (see Runner::empty_dirs), space-separated
+    // relative paths; the walk refused any carrying a space. Inserted only
+    // when non-empty, for the same hash-stability reason as the aliases.
+    if !task.empty_dirs.is_empty() {
+        drv.env.insert(
+            b"NIX_NINJA_EMPTY_DIRS"[..].into(),
+            task.empty_dirs.join(" ").into_bytes().into(),
         );
     }
 
@@ -5256,6 +5312,12 @@ fn is_tree_path(p: &Path) -> bool {
 enum BuildDirDisposition {
     /// An in-tree symlink, recreated in the sandbox as a link.
     Alias(String, String),
+    /// A symlink to a FILE outside the build directory but inside the
+    /// project tree: recreated as a link, for a task that holds the target
+    /// (a compile whose discovery placed the header), AND uploaded as
+    /// bytes, for a task that never will (x265's link task and the archive
+    /// its sibling build made).
+    AliasAndUpload(String, String),
     /// Upload the bytes at this path.
     Upload,
     /// Not an input: a directory, a dangling link, or a special file.
@@ -5276,7 +5338,12 @@ fn build_dir_disposition(
 ) -> BuildDirDisposition {
     if entry_is_symlink {
         if let Some((link, target)) = alias_symlink_entry(build_dir, path) {
-            return BuildDirDisposition::Alias(link, target);
+            let climbs_out = alias_target_climbs_out(build_dir, path);
+            return if climbs_out && path.is_file() {
+                BuildDirDisposition::AliasAndUpload(link, target)
+            } else {
+                BuildDirDisposition::Alias(link, target)
+            };
         }
         // Not an in-tree alias, so nothing recreates it in a sandbox and
         // dropping it loses the file. x265 links its 10- and 12-bit archives
@@ -5295,29 +5362,121 @@ fn build_dir_disposition(
     }
 }
 
-fn alias_symlink_entry(build_dir: &Path, link_abs: &Path) -> Option<(String, String)> {
-    let target = std::fs::read_link(link_abs).ok()?;
-    if target.is_absolute() {
-        return None;
-    }
-    let rel_link = link_abs.strip_prefix(build_dir).ok()?;
-    // Lexical confinement: resolve `..` against the link's directory
-    // depth. A target climbing out of the build dir is not an alias to a
-    // build product and must not be recreated in a sandbox.
-    let link_depth = rel_link.components().count().saturating_sub(1);
-    let mut depth = link_depth as isize;
+/// Whether a symlink's target, resolved lexically against the link's own
+/// directory, lies outside `build_dir`.
+fn alias_target_climbs_out(build_dir: &Path, link_abs: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(link_abs) else {
+        return false;
+    };
+    let Some(parent) = link_abs.parent() else {
+        return false;
+    };
+    // An absolute target starts over at the root; appending its components
+    // to the link's directory read every absolute link as in-tree
+    // (rdma-core's common rst fragments, carried as a link to nothing).
+    let base: &Path = if target.is_absolute() {
+        Path::new("/")
+    } else {
+        parent
+    };
+    let mut resolved: Vec<std::ffi::OsString> = base
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_owned()),
+            _ => None,
+        })
+        .collect();
     for c in target.components() {
         match c {
             std::path::Component::ParentDir => {
-                depth -= 1;
-                if depth < 0 {
-                    return None;
-                }
+                resolved.pop();
             }
-            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::Normal(n) => resolved.push(n.to_owned()),
+            _ => {}
+        }
+    }
+    let abs: PathBuf = std::iter::once(std::ffi::OsString::from("/"))
+        .chain(resolved)
+        .collect();
+    !abs.starts_with(build_dir)
+}
+
+fn alias_symlink_entry(build_dir: &Path, link_abs: &Path) -> Option<(String, String)> {
+    let mut target = std::fs::read_link(link_abs).ok()?;
+    let rel_link = link_abs.strip_prefix(build_dir).ok()?;
+    // AN ABSOLUTE TARGET INSIDE THE PROJECT TREE IS RESPELLED RELATIVE TO
+    // THE LINK. rdma-core publishes every header as
+    // `build/include/<dir>/<h> -> ${CMAKE_CURRENT_SOURCE_DIR}/<h>`, an
+    // absolute path into the source tree; the sandbox holds that tree at
+    // the same relative offset (`../<dir>/<h>`, placed by discovery) and
+    // nowhere near the absolute path, so the text that resolves there is
+    // the relative one. A target outside the project tree stays refused.
+    if target.is_absolute() {
+        if !same_project_tree(build_dir, &target) || !target.exists() {
+            return None;
+        }
+        let from = link_abs.parent()?;
+        let (mut a, mut b): (Vec<_>, Vec<_>) = (
+            from.components().collect::<Vec<_>>(),
+            target.components().collect::<Vec<_>>(),
+        );
+        while !a.is_empty() && !b.is_empty() && a[0] == b[0] {
+            a.remove(0);
+            b.remove(0);
+        }
+        let mut rel = PathBuf::new();
+        for _ in &a {
+            rel.push("..");
+        }
+        for c in b {
+            rel.push(c.as_os_str());
+        }
+        target = rel;
+    }
+    // Lexical confinement. The target is resolved against the link's own
+    // directory without touching the filesystem, and it may leave the
+    // build directory as long as it stays in the PROJECT tree: rdma-core
+    // configures `build/include/ccan -> ../../ccan`, a link to the source
+    // tree, and every `#include <ccan/...>` resolves through it; refusing
+    // any climb left the sandbox without the link while the headers it
+    // reaches were placed at `../ccan` (configuration B, 2026-09-04). A
+    // target leaving the project tree (`/etc`, `/nix/store`) is refused,
+    // the same test the output normaliser applies.
+    let mut resolved: Vec<std::ffi::OsString> = build_dir
+        .join(rel_link.parent().unwrap_or(Path::new("")))
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_owned()),
+            _ => None,
+        })
+        .collect();
+    for c in target.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                resolved.pop()?;
+            }
+            std::path::Component::Normal(n) => resolved.push(n.to_owned()),
             std::path::Component::CurDir => {}
             _ => return None,
         }
+    }
+    let resolved_abs: PathBuf = std::iter::once(std::ffi::OsString::from("/"))
+        .chain(resolved)
+        .collect();
+    // A climb out of the build directory stays an alias while the target
+    // is in the project tree. A link to a FILE out there is ALSO uploaded
+    // by the walk (`AliasAndUpload`): rdma-core links every public header
+    // into build/include from the source tree and a compile finds the
+    // header through the link once discovery has placed the target, while
+    // x265's archive from a sibling build reaches its link task only as
+    // bytes.
+    // In-tree links are carried even dangling (a soname alias before its
+    // library links); a climb-out is carried only to something that exists,
+    // so a link to a sibling build that was never made stays out.
+    let stays_in = resolved_abs.starts_with(build_dir);
+    let in_project = same_project_tree(build_dir, &resolved_abs) && resolved_abs.exists();
+    if !stays_in && !in_project {
+        return None;
     }
     let l = rel_link.to_str()?;
     let t = target.to_str()?;
@@ -5519,6 +5678,71 @@ fn xinclude_href_of(tag: &str) -> Option<String> {
 /// KEYED ON `--xinclude`, which is the flag that makes the parts load.
 /// Without it xsltproc reads the one document and the parts are not inputs,
 /// so a broader key would upload files no run opens.
+/// A reStructuredText document handed to a docutils writer (`rst2man`,
+/// `rst2html`, rdma-core's `pandoc-prebuilt.py --rst`). Its `.. include::`
+/// directives name files the edge does not declare: rdma-core's man pages
+/// pull option fragments from `<build>/infiniband-diags/man/common/`, a
+/// directory of configure-time links into the source tree, and a build
+/// directory over the blanket's limit delivered none of them (configuration
+/// B, 2026-09-04, `InputError: No such file or directory: ...opt_G.rst`).
+fn rst_invocation(args: &[String]) -> Option<Vec<PathBuf>> {
+    if !args
+        .iter()
+        .any(|a| a.contains("rst2") || a.ends_with("pandoc-prebuilt.py"))
+    {
+        return None;
+    }
+    let docs: Vec<PathBuf> = args
+        .iter()
+        .filter(|a| !a.starts_with('-') && a.ends_with(".rst"))
+        .map(PathBuf::from)
+        .collect();
+    (!docs.is_empty()).then_some(docs)
+}
+
+/// Every file an rst document reaches through `.. include::`, transitively,
+/// each resolved against the including document's directory as docutils
+/// does. Missing files are reported as paths too: the caller's existence
+/// check decides, and a reader that silently drops them has no way to say
+/// so. Capped so a cycle terminates.
+fn rst_include_closure(root: &Path, docs: &[PathBuf], cap: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut queue: Vec<PathBuf> = docs
+        .iter()
+        .map(|d| {
+            if d.is_absolute() {
+                d.clone()
+            } else {
+                root.join(d)
+            }
+        })
+        .collect();
+    while let Some(doc) = queue.pop() {
+        if out.len() >= cap || !seen.insert(doc.clone()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&doc) else {
+            continue;
+        };
+        let dir = doc.parent().unwrap_or(root);
+        for line in text.lines() {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix(".. include::") else {
+                continue;
+            };
+            let name = rest.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let p = dir.join(name);
+            out.push(p.clone());
+            queue.push(p);
+        }
+    }
+    out
+}
+
 fn xinclude_invocation(args: &[String]) -> Option<Vec<PathBuf>> {
     if !args.iter().any(|a| a == "--xinclude") {
         return None;
@@ -10914,8 +11138,54 @@ mod alias_symlink_tests {
 
         // Negative controls, each refused for a different reason, because
         // an entry that accepts everything passes the positives above.
+        // Out of the build dir but inside the project tree and naming a
+        // DIRECTORY: carried, the rdma-core shape (`build/include/ccan ->
+        // ../../ccan`). Its own root, so the directory above the build dir
+        // is this test's and not the machine's. A file out there is x265's
+        // archive and stays an upload (its own test below).
+        let root = std::env::temp_dir().join(format!("nn-alias-climb-{}", std::process::id()));
+        let build = root.join("build");
+        std::fs::create_dir_all(build.join("include")).unwrap();
+        std::fs::create_dir_all(root.join("ccan")).unwrap();
+        let src = build.join("include/ccan");
+        symlink("../../ccan", &src).unwrap();
+        assert_eq!(
+            alias_symlink_entry(&build, &src),
+            Some(("include/ccan".to_string(), "../../ccan".to_string()))
+        );
+        std::fs::remove_dir_all(&root).ok();
+
+        // An ABSOLUTE target inside the project tree is respelled relative
+        // to the link: rdma-core's published headers.
+        let hdr_root = std::env::temp_dir().join(format!("nn-alias-abs-{}", std::process::id()));
+        let hdr_build = hdr_root.join("build");
+        std::fs::create_dir_all(hdr_build.join("include/ccan")).unwrap();
+        std::fs::create_dir_all(hdr_root.join("ccan")).unwrap();
+        std::fs::write(hdr_root.join("ccan/str.h"), b"").unwrap();
+        let hdr = hdr_build.join("include/ccan/str.h");
+        symlink(hdr_root.join("ccan/str.h"), &hdr).unwrap();
+        assert_eq!(
+            alias_symlink_entry(&hdr_build, &hdr),
+            Some((
+                "include/ccan/str.h".to_string(),
+                "../../../ccan/str.h".to_string()
+            ))
+        );
+        // And it climbs out, so the walk uploads the bytes as well.
+        assert!(super::alias_target_climbs_out(&hdr_build, &hdr));
+        assert_eq!(
+            super::build_dir_disposition(&hdr_build, true, false, &hdr),
+            super::BuildDirDisposition::AliasAndUpload(
+                "include/ccan/str.h".into(),
+                "../../../ccan/str.h".into()
+            )
+        );
+        std::fs::remove_dir_all(&hdr_root).ok();
+
+        // Past the project tree's root: refused. The build dir here is
+        // /tmp/<name>/, so four steps up leave `/tmp`.
         let esc = orc.join("escape");
-        symlink("../../etc/passwd", &esc).unwrap();
+        symlink("../../../../etc/passwd", &esc).unwrap();
         assert_eq!(alias_symlink_entry(&d, &esc), None, "escaping target");
 
         let abs = orc.join("absolute");
@@ -10946,7 +11216,7 @@ mod alias_symlink_tests {
     // through the link, which is what the upload branch tests with
     // `is_file`.
     #[test]
-    fn an_escaping_symlink_to_a_real_file_is_no_alias_but_is_readable() {
+    fn a_climbing_symlink_to_a_real_file_is_an_alias_and_readable() {
         let d = std::env::temp_dir().join(format!("nn-x265-test-{}", std::process::id()));
         let build = d.join("build");
         let siblings = d.join("build-10bits");
@@ -10961,9 +11231,10 @@ mod alias_symlink_tests {
 
         assert_eq!(
             alias_symlink_entry(&build, &link),
-            None,
-            "target climbs out of the build dir, so it is not an alias"
+            Some(("libx265-10.a".into(), "../build-10bits/libx265.a".into())),
+            "in the project tree, so the link text is carried as well"
         );
+        assert!(super::alias_target_climbs_out(&build, &link));
         assert!(
             link.is_file(),
             "is_file follows the link, so the upload branch reaches the archive"
@@ -11399,7 +11670,13 @@ mod build_dir_disposition_tests {
 
         let find = |n: &str| got.iter().find(|(k, _)| k == n).map(|(_, v)| v).unwrap();
         // The regression: a link out of the tree carries real bytes.
-        assert_eq!(*find("libx265-10.a"), BuildDirDisposition::Upload);
+        assert_eq!(
+            *find("libx265-10.a"),
+            BuildDirDisposition::AliasAndUpload(
+                "libx265-10.a".into(),
+                "../build-10bits/libx265.a".into()
+            )
+        );
         // A link out of the tree with no target is not an input.
         assert_eq!(*find("libx265-12.a"), BuildDirDisposition::Skip);
         // An in-tree link stays a link rather than being uploaded twice.
@@ -11833,5 +12110,60 @@ mod python_module_tests {
                 "gen/emit/__init__.py"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod rst_reader_tests {
+    use super::{rst_include_closure, rst_invocation};
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_docutils_writer_names_its_rst_and_the_includes_are_closed_over() {
+        let args: Vec<String> = "python3 /src/buildlib/pandoc-prebuilt.py --build /b --rst /nix/store/x/bin/rst2man /b/man/ibsysstat.8.rst /b/man/ibsysstat.8"
+            .split(' ')
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            rst_invocation(&args),
+            Some(vec![PathBuf::from("/b/man/ibsysstat.8.rst")])
+        );
+        let plain: Vec<String> = "gcc -c a.c -o a.o".split(' ').map(String::from).collect();
+        assert_eq!(rst_invocation(&plain), None);
+
+        let d = std::env::temp_dir().join(format!(
+            "nn-rst-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(d.join("build/man/common")).unwrap();
+        std::fs::write(
+            d.join("build/man/page.8.rst"),
+            "Title\n=====\n\n.. include:: ../../build/man/common/opt_G.rst\n.. include:: common/opt_C.rst\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("build/man/common/opt_G.rst"),
+            ".. include:: opt_inner.rst\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("build/man/common/opt_inner.rst"), "inner\n").unwrap();
+        let got = rst_include_closure(&d.join("build/man"), &[PathBuf::from("page.8.rst")], 64);
+        let mut names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["opt_C.rst", "opt_G.rst", "opt_inner.rst"],
+            "{got:?}"
+        );
+        // The missing one is still named: existence is the caller's check.
+        assert!(got.iter().any(|p| p.ends_with("common/opt_C.rst")));
+        std::fs::remove_dir_all(&d).ok();
     }
 }
