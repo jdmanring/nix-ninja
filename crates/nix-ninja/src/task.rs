@@ -10540,17 +10540,22 @@ pub fn discover_c_includes(
                 let store_path: StorePath =
                     store_dir.parse(full_path.to_str().context("Path was not valid UTF-8")?)?;
                 // THE OUTER DERIVATION'S OWN OUTPUTS ARE NEVER INPUTS, on
-                // this route as well as `extract_store_paths`. An ordinary
-                // task never reaches here with one, because the command it
-                // was scanned from carries a placeholder that names no
-                // file; an LTO compile keeps the REAL outer paths (see
-                // `lto_raw`), so a `-I$out/include` resolves, the scan
-                // unions the outer output in, and the task tries to
-                // realise a path the daemon has not registered:
-                // "AddToStore: path '...-nss-3.112.5' is not valid"
-                // (nss 3.112.5, compiler route, 2026-09-05). The exclusion
-                // is here rather than on the input swap, which an LTO task
-                // needs for everything else.
+                // this route as well as `extract_store_paths`. A package
+                // that stages headers into its own output and compiles
+                // against them puts the outer output here the moment a
+                // source actually opens one, and the task then tries to
+                // declare a path the daemon has not registered:
+                // "AddToStore: path '...-nss-3.112.5' is not valid".
+                // nss carries `-I$out/private/nss` on every compile and
+                // only the libpkix objects fail, which are the ones that
+                // include a header resident there.
+                //
+                // THIS IS NOT THE WHOLE FIX FOR THAT PACKAGE. Excluding
+                // the path leaves the header unreachable, so the daemon
+                // rejection becomes an ordinary missing-include error.
+                // Carrying such a file as BYTES is the other half and is
+                // a pricing decision, since it keys the task on staged
+                // content. Recorded in local/pending/next-rekey-batch.md.
                 if outer_output_paths()
                     .iter()
                     .any(|o| full_path == Path::new(o))
