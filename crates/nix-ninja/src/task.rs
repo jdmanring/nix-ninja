@@ -1467,6 +1467,10 @@ impl Runner {
             .filter_map(|p| normalize_build_path(&self.config.build_dir, p).ok())
             .collect();
 
+        // Directories holding a module named by `python -m a.b.c`, resolved
+        // through the command's own PYTHONPATH; merged into the sibling
+        // seeding below, which otherwise keys only on `.py` inputs.
+        let mut py_module_dirs: Vec<PathBuf> = Vec::new();
         if let Some(cmdline) = &cmdline {
             let args = shell_words::split(cmdline)?;
             // Read before the loop consumes `args`: see the `cmake -P` pass
@@ -1500,6 +1504,14 @@ impl Runner {
             } else {
                 (0, PathBuf::new())
             };
+            if let Some((module, roots)) = python_module_invocation(&args) {
+                for rel in python_module_candidates(&module, &roots) {
+                    let rel = rebase_post_cd(&cd_dir, &rel);
+                    if self.config.build_dir.join(&rel).is_file() {
+                        py_module_dirs.push(parent_dir_or_here(&rel));
+                    }
+                }
+            }
             // json_schema_compiler resolves a cross-namespace type
             // (extensionTypes.InjectDetails from web_view_internal.json) by
             // loading the referenced namespace's schema from the same api
@@ -2123,6 +2135,7 @@ impl Runner {
         // its files in self.derived_files/files for the whole run, and
         // every later task pays one contains_key per sibling.
         let mut py_dirs: rustc_hash::FxHashSet<PathBuf> = rustc_hash::FxHashSet::default();
+        py_dirs.extend(py_module_dirs);
         for i in input_set.values() {
             if i.build_path.extension().is_some_and(|e| e == "py")
                 && Path::new(&i.build_path).is_file()
@@ -9905,6 +9918,57 @@ fn generate_frandom_seed(cmdline: &str) -> String {
 /// store-path lib is already visible in every sandbox) or meson's SHSYM
 /// `.symbols` relink guard, the only edge-visible handle on the lib it
 /// certifies.
+/// `python -m a.b.c` names a MODULE, not a file, so nothing on the command
+/// line ends in `.py` and the sibling seeding never fires (xkeyboard-config,
+/// class 20: `No module named rules.generator`). The module and the search
+/// roots python will use: every `PYTHONPATH=` assignment on the line, split
+/// on `:`, then the working directory, which `-m` always searches first.
+fn python_module_invocation(args: &[String]) -> Option<(String, Vec<String>)> {
+    let mut roots: Vec<String> = Vec::new();
+    let mut seen_python = false;
+    let mut toks = args.iter().map(String::as_str);
+    while let Some(tok) = toks.next() {
+        if let Some(v) = tok.strip_prefix("PYTHONPATH=") {
+            roots.extend(v.split(':').filter(|e| !e.is_empty()).map(str::to_string));
+            continue;
+        }
+        if !seen_python {
+            let base = tok.rsplit('/').next().unwrap_or(tok);
+            seen_python = base.starts_with("python");
+            continue;
+        }
+        if tok == "-m" {
+            let module = toks.next()?;
+            if module.is_empty() || module.starts_with('-') {
+                return None;
+            }
+            roots.push(".".to_string());
+            return Some((module.to_string(), roots));
+        }
+        if !tok.starts_with('-') {
+            return None; // a script or argument came first; -m did not apply
+        }
+    }
+    None
+}
+
+/// Where `a.b.c` can live under each root: the module file or the package's
+/// `__init__.py`, as build-directory-relative paths.
+fn python_module_candidates(module: &str, roots: &[String]) -> Vec<String> {
+    let rel = module.replace('.', "/");
+    roots
+        .iter()
+        .flat_map(|r| {
+            let base = if r == "." {
+                rel.clone()
+            } else {
+                format!("{r}/{rel}")
+            };
+            [format!("{base}.py"), format!("{base}/__init__.py")]
+        })
+        .collect()
+}
+
 /// The token a shell would exec for this command line. Skips CMake's
 /// `: &&` guards, a `cd DIR &&` prologue as a pair (the directory is a
 /// plausible binary name), leading `VAR=value` assignments, which the
@@ -11583,5 +11647,56 @@ mod command_program_tests {
         assert_eq!(command_program("=x prog"), Some("=x"));
         assert_eq!(command_program("   "), None);
         assert_eq!(command_program("cd sub"), None);
+    }
+}
+
+#[cfg(test)]
+mod python_module_tests {
+    use super::{python_module_candidates, python_module_invocation};
+
+    fn split(s: &str) -> Vec<String> {
+        shell_words::split(s).unwrap()
+    }
+
+    #[test]
+    fn a_dash_m_module_is_read_with_its_search_roots() {
+        let got =
+            python_module_invocation(&split("env PYTHONPATH=../src python3 -m gen.emit gen.h"));
+        assert_eq!(
+            got,
+            Some(("gen.emit".into(), vec!["../src".into(), ".".into()]))
+        );
+        let got = python_module_invocation(&split(
+            "PYTHONPATH=a:b /nix/store/x/bin/python3.13 -B -m pkg.mod",
+        ));
+        assert_eq!(
+            got,
+            Some(("pkg.mod".into(), vec!["a".into(), "b".into(), ".".into()]))
+        );
+        assert_eq!(
+            python_module_invocation(&split("python3 -m gen.emit")),
+            Some(("gen.emit".into(), vec![".".into()]))
+        );
+        // Not a module invocation: a script, a flag after -m, no python.
+        assert_eq!(
+            python_module_invocation(&split("python3 gen/emit.py -m x")),
+            None
+        );
+        assert_eq!(python_module_invocation(&split("python3 -m -x")), None);
+        assert_eq!(python_module_invocation(&split("perl -m gen.emit")), None);
+    }
+
+    #[test]
+    fn candidates_cover_module_and_package_under_every_root() {
+        let roots = vec!["../src".to_string(), ".".to_string()];
+        assert_eq!(
+            python_module_candidates("gen.emit", &roots),
+            vec![
+                "../src/gen/emit.py",
+                "../src/gen/emit/__init__.py",
+                "gen/emit.py",
+                "gen/emit/__init__.py"
+            ]
+        );
     }
 }
