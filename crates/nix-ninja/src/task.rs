@@ -2556,6 +2556,41 @@ fn forwarded_to_tasks(key: &str) -> bool {
         || key == "PYTHONPATH"
 }
 
+/// A test fixture directory, removed when dropped and removed FIRST as
+/// well: the name is per process and a pid is reused, so an earlier run's
+/// leftovers would arrive as this run's state. Removing only at the start
+/// left one directory per test per run in the host's temp directory.
+#[cfg(test)]
+pub(crate) struct Scratch(PathBuf);
+#[cfg(test)]
+impl Scratch {
+    pub(crate) fn new(name: String) -> Self {
+        let d = std::env::temp_dir().join(name);
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        Scratch(d)
+    }
+}
+#[cfg(test)]
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+#[cfg(test)]
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+#[cfg(test)]
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod forwarded_to_tasks_tests {
     use super::forwarded_to_tasks;
@@ -6493,11 +6528,8 @@ mod phony_ordering_tests {
     /// once: tests run on parallel threads, so they wipe each other's
     /// fixtures, and a pid is reused, so an old run's leftovers arrive as
     /// this run's state.
-    fn scratch(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("nn-phony-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn scratch(tag: &str) -> super::Scratch {
+        super::Scratch::new(format!("nn-phony-{tag}-{}", std::process::id()))
     }
 
     /// CMake's `phony || .`, the case the guard exists for.
@@ -8843,9 +8875,7 @@ mod depfile_read_back_tests {
         // REMOVED FIRST. The name is only per-process, and a pid is reused:
         // a leftover `linked.o.d` from an earlier run made the symlink below
         // fail with EEXIST, intermittently and only under the full suite.
-        let d = std::env::temp_dir().join(format!("nndf{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        let d = super::Scratch::new(format!("nndf{}", std::process::id()));
         let src = d.join("a.c");
         std::fs::write(&src, "int x;\n").unwrap();
         let dep = d.join("a.o.d");
@@ -9379,10 +9409,8 @@ mod depfile_applies_here_tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
-    fn fixture(tag: &str, dep_body: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("nnapp-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+    fn fixture(tag: &str, dep_body: &str) -> super::Scratch {
+        let d = super::Scratch::new(format!("nnapp-{tag}-{}", std::process::id()));
         std::fs::write(d.join("a.c"), "int x;\n").unwrap();
         std::fs::write(d.join("a.o.d"), dep_body).unwrap();
         d
@@ -11431,9 +11459,7 @@ mod create_symlink_undeclared_output_tests {
         // right place. An angle include that is missing SUCCEEDS at finding
         // the wrong file.
         let _g = CHDIR_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join(format!("nn-angle-i-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = super::Scratch::new(format!("nn-angle-i-{}", std::process::id()));
         std::fs::write(dir.join("wchar.h"), b"#ifndef GEN_WCHAR\n#define GEN_WCHAR\nstatic void mbszero(void*p){(void)p;}\n#endif\n").unwrap();
         std::fs::write(dir.join("config.h"), b"#define PACKAGE \"m4\"\n").unwrap();
         std::fs::write(
