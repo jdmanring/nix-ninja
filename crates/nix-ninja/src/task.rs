@@ -73,10 +73,22 @@ pub struct Tools {
 /// paid for with the object-suffix allowlist, where an unrecognised suffix
 /// meant no dependency discovery and a task that could not compile.
 ///
-/// TWO OF THESE ARE MEASURED AND THREE ARE JUDGEMENT. `sed` is p11-kit's,
+/// THREE OF THESE ARE MEASURED AND FOUR ARE JUDGEMENT. `sed` is p11-kit's,
 /// `xxd` is libvmaf's; `awk`, `grep` and `m4` are what a generated script
 /// reaches for next, and nothing has bounded that. Each is a small store
 /// path already in almost every build's closure.
+///
+/// `nm` and `readelf` are meson's, and they arrived by the DEFER trigger
+/// below rather than by anyone reporting them. meson's link rule runs
+/// `symbolextractor`, which reaches `print_tool_warning` ONLY when it
+/// cannot find one of them; it then dies writing
+/// `meson-private/symbolextractor_tool_warning_printed`, a directory no
+/// task stages. `nixos-test-nix-build-shared-lib` had been red on `main`
+/// for it. Where that directory happens to exist the same absence is
+/// SILENT and costs symbol extraction, so every meson shared library
+/// relinks in full where it could have been skipped, which is a defect
+/// nobody would ever report because the build succeeds. Both resolve to
+/// binutils, already in the closure of anything carrying a compiler.
 ///
 /// HOW MANY OF THESE ACTUALLY RESOLVE IS A PROPERTY OF THE STDENV, NOT OF
 /// THIS LIST, so the length of the array is not a claim about the sandbox.
@@ -91,7 +103,7 @@ pub struct Tools {
 /// measurement enumerates this population and only a build can report a
 /// member. A trigger phrased as "when someone notices the closure cost"
 /// would never fire.
-const SCRIPT_TOOLS: [&str; 5] = ["sed", "awk", "grep", "m4", "xxd"];
+const SCRIPT_TOOLS: [&str; 7] = ["sed", "awk", "grep", "m4", "xxd", "nm", "readelf"];
 
 impl Tools {
     pub fn new(store_dir: &StoreDir) -> Result<Self> {
