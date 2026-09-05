@@ -5451,9 +5451,9 @@ fn alias_symlink_entry(build_dir: &Path, link_abs: &Path) -> Option<(String, Str
     // In-tree links are carried even dangling (a soname alias before its
     // library links); a climb-out is carried only to something that exists,
     // so a link to a sibling build that was never made stays out.
-    if !resolved_abs.starts_with(build_dir)
-        && !(same_project_tree(build_dir, &resolved_abs) && resolved_abs.exists())
-    {
+    let stays_in = resolved_abs.starts_with(build_dir);
+    let in_project = same_project_tree(build_dir, &resolved_abs) && resolved_abs.exists();
+    if !stays_in && !in_project {
         return None;
     }
     let l = rel_link.to_str()?;
