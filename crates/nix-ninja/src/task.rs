@@ -12702,7 +12702,10 @@ mod gresource_tests {
         .map(|s| s.to_string())
         .collect();
         let (docs, dirs) = gresource_invocation(&args).expect("the tool is named");
-        assert_eq!(docs, vec![PathBuf::from("../gio/tests/111_digit_test.gresource.xml")]);
+        assert_eq!(
+            docs,
+            vec![PathBuf::from("../gio/tests/111_digit_test.gresource.xml")]
+        );
         assert_eq!(dirs, vec![PathBuf::from("/build/glib-2.88.3/gio/tests")]);
     }
 
@@ -12746,5 +12749,55 @@ mod gresource_tests {
             &[]
         )
         .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod outer_output_input_tests {
+    use harmonia_store_path::StoreDir;
+    /// nss's compile carries `-I$out/private/nss`, its own output, because
+    /// the build stages headers there and includes from them. The path
+    /// exists on disk during the build and is NOT yet a valid store path,
+    /// so declaring it is an AddToStore the daemon refuses:
+    /// `path '...-nss-3.112.5' is not valid`.
+    #[test]
+    fn a_path_under_the_outer_output_is_not_an_input() {
+        let store = StoreDir::new(std::path::Path::new("/nix/store")).expect("store dir");
+        // AN EXISTING PATH, so the existence check above the guard cannot
+        // be what rejects it. nss's own output exists on disk during the
+        // build (the headers are staged into it) and is simply not valid
+        // yet, which is the whole reason the daemon refuses it.
+        let Some(out) = std::fs::read_dir("/nix/store").ok().and_then(|mut d| {
+            d.find_map(|e| {
+                let p = e.ok()?.path();
+                let s = p.to_str()?.to_string();
+                (p.is_dir() && !s.ends_with(".drv") && s.len() > 44).then_some(s)
+            })
+        }) else {
+            return; // no store to read; the assertion would say nothing
+        };
+        let out = out.as_str();
+        std::env::set_var("outputs", "out");
+        std::env::set_var("out", out);
+        let re =
+            regex::Regex::new(r"/nix/store\/[a-z0-9]{32}-[0-9a-zA-Z\+\-\._\?=]+").expect("regex");
+        let cmdline = format!("gcc -I{out}/private/nss -I{out}/public/nss -c a.c -o a.o");
+        let got = super::extract_store_paths(&store, &re, &cmdline).expect("extract");
+        assert!(
+            got.is_empty(),
+            "the outer output leaked in as an input: {got:?}"
+        );
+
+        // THE CONTROL, and it is what makes the assertion above mean
+        // something: with the outer output unnamed, the same command line
+        // yields the same path as an input. So the guard is what rejects
+        // it, not the existence check it sits behind.
+        std::env::remove_var("out");
+        std::env::remove_var("outputs");
+        let control = super::extract_store_paths(&store, &re, &cmdline).expect("extract");
+        assert!(
+            !control.is_empty(),
+            "the fixture cannot discriminate: nothing extracts this path even unguarded"
+        );
     }
 }
