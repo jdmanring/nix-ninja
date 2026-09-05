@@ -668,7 +668,18 @@ impl Runner {
     // Build systems like Meson may generate files via `configure_file` that are
     // not listed as implicit inputs in the build.ninja file. So we must read
     // the build directory and consider them implict inputs for all tasks.
-    pub fn read_build_dir(&mut self, files: &mut graph::GraphFiles) -> Result<()> {
+    pub fn read_build_dir(&mut self, graph: &mut graph::Graph) -> Result<()> {
+        // A DEPFILE IS AN EDGE'S PRODUCT WITHOUT A NODE. The graph declares
+        // it on the edge (`depfile =`), the compiler writes it, and it is
+        // placed as a copy after a pass, so the next pass's walk found it
+        // as an undeclared file: brotli's install pass took 40 depfiles
+        // into every blanket-taking task (13 entries became 53, B, eb94be4).
+        let depfiles: HashSet<String> = graph
+            .builds
+            .all_ids()
+            .filter_map(|id| graph.builds[id].depfile.clone())
+            .collect();
+        let files = &mut graph.files;
         for entry in WalkDir::new(&self.config.build_dir)
             .into_iter()
             .filter_entry(|e| {
@@ -702,9 +713,10 @@ impl Runner {
                 .map(|r| r.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let produced = matches!(disposition, BuildDirDisposition::Upload)
-                && files
-                    .lookup(&rel)
-                    .is_some_and(|f| files.by_id[f].input.is_some());
+                && (depfiles.contains(rel.as_str())
+                    || files
+                        .lookup(&rel)
+                        .is_some_and(|f| files.by_id[f].input.is_some()));
             if std::env::var_os("NIX_NINJA_DIAG").is_some() {
                 let d = match &disposition {
                     BuildDirDisposition::Alias(l, t) => format!("alias {l} -> {t}"),

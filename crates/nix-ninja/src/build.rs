@@ -119,7 +119,7 @@ pub fn build(
     // implicit-input blanket, so the walk bought it nothing; its headers
     // arrive through deps = gcc.
     if std::env::var_os("NIX_NINJA_NO_BUILD_DIR_SCAN").is_none() {
-        runner.read_build_dir(&mut loader.graph.files)?;
+        runner.read_build_dir(&mut loader.graph)?;
     }
 
     let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner);
