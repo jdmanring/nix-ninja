@@ -12,7 +12,7 @@
 //! covers its own crate, so a test added there re-keys every banked per-TU
 //! output. These reach the same `pub` functions from outside it.
 
-use nix_ninja_task::derived_file::{alias_link_target, placement_link_text};
+use nix_ninja_task::derived_file::{alias_link_target, placement_link_text, store_output};
 use std::path::{Path, PathBuf};
 
 fn dir(tag: &str) -> PathBuf {
@@ -105,16 +105,10 @@ fn the_alias_resolves_after_a_store_and_place_round_trip() {
     std::fs::write(build.join("libfoo.so.1.2.3"), b"ELF-LIBRARY").unwrap();
     std::os::unix::fs::symlink("libfoo.so.1.2.3", build.join("libfoo.so.1")).unwrap();
 
-    // Store, the way copy_outputs_to_placeholders does.
+    // Store through the task binary's own step, not a re-statement of it:
+    // the production call once reverted to a copy with this test green.
     for name in ["libfoo.so.1.2.3", "libfoo.so.1"] {
-        let src = build.join(name);
-        let dst = store.join(name);
-        match alias_link_target(&src) {
-            Some(text) => std::os::unix::fs::symlink(text, &dst).unwrap(),
-            None => {
-                std::fs::copy(&src, &dst).unwrap();
-            }
-        }
+        store_output(&build.join(name), &store.join(name)).unwrap();
     }
     assert!(
         std::fs::symlink_metadata(store.join("libfoo.so.1"))

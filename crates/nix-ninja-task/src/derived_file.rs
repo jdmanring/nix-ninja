@@ -374,6 +374,125 @@ pub fn create_symlinks(
     Ok(())
 }
 
+/// Store one output at its placeholder path. The alias, directory and
+/// plain-file cases are decided here so a test outside this crate's
+/// fileset can run the same step the task binary runs.
+pub fn store_output(build_path: &Path, target_path: &Path) -> Result<()> {
+    // A DIRECTORY OUTPUT IS THE ONLY WAY TO CARRY WHAT A RULE DOES NOT
+    // DECLARE. syncqt writes hundreds of forwarding headers whose names
+    // ninja never knows, so the driver declares the TREE and this copies
+    // whatever is in it. fs::copy is file-to-file and would fail with
+    // EISDIR here, which reads as a permissions problem.
+    // AN OUTPUT THAT IS A SYMLINK IS A NAME, AND `fs::copy` FOLLOWS IT.
+    // A link edge declares `libfoo.so.1.2.3`, `libfoo.so.1` and
+    // `libfoo.so` as three outputs, and the command - `cmake -E
+    // cmake_symlink_library` - writes one library and two links to it.
+    // Copying through them stored three real files of identical size,
+    // which loses the soname relationship and, because CMake's
+    // install-time RPATH rewrite skips a path it believes is a link,
+    // shipped the alias with its build-tree RPATH intact. brotli failed
+    // nixpkgs' forbidden-reference audit that way.
+    //
+    // The LINK TEXT is what is stored, not a resolved path. Each output
+    // is its own store object, so a target naming a sibling resolves
+    // against the build directory and nowhere else - which is where
+    // `create_symlinks` recreates it. Same reasoning as the
+    // NIX_NINJA_ALIASES mechanism, which carries text for the same
+    // reason and cannot cover this case: it is fed by the configure-time
+    // build-directory scan, and these links are made by an edge.
+    //
+    // Only a target confined to the link's own directory. Anything with
+    // a separator could climb out of the build tree, where nothing
+    // recreates it.
+    if let Some(target) = alias_link_target(build_path) {
+        if target_path.exists() || target_path.is_symlink() {
+            fs::remove_file(target_path).ok();
+        }
+        symlink(&target, target_path).map_err(|e| {
+            anyhow::anyhow!(
+                "symlink({} -> {}) for alias output: {e}",
+                target_path.display(),
+                target.display()
+            )
+        })?;
+        return Ok(());
+    }
+    if build_path.is_dir() {
+        copy_tree(build_path, target_path)?;
+        return Ok(());
+    }
+    fs::copy(build_path, target_path).map_err(|e| {
+        anyhow::anyhow!(
+            "copy({} -> {}): {e}",
+            build_path.display(),
+            target_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Copy a directory recursively, following nothing. Symlinks inside a build
+/// tree point at materialized inputs, so copying the LINK would carry a path
+/// that does not exist on the far side; copying what it resolves to is what
+/// the consumer needs.
+pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)
+        .map_err(|e| anyhow::anyhow!("create_dir_all({}): {e}", dst.display()))?;
+    for entry in
+        fs::read_dir(src).map_err(|e| anyhow::anyhow!("read_dir({}): {e}", src.display()))?
+    {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        // metadata() follows the link; file_type() would not.
+        // A TOOL'S OWN INCREMENTAL-STATE DIRECTORY MUST NOT BE CAPTURED.
+        // syncqt writes `.syncqt_staging` beside the headers it generates
+        // and reads it to decide the sync is already done. Copying it into
+        // the tree output makes it an INPUT on the next run, syncqt then
+        // skips, and the task succeeds while generating nothing - the output
+        // is byte-identical every time, which reads as determinism rather
+        // than as a short circuit. Measured on qtsvg: eight files captured,
+        // three of them staging, and no private forwarding headers ever.
+        // Dot-directories generally, because this is what tools use for the
+        // purpose and none of them belongs in a declared output.
+        // EXCEPT `.syncqt_staging` ITSELF, since 2026-08-23: Qt's install
+        // rule installs the module's public headers FROM that directory
+        // (`file(INSTALL ... include/QtSvg/.syncqt_staging)`), so a tree
+        // without it installs a library with no headers. The short circuit
+        // the exclusion guarded against is closed at its cause instead: the
+        // syncqt branch in main() deletes any staging dir that arrived as an
+        // input before the tool runs, so syncqt never finds a sync "done".
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && name != ".syncqt_staging" {
+            continue;
+        }
+        let md = match fs::metadata(&from) {
+            Ok(m) => m,
+            // A DANGLING LINK IS NOT AN ERROR HERE. A build tree carries
+            // links to inputs that were materialized for a different task;
+            // failing on one would turn a complete output into no output.
+            Err(_) => continue,
+        };
+        if md.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            fs::copy(&from, &to).map_err(|e| {
+                anyhow::anyhow!("copy({} -> {}): {e}", from.display(), to.display())
+            })?;
+            // fs::copy carries the source mode, and a generated header is
+            // often 0444. A later task that has to overwrite it dies EACCES,
+            // which is the same defect the duplicate-output fix already met.
+            let mut perms = fs::metadata(&to)
+                .map_err(|e| anyhow::anyhow!("metadata({}): {e}", to.display()))?
+                .permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(&to, perms);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod link_tree_tests {
     use super::link_tree;
@@ -461,6 +580,34 @@ mod link_tree_tests {
         // what is missing rather than overwrite it.
         assert_eq!(fs::read(dst.join("shared.h")).unwrap(), b"declared output");
         assert!(!dst.join("shared.h").is_symlink());
+    }
+
+    /// The skip guard has two halves, `exists()` and `is_symlink()`, and
+    /// the arm above pre-places a REGULAR file, which the first half alone
+    /// rejects. An alias output is placed as a DANGLING link, for which
+    /// `exists()` answers no; only `is_symlink()` keeps link_tree from
+    /// failing with EEXIST on top of it. Reverting that half fails here.
+    #[test]
+    fn a_dangling_link_already_at_the_destination_is_left_alone() {
+        let t = Tmp::new("dangling");
+        let src = t.path().join("src");
+        let dst = t.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("libfoo.so"), b"from the tree").unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        std::os::unix::fs::symlink("libfoo.so.1.2.3", dst.join("libfoo.so")).unwrap();
+        assert!(
+            !dst.join("libfoo.so").exists(),
+            "the fixture must be DANGLING"
+        );
+
+        link_tree(&src, &dst).unwrap();
+
+        assert_eq!(
+            fs::read_link(dst.join("libfoo.so")).unwrap(),
+            Path::new("libfoo.so.1.2.3"),
+            "the placed alias must survive the tree walk"
+        );
     }
 
     #[test]

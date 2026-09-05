@@ -1063,6 +1063,41 @@ mod tests {
     /// so two scanning tests in parallel see each other's increments.
     static SCAN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// One scratch directory per test, UNIQUE PER RUN. Twelve fixtures here
+    /// were named by pid alone and cleared with a blind `remove_dir_all`:
+    /// 730 leftovers on disk against a `pid_max` of 32768, so names recur
+    /// and the clear's failure cannot report. A pid, a monotonic clock and a
+    /// counter never recur; `create_dir` fails loudly if they ever do.
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p =
+                std::env::temp_dir().join(format!("nn-{tag}-{}-{nanos}-{n}", std::process::id()));
+            std::fs::create_dir(&p).unwrap();
+            Scratch(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // Litter, never a collision: the next run gets a fresh name.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The scan counters are global; a test that asserts on them while
+    /// holding this lock and FAILS poisons it, and every later taker died
+    /// on the poison rather than on itself: nine cascades from one root,
+    /// reproduced at load 36. Recover the guard, so a red arm is the arm.
+    fn scan_lock() -> std::sync::MutexGuard<'static, ()> {
+        SCAN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn function_like_computed_include_reports_the_scan_incomplete() {
         // cmake's kwsys, 2026-08-24: kwsysPrivate.h defines
@@ -1074,11 +1109,9 @@ mod tests {
         // silent: the driver declared the task's inputs from a scan that
         // had quietly dropped the directive, and every kwsys TU died on a
         // missing cmsys/ header.
-        let _g = SCAN_TEST_LOCK.lock().unwrap();
-        let d = std::env::temp_dir().join(format!("nnkw{}", std::process::id()));
-        // Named by pid alone, so a previous run of this same test can leave the
-        // directory behind and `create_dir_all` then races its contents.
-        let _ = std::fs::remove_dir_all(&d);
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nnkw");
+        let d = _scratch.0.clone();
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join("kwsysPrivate.h"),
@@ -1128,11 +1161,9 @@ mod tests {
         // LZO_SEARCH_MATCH_INCLUDE_FILE` and the define lives in a config
         // header the same TU includes earlier. Same-file resolution cannot
         // see it; the walk-level table must.
-        let _g = SCAN_TEST_LOCK.lock().unwrap();
-        let d = std::env::temp_dir().join(format!("nnxf{}", std::process::id()));
-        // Named by pid alone, so a previous run of this same test can leave the
-        // directory behind and `create_dir_all` then races its contents.
-        let _ = std::fs::remove_dir_all(&d);
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nnxf");
+        let d = _scratch.0.clone();
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("config.h"), "#define SM_FILE \"sm_impl.h\"\n").unwrap();
         std::fs::write(d.join("body.h"), "#include SM_FILE\n").unwrap();
@@ -1167,9 +1198,9 @@ mod tests {
         // `#include MACRO`. The same-file resolution alone declares only
         // the default; the preprocessor picks the root's value. Both must
         // be declared.
-        let _g = SCAN_TEST_LOCK.lock().unwrap();
-        let d = std::env::temp_dir().join(format!("nn-gd-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nn-gd");
+        let d = _scratch.0.clone();
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(
             d.join("root.c"),
@@ -1205,9 +1236,9 @@ mod tests {
         // libpng mips_init.c: the computed include's value resolves via
         // -I. (build root), not the includer's own dir; joining the
         // includer dir fabricated mips/contrib/... which exists nowhere.
-        let _g = SCAN_TEST_LOCK.lock().unwrap();
-        let d = std::env::temp_dir().join(format!("nn-head-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nn-head");
+        let d = _scratch.0.clone();
         std::fs::create_dir_all(d.join("contrib")).unwrap();
         std::fs::create_dir_all(d.join("mips")).unwrap();
         std::fs::write(d.join("contrib/x.c"), "\n").unwrap();
@@ -1239,11 +1270,9 @@ mod tests {
         // global too, so a test that parses without this lock is counted by
         // whichever test is reading those counters at the time. That is the
         // whole of the intermittent "parsed exactly once: left 2".
-        let _g = SCAN_TEST_LOCK.lock().unwrap();
-        let dir = std::env::temp_dir().join(format!("nn-nasm-{}", std::process::id()));
-        // Named by pid alone, so a previous run of this same test can leave the
-        // directory behind and `create_dir_all` then races its contents.
-        let _ = std::fs::remove_dir_all(&dir);
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nn-nasm");
+        let dir = _scratch.0.clone();
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("cpuid.asm");
         std::fs::write(&src, b"; x86 helpers\n%include \"ext/x86/x86inc.asm\"\n%include\t\"config.asm\"\ncglobal cpu_cpuid\n").unwrap();
@@ -1265,16 +1294,14 @@ mod tests {
         // global too, so a test that parses without this lock is counted by
         // whichever test is reading those counters at the time. That is the
         // whole of the intermittent "parsed exactly once: left 2".
-        let _g = SCAN_TEST_LOCK.lock().unwrap();
+        let _g = scan_lock();
         // groff's lbp.cpp: an ISO-8859 byte in a comment on line 2, every
         // include after it. The old lines()-based loop broke at the bad
         // byte and declared ZERO includes; the task then died on the first
         // missing header. The scan must survive the byte and keep every
         // directive that follows it.
-        let dir = std::env::temp_dir().join(format!("nn-8859-{}", std::process::id()));
-        // Named by pid alone, so a previous run of this same test can leave the
-        // directory behind and `create_dir_all` then races its contents.
-        let _ = std::fs::remove_dir_all(&dir);
+        let _scratch = Scratch::new("nn-8859");
+        let dir = _scratch.0.clone();
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("lbp.cpp");
         let mut body = b"/*\n   Written by Francisco Andr\xe9s Verd\xfa\n*/\n".to_vec();
@@ -1296,8 +1323,9 @@ mod tests {
         // `#  include`. The first fix matched the glued literal only, so
         // lzo failed a second time on the identical symptom with the fix
         // for it already shipped. Same fixture, indented spelling.
-        let _g = SCAN_TEST_LOCK.lock().unwrap();
-        let f = std::env::temp_dir().join(format!("nn-sp-test-{}.c", std::process::id()));
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nn-sp-test");
+        let f = _scratch.0.join("t.c");
         std::fs::write(&f, "#  define SM_INC \"sm2_impl.h\"\n#  include SM_INC\n").unwrap();
         let dirs = super::scan_directives(&f).unwrap();
         let names: Vec<String> = dirs
@@ -1318,9 +1346,9 @@ mod tests {
         // compiler resolves the nested quoted include at the SPELLED
         // location, so the scan must declare it there too, not only at
         // the canonical source spelling.
-        let _g = SCAN_TEST_LOCK.lock().unwrap();
-        let d = std::env::temp_dir().join(format!("nn-nspr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nn-nspr");
+        let d = _scratch.0.clone();
         for sub in ["pr/include/obsolete", "dist/include/nspr/obsolete", "lib"] {
             std::fs::create_dir_all(d.join(sub)).unwrap();
         }
@@ -1368,8 +1396,9 @@ mod tests {
 
     #[test]
     fn computed_include_through_same_file_define_is_declared() {
-        let _g = SCAN_TEST_LOCK.lock().unwrap();
-        let f = std::env::temp_dir().join(format!("nn-ci-test-{}.c", std::process::id()));
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nn-ci-test");
+        let f = _scratch.0.join("t.c");
         std::fs::write(&f, "#define SIMD_HEADER \"simd-support/simd-sse2.h\"\n#include SIMD_HEADER\n#include <math.h>\n#define FN(x) \"not-a-path\"\n#include UNKNOWN_MACRO\n").unwrap();
         let dirs = super::scan_directives(&f).unwrap();
         let names: Vec<String> = dirs
@@ -1421,6 +1450,35 @@ mod tests {
         assert_eq!(miss, None);
     }
 
+    /// A MISS SATISFIED BY ENOENT PROVES NOTHING ABOUT THE MAP: the arm
+    /// above's miss is `None` whether the map was consulted or not, because
+    /// nothing at that path exists on disk. Here the missed path EXISTS, so
+    /// the only correct answer is its canonical disk path - a map that
+    /// over-matched (answering `c.h` from the `b.h` entry) and a map that
+    /// swallowed every probe both fail this.
+    #[test]
+    fn a_map_miss_falls_through_to_the_disk() {
+        let _scratch = Scratch::new("vmiss");
+        let root = _scratch.0.clone();
+        std::fs::create_dir_all(root.join("gen/a")).unwrap();
+        std::fs::write(root.join("gen/a/c.h"), b"on disk").unwrap();
+        let mut vp = HashMap::new();
+        vp.insert(root.join("gen/a/b.h"), PathBuf::from("/store/x-b.h"));
+
+        let hit = canonicalize_cached(root.join("gen/a/b.h"), Some(&vp)).unwrap();
+        assert_eq!(
+            hit,
+            Some(PathBuf::from("/store/x-b.h")),
+            "absent on disk, answered by the map"
+        );
+        let miss = canonicalize_cached(root.join("gen/a/c.h"), Some(&vp)).unwrap();
+        assert_eq!(
+            miss,
+            Some(root.join("gen/a/c.h").canonicalize().unwrap()),
+            "not in the map, answered by the disk"
+        );
+    }
+
     // Upstream PR 56 ships the regex widening with no test. An inference rule
     // with no test is how the eight input classes this fork carries were each
     // found the expensive way - as a resolved-derivation failure thousands of
@@ -1468,12 +1526,10 @@ mod tests {
     /// the build silently stops tracking a header.
     #[test]
     fn directive_cache_hits_across_tus_and_invalidates_on_edit() {
-        let _g = SCAN_TEST_LOCK.lock().unwrap();
+        let _g = scan_lock();
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("nnscan{}", std::process::id()));
-        // Named by pid alone, so a previous run of this same test can leave the
-        // directory behind and `create_dir_all` then races its contents.
-        let _ = std::fs::remove_dir_all(&dir);
+        let _scratch = Scratch::new("nnscan");
+        let dir = _scratch.0.clone();
         std::fs::create_dir_all(&dir).unwrap();
         let h = dir.join("shared.h");
         std::fs::File::create(&h)
@@ -1523,10 +1579,9 @@ mod tests {
     /// instead of failing the task.
     #[test]
     fn a_declared_virtual_header_that_does_not_exist_yet_scans_as_empty() {
-        let d = std::env::temp_dir().join(format!("nnvirt{}", std::process::id()));
-        // Named by pid alone, so a previous run of this same test can leave the
-        // directory behind and `create_dir_all` then races its contents.
-        let _ = std::fs::remove_dir_all(&d);
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nnvirt");
+        let d = _scratch.0.clone();
         std::fs::create_dir_all(&d).unwrap();
         let tu = d.join("nix-channel.cc");
         // Exactly nix's spelling: a quoted include of a .gen.hh that meson
@@ -1573,10 +1628,9 @@ mod tests {
     /// A file NOT declared virtual still fails loudly.
     #[test]
     fn a_missing_header_that_was_never_declared_virtual_still_fails() {
-        let d = std::env::temp_dir().join(format!("nnvirtneg{}", std::process::id()));
-        // Named by pid alone, so a previous run of this same test can leave the
-        // directory behind and `create_dir_all` then races its contents.
-        let _ = std::fs::remove_dir_all(&d);
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nnvirtneg");
+        let d = _scratch.0.clone();
         std::fs::create_dir_all(&d).unwrap();
         let absent = d.join("not-generated-by-anything.h");
         assert!(!absent.exists());
