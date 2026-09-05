@@ -110,13 +110,13 @@ impl Tools {
         })
     }
 
-    /// The compiler. Every task derivation lists it as an input and puts
-    /// it on the sandbox PATH (`build_task_derivation`), compile edge or
-    /// not, so a build with no compile edge still fails here without one.
-    /// Dropping it from non-compile tasks would re-key every task.
+    /// The compiler, for a task whose command names a toolchain program
+    /// or whose edge is `deps = gcc` (`command_names_toolchain` in
+    /// `build_task_derivation`); any other task carries neither the
+    /// wrapper nor its 27-path closure.
     pub fn require_cc(&self) -> Result<&StorePath> {
         self.cc.as_ref().ok_or_else(|| {
-            anyhow!("`cc` is not on PATH; every task derivation needs the compiler as an input")
+            anyhow!("`cc` is not on PATH, and this task names a compiler or binutils program")
         })
     }
 }
@@ -2945,8 +2945,20 @@ fn build_task_derivation(
     // Needed by all tasks.
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.bash.clone()));
-    drv.inputs
-        .insert(SingleDerivedPath::Opaque(tools.require_cc()?.clone()));
+    // THE COMPILER ONLY WHERE THE COMMAND NAMES ONE. The wrapper's closure
+    // is 27 store paths against 14 for every other tool a task carries,
+    // and under a round each path in a task's closure is one acquisition
+    // of the daemon's store mutex at realise (consumer's profile,
+    // 2026-09-04). A generator, a `cmake -E` step or a python script
+    // gets a 14-path closure; anything naming cc, ld, ar, gfortran and
+    // the rest by any spelling keeps it, as does every `deps = gcc`
+    // edge. A script that execs the compiler without naming it on the
+    // command line fails LOUDLY with "cc: not found", never silently.
+    let needs_cc = task.deps.as_deref() == Some("gcc") || command_names_toolchain(cmdline);
+    if needs_cc {
+        drv.inputs
+            .insert(SingleDerivedPath::Opaque(tools.require_cc()?.clone()));
+    }
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.coreutils.clone()));
     drv.inputs
@@ -3466,12 +3478,15 @@ fn build_task_derivation(
 
     {
         // Prepare $PATH to have coreutils and bash.
-        let mut path: Vec<String> = vec![
-            format!("{}/bin", task.store_dir.display(&tools.bash)),
-            format!("{}/bin", task.store_dir.display(tools.require_cc()?)),
-            format!("{}/bin", task.store_dir.display(&tools.coreutils)),
-            format!("{}/bin", task.store_dir.display(&tools.patchelf)),
-        ];
+        let mut path: Vec<String> = vec![format!("{}/bin", task.store_dir.display(&tools.bash))];
+        if needs_cc {
+            path.push(format!(
+                "{}/bin",
+                task.store_dir.display(tools.require_cc()?)
+            ));
+        }
+        path.push(format!("{}/bin", task.store_dir.display(&tools.coreutils)));
+        path.push(format!("{}/bin", task.store_dir.display(&tools.patchelf)));
         // See SCRIPT_TOOLS: a generator edge execs these and a missing one
         // fails silently, with a zero exit status and an empty output file.
         for sp in &tools.script_tools {
@@ -3585,9 +3600,9 @@ fn build_task_derivation(
         // and the per-TU bank is the whole point of this tool. `-flto=1` is
         // serial by request and bare `-flto` asks for no parallelism, so
         // neither needs `make`; `auto` and `jobserver` do.
-        let cc_dir: Option<PathBuf> = tools
-            .require_cc()
-            .ok()
+        let cc_dir: Option<PathBuf> = needs_cc
+            .then(|| tools.require_cc().ok())
+            .flatten()
             .map(|cc| PathBuf::from(task.store_dir.display(cc).to_string()));
         if lto_needs_make(cmdline, cc_dir.as_deref()) {
             if let Ok(Some(sp)) = which_store_path_opt(&task.store_dir, "make") {
@@ -10351,6 +10366,54 @@ fn python_module_candidates(module: &str, roots: &[String]) -> Vec<String> {
 /// assignment failed the task as a missing tool, and resolving `env` left
 /// the real program off the sandbox PATH. GN quotes interpreter paths, and the
 /// shell strips those at exec time, so they are stripped here too.
+/// Does the command name a toolchain program, by the basename of any
+/// token? Matched by SPELLING, not by position: a link runs `gcc` after
+/// `&&`, meson archives with `gcc-ar` inside `sh -c`, and a compiler
+/// named by store path still ends in `/gcc`. The set is the C, C++ and
+/// Fortran drivers plus binutils, which the cc wrapper reaches through
+/// `-B` and a script reaches through PATH.
+fn command_names_toolchain(cmdline: &str) -> bool {
+    const TOOLS: [&str; 26] = [
+        "cc",
+        "c++",
+        "cpp",
+        "gcc",
+        "g++",
+        "gfortran",
+        "f95",
+        "f77",
+        "clang",
+        "clang++",
+        "ld",
+        "ld.bfd",
+        "ld.gold",
+        "ld.lld",
+        "lld",
+        "as",
+        "ar",
+        "nm",
+        "ranlib",
+        "strip",
+        "objcopy",
+        "objdump",
+        "readelf",
+        "gcc-ar",
+        "gcc-nm",
+        "gcc-ranlib",
+    ];
+    cmdline
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ';' | '|' | '&' | '(' | ')' | '<' | '>' | '"' | '\'' | '`' | '='
+                )
+        })
+        .filter(|t| !t.is_empty())
+        .map(|t| t.rsplit('/').next().unwrap_or(t))
+        .any(|base| TOOLS.contains(&base))
+}
+
 fn command_program(cmdline: &str) -> Option<&str> {
     let mut toks = cmdline.split_whitespace();
     loop {
@@ -12087,6 +12150,30 @@ mod gcc_toolchain_tool_tests {
     fn the_family_is_three() {
         let got = gcc_toolchain_tools_named("sh -c \"gcc-ranlib x.a && gcc-nm x.a\"");
         assert_eq!(got, vec!["gcc-nm", "gcc-ranlib"]);
+    }
+}
+
+#[cfg(test)]
+mod command_names_toolchain_tests {
+    use super::command_names_toolchain as names;
+
+    #[test]
+    fn a_compiler_by_any_spelling_is_named() {
+        assert!(names("gcc -c a.c -o a.o"));
+        assert!(names(
+            "/nix/store/abc-gcc-wrapper-15.2.0/bin/g++ -o app main.o"
+        ));
+        assert!(names("cd sub && gfortran -c m.f90"));
+        assert!(names("/bin/sh -c \"rm -f x.a && gcc-ar csrDT x.a x.o\""));
+        assert!(names("CC=gcc python3 build.py"));
+    }
+
+    #[test]
+    fn a_generator_is_not() {
+        assert!(!names("python3 gen.py --out gen.h"));
+        assert!(!names("cmake -E copy_if_different a b"));
+        assert!(!names("./gen.sh out.txt"));
+        assert!(!names("glib-mkenums --template t.h.in a.h"));
     }
 }
 
