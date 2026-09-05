@@ -606,26 +606,23 @@ impl Runner {
             if key.starts_with("NIX_CFLAGS_COMPILE") {
                 *value = remove_frandom_seed(value);
             }
-            // SAME CLASS, OTHER VARIABLE. In a drop-in the outer
-            // derivation's cc-wrapper puts `-rpath $out/lib` into
-            // NIX_LDFLAGS, and $out is the OUTER output path: it moves with
-            // every change to the outer derivation, a source edit included,
-            // so every task re-keyed on it and a one-line edit rebuilt all
-            // 105 of qtsvg's TUs (measured 2026-08-23, after the input
-            // blanket was already off for compiles - this was the last
-            // term). Nothing inside a task needs it: a compile never links,
-            // and the install step rewrites RPATH off the build tree anyway.
-            if key.starts_with("NIX_LDFLAGS") {
-                let before = value.clone();
-                *value = remove_outer_rpath(value);
-                if std::env::var_os("NIX_NINJA_DIAG").is_some() {
-                    eprintln!(
-                        "nix-ninja: DIAG {key} outer={:?} before=[{}] after=[{}]",
-                        outer_output_paths(),
-                        &before[..before.len().min(120)],
-                        &value[..value.len().min(120)]
-                    );
-                }
+            // The outer derivation's cc-wrapper puts `-rpath $lib/lib` into
+            // NIX_LDFLAGS. That pair used to be DROPPED here so that $lib,
+            // which moves with every change to the outer derivation, did
+            // not key every task (qtsvg: one edit rebuilt 105 TUs,
+            // 2026-08-23). The placeholder rewrite below keeps the key
+            // stable with the pair kept, and a LINK task needs it: without
+            // it the linked library's only route to its sibling was the
+            // sibling's task-output directory that assemble_rpath appends,
+            // which CMake's installer does not replace and fixup's shrink
+            // then keeps, so the installed library carried a task output in
+            // its RUNPATH and closure (brotli, configuration B, 2026-09-04).
+            if key.starts_with("NIX_LDFLAGS") && std::env::var_os("NIX_NINJA_DIAG").is_some() {
+                eprintln!(
+                    "nix-ninja: DIAG {key} outer={:?} value=[{}]",
+                    outer_output_paths(),
+                    &value[..value.len().min(160)]
+                );
             }
         }
 
@@ -4252,10 +4249,9 @@ mod lto_make_gate_tests {
 /// when it materializes an output into the build tree (`local.rs`).
 pub fn outer_rewrite_map() -> Vec<(String, String)> {
     let store_dir = std::env::var("NIX_STORE").unwrap_or_else(|_| "/nix/store".into());
-    std::env::var("outputs")
-        .unwrap_or_else(|_| "out".into())
-        .split_whitespace()
-        .filter_map(|name| std::env::var(name).ok().map(|p| (name.to_string(), p)))
+    outer_output_names()
+        .into_iter()
+        .filter_map(|name| std::env::var(&name).ok().map(|p| (name, p)))
         .filter_map(|(name, real)| {
             // /nix/store/<32 base32 chars>-<rest>
             let rel = real.strip_prefix(&format!("{store_dir}/"))?;
@@ -4315,12 +4311,38 @@ pub fn outer_restore_map() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The outer derivation's output paths, from the `outputs` env var the
-/// builder is given (`$out`, `$dev`, ...). Empty outside a build.
+/// The outer derivation's output NAMES. A plain derivation exports them as
+/// the `outputs` variable; under `__structuredAttrs` no attribute is an
+/// environment variable and the names are the keys of `outputs` in the
+/// file `NIX_ATTRS_JSON_FILE` names. Reading only the variable left a
+/// structured-attrs build with `out` alone: `$lib` and `$dev` were never
+/// rewritten to placeholders, so every task of a multi-output package keyed
+/// on them, and the self-rpath naming `$lib` was neither dropped nor
+/// rewritten (brotli on the consumer's route, 2026-09-04). Each output's
+/// PATH is its own variable in both modes.
+fn outer_output_names() -> Vec<String> {
+    if let Ok(v) = std::env::var("outputs") {
+        return v.split_whitespace().map(str::to_string).collect();
+    }
+    if let Some(names) = std::env::var_os("NIX_ATTRS_JSON_FILE")
+        .and_then(|f| std::fs::read(f).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| {
+            v.get("outputs")?
+                .as_object()
+                .map(|o| o.keys().cloned().collect::<Vec<_>>())
+        })
+    {
+        return names;
+    }
+    vec!["out".to_string()]
+}
+
+/// The outer derivation's output paths (`$out`, `$dev`, ...). Empty
+/// outside a build.
 fn outer_output_paths() -> Vec<String> {
-    std::env::var("outputs")
-        .unwrap_or_else(|_| "out".into())
-        .split_whitespace()
+    outer_output_names()
+        .into_iter()
         .filter_map(|o| std::env::var(o).ok())
         .collect()
 }
@@ -9952,32 +9974,6 @@ pub fn discover_c_includes(
     })
 }
 
-/// Drop every `-rpath <path>` pair whose path names one of the OUTER
-/// derivation's outputs ($out, $dev, ... as the `outputs` env lists them).
-/// Other rpath entries (store libraries) are inputs and stay. A link task
-/// that loses its own lib directory this way is left with the sibling's
-/// task-output directory that `assemble_rpath` appends, and CMake's install
-/// step does not put the lib directory back; measured on brotli under
-/// configuration B, open in the pending record.
-fn remove_outer_rpath(value: &str) -> String {
-    let outer = outer_output_paths();
-    let toks: Vec<&str> = value.split_whitespace().collect();
-    let mut out: Vec<&str> = Vec::with_capacity(toks.len());
-    let mut i = 0;
-    while i < toks.len() {
-        if toks[i] == "-rpath"
-            && i + 1 < toks.len()
-            && outer.iter().any(|o| toks[i + 1].starts_with(o.as_str()))
-        {
-            i += 2;
-            continue;
-        }
-        out.push(toks[i]);
-        i += 1;
-    }
-    out.join(" ")
-}
-
 /// The build-path field of an encoded `store:build_path:rel` input.
 fn encoded_build_path(e: &str) -> &str {
     e.split(':').nth(1).unwrap_or(e)
@@ -10786,22 +10782,71 @@ mod ninja_pool_tests {
     }
 
     #[test]
-    fn remove_outer_rpath_strips_the_out_lib_pair() {
+    fn a_self_rpath_is_forwarded_as_a_placeholder_not_dropped() {
         let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("outputs", "out dev");
+        std::env::set_var("outputs", "out lib");
         std::env::set_var(
             "out",
-            "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-cc-dropin-1.2.16.1",
+            "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-brotli-1.2.0",
+        );
+        std::env::set_var(
+            "lib",
+            "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-brotli-1.2.0-lib",
+        );
+        let v = "-rpath /nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-brotli-1.2.0-lib/lib -L/nix/store/klkb81wkzlz3bpfv6brnh3gwcapy5b4w-boost-1.89.0/lib";
+        let fwd = super::rewrite_str(v, &super::outer_rewrite_map());
+        assert!(
+            fwd.starts_with("-rpath /nix/store/"),
+            "the pair is kept: {fwd}"
+        );
+        assert!(
+            !fwd.contains("npbwm562dyvwjim6j7qa1cish2vxlqr0"),
+            "and names the placeholder: {fwd}"
+        );
+        assert_eq!(fwd.len(), v.len());
+    }
+    #[test]
+    fn output_names_come_from_the_attrs_file_under_structured_attrs() {
+        let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("outputs");
+        let d = std::env::temp_dir().join(format!(
+            "nn-attrs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&d).unwrap();
+        let f = d.join(".attrs.json");
+        std::fs::write(
+            &f,
+            br#"{"outputs":{"out":"/o","dev":"/d","lib":"/l"},"name":"x"}"#,
+        )
+        .unwrap();
+        std::env::set_var("NIX_ATTRS_JSON_FILE", &f);
+        std::env::set_var(
+            "out",
+            "/nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-brotli-1.2.0",
         );
         std::env::set_var(
             "dev",
-            "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-alsa-lib-cc-dropin-1.2.16.1-dev",
+            "/nix/store/8xflmr65ja7ydycn7gxzcnipi7l9wip4-brotli-1.2.0-dev",
         );
-        let v = "-rpath /nix/store/29byqlv4flilwli8hc23rm9v1cpn32pl-alsa-lib-cc-dropin-1.2.16.1/lib  -L/nix/store/klkb81wkzlz3bpfv6brnh3gwcapy5b4w-boost-1.89.0/lib";
+        std::env::set_var(
+            "lib",
+            "/nix/store/npbwm562dyvwjim6j7qa1cish2vxlqr0-brotli-1.2.0-lib",
+        );
+        let mut names = super::outer_output_names();
+        names.sort();
+        assert_eq!(names, vec!["dev", "lib", "out"]);
         assert_eq!(
-            super::remove_outer_rpath(v),
-            "-L/nix/store/klkb81wkzlz3bpfv6brnh3gwcapy5b4w-boost-1.89.0/lib"
+            super::outer_rewrite_map().len(),
+            3,
+            "all three outputs get placeholders"
         );
+        std::env::remove_var("NIX_ATTRS_JSON_FILE");
+        std::fs::remove_dir_all(&d).ok();
     }
 
     use super::pool_permits_from_depths;
