@@ -2992,10 +2992,20 @@ fn build_task_derivation(
     // placeholder would be baked into checksummed LTO bytecode, so the
     // equal-length byte rewrite that restores it cannot reach it.
     let lto_raw = task.deps.as_deref() == Some("gcc") && task_is_lto(cmdline, &task.wrapper_vars);
+    // Mirror any include directory the command names inside the outer
+    // derivation's own output. Computed BEFORE the placeholder rewrite,
+    // because the rewrite is what makes the outer path unrecognisable, and
+    // empty for every command that names no such directory.
+    let outer_mirror = outer_include_mirror_flags(cmdline, &outer_output_paths());
     let cmdline = &if lto_raw {
         cmdline.to_string()
     } else {
         rewrite_str(cmdline, &outer_rewrite_map())
+    };
+    let cmdline = &if outer_mirror.is_empty() {
+        cmdline.clone()
+    } else {
+        format!("{cmdline} {}", outer_mirror.join(" "))
     };
     drv.args.push(cmdline.to_string().into_bytes().into());
 
@@ -10318,6 +10328,116 @@ mod dotdot_dirs_env_tests {
     }
 }
 
+/// Extra include flags mirroring every include directory the command names
+/// INSIDE the outer derivation's own output.
+///
+/// A package that stages its headers into its own output and then compiles
+/// against them (nss: `-I$out/private/nss` on every command, and only the
+/// objects that open a header there fail) cannot have that directory in the
+/// sandbox: the outer output is not a valid store path while the build that
+/// produces it is running, which is what the daemon refuses. Discovery
+/// copies the headers it finds there to `OUTER_STAGE_DIR` at the outer
+/// output's own layout; this adds the matching search path so the compiler
+/// looks where they were put.
+///
+/// Returns EMPTY for a command that names no outer output, which is every
+/// task of every package that does not do this. The emitted command line is
+/// then byte for byte what it was, so nothing else is re-keyed.
+fn outer_include_mirror_flags(cmdline: &str, outer: &[String]) -> Vec<String> {
+    const FLAGS: [&str; 4] = ["-I", "-iquote", "-isystem", "-idirafter"];
+    let mut out: Vec<String> = Vec::new();
+    let args: Vec<String> = shell_words::split(cmdline).unwrap_or_default();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        // Both spellings: `-Ifoo` and `-I foo`.
+        let value = FLAGS.iter().find_map(|f| {
+            if let Some(rest) = a.strip_prefix(f) {
+                if !rest.is_empty() {
+                    return Some(rest.to_string());
+                }
+                if a == *f {
+                    return args.get(i + 1).cloned();
+                }
+            }
+            None
+        });
+        i += 1;
+        let Some(value) = value else { continue };
+        for root in outer {
+            if let Ok(rest) = Path::new(&value).strip_prefix(root) {
+                let mirrored = Path::new(OUTER_STAGE_DIR).join(rest);
+                let flag = format!("-I{}", mirrored.display());
+                if !out.contains(&flag) {
+                    out.push(flag);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod outer_include_mirror_tests {
+    const OUT: &str = "/nix/store/g7j6jqwxfpqi1lra1kixyqplbisigk6m-nss-3.112.5";
+
+    /// THE ZERO IS THE POINT. A command that names no directory inside the
+    /// outer output must produce no flags, because that is what keeps every
+    /// task of every other package off this change's key.
+    #[test]
+    fn a_command_naming_no_outer_directory_gets_no_flags() {
+        let outer = vec![OUT.to_string()];
+        let f = super::outer_include_mirror_flags(
+            "gcc -I/nix/store/aaa-nspr-dev/include -Ibuild/include -c a.c -o a.o",
+            &outer,
+        );
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    /// And the control for it: the same call with a directory inside the
+    /// outer output DOES produce one, so the assertion above is not passing
+    /// because the function never returns anything.
+    #[test]
+    fn an_include_inside_the_outer_output_is_mirrored() {
+        let outer = vec![OUT.to_string()];
+        let f = super::outer_include_mirror_flags(
+            &format!("gcc -I{OUT}/private/nss -c a.c -o a.o"),
+            &outer,
+        );
+        assert_eq!(
+            f,
+            vec![".nn-outer/private/nss"]
+                .iter()
+                .map(|d| format!("-I{d}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `-I dir` as two words, which is the spelling a hand-written rule
+    /// tends to use and the one a prefix-only parser drops.
+    #[test]
+    fn the_separated_spelling_is_read_too() {
+        let outer = vec![OUT.to_string()];
+        let f = super::outer_include_mirror_flags(
+            &format!("gcc -I {OUT}/public/nss -c a.c -o a.o"),
+            &outer,
+        );
+        assert_eq!(f, vec!["-I.nn-outer/public/nss".to_string()]);
+    }
+
+    /// Outside a build there are no outer outputs at all, so nothing fires.
+    #[test]
+    fn no_outer_outputs_means_no_flags() {
+        let f = super::outer_include_mirror_flags(&format!("gcc -I{OUT}/private/nss -c a.c"), &[]);
+        assert!(f.is_empty(), "{f:?}");
+    }
+}
+
+/// Where a header copied out of the outer derivation's own output is staged
+/// in the build directory. One directory, so the extra include paths a task
+/// carries mirror the outer output's own layout under it.
+pub const OUTER_STAGE_DIR: &str = ".nn-outer";
+
 pub struct Discovered {
     pub deps: Vec<DerivedFile>,
     pub store_paths: Vec<StorePath>,
@@ -10510,6 +10630,8 @@ pub fn discover_c_includes(
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
     let mut to_upload: Vec<PathBuf> = Vec::new();
+    // (absolute path under an outer output, where the task will stage it)
+    let mut outer_files: Vec<(PathBuf, PathBuf)> = Vec::new();
     // Discovered paths that are not on disk and were not recognised as
     // declared. See the upload guard below.
     let mut absent: Vec<PathBuf> = Vec::new();
@@ -10565,10 +10687,13 @@ pub fn discover_c_includes(
                 // needs the include path rewritten to wherever the task
                 // stages it, which is a larger change than this guard.
                 // Recorded in local/pending/next-rekey-batch.md.
-                if outer_output_paths()
-                    .iter()
-                    .any(|o| full_path == Path::new(o))
+                if let Some(root) = outer_output_paths()
+                    .into_iter()
+                    .find(|o| full_path == Path::new(o))
                 {
+                    if let Ok(rest) = include.strip_prefix(&root) {
+                        outer_files.push((include.clone(), Path::new(OUTER_STAGE_DIR).join(rest)));
+                    }
                     continue;
                 }
                 discovered_store_paths.push(store_path);
@@ -10645,6 +10770,24 @@ pub fn discover_c_includes(
             )
         })?,
     );
+
+    // A HEADER THE PACKAGE STAGED INTO ITS OWN OUTPUT IS CARRIED AS BYTES.
+    // Declaring the outer output as an input is what the daemon refuses
+    // ("path ... is not valid"), and the upload's own build path is no use
+    // either: it is not below the build directory, so it climbs out of it
+    // while the command still names the header through an absolute include
+    // path into the store. The upload is therefore restaged under
+    // OUTER_STAGE_DIR at the outer output's own layout, and the caller adds
+    // the directory to the command.
+    if !outer_files.is_empty() {
+        let (sources, staged): (Vec<PathBuf>, Vec<PathBuf>) = outer_files.into_iter().unzip();
+        let uploaded = new_opaque_files(rpc_client, build_dir, sources)
+            .context("uploading headers staged in the outer derivation's own output")?;
+        for (mut file, stage) in uploaded.into_iter().zip(staged) {
+            file.build_path = stage;
+            discovered_deps.push(file);
+        }
+    }
 
     USED_HEADERS.fetch_add(
         used_declared.len() as u64,
