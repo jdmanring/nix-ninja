@@ -110,15 +110,13 @@ impl Tools {
         })
     }
 
-    /// The compiler, for the paths that genuinely need one. A build with no
-    /// compile edges never reaches here, which is the point.
+    /// The compiler. Every task derivation lists it as an input and puts
+    /// it on the sandbox PATH (`build_task_derivation`), compile edge or
+    /// not, so a build with no compile edge still fails here without one.
+    /// Dropping it from non-compile tasks would re-key every task.
     pub fn require_cc(&self) -> Result<&StorePath> {
         self.cc.as_ref().ok_or_else(|| {
-            anyhow!(
-                "`cc` is not on PATH, and this build has a task that needs a \
-                 compiler. A build with no compile targets does not reach \
-                 this point."
-            )
+            anyhow!("`cc` is not on PATH; every task derivation needs the compiler as an input")
         })
     }
 }
@@ -4879,10 +4877,10 @@ fn patched_env_shebang(path: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     };
     // One copy per call, removed by the caller once uploaded (see
-    // `upload_temp_done`); the upload cache keyed on the source path makes
-    // a repeat call for the same script skip the write. TMP_SEQ keeps two
-    // concurrent calls from writing one file (same race as the nn-outer
-    // copies).
+    // `upload_temp_done`). A repeat call for the same script writes and
+    // removes another tiny copy, because this runs before the upload
+    // cache is consulted. TMP_SEQ keeps two concurrent calls from writing
+    // one file (same race as the nn-outer copies).
     let out = std::env::temp_dir().join(format!(
         "nn-shebang-{}-{}-{}",
         std::process::id(),
