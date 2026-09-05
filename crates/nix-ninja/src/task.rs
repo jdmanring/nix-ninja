@@ -4582,7 +4582,9 @@ fn new_opaque_file(
         &name,
         upload_src.as_deref().unwrap_or(&canonical_path),
         &canonical_path,
-    )?;
+    );
+    upload_temp_done(upload_src);
+    let store_path = store_path?;
 
     Ok(DerivedFile {
         derived_path: SingleDerivedPath::Opaque(store_path),
@@ -4691,7 +4693,9 @@ fn new_opaque_file_raw(
     let name = opaque_upload_name(&path, &canonical_path);
     let upload_src = patched_env_shebang(&canonical_path)?;
     let store_path =
-        rpc_client.add_to_store_nar(&name, upload_src.as_deref().unwrap_or(&canonical_path))?;
+        rpc_client.add_to_store_nar(&name, upload_src.as_deref().unwrap_or(&canonical_path));
+    upload_temp_done(upload_src);
+    let store_path = store_path?;
     Ok(DerivedFile {
         derived_path: SingleDerivedPath::Opaque(store_path),
         build_path: relative_path,
@@ -4796,22 +4800,14 @@ fn patched_env_shebang(path: &Path) -> Result<Option<PathBuf>> {
     }) else {
         return Ok(None);
     };
-    // Memoized per source path: the same script is uploaded once per
-    // walk memo miss, but several scripts share interpreters and the
-    // tmp copies are tiny; keyed by source so repeat calls are free.
-    static SHEBANG_MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, PathBuf>>> =
-        std::sync::OnceLock::new();
-    let memo = SHEBANG_MEMO.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    if let Some(hit) = memo.lock().unwrap().get(path) {
-        return Ok(Some(hit.clone()));
-    }
-    let dir = std::env::temp_dir().join(format!("nix-ninja-shebang-{}", std::process::id()));
-    fs::create_dir_all(&dir)?;
-    // TMP_SEQ, not memo.len(): two concurrent misses could draw the same
-    // length and write one file from two threads (same race as the
-    // nn-outer copies).
-    let out = dir.join(format!(
-        "{}-{}",
+    // One copy per call, removed by the caller once uploaded (see
+    // `upload_temp_done`); the upload cache keyed on the source path makes
+    // a repeat call for the same script skip the write. TMP_SEQ keeps two
+    // concurrent calls from writing one file (same race as the nn-outer
+    // copies).
+    let out = std::env::temp_dir().join(format!(
+        "nn-shebang-{}-{}-{}",
+        std::process::id(),
         TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         path.file_name()
             .and_then(|n| n.to_str())
@@ -4821,8 +4817,20 @@ fn patched_env_shebang(path: &Path) -> Result<Option<PathBuf>> {
     patched.extend_from_slice(&body[first_nl + 1..]);
     fs::write(&out, patched)?;
     fs::set_permissions(&out, fs::Permissions::from_mode(0o755))?;
-    memo.lock().unwrap().insert(path.to_path_buf(), out.clone());
     Ok(Some(out))
+}
+
+/// Remove the temporary copy an upload was taken from, if there was one.
+///
+/// Every rewritten upload (shebang, outer placeholder, dependency info)
+/// is a file under the temp directory that only the `add_to_store` call
+/// reads. Left behind, one per input per driver run, they filled a 16 GiB
+/// tmpfs to 4.8 GiB over four days of rounds (20,087 files) and pushed
+/// the machine into swap.
+fn upload_temp_done(upload_src: Option<PathBuf>) {
+    if let Some(tmp) = upload_src {
+        let _ = fs::remove_file(tmp);
+    }
 }
 
 /// An ABSOLUTE build_path is a sandbox escape: nix-ninja-task joins it
@@ -8274,6 +8282,9 @@ mod python_import_names_tests {
         std::fs::write(&exotic, "#!/usr/bin/env -S sh -e\nbody\n").unwrap();
         std::fs::set_permissions(&exotic, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(super::patched_env_shebang(&exotic).unwrap().is_none());
+        // The copy lives only until its upload; the caller removes it.
+        super::upload_temp_done(Some(patched.clone()));
+        assert!(!patched.exists(), "shebang copy left in the temp dir");
         std::fs::remove_dir_all(&d).unwrap();
     }
 
