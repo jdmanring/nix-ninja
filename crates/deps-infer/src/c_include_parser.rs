@@ -681,8 +681,15 @@ pub fn extract_includes(
     // `#include <alsa/sound/type_compat.h>`; canonical alone put the file
     // at include/sound/type_compat.h and the compile died "No such file"
     // (2026-08-23, the first make package through the compiler drop-in).
-    // Only relative spellings are added - an absolute spelling is a store
-    // path or a system header, where symlinks are the store's own business.
+    // A store-path spelling is not added: symlinks inside a store object
+    // are the store's own business and the object is mounted whole. Any
+    // other absolute spelling is kept, because the compiler drop-in keeps
+    // its `-I` absolute under the exact mirror (`/build/<src>/build/include`)
+    // and the spelled path is still the one the compiler opens: rdma-core
+    // links every public header into build/include and its compiles died
+    // `ccan/str.h: No such file` when only relative spellings were kept
+    // (configuration B, 2026-09-05; the same command with a relativised
+    // `-I` on configuration A carried both spellings).
     let mut dotdot_dirs: Vec<PathBuf> = Vec::new();
     {
         let mut push_both = |head: &Path, tail: &Path, canonical: PathBuf| {
@@ -696,7 +703,7 @@ pub fn extract_includes(
                 }
             }
             let spelled = lexical_normalize(&raw);
-            if spelled != canonical && spelled.is_relative() {
+            if spelled != canonical && !spelled.starts_with("/nix/store") {
                 result.push(spelled);
             }
             result.push(canonical);
@@ -1391,6 +1398,37 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("dist/include/nspr/obsolete/protypes.h")),
             "nested quoted include missing its spelled location: {names:?}"
+        );
+    }
+
+    #[test]
+    fn absolute_include_dir_over_a_link_declares_the_spelled_path() {
+        // rdma-core on the compiler drop-in, configuration B, 2026-09-05:
+        // CMake links build/include/ccan/str.h to the source tree
+        // ABSOLUTELY and the command carries `-I/build/source/build/include`
+        // verbatim under the exact mirror. The spelled path is what the
+        // compiler opens in the sandbox; keeping only relative spellings
+        // dropped it and the compile died `ccan/str.h: No such file`.
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nn-abs-link");
+        let d = _scratch.0.clone();
+        for sub in ["ccan", "build/include/ccan"] {
+            std::fs::create_dir_all(d.join(sub)).unwrap();
+        }
+        std::fs::write(d.join("ccan/str.h"), "\n").unwrap();
+        std::os::unix::fs::symlink(d.join("ccan/str.h"), d.join("build/include/ccan/str.h"))
+            .unwrap();
+        std::fs::write(d.join("ccan/str.c"), "#include <ccan/str.h>\n").unwrap();
+        let got = bfs_parse_includes(
+            vec![d.join("ccan/str.c")],
+            &[d.join("build/include")],
+            None,
+        )
+        .unwrap()
+        .includes;
+        assert!(
+            got.contains(&d.join("build/include/ccan/str.h")),
+            "absolute spelled path missing: {got:?}"
         );
     }
 
