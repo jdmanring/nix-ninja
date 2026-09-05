@@ -186,6 +186,93 @@ fn stall_allowance_s(stall_attempts: u32) -> u64 {
     300u64 << (2 * stall_attempts.min(2))
 }
 
+fn now_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Bound a daemon exchange that is not a build. The build watchdog in
+/// `build_paths_uncached` covered one of the client's six exchanges, and
+/// a driver that starts fresh for every compile (the compiler drop-in)
+/// spends its daemon time in the other five: NAR uploads of every input,
+/// the derivation upload, the text uploads. Twelve such drivers sat asleep
+/// for three hours inside a wedged daemon with nothing printed, while the
+/// ninja-route drivers, already past their uploads, aborted DaemonStalled
+/// on schedule. One allowance and no retry: an upload streams from a
+/// producer that cannot be restarted, and turning an unbounded wait into
+/// a named failure is the whole gap. Dropping the timed-out future leaves
+/// the guard dirty, so the pool discards the connection and the daemon
+/// child behind it is killed, which is what frees its locks.
+async fn bounded<T>(
+    what: &str,
+    allowance: std::time::Duration,
+    fut: impl std::future::Future<Output = std::result::Result<T, DaemonError>>,
+) -> Result<T> {
+    match tokio::time::timeout(allowance, fut).await {
+        Ok(out) => out.map_err(Error::from),
+        Err(_elapsed) => {
+            eprintln!(
+                "nix-ninja: [{}] WATCHDOG timeout on {what}: no daemon reply in {}s; \
+                 dropped the connection",
+                now_s(),
+                allowance.as_secs(),
+            );
+            Err(Error::DaemonStalled {
+                attempts: 1,
+                connect_failures: 0,
+                last_allowance_s: allowance.as_secs(),
+            })
+        }
+    }
+}
+
+/// The allowance every non-build exchange gets: the first rung of the
+/// build watchdog's ladder.
+fn upload_allowance() -> std::time::Duration {
+    std::time::Duration::from_secs(stall_allowance_s(0))
+}
+
+#[cfg(test)]
+mod bounded_exchange_tests {
+    use super::{bounded, Error};
+
+    #[test]
+    fn a_silent_exchange_ends_as_daemon_stalled() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let got = rt.block_on(bounded::<()>(
+            "probe",
+            std::time::Duration::from_millis(20),
+            std::future::pending(),
+        ));
+        assert!(
+            matches!(got, Err(Error::DaemonStalled { attempts: 1, .. })),
+            "{got:?}"
+        );
+    }
+
+    /// Every daemon exchange except the build's own watchdog loop goes
+    /// through `bounded`; a new `execute` site added without it reopens
+    /// the unbounded wait this module exists to close.
+    #[test]
+    fn every_exchange_but_the_build_is_bounded() {
+        let src = include_str!("lib.rs");
+        // Needles assembled at run time so this test's own text is not a
+        // match.
+        let executes = src.matches(&[".execute(", "|client|"].concat()).count();
+        let bounded_calls = src.matches(&["bounded(", "\n"].concat()).count();
+        assert_eq!(
+            executes,
+            bounded_calls + 1,
+            "execute sites {executes}, bounded {bounded_calls}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod watchdog_policy_tests {
     use super::stall_allowance_s;
@@ -546,8 +633,10 @@ impl BuilderRpcClient {
         let info = self.runtime.block_on(async {
             let mut guard = self.pool.acquire().await?;
             let source = BufReader::new(Cursor::new(bytes.clone()));
-            guard
-                .execute(|client| {
+            bounded(
+                &format!("add_drv_to_store {name}"),
+                upload_allowance(),
+                guard.execute(|client| {
                     client.add_ca_to_store(
                         &name,
                         ContentAddressMethodAlgorithm::Text,
@@ -555,8 +644,9 @@ impl BuilderRpcClient {
                         false,
                         source,
                     )
-                })
-                .await
+                }),
+            )
+            .await
         })?;
 
         // Retained ONLY inside a derivation, where builder-rpc-v0 does not
@@ -592,16 +682,20 @@ impl BuilderRpcClient {
             .block_on(async {
                 let mut guard = self.pool.acquire().await?;
                 let source = BufReader::new(Cursor::new(bytes));
+                let what = format!("add_to_store_text {name}");
                 if self.in_drv {
-                    guard
-                        .execute(|client| {
+                    bounded(
+                        &what,
+                        upload_allowance(),
+                        guard.execute(|client| {
                             client.add_to_store_scanning(
                                 name,
                                 ContentAddressMethodAlgorithm::Text,
                                 source,
                             )
-                        })
-                        .await
+                        }),
+                    )
+                    .await
                 } else {
                     // Unfortunately outside of a derivation we do not have a good
                     // idea of possible paths for which we can scan.
@@ -610,8 +704,10 @@ impl BuilderRpcClient {
                     // An empty reference set is identical to the fallback `nix store add` case
                     // and preferable to no running outside a derivation at all.
                     let refs = Default::default();
-                    guard
-                        .execute(|client| {
+                    bounded(
+                        &what,
+                        upload_allowance(),
+                        guard.execute(|client| {
                             client.add_ca_to_store(
                                 name,
                                 ContentAddressMethodAlgorithm::Text,
@@ -619,14 +715,15 @@ impl BuilderRpcClient {
                                 false,
                                 source,
                             )
-                        })
-                        .await
+                        }),
+                    )
+                    .await
                 }
             })
             .map_err(|e| Error::AddToStore {
                 name: name.to_string(),
                 detail: format!("text, {} bytes", bytes.len()),
-                source: Box::new(Error::from(e)),
+                source: Box::new(e),
             })?;
         Ok(info.path)
     }
@@ -732,9 +829,12 @@ impl BuilderRpcClient {
                 });
                 let mut guard = self.pool.acquire().await?;
                 let source = BufReader::new(reader);
+                let what = format!("add_to_store_nar {name}");
                 let out = if self.in_drv {
-                    guard
-                        .execute(|client| {
+                    bounded(
+                        &what,
+                        upload_allowance(),
+                        guard.execute(|client| {
                             client.add_to_store_scanning(
                                 name,
                                 ContentAddressMethodAlgorithm::NixArchive(
@@ -742,13 +842,16 @@ impl BuilderRpcClient {
                                 ),
                                 source,
                             )
-                        })
-                        .await
+                        }),
+                    )
+                    .await
                 } else {
                     // Suboptimal fallback, see add_to_store_text
                     let refs = Default::default();
-                    guard
-                        .execute(|client| {
+                    bounded(
+                        &what,
+                        upload_allowance(),
+                        guard.execute(|client| {
                             client.add_ca_to_store(
                                 name,
                                 ContentAddressMethodAlgorithm::NixArchive(
@@ -758,8 +861,9 @@ impl BuilderRpcClient {
                                 false,
                                 source,
                             )
-                        })
-                        .await
+                        }),
+                    )
+                    .await
                 };
                 // Join AFTER the RPC: the daemon drains the pipe, so joining
                 // first deadlocks on any NAR larger than the buffer. A producer
@@ -770,10 +874,7 @@ impl BuilderRpcClient {
                     Ok(Err(e)) => return Err(e),
                     Err(join) => return Err(Error::Nar(format!("nar encoder panicked: {join}"))),
                 }
-                // The early returns above fix this block's error type, so the
-                // RPC's own error needs converting rather than being handed back
-                // raw the way it was before the join existed.
-                out.map_err(Error::from)
+                out
             })
             .map_err(|e| Error::AddToStore {
                 name: name.to_string(),
@@ -1052,12 +1153,6 @@ impl BuilderRpcClient {
         // gauge only ever printed after the fact.
         static IN_FLIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         static PEAK_IN_FLIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        fn now_s() -> u64 {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        }
         use std::sync::atomic::Ordering::Relaxed;
         // WHAT THE WAIT IS FOR. A stall message naming only a duration and a
         // count says the same thing every time it fires, so eleven timeouts
@@ -1389,9 +1484,12 @@ impl BuilderRpcClient {
     pub fn submit_output(&self, path: &SingleDerivedPath, name: &OutputName) -> Result<()> {
         self.runtime.block_on(async {
             let mut guard = self.pool.acquire().await?;
-            guard
-                .execute(|client| client.submit_output(path, name))
-                .await
+            bounded(
+                &format!("submit_output {name}"),
+                upload_allowance(),
+                guard.execute(|client| client.submit_output(path, name)),
+            )
+            .await
         })?;
         Ok(())
     }
