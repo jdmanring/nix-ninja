@@ -202,12 +202,16 @@ nixNinjaExtraInputs = [
 
 ### Keying a task on a generation rather than on the builder
 
+This section describes a facility this fork adds; the sections around it
+describe nix-ninja itself.
+
 `nix-ninja-task`'s store path appears in every plain task derivation twice,
 as the `builder` string and again among the inputs, and the driver's appears
 the same way in every dynamic one. Neither is an ingredient of the result. An
-ordinary compile driven at two revisions of the task binary produces the same
-object byte for byte, so moving either binary recomputes outputs the store
-already holds.
+ordinary compile driven at `37672a4` and at `24c94aa`, with the task binaries
+those revisions build, produces the same object byte for byte, sha256
+`fd0a4751af5ddbf9a9d2a3824b77b6d2fbe0dc6c71b0acf242c9764ae87ac11b`, so moving
+either binary recomputes outputs the store already holds.
 
 Content addressing does not recover it. The emitted derivations are floating
 content-addressed, so early cutoff fires and stops propagation above an
@@ -226,9 +230,12 @@ binaries this project puts in every key:
 Set, the two binaries leave both the `builder` string and the input set, and
 `NIX_NINJA_TASK_ABI` is emitted into the derivation's environment in their
 place, for the dynamic derivation as well as the plain one. Unset, every
-emitted derivation is byte for byte what it was. `stable_task_builder`,
-`stable_driver_builder` and `task_abi` read the three; `task_builder_path`
-and `driver_builder_path` are the two funnels every emission passes through.
+emitted derivation is byte for byte what it was. A generation set on its own
+is not enough and does not reach the key: with both binaries still keyed on
+their store paths it would distinguish nothing, so emitting it would re-key
+the whole bank for no gain. The three are read by `stable_task_builder`,
+`stable_driver_builder` and `task_abi`, and `task_builder_path` and
+`driver_builder_path` choose the builder.
 
 The mapping has to reach the daemon. The nix CLI forwards
 `--option extra-sandbox-paths` for a trusted user and this project's rpc
@@ -248,13 +255,15 @@ A sandbox mounts the closure of a `sandbox-paths` entry, so neither binary
 needs a static build; a mapped builder finds its own glibc with no input
 declared.
 
-Supplying either builder path without `NIX_NINJA_TASK_ABI` is refused, and
-the refusal is in `builder_path` rather than at startup because the driver
-re-enters itself as `-t dynamic-task`, where a startup check would be a
-different guard from the one the key depends on. The alternative is worse
-than a hard failure: every task derivation would key on a generation that
-does not exist, and a later change to what a task writes would silently reuse
-banked outputs from a binary that wrote something else.
+Two configurations are refused rather than accepted with a warning: either
+builder path without `NIX_NINJA_TASK_ABI`, and either builder path spelled
+without a leading slash, since a sandbox mapping names an absolute path.
+Both would otherwise key every task derivation on a generation that does not
+exist, and a later change to what a task writes would reuse banked outputs
+from a binary that wrote something else, with nothing in the log to say so.
+The refusal is raised in `builder_path`, where the derivation is built,
+rather than at startup: the driver re-enters itself as `-t dynamic-task`, so
+a startup check would not be the guard the key depends on.
 
 That is the trade the generation exists to control. A task derivation stops
 recording which binary built it, so two binaries that would write different
@@ -263,9 +272,9 @@ thing separating them. A change to what a task writes must move it, and pays
 one re-key deliberately. A change that fixes a task which previously failed
 moves nothing, because a failing task banked no output to invalidate.
 
-Because the keyed and the unkeyed bank produce identical logs, identical
-outputs and identical exit statuses, the driver reports which keying it used
-once per process on stderr, and says nothing when neither variable is set
+An ABI-keyed bank and a builder-keyed one are otherwise indistinguishable
+from a build log, so the driver names the keying it used once per process on
+stderr, and says nothing when neither builder path is set
 (`report_keying_once`).
 
 ### Explicit /nix/store references
