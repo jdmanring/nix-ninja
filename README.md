@@ -113,6 +113,42 @@ to discuss larger changes first, especially when the design space is large.
 Please read [CONTRIBUTING](CONTRIBUTING.md) and the [design notes] so you
 understand the big picture and prior art.
 
+## Where this fork stands
+
+The milestones above are upstream's, and the state below is this fork's
+against them. Upstream cannot close an issue on work that lives here, so
+their tracker reads as though less has been done than has.
+
+`0.1.0` is complete here, including the two issues still listed open there. A
+CMake project builds end to end through the driver, and phony targets are
+supported past the original scope: aliases expand transitively, a phony over
+no file is tolerated the way a header-only CMake project emits it, and a
+source file that the generator also marks as a phony output still reaches the
+task that needs it.
+
+`0.2.0` is three of its five issues. The benchmarks exist for both generation and
+end-to-end compilation, and a configure step can be cached in its own
+derivation rather than re-run per build. Two items remain: a task's depfile is
+now a declared output, which gives the driver a real dependency list, but that
+list is not yet read back in place of inference; and the store-add path is
+partly off the critical path without the issue being closed.
+
+Beyond that there are no upstream goalposts, and most of what this fork has
+built already sits outside them. Driving real packages surfaced failure
+classes that no roadmap anticipated: headers a package stages into its own
+output, soname aliases whose targets never reach the sandbox, generated files
+adopted as sources by a later pass, linker scripts written by one edge and
+named by another, and manifests that declare their inputs in their own
+markup. Each is closed against a gate that fails on the revision before its
+fix, and the gates run as two corpora, one outside any derivation and one
+inside an ordinary recursive-nix build, since a verification is a claim about
+the configuration it was taken on.
+
+The direction from here is the cost of a change rather than its correctness.
+Every task derivation is a cache key, so an edit to the driver is free only
+when it emits the same bytes for the work it was not aimed at, and that is
+measured before anything lands rather than argued.
+
 ## Directories this fork adds
 
 Four directories here do not exist in `pdtpartners/nix-ninja`, and each is
