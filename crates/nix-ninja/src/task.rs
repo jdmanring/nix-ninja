@@ -3049,7 +3049,7 @@ fn build_task_derivation(
     let mut drv = Derivation::new(
         "ninja-build".parse()?,
         task.system.clone().into_bytes().into(),
-        task_builder_path(&task.store_dir.display(&tools.nix_ninja_task).to_string())
+        task_builder_path(&task.store_dir.display(&tools.nix_ninja_task).to_string())?
             .into_bytes()
             .into(),
     );
@@ -4032,7 +4032,7 @@ fn build_dynamic_task_derivation(
         // binary's. The same treatment applies, and it has to: closing only
         // the plain half leaves every dynamic task re-keyed by a driver edit
         // and the bank only partly saved.
-        driver_builder_path(&store_dir.display(&tools.nix_ninja).to_string())
+        driver_builder_path(&store_dir.display(&tools.nix_ninja).to_string())?
             .into_bytes()
             .into(),
     );
@@ -4059,6 +4059,18 @@ fn build_dynamic_task_derivation(
             .cmp(encoded_build_path(b))
             .then(a.cmp(b))
     });
+    // THE GENERATION BELONGS HERE TOO, and leaving it on the plain derivation
+    // alone closes half the class. A dynamic task derivation's OUTPUT is not
+    // determined by the plain derivation it embeds: `-t dynamic-task` runs
+    // the driver's own discovery inside the sandbox and resubmits, so a
+    // driver change that alters what discovery declares alters what this
+    // derivation produces while the embedded bytes are untouched. Under a
+    // stable driver builder that is exactly the change nothing else records.
+    if let Some(abi) = task_abi() {
+        drv.env
+            .insert(b"NIX_NINJA_TASK_ABI"[..].into(), abi.into_bytes().into());
+    }
+
     drv.env.insert(
         b"NIX_NINJA_INPUTS"[..].into(),
         inputs.join(" ").into_bytes().into(),
@@ -5761,10 +5773,11 @@ fn stable_driver_builder() -> Option<String> {
         .filter(|v| v.starts_with('/'))
 }
 
-fn driver_builder_path(store_driver: &str) -> String {
+fn driver_builder_path(store_driver: &str) -> Result<String> {
     report_keying_once();
     builder_path(
         stable_driver_builder().as_deref(),
+        task_abi().as_deref(),
         store_driver,
         "nix-ninja",
     )
@@ -5780,10 +5793,32 @@ fn task_abi() -> Option<String> {
 /// The builder string, given the configured override and the store path this
 /// has always used. PURE, so the choice is testable without setting a process
 /// wide variable: two tests in this file already race on exactly that.
-fn builder_path(stable: Option<&str>, store_dir: &str, exe: &str) -> String {
+///
+/// A STABLE BUILDER WITH NO GENERATION IS REFUSED, and the refusal is the
+/// point rather than a guard against a typo. Dropping the binary from the key
+/// is what makes the bank survive a bump; `NIX_NINJA_TASK_ABI` is then the
+/// ONLY thing distinguishing two binaries that write different bytes. Set the
+/// builder alone and every task derivation is keyed on a generation that does
+/// not exist, so a later change to what a task writes reuses banked outputs
+/// that were never rebuilt, with nothing in the log to say so. That failure
+/// has no expiry and no signature; one missing variable is enough to reach
+/// it. Refusing to emit is the loud half of the same trade the missing
+/// sandbox mapping already takes, where a task dies naming the path it could
+/// not execute.
+fn builder_path(
+    stable: Option<&str>,
+    abi: Option<&str>,
+    store_dir: &str,
+    exe: &str,
+) -> Result<String> {
     match stable {
-        Some(p) => p.to_string(),
-        None => format!("{store_dir}/bin/{exe}"),
+        Some(p) if abi.is_none() => Err(anyhow!(
+            "a stable builder path is configured ({p}) but NIX_NINJA_TASK_ABI is not set; \
+             every task derivation would key on a generation that does not exist, and a \
+             later change to what a task writes would reuse stale banked outputs silently"
+        )),
+        Some(p) => Ok(p.to_string()),
+        None => Ok(format!("{store_dir}/bin/{exe}")),
     }
 }
 
@@ -5808,10 +5843,11 @@ fn report_keying_once() {
     });
 }
 
-fn task_builder_path(store_task: &str) -> String {
+fn task_builder_path(store_task: &str) -> Result<String> {
     report_keying_once();
     builder_path(
         stable_task_builder().as_deref(),
+        task_abi().as_deref(),
         store_task,
         "nix-ninja-task",
     )
@@ -12426,42 +12462,91 @@ mod create_symlink_undeclared_output_tests {
     #[test]
     fn a_builder_path_is_the_store_one_unless_a_stable_one_is_configured() {
         // Unconfigured, both binaries keep the spelling every emitted
-        // derivation has always carried. This is the arm that says the knob
-        // costs nothing while it is off.
+        // derivation has always carried, and the ABI is irrelevant there:
+        // the store path is already the generation. This is the arm that
+        // says the knob costs nothing while it is off, and it is taken with
+        // the ABI BOTH ways so a guard written on the wrong condition, one
+        // refusing whenever the ABI is unset, fails here rather than passing
+        // as a stricter rule.
         assert_eq!(
             builder_path(
                 None,
+                None,
                 "/nix/store/aaa-nix-ninja-task-0.1.0",
                 "nix-ninja-task"
-            ),
+            )
+            .unwrap(),
             "/nix/store/aaa-nix-ninja-task-0.1.0/bin/nix-ninja-task"
         );
         assert_eq!(
-            builder_path(None, "/nix/store/bbb-nix-ninja-0.1.0", "nix-ninja"),
+            builder_path(
+                None,
+                Some("1"),
+                "/nix/store/bbb-nix-ninja-0.1.0",
+                "nix-ninja"
+            )
+            .unwrap(),
             "/nix/store/bbb-nix-ninja-0.1.0/bin/nix-ninja"
         );
         // Configured, the store path is out of the string entirely, which is
         // the whole point: two binaries must give one answer.
         let stable = Some("/nn/bin/nix-ninja-task");
+        let abi = Some("1");
         assert_eq!(
             builder_path(
                 stable,
+                abi,
                 "/nix/store/aaa-nix-ninja-task-0.1.0",
                 "nix-ninja-task"
-            ),
+            )
+            .unwrap(),
             builder_path(
                 stable,
+                abi,
                 "/nix/store/ccc-nix-ninja-task-0.1.0",
                 "nix-ninja-task"
-            ),
+            )
+            .unwrap(),
         );
         assert_eq!(
             builder_path(
                 stable,
+                abi,
                 "/nix/store/aaa-nix-ninja-task-0.1.0",
                 "nix-ninja-task"
-            ),
+            )
+            .unwrap(),
             "/nn/bin/nix-ninja-task"
+        );
+    }
+
+    /// THE MISCONFIGURATION THE KNOB MAKES REACHABLE, and it is the one
+    /// failure this design adds rather than removes. A stable builder with no
+    /// generation keys every task derivation on nothing, so a later change to
+    /// what a task writes reuses banked outputs silently and forever. The
+    /// three arms above are the control this one needs: an unconditional
+    /// error satisfies the refusal and fails them, which is what a guard
+    /// written as "no ABI, no emission" would be.
+    #[test]
+    fn a_stable_builder_without_a_generation_is_refused() {
+        let e = builder_path(
+            Some("/nn/bin/nix-ninja-task"),
+            None,
+            "/nix/store/aaa-nix-ninja-task-0.1.0",
+            "nix-ninja-task",
+        )
+        .expect_err("a stable builder with no ABI must not emit");
+        let msg = e.to_string();
+        // The message has to name the variable an operator sets, not merely
+        // report that something is wrong: this fires inside a build log
+        // thousands of lines long.
+        assert!(
+            msg.contains("NIX_NINJA_TASK_ABI"),
+            "the refusal must name the variable: {msg}"
+        );
+        assert!(
+            msg.contains("/nn/bin/nix-ninja-task"),
+            "the refusal must name the configured path: {msg}"
         );
     }
 
