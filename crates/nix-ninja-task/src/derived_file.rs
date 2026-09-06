@@ -126,6 +126,29 @@ pub fn alias_link_target(build_path: &Path) -> Option<PathBuf> {
     (target.parent() == Some(Path::new(""))).then_some(target)
 }
 
+/// WHAT COUNTS AS A HEADER, for every question in this workspace that needs
+/// to ask. The driver filters a translation unit's closure with it and the
+/// placement below decides a copy with it, and those two answers must be the
+/// same answer: when they were written separately they diverged, the copy
+/// rule listing four spellings against the driver's eleven, and a compile
+/// naming an `.inl` includer failed while the same chain in `.h` built.
+///
+/// THE LIST IS THE RISK, NOT THE POLARITY. Inverting it is wrong: the filter
+/// exists to keep a closure from swallowing generated OBJECTS and SOURCES
+/// when a phony is expanded, so "drop what is not provably a header" is the
+/// intended direction. What can go wrong is a spelling nobody listed, and
+/// the cost is an input dropped and a compile dying on its own include.
+///
+/// `.hxx` is the one that mattered: it is CMake's OWN spelling for a
+/// generated precompiled header (`cmake_pch.hxx`). `.H`, `.tcc` and `.inl`
+/// are the other conventions in wide use; `.h++` and `.hp` complete the set.
+pub fn header_like(p: &Path) -> bool {
+    matches!(
+        p.extension().and_then(|e| e.to_str()),
+        Some("h" | "H" | "hh" | "hp" | "hpp" | "hxx" | "h++" | "inc" | "ipp" | "inl" | "tcc")
+    )
+}
+
 /// What a placement should point AT: the store object's own link text when
 /// that object is itself a symlink, and otherwise the store path.
 ///
@@ -378,30 +401,31 @@ pub fn create_symlinks(
         // `&&` binds tighter than `||`: appended, the exclusion applied to
         // the `node_modules` clause alone, compiled, and left every header
         // copying an alias.
+        // A HEADER JOINS FOR THE SAME REASON WITH A DIFFERENT CONSUMER.
+        // Under `#pragma GCC system_header`, which CMake's generated
+        // precompiled-header wrapper confers on everything it includes, a
+        // header reached as a QUOTED SIBLING of an already relocated header
+        // resolves its own siblings from the store directory holding that
+        // single file. The includer's reported path does not move, which is
+        // why an earlier wording here, that a searched header is recorded at
+        // its resolved path, described the wrong step. glslang's
+        // SymbolTable.h reaches `../Include/Common.h` that way and cannot. A
+        // copy keeps the includer in the build tree beside its siblings.
+        //
+        // `header_like` rather than a list written again here: the two
+        // diverged when they were separate, at four spellings against
+        // eleven, and `.inl`, `.inc`, `.ipp` and `.tcc` failed this class
+        // while `.h` built.
         let copy_not_link = !source_path.is_symlink()
-            && (input.build_path.extension().is_some_and(|e| {
-                e == "py"
-                    || e == "mjs"
-                    || e == "js"
-                    || e == "cjs"
-                    // Headers join for the same reason with a different
-                    // consumer: under `#pragma GCC system_header`, which
-                    // CMake's generated precompiled-header wrapper confers on
-                    // everything it includes, a header REACHED BY A DIRECTORY
-                    // SEARCH is recorded at its resolved path, so its own
-                    // quoted includes resolve from the store directory
-                    // holding that single file. glslang's SymbolTable.h
-                    // reaches `../Include/Common.h` that way and cannot. A
-                    // copy keeps the includer in the build tree beside its
-                    // siblings.
-                    || e == "h"
-                    || e == "hpp"
-                    || e == "hxx"
-                    || e == "hh"
-            }) || input
+            && (input
                 .build_path
-                .components()
-                .any(|c| c.as_os_str() == "node_modules"));
+                .extension()
+                .is_some_and(|e| e == "py" || e == "mjs" || e == "js" || e == "cjs")
+                || header_like(&input.build_path)
+                || input
+                    .build_path
+                    .components()
+                    .any(|c| c.as_os_str() == "node_modules"));
         if copy_not_link {
             fs::copy(&source_path, &dest_path)
                 .map_err(|e| anyhow!("copy({:?} -> {}): {e}", source_path, dest_path.display()))?;

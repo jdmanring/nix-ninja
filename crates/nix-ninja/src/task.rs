@@ -7596,28 +7596,7 @@ fn prune_line(declared: u64, kept: u64) -> String {
     }
 }
 
-/// One definition, because this was written THREE times and the copies had
-/// already diverged: the metric's copy and one of the two filter copies
-/// lacked the module-tree case the third carried.
-///
-/// THE LIST IS THE RISK, NOT THE POLARITY. Unlike the compile-versus-link
-/// test, inverting this one is wrong: the filter exists to keep a
-/// translation unit's closure from swallowing generated OBJECTS and SOURCES
-/// when a phony is expanded, so "drop what is not provably a header" is the
-/// intended direction. What can go wrong is a header spelling nobody listed,
-/// and the cost is identical to the `.ol` regression - the input is dropped
-/// and the compile dies on its own include.
-///
-/// `.hxx` is the one that mattered: it is CMake's OWN spelling for a
-/// generated precompiled header (`cmake_pch.hxx`), and it was in none of the
-/// three copies. `.H`, `.tcc` and `.inl` are the other conventions in wide
-/// use; `.h++` and `.hp` complete the C++ set.
-fn header_like(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|e| e.to_str()),
-        Some("h" | "H" | "hh" | "hp" | "hpp" | "hxx" | "h++" | "inc" | "ipp" | "inl" | "tcc")
-    )
-}
+use nix_ninja_task::derived_file::header_like;
 
 /// dyn's two expensive halves, separated because they have different fixes.
 // Hoisted with RESOLVE_MS, same reason: the end-of-run report needs the

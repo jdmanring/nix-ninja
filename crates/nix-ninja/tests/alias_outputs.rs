@@ -653,3 +653,58 @@ fn the_collision_message_reports_whether_the_claimants_agree() {
         "and a genuine disagreement must still say so: {diff}"
     );
 }
+
+/// THE COPY RULE AND THE DRIVER'S FILTER ARE ONE PREDICATE, and this pins the
+/// spelling that showed they were not. With the rule listing four suffixes a
+/// declared `.inl` was placed as a link, and under a precompiled header its
+/// own quoted sibling then resolved from the store directory holding that one
+/// file, so the compile failed while the same chain in `.h` built. Measured on
+/// configuration B: at the revision before the fix every suffix failed, and
+/// after it `.h` built while `.inl`, `.inc`, `.ipp` and `.tcc` still failed.
+#[test]
+fn every_header_spelling_is_placed_as_a_copy() {
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::{create_symlinks, header_like, DerivedFile};
+
+    let d = dir("header-suffixes");
+    let store_root = d.join("store");
+    let build = d.join("build");
+    std::fs::create_dir_all(&build).unwrap();
+
+    let store_dir = StoreDir::new(&store_root).unwrap();
+    let mut inputs = Vec::new();
+    let spellings = [
+        "h", "H", "hh", "hp", "hpp", "hxx", "h++", "inc", "ipp", "inl", "tcc",
+    ];
+    for (i, ext) in spellings.iter().enumerate() {
+        let hash = format!("{:0>32}", format!("{i}aaaaaaaa"));
+        let name = format!("ninja-build-include-sib.{ext}");
+        let sp = store_root.join(format!("{hash}-{name}"));
+        std::fs::create_dir_all(sp.join("include")).unwrap();
+        std::fs::write(sp.join(format!("include/sib.{ext}")), b"#include \"n.h\"\n").unwrap();
+        let rel = format!("include/sib.{ext}");
+        inputs.push(
+            DerivedFile::from_encoded(
+                &store_dir,
+                &format!("{}/{hash}-{name}:{rel}:{rel}", store_root.display()),
+            )
+            .unwrap(),
+        );
+    }
+
+    create_symlinks(&build, &store_dir, inputs, false).expect("headers place as copies");
+
+    for ext in spellings {
+        let placed = build.join(format!("include/sib.{ext}"));
+        assert!(
+            header_like(std::path::Path::new(&format!("x.{ext}"))),
+            ".{ext} must be header-shaped to the shared predicate"
+        );
+        assert!(
+            !placed.is_symlink(),
+            ".{ext} was placed as a link, so its quoted siblings resolve from \
+             the store directory holding that one file"
+        );
+        assert!(placed.is_file(), ".{ext} was not placed at all");
+    }
+}
