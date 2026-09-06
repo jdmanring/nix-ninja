@@ -3238,6 +3238,71 @@ fn build_task_derivation(
         }
     }
 
+    // A TASK OUTPUT AND AN UPLOAD OF THE SAME NAME ARE ONE FILE, AND THE
+    // OUTPUT IS THE ONE THE BUILD MEANS. dav1d 1.5.3 on the ninja route:
+    // `include/vcs_version.h` is claimed by the edge that generates it and
+    // by an upload of a file of that name, and `create_symlinks` refuses the
+    // second rather than choosing, so the task dies in sandbox setup with
+    // "Two different files claim one build path".
+    //
+    // THE PASS BELOW CANNOT SEE IT. It filters to `Opaque` before grouping,
+    // which is right for the collision it was written for (one file uploaded
+    // twice at two contents) and blind to this one, where the two claimants
+    // are different KINDS. The discriminator is the variant, `Built` against
+    // `Opaque`, and not the producing derivation's name, which merely happens
+    // to encode the build path and would be a naming convention doing a
+    // type's work.
+    //
+    // NOT TWO SOURCES DISAGREEING. Both dav1d claimants hold the same bytes:
+    // the supposed source is itself `/* auto-generated, do not edit */` and
+    // one `#define DAV1D_VERSION`. This is the class where a later pass
+    // adopts a placed product as an input, reaching a fourth route beyond the
+    // three closed at `f2dba47`, so preferring the output cannot silently
+    // compile the wrong header. The edge's own flags agree independently:
+    // `-Iinclude` precedes `-I../include`, so the build-tree copy is what an
+    // ordinary build opens.
+    //
+    // Dropping the upload rather than the output is also the only order that
+    // works: the output does not exist yet, so it cannot be re-read the way
+    // the pass below re-reads a stale upload.
+    {
+        let built_paths: rustc_hash::FxHashSet<PathBuf> = task
+            .inputs
+            .iter()
+            .chain(discovered_inputs.iter())
+            .filter(|i| matches!(i.derived_path, SingleDerivedPath::Built { .. }))
+            .map(|i| i.build_path.clone())
+            .collect();
+        if !built_paths.is_empty() {
+            let shadowed: Vec<DerivedFile> = task
+                .inputs
+                .iter()
+                .chain(discovered_inputs.iter())
+                .filter(|i| {
+                    matches!(i.derived_path, SingleDerivedPath::Opaque(_))
+                        && built_paths.contains(&i.build_path)
+                })
+                .cloned()
+                .collect();
+            for up in &shadowed {
+                eprintln!(
+                    "nix-ninja: {} is produced by an edge and was also uploaded as a source; keeping the edge's output",
+                    up.build_path.display(),
+                );
+                input_set.remove(&up.to_encoded(&task.store_dir));
+                drv.inputs.remove(&up.derived_path);
+            }
+            if !shadowed.is_empty() {
+                let dropped: rustc_hash::FxHashSet<PathBuf> =
+                    shadowed.iter().map(|d| d.build_path.clone()).collect();
+                discovered_inputs.retain(|d| {
+                    !(matches!(d.derived_path, SingleDerivedPath::Opaque(_))
+                        && dropped.contains(&d.build_path))
+                });
+            }
+        }
+    }
+
     // ONE BUILD PATH, ONE CONTENT. A file the outer build regenerates
     // while discovery is scanning (gperf: automake's remake rule re-runs
     // `config.status config.h` under make -j beside the compiles) gets
