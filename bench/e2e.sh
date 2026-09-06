@@ -146,6 +146,7 @@ if stats:
 
 # Parse the phases the driver prints, so a diff is per-phase and not just
 # wall clock. Absent keys mean the line was absent, NOT that a phase was zero.
+missed = []
 if resolved:
     for key, pat in [
         ("tasks", r"resolved (\d+) tasks"),
@@ -155,11 +156,30 @@ if resolved:
         ("dyn_discover_s", r"discover (\d+) s"),
         ("plain_adddrv_s", r"plain adddrv (\d+) s"),
         ("plain_adddrv_calls", r"plain adddrv \d+ s/(\d+) calls"),
+        # The store-add phase, and the share of it the stamp cache answered.
+        # The pair without the third term is the reading that misleads: a
+        # total says the phase is large and never that the majority of it is
+        # a memo lookup no change can reach.
+        ("file_add_s", r"file adds (\d+) s"),
+        ("file_add_calls", r"file adds \d+ s/(\d+) calls"),
+        ("file_add_hit_s", r"file adds \d+ s/\d+ calls \((\d+) s on cache hits\)"),
+        ("nar_sent", r"nar (\d+)/\d+ sent"),
+        ("nar_calls", r"nar \d+/(\d+) sent"),
         ("rss_mib", r"rss (\d+) MiB"),
     ]:
         m = re.search(pat, resolved)
         if m:
             rec[key] = int(m.group(1))
+        else:
+            missed.append(key)
+    # A KEY MISSING FROM A LINE THAT WAS PRESENT IS AN INSTRUMENT FAULT, not a
+    # zero, and it is silent: the driver renames a phase, every later record
+    # omits it, and a diff across the rename reads as the phase disappearing.
+    # Recorded in the record itself so the reader sees it without re-running.
+    if missed:
+        rec["unparsed_phases"] = missed
+        print("phase keys not found in the driver line: " + " ".join(missed),
+              file=sys.stderr)
 with open(out, "w") as fh:
     json.dump(rec, fh, indent=2, sort_keys=True)
 print(json.dumps(rec, indent=2, sort_keys=True))

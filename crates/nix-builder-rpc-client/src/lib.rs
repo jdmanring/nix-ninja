@@ -762,17 +762,13 @@ impl BuilderRpcClient {
                 .as_nanos();
             Some((md.len(), mtime))
         });
-        if let Some((size, mtime)) = stamp {
-            if let Some((s, m, sp)) = self.nar_uploads.lock().unwrap().get(key) {
-                if *s == size && *m == mtime {
-                    NAR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    ADD_HIT_US.fetch_add(
-                        t0.elapsed().as_micros() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    return Ok(sp.clone());
-                }
-            }
+        if let Some(sp) = nar_stamp_hit(&self.nar_uploads, key, stamp) {
+            NAR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ADD_HIT_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            return Ok(sp);
         }
         NAR_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sp = self.add_to_store_nar(name, path)?;
@@ -1573,17 +1569,15 @@ static ADD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 static ADD_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ADD_HIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `(milliseconds, calls)` spent adding files to the store.
-pub fn file_add_stats() -> (u64, u64) {
+/// `(milliseconds, calls, milliseconds on stamp-cache hits)` spent adding
+/// files to the store. The third term is reported with the first two rather
+/// than separately because the pair alone is the reading that misleads.
+pub fn file_add_stats() -> (u64, u64, u64) {
     (
         ADD_MS.load(std::sync::atomic::Ordering::Relaxed),
         ADD_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        ADD_HIT_US.load(std::sync::atomic::Ordering::Relaxed) / 1000,
     )
-}
-
-/// Milliseconds of the above spent on calls the stamp cache answered.
-pub fn file_add_hit_ms() -> u64 {
-    ADD_HIT_US.load(std::sync::atomic::Ordering::Relaxed) / 1000
 }
 
 /// Times one file-add call into the counters above.
@@ -1992,6 +1986,28 @@ mod nar_upload_memo_tests {
 /// covered this asserted that `fs::metadata` of a nonexistent path is an
 /// error, which is a fact about the standard library: it called nothing in
 /// this crate, so the guard could be deleted with it green.
+/// The stamp-cache lookup, decided without a daemon.
+///
+/// Extracted for the same reason as `remember_nar_stamp` below: the
+/// enclosing upload needs a connection and this decision does not, so a
+/// test of the decision would otherwise have to assert around one.
+///
+/// It answers only on a stamp that matches in BOTH size and mtime. Size
+/// alone would adopt a same-length rewrite of a file, which is the shape an
+/// edit to a version string or a generated header takes; mtime alone would
+/// adopt a restored copy. The `None` stamp is the unstattable key, which can
+/// never hit, and is the case a test of the happy path does not reach.
+fn nar_stamp_hit(
+    map: &Mutex<HashMap<PathBuf, (u64, u128, StorePath)>>,
+    key: &Path,
+    stamp: Option<(u64, u128)>,
+) -> Option<StorePath> {
+    let (size, mtime) = stamp?;
+    let guard = map.lock().unwrap();
+    let (s, m, sp) = guard.get(key)?;
+    (*s == size && *m == mtime).then(|| sp.clone())
+}
+
 fn remember_nar_stamp(
     map: &Mutex<HashMap<PathBuf, (u64, u128, StorePath)>>,
     key: &Path,
@@ -2065,5 +2081,67 @@ mod transient_error_tests {
         assert!(!transient_daemon_error(
             "copying '/build/out' to '/nix/store/x': File exists"
         ));
+    }
+}
+
+#[cfg(test)]
+mod nar_stamp_hit_tests {
+    use super::*;
+
+    fn sp() -> StorePath {
+        "00000000000000000000000000000000-x"
+            .parse()
+            .expect("fixture store path must parse")
+    }
+
+    fn map_with(
+        key: &Path,
+        size: u64,
+        mtime: u128,
+    ) -> Mutex<HashMap<PathBuf, (u64, u128, StorePath)>> {
+        let mut m = HashMap::new();
+        m.insert(key.to_path_buf(), (size, mtime, sp()));
+        Mutex::new(m)
+    }
+
+    #[test]
+    fn a_matching_stamp_hits() {
+        let k = Path::new("/build/src/main.c");
+        assert!(nar_stamp_hit(&map_with(k, 12, 34), k, Some((12, 34))).is_some());
+    }
+
+    #[test]
+    fn a_same_length_rewrite_does_not_hit() {
+        // The shape an edited version string takes: identical size, new mtime.
+        // Size alone would adopt the stale store path and compile the old bytes.
+        let k = Path::new("/build/version.h");
+        assert!(nar_stamp_hit(&map_with(k, 12, 34), k, Some((12, 99))).is_none());
+    }
+
+    #[test]
+    fn a_restored_copy_does_not_hit() {
+        // Same mtime, different size: mtime alone would adopt it.
+        let k = Path::new("/build/gen.c");
+        assert!(nar_stamp_hit(&map_with(k, 12, 34), k, Some((99, 34))).is_none());
+    }
+
+    #[test]
+    fn an_unstattable_key_cannot_hit() {
+        // The zero case, and the one a happy-path test never reaches: with no
+        // stamp there is nothing to compare, so the entry must not be adopted
+        // however well it matches on every other count.
+        let k = Path::new("/build/vanished.c");
+        assert!(nar_stamp_hit(&map_with(k, 12, 34), k, None).is_none());
+    }
+
+    #[test]
+    fn an_absent_key_does_not_hit() {
+        let k = Path::new("/build/known.c");
+        assert!(nar_stamp_hit(
+            &map_with(k, 12, 34),
+            Path::new("/build/other.c"),
+            Some((12, 34))
+        )
+        .is_none());
     }
 }

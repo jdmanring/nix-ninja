@@ -4210,8 +4210,7 @@ fn report_progress(n_tasks: u64) {
     // the store, over the calls that spent them. Printed in seconds beside
     // the counts already here, so the share of a run is readable rather than
     // inferred from the upload count.
-    let (file_add_ms, file_add_calls) = nix_builder_rpc_client::file_add_stats();
-    let file_add_hit_ms = nix_builder_rpc_client::file_add_hit_ms();
+    let (file_add_ms, file_add_calls, file_add_hit_ms) = nix_builder_rpc_client::file_add_stats();
     // parsed / reached: misses are files actually read, the sum is
     // every time a TU needed one. The gap is the sharing.
     let (scan_hit, scan_miss) = deps_infer::c_include_parser::scan_stats();
