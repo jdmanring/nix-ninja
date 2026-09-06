@@ -169,6 +169,18 @@ Every task derivation is a cache key, so an edit to the driver is free only
 when it emits the same bytes for the work it was not aimed at, and that is
 measured before anything lands rather than argued.
 
+That accounting also found a cost the design never needed to pay. Both
+binaries sit in every task derivation, as the builder string and again among
+the inputs, while neither is an ingredient of the result: the same compile
+driven at two revisions of the task binary yields the same object byte for
+byte. Three environment variables key a task on a declared generation
+instead, the way `sandbox-paths` already maps `/bin/sh` so that a busybox
+upgrade re-keys nothing. Unset, every emitted derivation is unchanged. Set,
+they require a matching sandbox path entry in the daemon's own configuration,
+and a builder path supplied without a generation is refused rather than
+allowed to key on one that does not exist. The contract is in the [design
+notes].
+
 ## Directories this fork adds
 
 Four directories here do not exist in `pdtpartners/nix-ninja`, and each is
