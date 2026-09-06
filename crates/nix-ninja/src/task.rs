@@ -3572,9 +3572,10 @@ fn build_task_derivation(
     });
 
     // THE ABI GENERATION IS IN THE KEY, and it is the only thing that is once
-    // the builder path stops moving. Absent unless configured, so a tree that
-    // does not use the stable builder emits exactly what it always emitted.
-    if let Some(abi) = task_abi() {
+    // the builder path stops moving. Absent unless a stable builder is
+    // configured, so a tree that does not use one emits exactly what it
+    // always emitted whatever the generation says.
+    if let Some(abi) = emitted_abi() {
         drv.env
             .insert(b"NIX_NINJA_TASK_ABI"[..].into(), abi.into_bytes().into());
     }
@@ -4066,7 +4067,7 @@ fn build_dynamic_task_derivation(
     // driver change that alters what discovery declares alters what this
     // derivation produces while the embedded bytes are untouched. Under a
     // stable driver builder that is exactly the change nothing else records.
-    if let Some(abi) = task_abi() {
+    if let Some(abi) = emitted_abi() {
         drv.env
             .insert(b"NIX_NINJA_TASK_ABI"[..].into(), abi.into_bytes().into());
     }
@@ -5759,18 +5760,14 @@ fn undeclared_outputs(
 /// OFF BY DEFAULT. Unset, every derivation is byte for byte what it was, so
 /// nothing is re-keyed by this existing.
 fn stable_task_builder() -> Option<String> {
-    std::env::var("NIX_NINJA_TASK_BUILDER")
-        .ok()
-        .filter(|v| v.starts_with('/'))
+    std::env::var("NIX_NINJA_TASK_BUILDER").ok().filter(|v| !v.is_empty())
 }
 
 /// The driver's counterpart to `stable_task_builder`, for the derivations the
 /// DRIVER builds. Separate variable because the two binaries are supplied to
 /// the sandbox as separate mappings and either can be configured alone.
 fn stable_driver_builder() -> Option<String> {
-    std::env::var("NIX_NINJA_DRIVER_BUILDER")
-        .ok()
-        .filter(|v| v.starts_with('/'))
+    std::env::var("NIX_NINJA_DRIVER_BUILDER").ok().filter(|v| !v.is_empty())
 }
 
 fn driver_builder_path(store_driver: &str) -> Result<String> {
@@ -5784,6 +5781,27 @@ fn driver_builder_path(store_driver: &str) -> Result<String> {
 }
 
 /// The ABI generation a task derivation is keyed on, empty unless set.
+/// The generation to EMIT, which is not the same question as whether a
+/// generation is configured. The ABI earns its place in the key only where a
+/// builder has left it: with both binaries still keyed on their store paths,
+/// a generation adds nothing a re-key does not already do, so emitting it
+/// there is a global re-key that buys nothing and that `report_keying_once`
+/// is silent about, since neither builder is set. Either stable path is
+/// enough, because the two derivation classes are emitted as a pair and the
+/// dynamic one embeds the plain one.
+fn emitted_abi() -> Option<String> {
+    abi_in_key(
+        stable_task_builder().is_some() || stable_driver_builder().is_some(),
+        task_abi(),
+    )
+}
+
+/// PURE, for the same reason `builder_path` is: the decision is testable
+/// without setting a process wide variable.
+fn abi_in_key(any_stable_builder: bool, abi: Option<String>) -> Option<String> {
+    if any_stable_builder { abi } else { None }
+}
+
 fn task_abi() -> Option<String> {
     std::env::var("NIX_NINJA_TASK_ABI")
         .ok()
@@ -5812,6 +5830,12 @@ fn builder_path(
     exe: &str,
 ) -> Result<String> {
     match stable {
+        Some(p) if !p.starts_with('/') => Err(anyhow!(
+            "a stable builder path is configured ({p}) but is not absolute; a sandbox \
+             mapping names an absolute path, so this value can never be the builder, \
+             and discarding it silently would key the bank on a generation while both \
+             binaries stayed in it"
+        )),
         Some(p) if abi.is_none() => Err(anyhow!(
             "a stable builder path is configured ({p}) but NIX_NINJA_TASK_ABI is not set; \
              every task derivation would key on a generation that does not exist, and a \
@@ -12548,6 +12572,54 @@ mod create_symlink_undeclared_output_tests {
             msg.contains("/nn/bin/nix-ninja-task"),
             "the refusal must name the configured path: {msg}"
         );
+    }
+
+    /// A NON-ABSOLUTE VALUE USED TO BE DISCARDED IN SILENCE, which is the
+    /// same end state as the refusal above reached by a typo: the reader
+    /// filtered on a leading slash, so the builder stayed the store path, the
+    /// keying report stayed quiet because no builder read as configured, and
+    /// a generation set alongside it re-keyed the bank for nothing. The
+    /// absolute requirement is real, so it is refused where it can be named.
+    #[test]
+    fn a_non_absolute_stable_builder_is_refused_rather_than_discarded() {
+        let e = builder_path(
+            Some("nn/bin/nix-ninja-task"),
+            Some("1"),
+            "/nix/store/aaa-nix-ninja-task-0.1.0",
+            "nix-ninja-task",
+        )
+        .expect_err("a relative stable builder must not emit");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("nn/bin/nix-ninja-task"),
+            "the refusal must name the configured path: {msg}"
+        );
+        // The control: the same path made absolute is accepted, so the arm
+        // above fails for the spelling and not because every value errors.
+        assert_eq!(
+            builder_path(
+                Some("/nn/bin/nix-ninja-task"),
+                Some("1"),
+                "/nix/store/aaa-nix-ninja-task-0.1.0",
+                "nix-ninja-task",
+            )
+            .expect("an absolute stable builder with a generation must emit"),
+            "/nn/bin/nix-ninja-task"
+        );
+    }
+
+    /// THE GENERATION IS NOT A KEY ON ITS OWN. With both binaries still keyed
+    /// on their store paths a generation distinguishes nothing, so emitting
+    /// it is a global re-key with no benefit, and `report_keying_once` is
+    /// silent about it because neither builder is configured.
+    #[test]
+    fn a_generation_alone_does_not_reach_the_key() {
+        assert_eq!(abi_in_key(false, Some("1".into())), None);
+        // Both controls: a generation with a stable builder reaches the key,
+        // and a stable builder with no generation has none to carry. Without
+        // these, a function returning None unconditionally passes the arm.
+        assert_eq!(abi_in_key(true, Some("1".into())), Some("1".into()));
+        assert_eq!(abi_in_key(true, None), None);
     }
 
     #[test]
