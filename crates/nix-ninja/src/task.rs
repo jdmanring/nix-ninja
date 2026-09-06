@@ -4027,12 +4027,19 @@ fn build_dynamic_task_derivation(
     let mut drv = Derivation::new(
         format!("{}.drv", input_drv.name).parse()?,
         input_drv.platform.clone(),
-        format!("{}/bin/nix-ninja", store_dir.display(&tools.nix_ninja))
+        // THE DRIVER IS THE BUILDER HERE, so a dynamic task derivation keys on
+        // the driver's store path exactly as a plain one keys on the task
+        // binary's. The same treatment applies, and it has to: closing only
+        // the plain half leaves every dynamic task re-keyed by a driver edit
+        // and the bank only partly saved.
+        driver_builder_path(&store_dir.display(&tools.nix_ninja).to_string())
             .into_bytes()
             .into(),
     );
-    drv.inputs
-        .insert(SingleDerivedPath::Opaque(tools.nix_ninja.clone()));
+    if stable_driver_builder().is_none() {
+        drv.inputs
+            .insert(SingleDerivedPath::Opaque(tools.nix_ninja.clone()));
+    }
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.nix.clone()));
 
@@ -5745,6 +5752,23 @@ fn stable_task_builder() -> Option<String> {
         .filter(|v| v.starts_with('/'))
 }
 
+/// The driver's counterpart to `stable_task_builder`, for the derivations the
+/// DRIVER builds. Separate variable because the two binaries are supplied to
+/// the sandbox as separate mappings and either can be configured alone.
+fn stable_driver_builder() -> Option<String> {
+    std::env::var("NIX_NINJA_DRIVER_BUILDER")
+        .ok()
+        .filter(|v| v.starts_with('/'))
+}
+
+fn driver_builder_path(store_driver: &str) -> String {
+    builder_path(
+        stable_driver_builder().as_deref(),
+        store_driver,
+        "nix-ninja",
+    )
+}
+
 /// The ABI generation a task derivation is keyed on, empty unless set.
 fn task_abi() -> Option<String> {
     std::env::var("NIX_NINJA_TASK_ABI")
@@ -5752,8 +5776,22 @@ fn task_abi() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// The builder string, given the configured override and the store path this
+/// has always used. PURE, so the choice is testable without setting a process
+/// wide variable: two tests in this file already race on exactly that.
+fn builder_path(stable: Option<&str>, store_dir: &str, exe: &str) -> String {
+    match stable {
+        Some(p) => p.to_string(),
+        None => format!("{store_dir}/bin/{exe}"),
+    }
+}
+
 fn task_builder_path(store_task: &str) -> String {
-    stable_task_builder().unwrap_or_else(|| format!("{store_task}/bin/nix-ninja-task"))
+    builder_path(
+        stable_task_builder().as_deref(),
+        store_task,
+        "nix-ninja-task",
+    )
 }
 
 /// The working directory a `cd <dir>` leaves behind, with `..` collapsed.
@@ -12360,6 +12398,48 @@ mod create_symlink_undeclared_output_tests {
             bd,
         );
         assert_eq!(v, vec![PathBuf::from("sub/deeper/b")]);
+    }
+
+    #[test]
+    fn a_builder_path_is_the_store_one_unless_a_stable_one_is_configured() {
+        // Unconfigured, both binaries keep the spelling every emitted
+        // derivation has always carried. This is the arm that says the knob
+        // costs nothing while it is off.
+        assert_eq!(
+            builder_path(
+                None,
+                "/nix/store/aaa-nix-ninja-task-0.1.0",
+                "nix-ninja-task"
+            ),
+            "/nix/store/aaa-nix-ninja-task-0.1.0/bin/nix-ninja-task"
+        );
+        assert_eq!(
+            builder_path(None, "/nix/store/bbb-nix-ninja-0.1.0", "nix-ninja"),
+            "/nix/store/bbb-nix-ninja-0.1.0/bin/nix-ninja"
+        );
+        // Configured, the store path is out of the string entirely, which is
+        // the whole point: two binaries must give one answer.
+        let stable = Some("/nn/bin/nix-ninja-task");
+        assert_eq!(
+            builder_path(
+                stable,
+                "/nix/store/aaa-nix-ninja-task-0.1.0",
+                "nix-ninja-task"
+            ),
+            builder_path(
+                stable,
+                "/nix/store/ccc-nix-ninja-task-0.1.0",
+                "nix-ninja-task"
+            ),
+        );
+        assert_eq!(
+            builder_path(
+                stable,
+                "/nix/store/aaa-nix-ninja-task-0.1.0",
+                "nix-ninja-task"
+            ),
+            "/nn/bin/nix-ninja-task"
+        );
     }
 
     #[test]
