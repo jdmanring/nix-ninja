@@ -7982,15 +7982,48 @@ fn upload_referenced_dir_uncached(
             // separate decision about the cap, to be taken with the size in
             // hand rather than by a fallback that happens to return nothing.
             if packages.is_empty() {
-                return Err(anyhow!(
-                    "dir arg {} holds more than {} files and contains no \
-                     importable python package, so this fallback has nothing \
-                     to upload and the task would run against an empty \
-                     directory; declare the files this edge needs as inputs, \
-                     or raise DIR_UPLOAD_CAP deliberately",
-                    dir.display(),
-                    DIR_UPLOAD_CAP
-                ));
+                // A DATA DIRECTORY, so carry it whole under its own cap.
+                // Measured on gobject-introspection 1.86.0, the package this
+                // class was reported from: `tests/scanner` is 2,216 files and
+                // 9.5 MiB with no `__init__.py` anywhere, so it is 2.16 times
+                // the package cap rather than a runaway match, and the
+                // generator that names it cannot work without it.
+                //
+                // Safe to widen because of what the narrow path DID: over the
+                // cap with no package it uploaded nothing and reported
+                // success, and the task then died inside the sandbox on a
+                // path that was not there. Edges of this shape have no banked
+                // output to spend, so carrying the directory can only move
+                // derivations that already fail.
+                //
+                // A separate constant rather than a raised DIR_UPLOAD_CAP:
+                // the package cap guards a different thing, an importable
+                // tree whose size is a property of a library, and raising
+                // both to serve one of them loses that. The refusal survives
+                // above this bound, since every input is a store path in the
+                // task's closure and closure size is measured here as daemon
+                // lock time.
+                const DATA_DIR_CAP: usize = 4096;
+                return match walk_dir_capped(rpc_client, build_dir, dir, DATA_DIR_CAP)? {
+                    Some(files) => {
+                        eprintln!(
+                            "nix-ninja: dir arg {} holds no python package; \
+                             carried it whole ({} files)",
+                            dir.display(),
+                            files.len()
+                        );
+                        Ok(files)
+                    }
+                    None => Err(anyhow!(
+                        "dir arg {} holds more than {} files and contains no \
+                         importable python package, so it is neither a \
+                         sys.path root nor a data directory this driver will \
+                         carry; declare the files this edge needs as inputs, \
+                         or raise DATA_DIR_CAP deliberately",
+                        dir.display(),
+                        DATA_DIR_CAP
+                    )),
+                };
             }
             let mut out = Vec::new();
             for p in packages {
