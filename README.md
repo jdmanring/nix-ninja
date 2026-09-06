@@ -136,11 +136,11 @@ The last of the five asked for the store-add path to come off the critical
 path, on the premise that generating derivations is slowed by adding almost
 every input file to the store one at a time. That premise was measured rather
 than acted on, and it does not hold. On a 345 task project the driver makes
-36,499 store adds, and the 35,435 of them answered from the stamp cache cost
+35,435 store adds, and the 34,371 of them answered from the stamp cache cost
 under a second between them, because that path stats the file and reads an
 in-process map without ever reaching the daemon. Every measurable second
-belongs to the thousand or so files that genuinely upload, which already
-stream and already upload concurrently, and which the stamp cache avoids
+belongs to the thousand or so files that genuinely upload, 1,064 of them
+here, which already stream and already upload concurrently, and which the stamp cache avoids
 repeating on a later run in the same build directory. What that residue
 costs depends on the state of the store rather than on the shape of the call
 (25 s cold against 4 s warm, at the same number of calls), which is the
