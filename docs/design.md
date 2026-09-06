@@ -277,6 +277,32 @@ from a build log, so the driver names the keying it used once per process on
 stderr, and says nothing when neither builder path is set
 (`report_keying_once`).
 
+### Environment variables the driver reads
+
+These are additions this fork makes; the sections around them describe
+nix-ninja itself. The three that key a task on a generation are described
+above and are not repeated here.
+
+| variable | effect |
+|---|---|
+| `NIX_NINJA_IMPLICIT_INPUTS_LIMIT` | The implicit-input blanket sweeps every undeclared file in the build directory into a task, and applies only while that set is no larger than this. `0` switches the blanket off, which is what a test of a discovery mechanism wants: with the blanket on, the file under test arrives whether or not the mechanism found it. Default 512. |
+| `NIX_NINJA_NO_BUILD_DIR_SCAN` | Set to anything, including the empty string, to skip the build-directory walk entirely. Presence is the whole test, so `=0` also disables it. |
+| `NIX_NINJA_PASS_ENV` | Whitespace-separated names to forward into every task on top of the built-in allowlist. A name that is not itself set is an error rather than a skip, because a silently dropped variable surfaces as a build failure inside a sandbox. |
+| `NIX_NINJA_RESOLVE_CACHE` | `0` disables the resolve cache, `1` enables it. Unset, it is on outside a nix build and off inside one, since a sandbox starts with no cache to read. |
+| `NIX_NINJA_KEEP_GOING` | `1` continues past a failed edge instead of stopping at the first. The run still exits nonzero, carrying the failure count. |
+| `NIX_NINJA_ASSUME_LTO` | `1` treats a link as LTO even where no flag on the command line says so. Any other value reads as unset. |
+| `NIX_NINJA_SYSTEM` | Overrides the system string emitted into task derivations when set and non-empty. |
+
+A value that is set but cannot be read is refused rather than replaced by the
+default. The distinction matters most for the blanket limit: a mistyped value
+that fell back to the default ran with the blanket on, so a gate that sets it
+to `0` to test a discovery mechanism would exercise the blanket instead and
+report a pass either way.
+
+The remaining `NIX_NINJA_` names in the source are not settings. They carry
+the driver's own arguments into a task derivation's environment, and the task
+binary reads them back inside the sandbox.
+
 ### Explicit /nix/store references
 
 Since `meson setup build` is configuring in a Nix environment, either locally
