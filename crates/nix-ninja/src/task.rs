@@ -7892,6 +7892,28 @@ fn upload_referenced_dir(
     Ok(fresh)
 }
 
+/// The immediate subdirectories of `dir` that are importable python
+/// packages, in read order.
+///
+/// A free function taking a path rather than part of the upload, because the
+/// upload needs a daemon and this decision does not; the same reason
+/// `remember_nar_stamp` sits outside its caller in the rpc client. What it
+/// answers decides whether the over-cap fallback applies at all: an empty
+/// result means the directory is not a `sys.path` root and the convention is
+/// the wrong one for it.
+fn importable_subpackages(dir: &Path) -> Result<Vec<PathBuf>> {
+    let entries =
+        fs::read_dir(dir).map_err(|e| anyhow!("read_dir({}) for dir arg: {e}", dir.display()))?;
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() && p.join("__init__.py").is_file() {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
 fn upload_referenced_dir_uncached(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &Path,
@@ -7941,23 +7963,47 @@ fn upload_referenced_dir_uncached(
             // (an __init__.py at their root), each itself capped; a
             // package that ALSO busts the cap is a hard error, because a
             // partial package import fails stranger than a named refusal.
+            let packages = importable_subpackages(dir)?;
+            // NO IMPORTABLE PACKAGE MEANS THIS IS NOT A sys.path ROOT, so
+            // the convention this fallback implements does not apply and
+            // there is nothing for it to do. Answering with an empty upload
+            // reports success and leaves the task running against an EMPTY
+            // directory, which fails later and somewhere else, or quietly
+            // produces less than it should.
+            //
+            // gobject-introspection names ../tests/scanner, a data tree with
+            // no package in it, and the consumer measured what followed: the
+            // generator's 18 dependencies fail and 110 top-level derivations
+            // go with them.
+            //
+            // Refusing does not build that package and is not meant to. It
+            // converts a silent wrong answer into one named failure at the
+            // edge that caused it. Carrying a large data directory is a
+            // separate decision about the cap, to be taken with the size in
+            // hand rather than by a fallback that happens to return nothing.
+            if packages.is_empty() {
+                return Err(anyhow!(
+                    "dir arg {} holds more than {} files and contains no \
+                     importable python package, so this fallback has nothing \
+                     to upload and the task would run against an empty \
+                     directory; declare the files this edge needs as inputs, \
+                     or raise DIR_UPLOAD_CAP deliberately",
+                    dir.display(),
+                    DIR_UPLOAD_CAP
+                ));
+            }
             let mut out = Vec::new();
-            let entries = fs::read_dir(dir)
-                .map_err(|e| anyhow!("read_dir({}) for dir arg: {e}", dir.display()))?;
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() && p.join("__init__.py").is_file() {
-                    match walk_dir_capped(rpc_client, build_dir, &p, DIR_UPLOAD_CAP)? {
-                        Some(files) => out.extend(files),
-                        None => {
-                            return Err(anyhow!(
-                                "python package {} holds more than {} files; \
-                                 declare its files as inputs or raise \
-                                 DIR_UPLOAD_CAP deliberately",
-                                p.display(),
-                                DIR_UPLOAD_CAP
-                            ))
-                        }
+            for p in packages {
+                match walk_dir_capped(rpc_client, build_dir, &p, DIR_UPLOAD_CAP)? {
+                    Some(files) => out.extend(files),
+                    None => {
+                        return Err(anyhow!(
+                            "python package {} holds more than {} files; \
+                             declare its files as inputs or raise \
+                             DIR_UPLOAD_CAP deliberately",
+                            p.display(),
+                            DIR_UPLOAD_CAP
+                        ))
                     }
                 }
             }
@@ -13233,5 +13279,79 @@ mod outer_output_input_tests {
             !control.is_empty(),
             "the fixture cannot discriminate: nothing extracts this path even unguarded"
         );
+    }
+}
+
+#[cfg(test)]
+mod importable_subpackage_tests {
+    use super::{importable_subpackages, Scratch};
+    use std::fs;
+
+    // Scratch, the helper this file already has, rather than a dev
+    // dependency: `Cargo.toml` and `Cargo.lock` are inside the task binary's
+    // fileset, so adding a crate for a unit test re-keys every banked
+    // compile in the consumer's store.
+    fn dir(name: &str, entries: &[(&str, bool)]) -> Scratch {
+        let td = Scratch::new(format!("nn-subpkg-{name}-{}", std::process::id()));
+        for (entry, is_pkg) in entries {
+            let p = td.join(entry);
+            fs::create_dir_all(&p).expect("mkdir");
+            if *is_pkg {
+                fs::write(p.join("__init__.py"), b"").expect("write");
+            }
+        }
+        td
+    }
+
+    #[test]
+    fn a_sys_path_root_reports_its_packages() {
+        let td = dir(
+            "root",
+            &[("jinja2", true), ("markupsafe", true), ("docs", false)],
+        );
+        let mut got: Vec<String> = importable_subpackages(&td)
+            .expect("read")
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["jinja2", "markupsafe"]);
+    }
+
+    #[test]
+    fn a_data_tree_reports_none() {
+        // gobject-introspection's shape: directories and files, no package.
+        // The over-cap fallback keys on this being empty, and answering with
+        // an empty upload instead of refusing is what took 110 derivations.
+        let td = dir("data", &[("annotations", false), ("scanner", false)]);
+        fs::write(td.join("test.h"), b"int x;").expect("write");
+        assert!(importable_subpackages(&td).expect("read").is_empty());
+    }
+
+    #[test]
+    fn a_loose_init_py_is_not_a_package_directory() {
+        // An __init__.py at the ROOT makes `dir` itself a package; it does
+        // not make `dir` a sys.path root holding packages. Counting it would
+        // let the fallback proceed on a directory whose files it never
+        // uploads, which is the silent case wearing a different shape.
+        let td = dir("loose", &[("data", false)]);
+        fs::write(td.join("__init__.py"), b"").expect("write");
+        assert!(importable_subpackages(&td).expect("read").is_empty());
+    }
+
+    #[test]
+    fn a_plain_file_named_like_a_package_is_not_one() {
+        let td = dir("file", &[]);
+        fs::write(td.join("jinja2"), b"not a directory").expect("write");
+        assert!(importable_subpackages(&td).expect("read").is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_directory_is_an_error_not_an_empty_answer() {
+        // The zero case that matters: a read failure must not arrive as "no
+        // packages here", because the caller turns that into a refusal whose
+        // message names the wrong cause.
+        let missing = std::path::Path::new("/nonexistent-dir-for-this-test/x");
+        assert!(importable_subpackages(missing).is_err());
     }
 }
