@@ -1405,6 +1405,65 @@ impl Runner {
         );
         let mut worklist: Vec<(FileId, bool)> =
             build.ordering_ins().iter().map(|f| (*f, false)).collect();
+
+        // A SONAME ALIAS IS CARRIED AS LINK TEXT AND THE FILE IT NAMES IS
+        // NOT CARRIED WITH IT, so the symlink the task recreates dangles and
+        // the linker reports every symbol of the aliased library undefined.
+        //
+        // liblapack 3.12.1 is the witnessed case (the consumer's ninja
+        // route): the link names `lib/liblapacke.so.3.12.0` and passes
+        // `-Wl,-rpath-link,<build>/lib`. liblapacke records
+        // `DT_NEEDED liblapack.so.3`, which exists in the build tree only as
+        // a configure-time alias to `liblapack.so.3.12.0`. No argument on the
+        // command line names either spelling, so nothing puts them in the
+        // input set, and `ld` finds neither along the rpath-link directory it
+        // was given.
+        //
+        // THE ALIAS IS ALREADY KNOWN: the walk records it and every task
+        // carries the whole set through `NIX_NINJA_ALIASES`. What is missing
+        // is the target, so seeding the worklist with it is the entire fix
+        // and it needs no ELF read. Reading each input's real `DT_NEEDED`
+        // would be more precise and would cost a dynamic-section parser plus
+        // the bytes to run it on, which a link task does not have: its
+        // library inputs are placeholders for outputs that do not exist yet.
+        //
+        // NARROWED TO A SHARED-LIBRARY LINK, and the narrowing is the whole
+        // emission argument. Seeding every task would add inputs to every
+        // generator that happens to run in a project with soname aliases,
+        // which is a re-key of everything wearing a driver-side fix. A
+        // compile is excluded by `is_gcc_task`; everything else must name a
+        // shared library among its own inputs or outputs to qualify.
+        //
+        // LESS PRECISE THAN DT_NEEDED ON PURPOSE: a link that needs one
+        // aliased library carries the targets of the others too. They are
+        // build products the graph already produces, the cost is inputs on
+        // link tasks in projects that have soname aliases at all, and the
+        // alternative buys precision with a parser and a bytes-at-driver-time
+        // assumption that does not hold.
+        if !is_gcc_task && !self.alias_symlinks.is_empty() {
+            let names_shared_lib = |fid: &FileId| {
+                shared_library_spelling(files.by_id[*fid].name.as_str())
+            };
+            if build.ordering_ins().iter().any(names_shared_lib)
+                || build.outs().iter().any(names_shared_lib)
+            {
+                for (link, target) in &self.alias_symlinks {
+                    if !shared_library_spelling(link) {
+                        continue;
+                    }
+                    // The target text is relative to the LINK's directory,
+                    // not to the build root, which is what a symlink means.
+                    let resolved = parent_dir_or_here(Path::new(link)).join(target);
+                    let resolved = resolved
+                        .components()
+                        .filter(|c| !matches!(c, std::path::Component::CurDir))
+                        .collect::<PathBuf>();
+                    if let Some(fid) = files.lookup(&resolved.to_string_lossy()) {
+                        worklist.push((fid, true));
+                    }
+                }
+            }
+        }
         let mut seen: rustc_hash::FxHashSet<FileId> = rustc_hash::FxHashSet::default();
         while let Some((fid, via_phony)) = worklist.pop() {
             if !seen.insert(fid) {
@@ -2601,6 +2660,18 @@ impl Runner {
             empty_dirs,
         })
     }
+}
+
+/// Does this path name a shared library, in either spelling a build tree
+/// uses: a plain `.so`, or a versioned `libfoo.so.1.2.3`. Written once and
+/// called from both sides of the soname-alias gate, since a predicate
+/// written twice diverges.
+fn shared_library_spelling(name: &str) -> bool {
+    let base = match name.rsplit_once('/') {
+        Some((_, b)) => b,
+        None => name,
+    };
+    base.ends_with(".so") || base.contains(".so.")
 }
 
 /// Include directories a compile command names, spelled relative to the
@@ -10468,6 +10539,49 @@ fn outer_include_stage_dirs(cmdline: &str, outer: &[String]) -> Vec<(PathBuf, Pa
         }
     }
     out
+}
+
+#[cfg(test)]
+mod soname_alias_tests {
+    use super::shared_library_spelling;
+
+    // THE ZERO CASE. A predicate that answered yes to everything would pass
+    // every positive test below and would put the alias targets on every
+    // link, which is the emission shape this narrowing exists to avoid.
+    #[test]
+    fn an_object_and_an_archive_are_not_shared_libraries() {
+        assert!(!shared_library_spelling("src/main.c.o"));
+        assert!(!shared_library_spelling("lib/libfoo.a"));
+        assert!(!shared_library_spelling("prog"));
+        assert!(!shared_library_spelling(""));
+    }
+
+    #[test]
+    fn both_spellings_of_a_shared_library_are_named() {
+        assert!(shared_library_spelling("lib/libfoo.so"));
+        assert!(shared_library_spelling("lib/liblapack.so.3"));
+        assert!(shared_library_spelling("lib/liblapacke.so.3.12.0"));
+    }
+
+    // A DIRECTORY IS NOT THE FILE. `.so` in a parent component says nothing
+    // about the entry, and meson names per-target directories after their
+    // product: `src/libdav1d.so.7.0.0.p/x.c.o` is an object under a
+    // directory whose name ends in the shape this looks for.
+    #[test]
+    fn only_the_basename_is_read() {
+        assert!(!shared_library_spelling(
+            "src/libdav1d.so.7.0.0.p/dav1d_lib.c.o"
+        ));
+        assert!(!shared_library_spelling("lib.so.d/notalib"));
+    }
+
+    // A suffix that merely CONTAINS the letters is not the extension, and
+    // the versioned branch must not reach it: `.solib`, `.source`.
+    #[test]
+    fn a_longer_suffix_is_not_a_shared_library() {
+        assert!(!shared_library_spelling("gen/table.solib"));
+        assert!(!shared_library_spelling("doc/readme.source"));
+    }
 }
 
 #[cfg(test)]
