@@ -176,6 +176,18 @@ if resolved:
     # zero, and it is silent: the driver renames a phase, every later record
     # omits it, and a diff across the rename reads as the phase disappearing.
     # Recorded in the record itself so the reader sees it without re-running.
+    # TWO COUNTERS OVER ONE POPULATION MUST AGREE. Every store add is either
+    # answered by the stamp cache or performed, so the store-add call count
+    # has to equal the NAR total. They are incremented by different code, so
+    # a divergence is an instrument fault and not a property of the build:
+    # the first version of this counter wrapped both a public entry point and
+    # the one it delegates to, and reported hits + 2 * uploads while looking
+    # entirely plausible on its own.
+    fa, nc = rec.get("file_add_calls"), rec.get("nar_calls")
+    if fa is not None and nc is not None and fa != nc:
+        rec["counter_disagreement"] = {"file_add_calls": fa, "nar_calls": nc}
+        print(f"store-add counters disagree: file adds {fa}, nar {nc}; "
+              "one path is counted more than once", file=sys.stderr)
     if missed:
         rec["unparsed_phases"] = missed
         print("phase keys not found in the driver line: " + " ".join(missed),

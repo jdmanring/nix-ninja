@@ -771,7 +771,12 @@ impl BuilderRpcClient {
             return Ok(sp);
         }
         NAR_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let sp = self.add_to_store_nar(name, path)?;
+        // The INNER upload, not the timed public wrapper: this call is
+        // already inside one, and calling the wrapper counted every miss
+        // twice and nested its duration inside its own total. Measured on
+        // two recorded runs, where the reported call count was exactly
+        // hits + 2 * uploads.
+        let sp = self.add_to_store_nar_inner(name, path)?;
         remember_nar_stamp(&self.nar_uploads, key, stamp, &sp);
         Ok(sp)
     }
@@ -1581,6 +1586,11 @@ pub fn file_add_stats() -> (u64, u64, u64) {
 }
 
 /// Times one file-add call into the counters above.
+///
+/// ONE CALL MUST PASS THROUGH ONE OF THESE. Every public entry point is
+/// wrapped, so an entry point that reaches another one counts its work twice
+/// and nests the inner duration inside the outer; the internal `*_inner`
+/// spellings exist for exactly that reason and are what a wrapped path calls.
 fn timed_add<T>(f: impl FnOnce() -> T) -> T {
     let t0 = std::time::Instant::now();
     let out = f();
