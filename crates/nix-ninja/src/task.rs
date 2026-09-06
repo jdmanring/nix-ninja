@@ -1688,11 +1688,21 @@ impl Runner {
             // an argument that was relative to begin with needs the other
             // direction, because it names a file under the cd target and
             // the upload path resolves against the build root.
-            let cd_dir = command_cd_dir(&args);
-            let cd_depth = cd_dir
-                .components()
-                .filter(|c| matches!(c, std::path::Component::Normal(_)))
-                .count();
+            let (cd_depth, cd_dir) = if args.len() >= 3
+                && args[0] == "cd"
+                && args[2] == "&&"
+                && !args[1].starts_with('/')
+            {
+                (
+                    Path::new(&args[1])
+                        .components()
+                        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                        .count(),
+                    PathBuf::from(&args[1]),
+                )
+            } else {
+                (0, PathBuf::new())
+            };
             if let Some((module, roots)) = python_module_invocation(&args) {
                 for rel in python_module_candidates(&module, &roots) {
                     let rel = rebase_post_cd(&cd_dir, &rel);
@@ -5663,12 +5673,7 @@ fn undeclared_outputs(
         for (i, t) in toks.iter().enumerate() {
             if *t == "cd" && (i == 0 || matches!(toks[i - 1], "&&" | ";")) {
                 if let Some(dir) = toks.get(i + 1) {
-                    let d = Path::new(dir.trim_matches('"'));
-                    base = if d.is_absolute() {
-                        d.to_path_buf()
-                    } else {
-                        cd_into(&base, d)
-                    };
+                    base = cd_into(&base, Path::new(dir.trim_matches('"')));
                 }
             }
             if *t == "create_symlink" && i > 0 && toks[i - 1] == "-E" {
@@ -5705,56 +5710,15 @@ fn cd_into(base: &Path, dir: &Path) -> PathBuf {
     for part in std::iter::once(start).chain(rest.iter().copied()) {
         for c in part.components() {
             match c {
-                // A RELATIVE BASE CANNOT ALWAYS POP. `cd ..` from nothing is
-                // the build dir's parent and has to stay spelled as one,
-                // which is the form the caller that rebases arguments needs;
-                // an absolute base pops down to its root and no further.
-                std::path::Component::ParentDir => match out.last().map(|s| s.as_os_str()) {
-                    Some(l) if l != "/" && l != ".." => {
-                        out.pop();
-                    }
-                    Some(l) if l == "/" => {}
-                    _ => out.push(std::ffi::OsString::from("..")),
-                },
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
                 std::path::Component::CurDir => {}
                 other => out.push(other.as_os_str().to_owned()),
             }
         }
     }
     out.iter().collect()
-}
-
-/// THE WORKING DIRECTORY A COMMAND'S ARGUMENTS RESOLVE AGAINST, relative to
-/// the build directory, and empty where they resolve against it.
-///
-/// The two readers that walk a command's `cd`s want different answers - this
-/// one rebases arguments and so wants nothing when the target is absolute,
-/// while the symlink reader wants the directory the link actually lands in -
-/// so they share `cd_into` rather than one function. What they had in common
-/// was the defect: each read a `cd` only as the command's FIRST word, and
-/// cmake appends an `add_custom_command(TARGET ... POST_BUILD)` to the
-/// target's own rule, so the `cd` follows the link and neither saw it.
-///
-/// An ABSOLUTE target resets the answer to empty on purpose. Under the exact
-/// mirror the driver ships the original command line, whose absolute cd
-/// target already names the task's own tree, so an argument beside it needs
-/// no rebasing.
-fn command_cd_dir(args: &[String]) -> PathBuf {
-    let mut dir = PathBuf::new();
-    for (i, a) in args.iter().enumerate() {
-        if a != "cd" || !(i == 0 || matches!(args[i - 1].as_str(), "&&" | ";")) {
-            continue;
-        }
-        let Some(target) = args.get(i + 1) else {
-            continue;
-        };
-        dir = if target.starts_with('/') {
-            PathBuf::new()
-        } else {
-            cd_into(&dir, Path::new(target.trim_matches('"')))
-        };
-    }
-    dir
 }
 
 /// `<dir>/CMakeFiles/<T>_autogen.dir` for an autogen edge whose outputs
@@ -12336,41 +12300,6 @@ mod create_symlink_undeclared_output_tests {
             bd,
         );
         assert_eq!(v, vec![PathBuf::from("sub/deeper/b")]);
-    }
-
-    #[test]
-    fn the_argument_rebaser_sees_a_cd_that_is_not_the_first_word() {
-        let a = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_string).collect() };
-        // A POST_BUILD command: the cd follows the link. Before this walk the
-        // rebaser read args[0] alone and returned nothing here, so an
-        // argument naming a file under the cd target resolved against the
-        // build root.
-        assert_eq!(
-            command_cd_dir(&a("cc -o prog x.c && cd sub && cmake -P gen.cmake")),
-            PathBuf::from("sub")
-        );
-        // The shape it already handled stays handled.
-        assert_eq!(
-            command_cd_dir(&a("cd src/core && tool a")),
-            PathBuf::from("src/core")
-        );
-        // An ABSOLUTE target resets to empty: under the mirror it already
-        // names the task's own tree and needs no rebasing.
-        assert_eq!(
-            command_cd_dir(&a("cd sub && cd /build/source/build && tool a")),
-            PathBuf::new()
-        );
-        // A climb above the build dir keeps its spelling, since a relative
-        // base has nothing to pop.
-        assert_eq!(command_cd_dir(&a("cd .. && tool a")), PathBuf::from(".."));
-        assert_eq!(
-            command_cd_dir(&a("cd sub && cd .. && tool a")),
-            PathBuf::new()
-        );
-        // A bare `cd` with no target, and a `cd` that is an argument rather
-        // than a command, add nothing.
-        assert_eq!(command_cd_dir(&a("tool --dir cd sub")), PathBuf::new());
-        assert_eq!(command_cd_dir(&a("tool a")), PathBuf::new());
     }
 
     #[test]
