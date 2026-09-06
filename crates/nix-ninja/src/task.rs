@@ -2276,13 +2276,17 @@ impl Runner {
         // emitted derivation is byte-identical to what upstream emits.
         // Read once per process: this runs per task, and env::var on a hot
         // path for a value that cannot change mid-run is waste.
-        static IMPLICIT_LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let implicit_limit = *IMPLICIT_LIMIT.get_or_init(|| {
-            std::env::var("NIX_NINJA_IMPLICIT_INPUTS_LIMIT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(IMPLICIT_INPUTS_LIMIT)
-        });
+        static IMPLICIT_LIMIT: std::sync::OnceLock<Result<usize, String>> =
+            std::sync::OnceLock::new();
+        let implicit_limit = match IMPLICIT_LIMIT.get_or_init(|| {
+            implicit_inputs_limit(
+                std::env::var("NIX_NINJA_IMPLICIT_INPUTS_LIMIT").ok(),
+                IMPLICIT_INPUTS_LIMIT,
+            )
+        }) {
+            Ok(n) => *n,
+            Err(e) => return Err(anyhow!("{e}")),
+        };
         // THE BRANCH IS THE FACT, NOT THE CONSTANT. Whether the blanket
         // fires depends on build_dir_inputs.len(), which nothing prints, so
         // a hypothesis about the blanket cannot be tested without this line.
@@ -5778,6 +5782,30 @@ fn driver_builder_path(store_driver: &str) -> Result<String> {
         store_driver,
         "nix-ninja",
     )
+}
+
+/// A CONFIGURED VALUE THAT CANNOT BE READ IS NOT A MISSING ONE. This parse
+/// used to fall back to the default, so a value that was set but unparseable
+/// ran with the blanket ON at the built-in limit. Gates set this to 0 to
+/// switch the implicit-input blanket off precisely so that a discovery
+/// mechanism is tested rather than the blanket, and one of them passed here
+/// with its subject deleted until it was set: a silent fallback makes that
+/// failure look like a pass, in every gate that sets it, with nothing in the
+/// output to say the value was ignored.
+///
+/// PURE, for the reason `builder_path` and `abi_in_key` are: the choice is
+/// testable without setting a process wide variable.
+fn implicit_inputs_limit(raw: Option<String>, default: usize) -> Result<usize, String> {
+    match raw {
+        None => Ok(default),
+        Some(v) => v.parse().map_err(|_| {
+            format!(
+                "NIX_NINJA_IMPLICIT_INPUTS_LIMIT is set to '{v}', which is not a number; \
+                 falling back to the default would run with the implicit-input blanket \
+                 on and report whatever the blanket supplied"
+            )
+        }),
+    }
 }
 
 /// The ABI generation a task derivation is keyed on, empty unless set.
@@ -12620,6 +12648,23 @@ mod create_symlink_undeclared_output_tests {
         // these, a function returning None unconditionally passes the arm.
         assert_eq!(abi_in_key(true, Some("1".into())), Some("1".into()));
         assert_eq!(abi_in_key(true, None), None);
+    }
+
+    /// A SET BUT UNPARSEABLE LIMIT USED TO READ AS AN UNSET ONE, which is the
+    /// silent-discard class the builder path readers had: a configured value
+    /// dropped for being unreadable, with the default supplying a verdict.
+    /// Gates set this to 0 so that a discovery mechanism is tested rather than
+    /// the blanket, so the fallback makes a gate pass for the wrong reason.
+    #[test]
+    fn an_unparseable_implicit_limit_is_refused_rather_than_defaulted() {
+        let e = implicit_inputs_limit(Some("1O".into()), 512)
+            .expect_err("a set but unparseable limit must not fall back");
+        assert!(e.contains("1O"), "the refusal must name the value: {e}");
+        // Both controls, because a function returning Err unconditionally
+        // satisfies the arm above: absent falls back to the default, and the
+        // zero a gate actually sets is read as zero rather than as absent.
+        assert_eq!(implicit_inputs_limit(None, 512), Ok(512));
+        assert_eq!(implicit_inputs_limit(Some("0".into()), 512), Ok(0));
     }
 
     #[test]
