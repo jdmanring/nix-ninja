@@ -304,14 +304,44 @@ pub fn create_symlinks(
                 // carry it silently across an upgrade.
                 Ok(existing) if existing == placement_link_text(&source_path) => continue,
                 Ok(existing) => {
+                    // THE MESSAGE STATES WHAT IT MEASURED. It used to assert
+                    // the claimants were DIFFERENT without opening either,
+                    // and in both witnessed instances (dav1d's
+                    // `vcs_version.h`, dtc's `version_gen.h`) they held
+                    // identical bytes: the store paths differ because one is
+                    // a bare upload and the other sits inside a directory
+                    // output, which is how each entered the store rather than
+                    // what it holds. A reader took the sentence for a
+                    // measurement and drew a class distinction from it.
+                    // This path is already fatal, so two reads cost nothing,
+                    // and the answer points at the class instead of away from
+                    // it: identical bytes are one content arriving under two
+                    // names, which is the duplicate-upload family.
+                    let resolved = dest_path.parent().map(|d| d.join(&existing));
+                    let verdict = match (
+                        resolved.as_deref().map(fs::read).transpose(),
+                        fs::read(&source_path),
+                    ) {
+                        (Ok(Some(a)), Ok(b)) if a == b => {
+                            "The two claimants hold IDENTICAL bytes, so this is one \
+                             content entering the store under two names rather than a \
+                             conflict."
+                        }
+                        (Ok(Some(_)), Ok(_)) => "The two claimants hold DIFFERENT bytes.",
+                        _ => {
+                            "Whether the two claimants agree was not established, \
+                             because at least one could not be read."
+                        }
+                    };
                     return Err(anyhow!(
                         "nix-ninja-task: {} is already a symlink to {}, and a \
-                         second input wants it to point at {}. Two different \
-                         files claim one build path.",
+                         second input wants it to point at {}. Two files claim \
+                         one build path. {}",
                         dest_path.display(),
                         existing.display(),
-                        source_path.display()
-                    ))
+                        source_path.display(),
+                        verdict
+                    ));
                 }
                 Err(e) => {
                     return Err(anyhow!(
@@ -338,15 +368,41 @@ pub fn create_symlinks(
         // before resolving its relative imports, so a symlinked
         // eslint.config.mjs resolved ../../third_party/... from inside
         // /nix/store and landed on /third_party (measured).
-        if input
-            .build_path
-            .extension()
-            .is_some_and(|e| e == "py" || e == "mjs" || e == "js" || e == "cjs")
-            || input
+        // AN ALIAS IS EXCLUDED FIRST, AND A HEADER IS WHERE THAT BITES. A
+        // store object that is itself a symlink carries link TEXT naming a
+        // sibling in another store object, so it is dangling in its own store
+        // path BY DESIGN and `fs::copy` on it is ENOENT. Every extension this
+        // rule covered before headers was a script, and no build system makes
+        // an alias of one; syncqt's forwarding headers are exactly that
+        // shape. Asked BEFORE the list rather than appended to it, because
+        // `&&` binds tighter than `||`: appended, the exclusion applied to
+        // the `node_modules` clause alone, compiled, and left every header
+        // copying an alias.
+        let copy_not_link = !source_path.is_symlink()
+            && (input.build_path.extension().is_some_and(|e| {
+                e == "py"
+                    || e == "mjs"
+                    || e == "js"
+                    || e == "cjs"
+                    // Headers join for the same reason with a different
+                    // consumer: under `#pragma GCC system_header`, which
+                    // CMake's generated precompiled-header wrapper confers on
+                    // everything it includes, a header REACHED BY A DIRECTORY
+                    // SEARCH is recorded at its resolved path, so its own
+                    // quoted includes resolve from the store directory
+                    // holding that single file. glslang's SymbolTable.h
+                    // reaches `../Include/Common.h` that way and cannot. A
+                    // copy keeps the includer in the build tree beside its
+                    // siblings.
+                    || e == "h"
+                    || e == "hpp"
+                    || e == "hxx"
+                    || e == "hh"
+            }) || input
                 .build_path
                 .components()
-                .any(|c| c.as_os_str() == "node_modules")
-        {
+                .any(|c| c.as_os_str() == "node_modules"));
+        if copy_not_link {
             fs::copy(&source_path, &dest_path)
                 .map_err(|e| anyhow!("copy({:?} -> {}): {e}", source_path, dest_path.display()))?;
             continue;

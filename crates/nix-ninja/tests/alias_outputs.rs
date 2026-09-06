@@ -501,3 +501,155 @@ fn a_placed_link_pulls_in_the_output_it_names() {
 
     std::fs::remove_dir_all(&d).ok();
 }
+
+/// A HEADER ALIAS, WHICH THE COPY RULE WOULD OTHERWISE DESTROY.
+///
+/// Headers are placed as COPIES rather than links, because under
+/// `#pragma GCC system_header` a header reached by a directory search is
+/// recorded at its resolved path and its own quoted includes then resolve
+/// from the store directory holding that one file (glslang's SymbolTable.h
+/// reaching `../Include/Common.h`).
+///
+/// That rule and this file's subject collide on one input. An alias output is
+/// a symlink carrying link TEXT for a sibling in another store object, so it
+/// is dangling in its own store path BY DESIGN, and `fs::copy` on it is
+/// ENOENT. Every extension the copy rule covered before headers was a script,
+/// and no build system makes an alias out of one; syncqt's forwarding headers
+/// are exactly that shape, so the exclusion became load bearing the moment
+/// `.h` joined the list.
+///
+/// Reverting the `is_symlink` guard fails this test with the copy's own
+/// ENOENT rather than with a wrong placement, which is the failure a package
+/// would see.
+#[test]
+fn a_header_alias_is_placed_as_text_and_not_copied() {
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
+
+    let d = dir("header-alias");
+    let store_root = d.join("store");
+    let build = d.join("build");
+    std::fs::create_dir_all(&build).unwrap();
+
+    let h_real = "1ccccccccccccccccccccccccccccccc";
+    let h_alias = "1ddddddddddddddddddddddddddddddd";
+    let real = store_root.join(format!("{h_real}-ninja-build-include-qtsvgversion.h"));
+    let alias = store_root.join(format!("{h_alias}-ninja-build-include-QtSvgVersion"));
+    std::fs::create_dir_all(real.join("include")).unwrap();
+    std::fs::create_dir_all(alias.join("include")).unwrap();
+    std::fs::write(real.join("include/qtsvgversion.h"), b"#define V 1\n").unwrap();
+    std::os::unix::fs::symlink("qtsvgversion.h", alias.join("include/QtSvgVersion.h")).unwrap();
+
+    let store_dir = StoreDir::new(&store_root).unwrap();
+    let enc = |h: &str, name: &str, rel: &str| {
+        let sp = format!("{}/{h}-{name}", store_root.display());
+        DerivedFile::from_encoded(&store_dir, &format!("{sp}:{rel}:{rel}")).unwrap()
+    };
+    let inputs = vec![
+        enc(
+            h_real,
+            "ninja-build-include-qtsvgversion.h",
+            "include/qtsvgversion.h",
+        ),
+        enc(
+            h_alias,
+            "ninja-build-include-QtSvgVersion",
+            "include/QtSvgVersion.h",
+        ),
+    ];
+
+    create_symlinks(&build, &store_dir, inputs, false)
+        .expect("a header alias is link text, and copying it is ENOENT on a dangling source");
+
+    assert!(
+        build.join("include/QtSvgVersion.h").is_symlink(),
+        "the alias stays a link: copying it would lose the forwarding relationship"
+    );
+    assert_eq!(
+        std::fs::read(build.join("include/QtSvgVersion.h")).unwrap(),
+        b"#define V 1\n",
+        "and it resolves to its co-output beside it"
+    );
+
+    // The ordinary header, the case the copy rule exists for, is a real file.
+    assert!(
+        !build.join("include/qtsvgversion.h").is_symlink(),
+        "a plain header is COPIED, so a searched includer keeps its build-tree \
+         directory and finds its own siblings"
+    );
+
+    std::fs::remove_dir_all(&d).ok();
+}
+
+/// THE COLLISION MESSAGE STATES WHAT IT MEASURED, NOT WHAT IT ASSUMED.
+///
+/// It used to assert the two claimants were DIFFERENT without opening either.
+/// In both witnessed instances (dav1d's `vcs_version.h`, dtc's
+/// `version_gen.h`) they held identical bytes, and a reader took the sentence
+/// for a measurement and drew a class distinction from it that does not
+/// exist. The wrong belief survived because the remedy is the same either
+/// way, so nothing downstream could contradict it.
+///
+/// Both verdicts are asserted here. Checking only the identical case would
+/// pass against a message that says "identical" unconditionally.
+#[test]
+fn the_collision_message_reports_whether_the_claimants_agree() {
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
+
+    let run = |tag: &str, bytes_b: &[u8]| -> String {
+        let d = dir(tag);
+        let store_root = d.join("store");
+        let build = d.join("build");
+        std::fs::create_dir_all(build.join("include")).unwrap();
+
+        let h_a = "1eeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let h_b = "1fffffffffffffffffffffffffffffff";
+        for (h, n) in [(h_a, "a"), (h_b, "b")] {
+            std::fs::create_dir_all(store_root.join(format!("{h}-ninja-build-{n}/include")))
+                .unwrap();
+        }
+        std::fs::write(
+            store_root.join(format!("{h_a}-ninja-build-a/include/version_gen.h")),
+            b"#define V \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            store_root.join(format!("{h_b}-ninja-build-b/include/version_gen.h")),
+            bytes_b,
+        )
+        .unwrap();
+
+        // A placement already standing, as the first claimant leaves it.
+        std::os::unix::fs::symlink(
+            store_root.join(format!("{h_a}-ninja-build-a/include/version_gen.h")),
+            build.join("include/version_gen.h"),
+        )
+        .unwrap();
+
+        let store_dir = StoreDir::new(&store_root).unwrap();
+        let sp = format!("{}/{h_b}-ninja-build-b", store_root.display());
+        let input = DerivedFile::from_encoded(
+            &store_dir,
+            &format!("{sp}:include/version_gen.h:include/version_gen.h"),
+        )
+        .unwrap();
+
+        let err = create_symlinks(&build, &store_dir, vec![input], false)
+            .expect_err("a second claimant on one build path aborts");
+        std::fs::remove_dir_all(&d).ok();
+        err.to_string()
+    };
+
+    let same = run("collide-same", b"#define V \"1\"\n");
+    assert!(
+        same.contains("IDENTICAL bytes"),
+        "byte-identical claimants are one content under two names: {same}"
+    );
+
+    let diff = run("collide-diff", b"#define V \"2\"\n");
+    assert!(
+        diff.contains("DIFFERENT bytes"),
+        "and a genuine disagreement must still say so: {diff}"
+    );
+}
