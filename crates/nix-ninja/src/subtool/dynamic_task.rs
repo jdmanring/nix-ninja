@@ -346,4 +346,55 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    /// THE TRANSITIVE HALF OF THE KEYING KNOB, and it is the only property
+    /// that makes a dynamic task derivation free of the task binary's store
+    /// path. `build_dynamic_task_derivation` emits the dynamic derivation
+    /// with `driver_builder_path` and embeds a plain derivation already
+    /// emitted through `task_builder_path`; this function is what re-reads
+    /// that plain derivation inside the sandbox, and the knob's coverage
+    /// depends on it leaving the builder alone rather than re-deriving it.
+    ///
+    /// WRITTEN AFTER A RETRACTION, which is why it exists at all: the
+    /// dynamic class was recorded as UNCOVERED on the strength of a store
+    /// search whose corpus predated the knob and could only return zero.
+    /// The property is established by reading, and a read is exactly what
+    /// a later edit does not repeat. A mutant reassigning `drv.builder`
+    /// here fails this and nothing else in the tree.
+    #[test]
+    fn discoveries_do_not_touch_the_builder() {
+        let store_dir = StoreDir::new(std::path::Path::new("/nix/store")).unwrap();
+        let builder = b"/nn-task/bin/nix-ninja-task";
+        let mut drv = Derivation::new(
+            "ninja-build".parse().unwrap(),
+            b"x86_64-linux"[..].into(),
+            builder[..].into(),
+        );
+
+        let discovered: StorePath = store_dir
+            .parse("/nix/store/fixs6b76qaj5m5h3xbyjzkgwlqcd5480-prog.c")
+            .unwrap();
+        let new_deps = update_derivation_with_discoveries(
+            &mut drv,
+            Vec::new(),
+            vec![discovered.clone()],
+            &store_dir,
+        )
+        .unwrap();
+
+        // THE CONTROL, and without it the builder assertion is satisfied by
+        // a function that returned early and did nothing. The discovered
+        // store path must have landed as an input.
+        assert!(new_deps.is_empty(), "no derived files were offered");
+        assert!(
+            drv.inputs.contains(&SingleDerivedPath::Opaque(discovered)),
+            "the discovered store path must become an input: {:?}",
+            drv.inputs
+        );
+        assert_eq!(
+            drv.builder.as_ref(),
+            &builder[..],
+            "the embedded plain derivation keeps the builder it was emitted with"
+        );
+    }
 }
