@@ -5657,17 +5657,35 @@ fn undeclared_outputs(
         // symlink shape (lz4cat, unlz4). The edge declares only the
         // CMakeFiles stamp; the link itself is an undeclared side effect
         // that real ninja leaves in the build tree and a sandboxed task
-        // discards. The link is relative to the command's `cd <dir> &&`
-        // prefix when one is present, the build dir otherwise.
+        // discards. The link is relative to the working directory in effect
+        // where the `create_symlink` runs, which the `cd` walk below tracks.
         let toks: Vec<&str> = c.split_whitespace().collect();
-        for w in toks.windows(4) {
-            if w[0] == "-E" && w[1] == "create_symlink" {
-                let link = w[3].trim_matches('"');
-                let base = if toks.first() == Some(&"cd") && toks.get(2) == Some(&"&&") {
-                    PathBuf::from(toks[1].trim_matches('"'))
-                } else {
-                    build_dir.to_path_buf()
+        // THE `cd` NEED NOT BE THE COMMAND'S FIRST WORD. cmake attaches an
+        // `add_custom_command(TARGET ... POST_BUILD)` to the END of the
+        // target's own rule, so the link edge reads
+        // `... g++ -o StandAlone/glslang ... && cd <abs>/StandAlone && cmake
+        // -E create_symlink glslang glslangValidator` (glslang 16.2.0, whose
+        // command declares no BYPRODUCTS at all). Reading only a leading `cd`
+        // left the base at the build root and declared a bare
+        // `glslangValidator`, which the task then failed as an output the
+        // command never wrote while the file sat one directory down.
+        let mut base = build_dir.to_path_buf();
+        for (i, t) in toks.iter().enumerate() {
+            if *t == "cd" && (i == 0 || matches!(toks[i - 1], "&&" | ";")) {
+                if let Some(dir) = toks.get(i + 1) {
+                    let dir = Path::new(dir.trim_matches('"'));
+                    base = if dir.is_absolute() {
+                        dir.to_path_buf()
+                    } else {
+                        base.join(dir)
+                    };
+                }
+            }
+            if *t == "create_symlink" && i > 0 && toks[i - 1] == "-E" {
+                let Some(link) = toks.get(i + 2) else {
+                    continue;
                 };
+                let link = link.trim_matches('"');
                 let abs = if Path::new(link).is_absolute() {
                     PathBuf::from(link)
                 } else {
@@ -12235,6 +12253,33 @@ mod create_symlink_undeclared_output_tests {
         // Negative control: an unrelated -E command adds nothing.
         let v = undeclared_outputs(&[], Some("cmake -E copy a b"), bd);
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn a_post_build_symlink_resolves_against_its_own_cd_and_not_the_build_dir() {
+        // glslang 16.2.0: an `add_custom_command(TARGET ... POST_BUILD)` is
+        // appended to the target's own link rule, so the `cd` sits in the
+        // MIDDLE of the command and the link is written one directory below
+        // the build root. Declared at the root it is an output no command
+        // wrote.
+        let bd = Path::new("/build/source/build");
+        let v = undeclared_outputs(
+            &[],
+            Some(
+                ": && /nix/store/x-gcc/bin/g++ -o StandAlone/glslang StandAlone/x.o                  && cd /build/source/build/StandAlone                  && /nix/store/y-cmake/bin/cmake -E create_symlink glslang glslangValidator",
+            ),
+            bd,
+        );
+        assert_eq!(v, vec![PathBuf::from("StandAlone/glslangValidator")]);
+
+        // A relative cd composes against the base in effect, and a second
+        // cd replaces the first rather than stacking on the build root.
+        let v = undeclared_outputs(
+            &[],
+            Some("cd sub && cd deeper && cmake -E create_symlink a b"),
+            bd,
+        );
+        assert_eq!(v, vec![PathBuf::from("sub/deeper/b")]);
     }
 
     #[test]
