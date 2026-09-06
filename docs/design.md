@@ -75,6 +75,40 @@ work. So I came up with `nix-ninja-task` which is responsible for three things:
    - NOTE: In the derivation, output paths are Nix placeholders but by the time
      `nix-ninja-task` runs, these are store paths already.
 
+#### Configure-time symlinks and what they point at
+
+Meson and CMake create shared-library SONAME aliases with `os.symlink` at
+configure time. No ninja edge produces `liborc-0.4.so.0`, and the only trace
+of it in the graph is a phony that lists it as an input, so a task cannot
+reach it by asking the graph. The build-directory walk records such a link as
+its link TEXT and `nix-ninja-task` recreates it after input setup, where the
+relative target resolves against whatever the task materialized.
+
+Recreating the link is half of it. A link whose target is not also an input
+is a dangling link, and it fails in a way that names neither the link nor the
+build system:
+
+```
+ld: liblapack.so.3, needed by lib/liblapacke.so.3.12.0, not found
+lib/liblapacke.so.3.12.0: undefined reference to `dgesvd_'
+```
+
+Nothing on that link's command line spells `liblapack.so.3`. It reaches the
+linker through the recorded `DT_NEEDED` of a library the command does name,
+and the build tree satisfies it with an alias. So a link naming a shared
+library also carries the files the recorded aliases point at.
+
+Reading each input's dynamic section would be more precise and is not
+available at the point where a task is built: an input produced by another
+edge is a placeholder for an output that does not exist yet, so there are no
+bytes to parse. Carrying the alias targets is a graph-level answer that needs
+none, at the cost of a link occasionally carrying a library it did not need.
+
+The carry is confined to a link naming a shared library. Applying it to every
+task would add inputs to every compile and every generator in a project that
+has aliases at all, which changes what the driver EMITS for targets the fix
+was not aimed at, and every emitted derivation is a cache key.
+
 ### Header files
 
 Ninja build files are not intended to be written by humans, so there are many
