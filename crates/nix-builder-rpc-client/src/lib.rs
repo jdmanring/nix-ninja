@@ -2126,12 +2126,16 @@ mod nar_stamp_hit_tests {
     }
 
     #[test]
-    fn an_unstattable_key_cannot_hit() {
-        // The zero case, and the one a happy-path test never reaches: with no
-        // stamp there is nothing to compare, so the entry must not be adopted
-        // however well it matches on every other count.
+    fn an_unstattable_key_cannot_hit_a_zero_stamped_entry() {
+        // The zero case, and the entry is stamped ZERO on purpose. Stamped
+        // anything else the assertion holds for the wrong reason, since the
+        // comparison fails on the values and the missing stamp is never the
+        // thing under test; a mutant substituting a zero default for the
+        // absent stamp survived exactly that fixture. Here the default WOULD
+        // match, so only refusing to compare at all keeps this green, which
+        // is the guard remember_nar_stamp's note relies on.
         let k = Path::new("/build/vanished.c");
-        assert!(nar_stamp_hit(&map_with(k, 12, 34), k, None).is_none());
+        assert!(nar_stamp_hit(&map_with(k, 0, 0), k, None).is_none());
     }
 
     #[test]
