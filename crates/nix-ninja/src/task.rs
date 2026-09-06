@@ -3049,12 +3049,9 @@ fn build_task_derivation(
     let mut drv = Derivation::new(
         "ninja-build".parse()?,
         task.system.clone().into_bytes().into(),
-        format!(
-            "{}/bin/nix-ninja-task",
-            task.store_dir.display(&tools.nix_ninja_task)
-        )
-        .into_bytes()
-        .into(),
+        task_builder_path(&task.store_dir.display(&tools.nix_ninja_task).to_string())
+            .into_bytes()
+            .into(),
     );
 
     // Outer output paths -> placeholders (see outer_rewrite_map), EXCEPT
@@ -3200,8 +3197,16 @@ fn build_task_derivation(
     }
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.coreutils.clone()));
-    drv.inputs
-        .insert(SingleDerivedPath::Opaque(tools.nix_ninja_task.clone()));
+    // THE BUILDER IS IN EVERY KEY TWICE, here and as the `builder` string,
+    // and that is what makes a one-character task-binary fix re-derive every
+    // banked compile. Under a stable builder path the binary is supplied to
+    // the sandbox the way nix supplies `/bin/sh`, so it is machinery rather
+    // than an input, and `task_abi()` is what a person moves when a change
+    // really does alter what a task writes.
+    if stable_task_builder().is_none() {
+        drv.inputs
+            .insert(SingleDerivedPath::Opaque(tools.nix_ninja_task.clone()));
+    }
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.patchelf.clone()));
     for sp in &tools.script_tools {
@@ -3565,6 +3570,14 @@ fn build_task_derivation(
             .cmp(encoded_build_path(b))
             .then(a.cmp(b))
     });
+
+    // THE ABI GENERATION IS IN THE KEY, and it is the only thing that is once
+    // the builder path stops moving. Absent unless configured, so a tree that
+    // does not use the stable builder emits exactly what it always emitted.
+    if let Some(abi) = task_abi() {
+        drv.env
+            .insert(b"NIX_NINJA_TASK_ABI"[..].into(), abi.into_bytes().into());
+    }
 
     drv.env.insert(
         b"NIX_NINJA_INPUTS"[..].into(),
@@ -5694,6 +5707,53 @@ fn undeclared_outputs(
         }
     }
     v
+}
+
+/// A BUILDER PATH THAT DOES NOT MOVE WHEN THE BUILDER DOES, when one is
+/// configured, and `None` for the store path this has always used.
+///
+/// WHY THIS EXISTS, measured rather than assumed. The task binary's store
+/// path is in the key of every plain task derivation, as the `builder` string
+/// and again as an input, so one byte in it re-derives the whole bank. The
+/// outputs do not change: one ordinary compile driven at `37672a4` and at
+/// `24c94aa`, with the two task binaries those revisions build, produced the
+/// same object to the byte, sha256 `fd0a4751af5ddbf9a9d2a3824b77b6d2fbe0dc6c`
+/// `71b0acf242c9764ae87ac11b`. The rebuild recomputes bytes the store already
+/// holds. Content addressing does not save it either: early cutoff stops
+/// propagation ABOVE an unchanged output, and the cost here is the leaves.
+///
+/// NIX ALREADY DOES THIS FOR THE SHELL. `/bin/sh` inside a sandbox is a
+/// stable path mapped from a store path by `sandbox-paths`, which is why a
+/// busybox upgrade does not re-key every derivation on the machine. The
+/// builder of a task derivation is the same kind of thing: build machinery,
+/// not an ingredient.
+///
+/// WHAT IT COSTS, stated because it is a real trade and not a free lunch: a
+/// task derivation no longer records WHICH task binary built it, so two
+/// binaries that would write different bytes become indistinguishable by key.
+/// That is what `NIX_NINJA_TASK_ABI` is for, and it belongs in the emitted
+/// environment where it is in the key. A change that alters what a task
+/// WRITES bumps it and pays for a re-key once, deliberately; a change that
+/// fixes a task that previously FAILED has no banked output to invalidate and
+/// bumps nothing.
+///
+/// OFF BY DEFAULT. Unset, every derivation is byte for byte what it was, so
+/// nothing is re-keyed by this existing.
+fn stable_task_builder() -> Option<String> {
+    std::env::var("NIX_NINJA_TASK_BUILDER")
+        .ok()
+        .filter(|v| v.starts_with('/'))
+}
+
+/// The ABI generation a task derivation is keyed on, empty unless set.
+fn task_abi() -> Option<String> {
+    std::env::var("NIX_NINJA_TASK_ABI")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+fn task_builder_path(store_task: &str) -> String {
+    stable_task_builder().unwrap_or_else(|| format!("{store_task}/bin/nix-ninja-task"))
 }
 
 /// The working directory a `cd <dir>` leaves behind, with `..` collapsed.
