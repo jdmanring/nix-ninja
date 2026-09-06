@@ -5762,6 +5762,7 @@ fn stable_driver_builder() -> Option<String> {
 }
 
 fn driver_builder_path(store_driver: &str) -> String {
+    report_keying_once();
     builder_path(
         stable_driver_builder().as_deref(),
         store_driver,
@@ -5786,7 +5787,29 @@ fn builder_path(stable: Option<&str>, store_dir: &str, exe: &str) -> String {
     }
 }
 
+/// SAY IT ONCE PER PROCESS, because a build log is the only place an operator
+/// can tell an ABI-keyed bank from a builder-keyed one, and the two produce
+/// identical logs otherwise. A run that was meant to use the stable paths and
+/// silently did not looks exactly like a run that used them; that ambiguity
+/// cost a package build here before this line existed.
+fn report_keying_once() {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| {
+        let (t, d) = (stable_task_builder(), stable_driver_builder());
+        if t.is_none() && d.is_none() {
+            return;
+        }
+        eprintln!(
+            "nix-ninja: task keys name builder task={} driver={} abi={}",
+            t.as_deref().unwrap_or("<store path>"),
+            d.as_deref().unwrap_or("<store path>"),
+            task_abi().as_deref().unwrap_or("<unset>"),
+        );
+    });
+}
+
 fn task_builder_path(store_task: &str) -> String {
+    report_keying_once();
     builder_path(
         stable_task_builder().as_deref(),
         store_task,
