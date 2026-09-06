@@ -5673,12 +5673,7 @@ fn undeclared_outputs(
         for (i, t) in toks.iter().enumerate() {
             if *t == "cd" && (i == 0 || matches!(toks[i - 1], "&&" | ";")) {
                 if let Some(dir) = toks.get(i + 1) {
-                    let dir = Path::new(dir.trim_matches('"'));
-                    base = if dir.is_absolute() {
-                        dir.to_path_buf()
-                    } else {
-                        base.join(dir)
-                    };
+                    base = cd_into(&base, Path::new(dir.trim_matches('"')));
                 }
             }
             if *t == "create_symlink" && i > 0 && toks[i - 1] == "-E" {
@@ -5699,6 +5694,31 @@ fn undeclared_outputs(
         }
     }
     v
+}
+
+/// The working directory a `cd <dir>` leaves behind, with `..` collapsed.
+///
+/// `Path::join` KEEPS A `..` COMPONENT, and the driver itself rewrites an
+/// ancestor cd target to a bare `..` (shaderc's check-copyright). Joined
+/// verbatim, an output under that directory is declared as `sub/../b`, a
+/// second spelling of a path that already has one, which is the collision
+/// the dav1d and dtc version headers are about.
+fn cd_into(base: &Path, dir: &Path) -> PathBuf {
+    let mut out: Vec<std::ffi::OsString> = Vec::new();
+    let start = if dir.is_absolute() { dir } else { base };
+    let rest: &[&Path] = if dir.is_absolute() { &[] } else { &[dir] };
+    for part in std::iter::once(start).chain(rest.iter().copied()) {
+        for c in part.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => out.push(other.as_os_str().to_owned()),
+            }
+        }
+    }
+    out.iter().collect()
 }
 
 /// `<dir>/CMakeFiles/<T>_autogen.dir` for an autogen edge whose outputs
@@ -12280,6 +12300,26 @@ mod create_symlink_undeclared_output_tests {
             bd,
         );
         assert_eq!(v, vec![PathBuf::from("sub/deeper/b")]);
+    }
+
+    #[test]
+    fn a_cd_walk_normalises_dotdot_and_a_leading_relative_cd() {
+        let bd = Path::new("/build/source/build");
+        // `..` REACHES THIS CODE: the driver rewrites an ancestor cd target
+        // to a bare `..` (shaderc). `Path::join` does not collapse it, and a
+        // declared output spelled `sub/../b` is a second spelling of a path
+        // that already has one, which is the collision the dav1d and dtc rows
+        // are about.
+        let v = undeclared_outputs(
+            &[],
+            Some("cd sub && cd .. && cmake -E create_symlink a b"),
+            bd,
+        );
+        assert_eq!(v, vec![PathBuf::from("b")]);
+        // A leading RELATIVE cd composes against the build dir rather than
+        // being taken as the base outright.
+        let v = undeclared_outputs(&[], Some("cd sub && cmake -E create_symlink a b"), bd);
+        assert_eq!(v, vec![PathBuf::from("sub/b")]);
     }
 
     #[test]
