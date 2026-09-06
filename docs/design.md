@@ -200,6 +200,74 @@ nixNinjaExtraInputs = [
 ];
 ```
 
+### Keying a task on a generation rather than on the builder
+
+`nix-ninja-task`'s store path appears in every plain task derivation twice,
+as the `builder` string and again among the inputs, and the driver's appears
+the same way in every dynamic one. Neither is an ingredient of the result. An
+ordinary compile driven at two revisions of the task binary produces the same
+object byte for byte, so moving either binary recomputes outputs the store
+already holds.
+
+Content addressing does not recover it. The emitted derivations are floating
+content-addressed, so early cutoff fires and stops propagation above an
+unchanged output, but the cost here is at the leaves: to learn that a
+compile's object is unchanged, the compile has to run.
+
+Nix already solves this for the shell. `/bin/sh` inside a sandbox is a stable
+path mapped from a store path by `sandbox-paths`, which is why upgrading
+busybox re-keys nothing. Three variables apply the same treatment to the two
+binaries this project puts in every key:
+
+    NIX_NINJA_TASK_BUILDER     stable path for nix-ninja-task
+    NIX_NINJA_DRIVER_BUILDER   stable path for the driver
+    NIX_NINJA_TASK_ABI         the generation the key uses instead
+
+Set, the two binaries leave both the `builder` string and the input set, and
+`NIX_NINJA_TASK_ABI` is emitted into the derivation's environment in their
+place, for the dynamic derivation as well as the plain one. Unset, every
+emitted derivation is byte for byte what it was. `stable_task_builder`,
+`stable_driver_builder` and `task_abi` read the three; `task_builder_path`
+and `driver_builder_path` are the two funnels every emission passes through.
+
+The mapping has to reach the daemon. The nix CLI forwards
+`--option extra-sandbox-paths` for a trusted user and this project's rpc
+client does not, so a driver run with the variables set and no daemon-side
+entry fails every task with
+
+```
+executing '/nn/bin/nix-ninja-task': No such file or directory
+```
+
+The entry maps the stable path to the store path, in the daemon's own
+configuration, and the daemon has to be restarted to read it:
+
+    extra-sandbox-paths = /nn/bin/nix-ninja-task=/nix/store/<hash>-nix-ninja-task-0.1.0/bin/nix-ninja-task
+
+A sandbox mounts the closure of a `sandbox-paths` entry, so neither binary
+needs a static build; a mapped builder finds its own glibc with no input
+declared.
+
+Supplying either builder path without `NIX_NINJA_TASK_ABI` is refused, and
+the refusal is in `builder_path` rather than at startup because the driver
+re-enters itself as `-t dynamic-task`, where a startup check would be a
+different guard from the one the key depends on. The alternative is worse
+than a hard failure: every task derivation would key on a generation that
+does not exist, and a later change to what a task writes would silently reuse
+banked outputs from a binary that wrote something else.
+
+That is the trade the generation exists to control. A task derivation stops
+recording which binary built it, so two binaries that would write different
+bytes become indistinguishable by key, and `NIX_NINJA_TASK_ABI` is the only
+thing separating them. A change to what a task writes must move it, and pays
+one re-key deliberately. A change that fixes a task which previously failed
+moves nothing, because a failing task banked no output to invalidate.
+
+Because the keyed and the unkeyed bank produce identical logs, identical
+outputs and identical exit statuses, the driver reports which keying it used
+once per process on stderr, and says nothing when neither variable is set
+(`report_keying_once`).
+
 ### Explicit /nix/store references
 
 Since `meson setup build` is configuring in a Nix environment, either locally
