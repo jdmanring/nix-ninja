@@ -603,7 +603,7 @@ fn the_collision_message_reports_whether_the_claimants_agree() {
         let build = d.join("build");
         std::fs::create_dir_all(build.join("include")).unwrap();
 
-        let h_a = "1eeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let h_a = "1fffffffffffffffffffffffffffffff";
         let h_b = "1fffffffffffffffffffffffffffffff";
         for (h, n) in [(h_a, "a"), (h_b, "b")] {
             std::fs::create_dir_all(store_root.join(format!("{h}-ninja-build-{n}/include")))
@@ -707,4 +707,93 @@ fn every_header_spelling_is_placed_as_a_copy() {
         );
         assert!(placed.is_file(), ".{ext} was not placed at all");
     }
+}
+
+/// TWO ROUTES TO ONE HEADER, NOW THAT A HEADER IS A COPY. The duplicate
+/// check asks `dest_path.is_symlink()`, which was true of every placement
+/// when it was written and is false of a header since the copy rule landed.
+/// qtsvg measured the two-route shape on `.cmake` files: one file discovered
+/// relative to the build dir and again through a `../` climb that resolves
+/// back to it, same store path, same destination. A store file is 0444, so
+/// the second placement copies onto a read-only regular file.
+#[test]
+fn one_header_reached_by_two_routes_is_a_duplicate_not_a_failure() {
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
+
+    let d = dir("header-two-routes");
+    let store_root = d.join("store");
+    let build = d.join("build");
+    std::fs::create_dir_all(build.join("sub")).unwrap();
+
+    let hash = "1fffffffffffffffffffffffffffffff";
+    let name = "ninja-build-include-two.h";
+    let sp = store_root.join(format!("{hash}-{name}"));
+    std::fs::create_dir_all(sp.join("include")).unwrap();
+    std::fs::write(sp.join("include/two.h"), b"#define TWO 2\n").unwrap();
+    let mut perms = std::fs::metadata(sp.join("include/two.h"))
+        .unwrap()
+        .permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(sp.join("include/two.h"), perms).unwrap();
+
+    let store_dir = StoreDir::new(&store_root).unwrap();
+    let enc = |rel: &str| {
+        DerivedFile::from_encoded(
+            &store_dir,
+            &format!("{}/{hash}-{name}:{rel}:include/two.h", store_root.display()),
+        )
+        .unwrap()
+    };
+    // The same file, spelled twice: directly, and through a climb that
+    // resolves back to the same destination.
+    let inputs = vec![enc("include/two.h"), enc("sub/../include/two.h")];
+
+    create_symlinks(&build, &store_dir, inputs, false)
+        .expect("one file reached by two spellings is a duplicate, not a conflict");
+    assert!(build.join("include/two.h").is_file());
+}
+
+/// A COPIED HEADER MUST BE WRITABLE. `fs::copy` carries the source mode and
+/// every store file is 0444, so a later task that overwrites the placement
+/// dies EACCES. `copy_tree` repairs this for directory inputs and the
+/// per-file copy did not.
+#[test]
+fn a_copied_header_is_writable_at_its_destination() {
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
+
+    let d = dir("header-mode");
+    let store_root = d.join("store");
+    let build = d.join("build");
+    std::fs::create_dir_all(&build).unwrap();
+
+    let hash = "1ggggggggggggggggggggggggggggggg";
+    let name = "ninja-build-include-mode.h";
+    let sp = store_root.join(format!("{hash}-{name}"));
+    std::fs::create_dir_all(sp.join("include")).unwrap();
+    let src = sp.join("include/mode.h");
+    std::fs::write(&src, b"#define M 1\n").unwrap();
+    let mut ro = std::fs::metadata(&src).unwrap().permissions();
+    ro.set_readonly(true);
+    std::fs::set_permissions(&src, ro).unwrap();
+
+    let store_dir = StoreDir::new(&store_root).unwrap();
+    let input = DerivedFile::from_encoded(
+        &store_dir,
+        &format!(
+            "{}/{hash}-{name}:include/mode.h:include/mode.h",
+            store_root.display()
+        ),
+    )
+    .unwrap();
+
+    create_symlinks(&build, &store_dir, vec![input], false).unwrap();
+
+    let placed = build.join("include/mode.h");
+    assert!(
+        !std::fs::metadata(&placed).unwrap().permissions().readonly(),
+        "the placed header is read-only, so a task overwriting it dies EACCES"
+    );
+    std::fs::write(&placed, b"#define M 2\n").expect("a placed header must be writable");
 }

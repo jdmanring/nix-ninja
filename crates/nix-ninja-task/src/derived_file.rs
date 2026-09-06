@@ -427,8 +427,42 @@ pub fn create_symlinks(
                     .components()
                     .any(|c| c.as_os_str() == "node_modules"));
         if copy_not_link {
+            // THE DUPLICATE CHECK ABOVE ASKS ONLY ABOUT LINKS, and a copied
+            // header is not one. The driver keys its input set by the build
+            // path as SPELLED, so one file discovered by two routes arrives
+            // twice, once relative and once as a `../` climb resolving back
+            // to the same destination; qtsvg measured that shape. While
+            // every placement was a symlink the second arrival compared link
+            // texts and was skipped. A regular file reaches neither arm, so
+            // it fell through to a copy onto an existing destination, and a
+            // store file is 0444, which makes that EACCES rather than a
+            // duplicate. Same bytes is the same file arriving twice.
+            if dest_path.is_file() {
+                match (fs::read(&dest_path), fs::read(&source_path)) {
+                    (Ok(a), Ok(b)) if a == b => continue,
+                    _ => {
+                        return Err(anyhow!(
+                            "nix-ninja-task: {} is already a file, and a second input wants \
+                             it to hold {:?}, whose bytes differ or could not be read",
+                            dest_path.display(),
+                            source_path
+                        ))
+                    }
+                }
+            }
             fs::copy(&source_path, &dest_path)
                 .map_err(|e| anyhow!("copy({:?} -> {}): {e}", source_path, dest_path.display()))?;
+            // `fs::copy` CARRIES THE SOURCE MODE, and every store file is
+            // 0444. A later task that has to overwrite this one then dies
+            // EACCES, which is the same defect `copy_tree` already repairs
+            // a few lines below for the same reason.
+            let mut perms = fs::metadata(&dest_path)
+                .map_err(|e| anyhow!("metadata({}): {e}", dest_path.display()))?
+                .permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(&dest_path, perms)
+                .map_err(|e| anyhow!("set_permissions({}): {e}", dest_path.display()))?;
             continue;
         }
 
