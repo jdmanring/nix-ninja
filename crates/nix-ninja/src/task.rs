@@ -1441,9 +1441,8 @@ impl Runner {
         // alternative buys precision with a parser and a bytes-at-driver-time
         // assumption that does not hold.
         if !is_gcc_task && !self.alias_symlinks.is_empty() {
-            let names_shared_lib = |fid: &FileId| {
-                shared_library_spelling(files.by_id[*fid].name.as_str())
-            };
+            let names_shared_lib =
+                |fid: &FileId| shared_library_spelling(files.by_id[*fid].name.as_str());
             if build.ordering_ins().iter().any(names_shared_lib)
                 || build.outs().iter().any(names_shared_lib)
             {
@@ -4206,6 +4205,13 @@ fn report_progress(n_tasks: u64) {
     // difference positionally and it is easy to lose in a rename.
     let (rl_asked, rl_sent) = nix_builder_rpc_client::realise_stats();
     let (nar_hits, nar_sent) = nix_builder_rpc_client::nar_upload_stats();
+    // UPSTREAM #18's premise, which was a suspicion with no instrument behind
+    // it: the milliseconds derivation generation spends adding input files to
+    // the store, over the calls that spent them. Printed in seconds beside
+    // the counts already here, so the share of a run is readable rather than
+    // inferred from the upload count.
+    let (file_add_ms, file_add_calls) = nix_builder_rpc_client::file_add_stats();
+    let file_add_hit_ms = nix_builder_rpc_client::file_add_hit_ms();
     // parsed / reached: misses are files actually read, the sum is
     // every time a TU needed one. The gap is the sharing.
     let (scan_hit, scan_miss) = deps_infer::c_include_parser::scan_stats();
@@ -4255,7 +4261,9 @@ fn report_progress(n_tasks: u64) {
              (worklist {} s, cmdline {} s, py {} s, grd {} s), \
              dyn {} s (realise {} s, discover {} s, update {} s/{} calls, adddrv {} s/{} calls, \
              plain adddrv {} s/{} calls, sandbox adddrv {} s/{} calls), \
-             realise {}/{} sent, nar {}/{} sent, scan {}/{} parsed, \
+             realise {}/{} sent, nar {}/{} sent, \
+             file adds {} s/{} calls ({} s on cache hits), \
+             scan {}/{} parsed, \
              rss {} MiB{}{}",
         RESOLVE_MS.load(Ordering::Relaxed) / 1000,
         NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
@@ -4277,6 +4285,9 @@ fn report_progress(n_tasks: u64) {
         rl_asked,
         nar_sent,
         nar_hits + nar_sent,
+        file_add_ms / 1000,
+        file_add_calls,
+        file_add_hit_ms / 1000,
         scan_miss,
         scan_hit + scan_miss,
         self_rss_mib(),

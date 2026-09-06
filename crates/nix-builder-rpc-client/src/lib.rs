@@ -743,6 +743,16 @@ impl BuilderRpcClient {
         path: &Path,
         key: &Path,
     ) -> Result<StorePath> {
+        timed_add(|| self.add_to_store_nar_cached_inner(name, path, key))
+    }
+
+    fn add_to_store_nar_cached_inner(
+        &self,
+        name: &str,
+        path: &Path,
+        key: &Path,
+    ) -> Result<StorePath> {
+        let t0 = std::time::Instant::now();
         let stamp = std::fs::metadata(key).ok().and_then(|md| {
             let mtime = md
                 .modified()
@@ -756,6 +766,10 @@ impl BuilderRpcClient {
             if let Some((s, m, sp)) = self.nar_uploads.lock().unwrap().get(key) {
                 if *s == size && *m == mtime {
                     NAR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ADD_HIT_US.fetch_add(
+                        t0.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     return Ok(sp.clone());
                 }
             }
@@ -809,6 +823,10 @@ impl BuilderRpcClient {
     /// it. Safe against retries because there are none: `execute` is FnOnce
     /// and poisons its connection on error, and no caller retries this.
     pub fn add_to_store_nar(&self, name: &str, path: &Path) -> Result<StorePath> {
+        timed_add(|| self.add_to_store_nar_inner(name, path))
+    }
+
+    fn add_to_store_nar_inner(&self, name: &str, path: &Path) -> Result<StorePath> {
         let info = self
             .runtime
             .block_on(async {
@@ -1522,6 +1540,62 @@ pub fn nar_upload_stats() -> (u64, u64) {
         NAR_HITS.load(std::sync::atomic::Ordering::Relaxed),
         NAR_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+/// Wall clock inside the file-add path, and the calls that spent it.
+///
+/// UPSTREAM #18 opens with a suspicion, that derivation generation is slowed
+/// by adding almost every input file to the store synchronously, and nothing
+/// here could confirm or refute it: the memo's hit and upload counts say how
+/// often the daemon was reached and never how long it took. A change made on
+/// the strength of the suspicion would have no number to be judged against
+/// afterwards either.
+///
+/// Measured around the whole call rather than around the transfer, since a
+/// cache hit is part of what the phase spends and an optimisation that only
+/// moves misses off the critical path has to be visible as such.
+///
+/// THE TOTAL IS THREAD TIME AND NOT WALL CLOCK. Adds already run eight wide
+/// under `new_opaque_files`, and each call adds its own elapsed time, so
+/// concurrent calls each contribute in full and the sum can exceed the phase
+/// that contains it. A figure larger than the generation window is evidence
+/// that the adds are already concurrent, never that they are the wall clock
+/// to be recovered.
+///
+/// The hit total is carried separately because the two halves have different
+/// remedies and only their split says which is worth pursuing. A memo hit
+/// never reaches the daemon: it stats the key and reads an in-process map, so
+/// where the hits are cheap, spreading them across threads parallelises
+/// almost nothing and the only route to the remaining time is making fewer
+/// real uploads. Microseconds, since a hit that took a whole millisecond
+/// would already be the answer.
+static ADD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ADD_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ADD_HIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(milliseconds, calls)` spent adding files to the store.
+pub fn file_add_stats() -> (u64, u64) {
+    (
+        ADD_MS.load(std::sync::atomic::Ordering::Relaxed),
+        ADD_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Milliseconds of the above spent on calls the stamp cache answered.
+pub fn file_add_hit_ms() -> u64 {
+    ADD_HIT_US.load(std::sync::atomic::Ordering::Relaxed) / 1000
+}
+
+/// Times one file-add call into the counters above.
+fn timed_add<T>(f: impl FnOnce() -> T) -> T {
+    let t0 = std::time::Instant::now();
+    let out = f();
+    ADD_MS.fetch_add(
+        t0.elapsed().as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    ADD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    out
 }
 
 /// Bytes in flight per NAR upload.
