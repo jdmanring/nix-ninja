@@ -133,19 +133,25 @@ reads that list back, so a compiled translation unit reports the headers it
 actually opened instead of the ones a scanner inferred.
 
 The last of the five asked for the store-add path to come off the critical
-path, on the premise that generating derivations is slowed by adding almost
-every input file to the store one at a time. That premise was measured rather
-than acted on, and it does not hold. On a 345 task project the driver makes
-35,435 store adds, and the 34,371 of them answered from the stamp cache cost
-under a second between them, because that path stats the file and reads an
-in-process map without ever reaching the daemon. Every measurable second
-belongs to the thousand or so files that genuinely upload, 1,064 of them
-here, which already stream and already upload concurrently, and which the stamp cache avoids
-repeating on a later run in the same build directory. What that residue
-costs depends on the state of the store rather than on the shape of the call
-(25 s cold against 4 s warm, at the same number of calls), which is the
-reason the split matters and a total does not: moving the cheap majority off
-the critical path would buy the second they cost between them.
+path, since generating derivations meant adding almost every input file to
+the store one at a time. Uploads now run concurrently against a connection
+pool rather than serially, a NAR streams instead of being built in memory,
+and a stamp map keyed on path, length and mtime skips a file already known,
+persisting across runs in the same build directory.
+
+The instrument that says what those are worth arrived after them. On a 345
+task project the driver makes 35,435 store adds, of which 34,371 are answered
+by the stamp map for under a second between them, because that path stats the
+file and reads an in-process map without ever reaching the daemon. The
+measurable time belongs to the 1,064 files that genuinely upload, and what
+they cost depends on the state of the store rather than on the shape of the
+call: 25 s cold against 4 s warm, at the same number of calls.
+
+That split is worth more than the total it comes from, because it says where
+further effort would go and where it would not. Roughly 97 percent of the
+calls are already a memo lookup, so moving them off the critical path buys
+the second they cost between them; the residue is real uploads that have to
+happen once each and already stream and already run concurrently.
 
 Beyond that there are no upstream goalposts, and most of what this fork has
 built already sits outside them. Driving real packages surfaced failure
