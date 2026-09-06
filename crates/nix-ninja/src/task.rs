@@ -5764,14 +5764,18 @@ fn undeclared_outputs(
 /// OFF BY DEFAULT. Unset, every derivation is byte for byte what it was, so
 /// nothing is re-keyed by this existing.
 fn stable_task_builder() -> Option<String> {
-    std::env::var("NIX_NINJA_TASK_BUILDER").ok().filter(|v| !v.is_empty())
+    std::env::var("NIX_NINJA_TASK_BUILDER")
+        .ok()
+        .filter(|v| !v.is_empty())
 }
 
 /// The driver's counterpart to `stable_task_builder`, for the derivations the
 /// DRIVER builds. Separate variable because the two binaries are supplied to
 /// the sandbox as separate mappings and either can be configured alone.
 fn stable_driver_builder() -> Option<String> {
-    std::env::var("NIX_NINJA_DRIVER_BUILDER").ok().filter(|v| !v.is_empty())
+    std::env::var("NIX_NINJA_DRIVER_BUILDER")
+        .ok()
+        .filter(|v| !v.is_empty())
 }
 
 fn driver_builder_path(store_driver: &str) -> Result<String> {
@@ -5827,7 +5831,11 @@ fn emitted_abi() -> Option<String> {
 /// PURE, for the same reason `builder_path` is: the decision is testable
 /// without setting a process wide variable.
 fn abi_in_key(any_stable_builder: bool, abi: Option<String>) -> Option<String> {
-    if any_stable_builder { abi } else { None }
+    if any_stable_builder {
+        abi
+    } else {
+        None
+    }
 }
 
 fn task_abi() -> Option<String> {
