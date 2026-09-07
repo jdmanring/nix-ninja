@@ -19,6 +19,14 @@ pub struct BuildConfig {
     pub build_dir: PathBuf,
     pub store_dir: StoreDir,
     pub is_output_derivation: bool,
+    /// A subtool asked what the driver WOULD emit. `-t drv` and `-t compdb`
+    /// answer a question about the graph and must not build anything, and
+    /// the outer-output write placement is the one step that otherwise
+    /// would: it realises the task and copies its output into the outer
+    /// derivation's output. Reading a derivation should not have that side
+    /// effect, and against a real store path it cannot, since the directory
+    /// is read only until the build that produces it is running.
+    pub emit_only: bool,
     pub jobs: usize,
     pub load_limit: f64,
     /// Ninja's `-v`. The edge declares one more output carrying the command's
@@ -102,6 +110,7 @@ pub fn build(
             build_dir: config.build_dir,
             store_dir: config.store_dir,
             is_output_derivation: config.is_output_derivation,
+            emit_only: config.emit_only,
             jobs: config.jobs,
             // Ninja's own per-edge concurrency classes. The parser has always
             // produced these and the runner never received them.

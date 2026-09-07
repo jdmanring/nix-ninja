@@ -224,6 +224,8 @@ pub struct RunnerConfig {
     pub build_dir: PathBuf,
     pub store_dir: StoreDir,
     pub is_output_derivation: bool,
+    /// See BuildConfig::emit_only. A query about the graph must not build.
+    pub emit_only: bool,
     /// Maximum tasks in flight. The `-j` flag parsed this and nothing
     /// consumed it; the runner spawned one thread per ready task,
     /// unbounded. On a graph with codegen fan-out (Chromium: one TU's
@@ -4711,7 +4713,7 @@ fn place_outer_stage_outputs(
     task: &Task,
     drv_path: &StorePath,
 ) -> Result<()> {
-    if task.outer_stage_outputs.is_empty() {
+    if task.outer_stage_outputs.is_empty() || config.emit_only {
         return Ok(());
     }
     let files: Vec<DerivedFile> = task

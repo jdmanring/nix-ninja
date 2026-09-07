@@ -590,6 +590,7 @@ fn build(
         build_dir: build_dir.to_path_buf(),
         store_dir: cli.store_dir.clone(),
         is_output_derivation: cli.is_output_derivation,
+        emit_only: cli.tool.is_some(),
         // -j0 means "auto": the machine's core count. The old reading of
         // 0 as "infinity" is what let one TU's codegen fan-out spawn
         // hundreds of concurrent tasks; unbounded is no longer
