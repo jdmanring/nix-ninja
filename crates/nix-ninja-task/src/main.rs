@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use harmonia_store_path::StoreDir;
-use nix_ninja_task::derived_file::{create_symlinks, store_output, DerivedFile};
+use nix_ninja_task::derived_file::{
+    create_symlinks, split_encoded_list, store_output, DerivedFile,
+};
 use nix_ninja_task::patchelf;
 use std::env;
 use std::fs;
@@ -71,14 +73,14 @@ fn main() -> Result<()> {
     let raw_outputs = inline_or_pass_as_file(cli.outputs.clone(), "NIX_NINJA_OUTPUTS")?;
 
     let mut inputs = Vec::new();
-    for encoded in raw_inputs.split_whitespace() {
+    for encoded in split_encoded_list(&raw_inputs) {
         // println!("Processing input {}", encoded);
         let input = DerivedFile::from_encoded(&cli.store_dir, encoded)?;
         inputs.push(input);
     }
 
     let mut outputs = Vec::new();
-    for encoded in raw_outputs.split_whitespace() {
+    for encoded in split_encoded_list(&raw_outputs) {
         // println!("Processing output {}", encoded);
         let output = DerivedFile::from_encoded(&cli.store_dir, encoded)?;
         outputs.push(output);
@@ -200,7 +202,7 @@ fn main() -> Result<()> {
         // name both spellings of one subproject. The predicate is the
         // driver's too, imported rather than written twice.
         let cwd = env::current_dir().unwrap_or_default();
-        for d in raw.split_whitespace() {
+        for d in split_encoded_list(&raw) {
             let p = std::path::Path::new(d);
             if !nix_ninja_task::derived_file::confined_relative_dir(&cwd, p) {
                 continue;
@@ -209,7 +211,7 @@ fn main() -> Result<()> {
         }
     }
     if let Ok(raw) = env::var("NIX_NINJA_ALIASES") {
-        for pair in raw.split_whitespace() {
+        for pair in split_encoded_list(&raw) {
             let Some((link, target)) = pair.split_once('=') else {
                 continue;
             };
@@ -697,7 +699,7 @@ fn producer_alias_symlinks(store_dir: &StoreDir, outputs: &[DerivedFile]) {
 /// half above.
 fn same_dir_aliases(raw: &str) -> Vec<(PathBuf, String, String)> {
     let mut out = Vec::new();
-    for pair in raw.split_whitespace() {
+    for pair in split_encoded_list(raw) {
         let Some((link, target)) = pair.split_once('=') else {
             continue;
         };
@@ -753,10 +755,18 @@ mod producer_alias_tests {
 
     #[test]
     fn the_orc_chain_lands_and_a_foreign_dir_does_not() {
-        let raw = "orc/liborc-0.4.so=liborc-0.4.so.0 \
-                   orc/liborc-0.4.so.0=liborc-0.4.so.0.42.0 \
-                   orc-test/liborc-test-0.4.so.0=liborc-test-0.4.so.0.42.0 \
-                   bad/esc=../out.so bad/abs=/nix/store/x.so";
+        // ONE ENTRY PER LINE, which is the encoded-list contract. This
+        // fixture was space separated and is what caught the separator
+        // change, since a space-joined list now reads as a single entry.
+        let raw = [
+            "orc/liborc-0.4.so=liborc-0.4.so.0",
+            "orc/liborc-0.4.so.0=liborc-0.4.so.0.42.0",
+            "orc-test/liborc-test-0.4.so.0=liborc-test-0.4.so.0.42.0",
+            "bad/esc=../out.so",
+            "bad/abs=/nix/store/x.so",
+        ]
+        .join(nix_ninja_task::derived_file::ENCODED_LIST_SEP);
+        let raw = raw.as_str();
         let aliases = same_dir_aliases(raw);
         // the `..` target and the absolute target are refused at parse
         assert_eq!(aliases.len(), 3);

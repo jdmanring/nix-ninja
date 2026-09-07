@@ -3,7 +3,7 @@ use harmonia_store_derivation::derivation::Derivation;
 use harmonia_store_derivation::derived_path::{OutputName, SingleDerivedPath};
 use harmonia_store_path::{StoreDir, StorePath};
 use nix_builder_rpc_client::BuilderRpcClient;
-use nix_ninja_task::derived_file::DerivedFile;
+use nix_ninja_task::derived_file::{split_encoded_list, DerivedFile, ENCODED_LIST_SEP};
 use std::sync::Arc;
 use std::{
     collections::{HashMap, HashSet},
@@ -101,8 +101,7 @@ fn prepare_build_environment(store_dir: &StoreDir) -> Result<(PathBuf, HashMap<P
     };
 
     // Get built inputs for dynamic dependency discovery
-    let derived_files: Vec<DerivedFile> = inputs
-        .split_whitespace()
+    let derived_files: Vec<DerivedFile> = split_encoded_list(&inputs)
         .filter_map(|encoded| DerivedFile::from_encoded(store_dir, encoded).ok())
         .collect();
 
@@ -228,8 +227,7 @@ pub fn update_derivation_with_discoveries(
         .map_or("", |(_, v)| std::str::from_utf8(v).unwrap());
 
     // Parse existing derivation inputs into a HashSet for deduplication
-    let mut input_set: HashSet<String> = drv_inputs
-        .split_whitespace()
+    let mut input_set: HashSet<String> = split_encoded_list(drv_inputs)
         .map(|s| s.to_string())
         .collect();
 
@@ -253,7 +251,7 @@ pub fn update_derivation_with_discoveries(
         inputs.sort();
         drv.env.insert(
             b"NIX_NINJA_INPUTS"[..].into(),
-            inputs.join(" ").into_bytes().into(),
+            inputs.join(ENCODED_LIST_SEP).into_bytes().into(),
         );
     }
 

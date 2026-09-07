@@ -13,7 +13,7 @@ use n2::{
     graph::{self, Build, BuildDependencies, BuildId, File, FileId},
 };
 use nix_builder_rpc_client::BuilderRpcClient;
-use nix_ninja_task::derived_file::DerivedFile;
+use nix_ninja_task::derived_file::{DerivedFile, ENCODED_LIST_SEP};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
@@ -3974,7 +3974,7 @@ fn build_task_derivation(
 
     drv.env.insert(
         b"NIX_NINJA_INPUTS"[..].into(),
-        inputs.join(" ").into_bytes().into(),
+        inputs.join(ENCODED_LIST_SEP).into_bytes().into(),
     );
 
     // Configure-time alias symlinks (see Runner::alias_symlinks). Encoded
@@ -3989,7 +3989,7 @@ fn build_task_derivation(
             .collect();
         drv.env.insert(
             b"NIX_NINJA_ALIASES"[..].into(),
-            encoded.join(" ").into_bytes().into(),
+            encoded.join(ENCODED_LIST_SEP).into_bytes().into(),
         );
     }
     // Directories to create in the sandbox (see Task::make_dirs),
@@ -3999,7 +3999,7 @@ fn build_task_derivation(
     if !task.make_dirs.is_empty() {
         drv.env.insert(
             b"NIX_NINJA_MAKE_DIRS"[..].into(),
-            task.make_dirs.join(" ").into_bytes().into(),
+            task.make_dirs.join(ENCODED_LIST_SEP).into_bytes().into(),
         );
     }
 
@@ -4161,7 +4161,7 @@ fn build_task_derivation(
     }
     drv.env.insert(
         b"NIX_NINJA_OUTPUTS"[..].into(),
-        outputs.join(" ").into_bytes().into(),
+        outputs.join(ENCODED_LIST_SEP).into_bytes().into(),
     );
 
     // Name the transcript so the task knows which of its outputs to tee the
@@ -4467,7 +4467,7 @@ fn build_dynamic_task_derivation(
 
     drv.env.insert(
         b"NIX_NINJA_INPUTS"[..].into(),
-        inputs.join(" ").into_bytes().into(),
+        inputs.join(ENCODED_LIST_SEP).into_bytes().into(),
     );
     // Same E2BIG hazard as the task derivation: see the passAsFile
     // comment in build_task_derivation.

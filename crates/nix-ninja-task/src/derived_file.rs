@@ -22,6 +22,42 @@ pub struct DerivedFile {
     pub rel_path: Option<PathBuf>, // Where file appears within derived path (None for opaque)
 }
 
+/// The separator between ENTRIES of an encoded list.
+///
+/// `NIX_NINJA_INPUTS`, `NIX_NINJA_OUTPUTS`, `NIX_NINJA_ALIASES` and
+/// `NIX_NINJA_MAKE_DIRS` carry one entry per element and EVERY element
+/// contains a build path. Joined on a space, a build path containing a space
+/// split one entry into two: meson names a target directory after its target,
+/// so libepoxy 1.5.10 has `test/khronos typedefs.p`, and the tail arrived at
+/// `from_encoded` alone and failed as `non-absolute store path
+/// "typedefs.p/khronos_typedefs.c.o"`. That message names the store-path parse
+/// and the split happened one layer above it. Two objects took the package and
+/// a whole server edition with them.
+///
+/// A newline cannot occur in a path ninja can express, where a space routinely
+/// does. THE SHIM'S ESCAPING FIX IS WHAT EXPOSED THIS: while the build
+/// statement was malformed ninja split the path first and the driver never saw
+/// a name with a space in it, so the defect was recorded as the shim's and was
+/// correctly recorded at the time.
+///
+/// The FIELD separator inside one entry is still `:`, and a build path
+/// containing a colon would mis-split the three fields the same way. No such
+/// path has been observed. DEFER(a build path carrying a colon is reported):
+/// length-prefix the fields or escape the separator.
+pub const ENCODED_LIST_SEP: &str = "\n";
+
+/// Split a list written with [`ENCODED_LIST_SEP`], dropping empty entries.
+///
+/// The empty filter is load bearing rather than tidiness. A value reaches the
+/// task either inline or through nix's `passAsFile`, which are two different
+/// byte paths, and only one of them is certain not to end with a separator.
+/// `split_whitespace` absorbed a trailing separator silently; a newline split
+/// does not, so the same fix without this filter would hand `from_encoded` an
+/// empty string and fail every task with the opposite error.
+pub fn split_encoded_list(raw: &str) -> impl Iterator<Item = &str> {
+    raw.lines().filter(|s| !s.is_empty())
+}
+
 impl DerivedFile {
     /// Encodes this DerivedFile for passing from nix-ninja to nix-ninja-task.
     ///
@@ -823,5 +859,40 @@ mod confined_relative_dir_tests {
             Path::new("../../../../nix/store/evil")
         ));
         assert!(!confined_relative_dir(cwd, Path::new("../../../../a/b")));
+    }
+}
+
+#[cfg(test)]
+mod encoded_list_tests {
+    use super::{split_encoded_list, ENCODED_LIST_SEP};
+
+    // THE BOUNDARY IS THE SUBJECT, NOT THE TRIPLE. A test that encodes one
+    // path with a space and decodes it passes under the old separator too,
+    // because nothing crosses an entry boundary. libepoxy's failure needs TWO
+    // entries with the space in the first, which is the only shape where a
+    // space-joined list hands the second entry's parser the first entry's
+    // tail. A mutant restoring `" "` fails this and passes a single-entry
+    // version of it.
+    #[test]
+    fn a_build_path_with_a_space_does_not_split_the_list() {
+        let entries = [
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-o:test/khronos typedefs.p/k.c.o:",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-p:plain/other.c.o:",
+        ];
+        let joined = entries.join(ENCODED_LIST_SEP);
+        let got: Vec<&str> = split_encoded_list(&joined).collect();
+        assert_eq!(got, entries, "a space inside an entry split the list");
+    }
+
+    // passAsFile and an inline environment variable are two different byte
+    // paths and only one is certain not to end with a separator. Without the
+    // empty filter this yields a third, empty entry, which `from_encoded`
+    // reports as a non-absolute store path: the same failure the fix removes,
+    // arriving from the opposite direction.
+    #[test]
+    fn a_trailing_separator_is_not_an_entry() {
+        let raw = format!("a:b:{sep}c:d:{sep}", sep = ENCODED_LIST_SEP);
+        assert_eq!(split_encoded_list(&raw).count(), 2);
+        assert_eq!(split_encoded_list("").count(), 0);
     }
 }
