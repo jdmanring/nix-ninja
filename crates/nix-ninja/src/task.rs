@@ -9428,6 +9428,31 @@ fn new_built_file(derived_path: SingleDerivedPath, build_path: PathBuf) -> Deriv
 // name is only a label - identity is the content hash - so a lossy map
 // is sound; two names colliding after the map still yield distinct
 // store paths unless their content is also identical.
+/// nix's store-path name cap.
+///
+/// A COPY, because `harmonia_store_path::MAX_NAME_LEN` is `pub(crate)`. The
+/// test `the_composed_name_is_accepted_by_the_real_validator` is what keeps
+/// the two honest: it parses the longest name this module can emit through
+/// `StorePathName`, so a cap that moves upstream fails a test here rather
+/// than a package in a round.
+const MAX_STORE_NAME_LEN: usize = 211;
+
+/// The longest derivation name a task output hangs off.
+///
+/// Task derivations are `ninja-build` and dynamic ones are `ninja-build.drv`
+/// (`Derivation::new` at the three sites). `OutputPathName` renders a
+/// non-default output as `<drv name>-<output name>` and parses THAT as a
+/// store path name, so the budget for the output name is the cap less the
+/// longer of the two derivation names and its separator. Taking the longer
+/// one everywhere keeps ONE rule for both classes.
+const LONGEST_TASK_DRV_NAME: &str = "ninja-build.drv";
+
+/// What one output name may occupy: 211 - 15 - 1 = 195.
+const MAX_OUTPUT_NAME_LEN: usize = MAX_STORE_NAME_LEN - LONGEST_TASK_DRV_NAME.len() - 1;
+
+/// Hex characters of path digest appended to a folded name.
+const FOLD_DIGEST_HEX: usize = 16;
+
 fn normalize_output(output: &str) -> String {
     let mapped: String = output
         .chars()
@@ -9436,13 +9461,53 @@ fn normalize_output(output: &str) -> String {
             _ => '-',
         })
         .collect();
-    if mapped.is_empty() {
+    let named = if mapped.is_empty() {
         "source".to_string()
     } else if mapped.starts_with('.') {
         format!("-{mapped}")
     } else {
         mapped
+    };
+    fold_long_output_name(named, output)
+}
+
+/// Bring an over-long output name under the store's cap, keeping it unique.
+///
+/// THE GUARD IS THE WHOLE EMISSION ARGUMENT and it is why this is not a
+/// global re-key: a name at or under the budget is returned untouched, byte
+/// for byte, so every task that builds today keeps the derivation it has. A
+/// name OVER the budget is one nix refuses, so the driver produced no
+/// derivation for it at all and there is no banked output to invalidate.
+///
+/// meson reaches the cap without anything exotic: it names a generated test
+/// object after the source twice, once for the target directory and again
+/// inside `meson-generated_.._<target>.c.o`, so wayland-protocols has five
+/// objects whose ninja path is 228 characters. The driver reported `invalid
+/// name length`, emitted nothing, and under keep-going took libxkbcommon,
+/// gtk+3, adwaita-icon-theme, libdecor and vte down with the package.
+///
+/// TRUNCATION ALONE WOULD BE WRONG: two objects under one long target differ
+/// only in their tail, so a prefix is exactly the part they share. The digest is
+/// taken over the FULL ORIGINAL path rather than the truncated or normalized
+/// form, so two paths that normalize alike still separate here.
+///
+/// Slicing by byte is sound because `normalize_output` maps every character
+/// outside the store's ASCII set to `-`, one `-` per `char`, so its result
+/// has no multi-byte boundary to split. The test with a non-ASCII long path
+/// is what holds that.
+fn fold_long_output_name(name: String, original: &str) -> String {
+    if name.len() <= MAX_OUTPUT_NAME_LEN {
+        return name;
     }
+    let digest = Sha256::digest(original.as_bytes());
+    let hex: String = digest
+        .iter()
+        .take(FOLD_DIGEST_HEX / 2)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let keep = MAX_OUTPUT_NAME_LEN - 1 - hex.len();
+    debug_assert!(name.is_char_boundary(keep), "normalize_output emits ASCII");
+    format!("{}-{hex}", &name[..keep])
 }
 
 /// Whether a ninja edge is a COMPILE, for the four closure-narrowing rules
@@ -10754,7 +10819,7 @@ mod new_built_file_tests {
 
 #[cfg(test)]
 mod normalize_output_tests {
-    use super::normalize_output;
+    use super::{normalize_output, MAX_OUTPUT_NAME_LEN};
 
     #[test]
     fn slash_still_maps_to_dash() {
@@ -10913,6 +10978,94 @@ mod normalize_output_tests {
         assert_eq!(refs.len(), 2, "absent file must not be invented: {refs:?}");
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    // ---- the store-name length cap -------------------------------------
+    //
+    // wayland-protocols 1.45 has five test objects whose ninja output path is
+    // 228 characters, because meson names a generated test object after the
+    // protocol XML twice. The driver reported `invalid name length`, emitted
+    // NO derivation, and failed the package.
+
+    /// The package's own shape, at its own length.
+    fn wayland_protocols_object() -> String {
+        let stem = "test-build-pedantic-unstable_keyboard_shortcuts_inhibit_\
+                    keyboard_shortcuts_inhibit_unstable_v1_xml";
+        let stem: String = stem.split_whitespace().collect();
+        format!("tests/{stem}.p/meson-generated_.._{stem}.c.o")
+    }
+
+    #[test]
+    fn a_name_within_the_budget_is_untouched() {
+        // THE EMISSION PROPERTY, and the reason this fix re-keys nothing that
+        // builds today. Exactly at the budget must pass through byte for byte.
+        let at = "a".repeat(MAX_OUTPUT_NAME_LEN);
+        assert_eq!(normalize_output(&at), at);
+        let under = "b".repeat(MAX_OUTPUT_NAME_LEN - 1);
+        assert_eq!(normalize_output(&under), under);
+    }
+
+    #[test]
+    fn an_over_long_name_is_folded_under_the_budget() {
+        let path = wayland_protocols_object();
+        assert!(
+            path.len() > MAX_OUTPUT_NAME_LEN,
+            "fixture must exceed the budget, got {}",
+            path.len()
+        );
+        let name = normalize_output(&path);
+        assert!(
+            name.len() <= MAX_OUTPUT_NAME_LEN,
+            "folded name is {} chars",
+            name.len()
+        );
+    }
+
+    #[test]
+    fn the_composed_name_is_accepted_by_the_real_validator() {
+        // THE WIRING TEST. Every assertion above is against this module's own
+        // copy of the cap; this one runs the name through the validator that
+        // actually refused the package, composed the way `OutputPathName`
+        // composes it for a non-default output. A cap that moves upstream
+        // fails HERE rather than in a round.
+        use harmonia_store_path::StorePathName;
+        let name = normalize_output(&wayland_protocols_object());
+        for drv in ["ninja-build", "ninja-build.drv"] {
+            let composed = format!("{drv}-{name}");
+            assert!(
+                composed.parse::<StorePathName>().is_ok(),
+                "{drv}: {} chars refused",
+                composed.len()
+            );
+        }
+        // And the output name itself, which is what OutputName::from_str took.
+        assert!(name.parse::<StorePathName>().is_ok());
+    }
+
+    #[test]
+    fn two_long_paths_sharing_a_prefix_do_not_collide() {
+        // TRUNCATION ALONE WOULD MERGE THESE. meson's doubled naming means the
+        // shared part is the PREFIX, so the digest is what separates them, and
+        // it is taken over the full original path.
+        let stem = "x".repeat(200);
+        let a = format!("{stem}/one.c.o");
+        let b = format!("{stem}/two.c.o");
+        let na = normalize_output(&a);
+        let nb = normalize_output(&b);
+        assert_ne!(na, nb, "two distinct long paths folded to one name");
+        assert!(na.len() <= MAX_OUTPUT_NAME_LEN && nb.len() <= MAX_OUTPUT_NAME_LEN);
+    }
+
+    #[test]
+    fn a_long_path_with_multibyte_characters_does_not_split_a_boundary() {
+        // The fold slices by byte. That is sound only because the map above
+        // emits one ASCII `-` per non-ASCII char, and this is what holds it:
+        // a naive slice of the ORIGINAL would panic mid-character.
+        let path = format!("{}/x.c.o", "\u{e9}\u{4e2d}".repeat(120));
+        let name = normalize_output(&path);
+        assert!(name.len() <= MAX_OUTPUT_NAME_LEN);
+        assert!(name.is_ascii(), "normalize_output must emit ASCII");
+    }
+
 }
 
 /// Discovers C include dependencies from a command line and input files.
