@@ -1710,36 +1710,13 @@ impl Runner {
         // writes it into the build directory by design, so the feature broke
         // the build it was meant to speed up. Nothing caught it because
         // nothing had ever run twice.
-        //
-        // A STAGED OUTER-OUTPUT WRITE NEEDS BOTH ITS SPELLINGS HERE, and it
-        // is the one member of this set a single run cannot expose. Its
-        // graph name is absolute, so `normalize_build_path` refuses it and
-        // the `.ok()` drops it silently: the edge's own output is then
-        // absent from the set that exists to keep it out of the inputs. The
-        // command still NAMES the outer output, and the driver copies the
-        // result back there, so the file is on disk for the next run to
-        // adopt as an input of the task that writes it. The staged spelling
-        // is what the task's own outputs carry and the declared spelling is
-        // what the command line carries, so both go in.
-        let mut self_outputs: HashSet<PathBuf> = HashSet::new();
-        for p in build
+        let self_outputs: HashSet<PathBuf> = build
             .outs()
             .iter()
             .map(|fid| PathBuf::from(&files.by_id[*fid].name))
             .chain(build.depfile.as_ref().map(PathBuf::from))
-        {
-            if let Some(staged) = (!self.config.is_output_derivation)
-                .then(|| outer_stage_output_path(&p))
-                .flatten()
-            {
-                self_outputs.insert(staged);
-                self_outputs.insert(p);
-                continue;
-            }
-            if let Ok(n) = normalize_build_path(&self.config.build_dir, p) {
-                self_outputs.insert(n);
-            }
-        }
+            .filter_map(|p| normalize_build_path(&self.config.build_dir, p).ok())
+            .collect();
 
         // Directories holding a module named by `python -m a.b.c`, resolved
         // through the command's own PYTHONPATH; merged into the sibling
