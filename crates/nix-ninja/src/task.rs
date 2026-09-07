@@ -11056,6 +11056,31 @@ mod normalize_output_tests {
     }
 
     #[test]
+    fn two_long_paths_that_normalize_alike_still_separate() {
+        // The map to the store charset is MANY TO ONE, so a space and a dash
+        // in one position give the same name. Short names are allowed to
+        // collide that way and the content hash separates the store paths.
+        // A FOLDED name cannot rely on that, because the digest is the only
+        // thing carrying the difference, so it is taken over the ORIGINAL
+        // path. A mutant digesting the normalized name survives every other
+        // test in this module and is caught here.
+        let stem = "x".repeat(200);
+        let spaced = format!("{stem}/a b.c.o");
+        let dashed = format!("{stem}/a-b.c.o");
+        assert_ne!(spaced, dashed, "the originals must differ");
+        assert_eq!(
+            normalize_output(&spaced[..40]),
+            normalize_output(&dashed[..40]),
+            "the fixture must be a genuine many-to-one pair once normalized"
+        );
+        assert_ne!(
+            normalize_output(&spaced),
+            normalize_output(&dashed),
+            "two distinct paths folded to one name"
+        );
+    }
+
+    #[test]
     fn a_long_path_with_multibyte_characters_does_not_split_a_boundary() {
         // The fold slices by byte. That is sound only because the map above
         // emits one ASCII `-` per non-ASCII char, and this is what holds it:
