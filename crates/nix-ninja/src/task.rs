@@ -9031,14 +9031,17 @@ mod task_needs_cc_tests {
         ));
     }
 
-    /// The two arms that predate the output-shape one, so a mutant deleting
-    /// either is caught here rather than by a gate that builds.
+    /// The two arms that predate the output-shape one, EACH ISOLATED FROM IT.
+    /// A first version of this test used `gcc -c a.c -o a.o`, whose output is
+    /// object shaped, so the output-shape arm answered first and a mutant
+    /// deleting the command-line arm survived. A LINK is the shape that
+    /// separates them: it names the compiler and writes no object.
     #[test]
     fn a_named_compiler_and_a_gcc_dependency_each_suffice() {
         assert!(task_needs_cc(
             None,
-            "gcc -c a.c -o a.o",
-            ["a.o"].into_iter()
+            "gcc -o prog a.o b.o",
+            ["prog"].into_iter()
         ));
         assert!(task_needs_cc(
             Some("gcc"),
