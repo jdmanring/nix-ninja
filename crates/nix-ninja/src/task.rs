@@ -11090,6 +11090,22 @@ fn command_program(cmdline: &str) -> Option<&str> {
             // `env VAR=value prog`: env is coreutils and always on the
             // sandbox PATH; the program it execs is what needs resolving.
             "env" => continue,
+            // gyp opens every shared-library link with a test, so the
+            // program sits after `then`:
+            //   if [ ! -e $lib -o ! -e $lib.TOC ]; then $ld -shared ...
+            // Skipping tokens one at a time cannot reach it, because the
+            // test's own operands are plausible binary names: `-e` comes
+            // first and the library path after it, and either would be
+            // resolved in the program's place. `cd` is stepped over as a
+            // pair for the same reason. Only the `then` branch is reachable
+            // in a sandbox, where the library cannot already exist.
+            "if" => {
+                for t in toks.by_ref() {
+                    if t == "then" {
+                        break;
+                    }
+                }
+            }
             tok if is_shell_assignment(tok) => continue,
             tok => return Some(tok.trim_matches(|c| c == '"' || c == '\'')),
         }
@@ -12873,6 +12889,16 @@ mod command_program_tests {
         assert_eq!(command_program("=x prog"), Some("=x"));
         assert_eq!(command_program("   "), None);
         assert_eq!(command_program("cd sub"), None);
+        // gyp's mtime_preserving_solink, the shape of every gyp project's
+        // shared-library link. Read from the generator rather than from a
+        // build: gyp/pylib/gyp/generator/ninja.py.
+        assert_eq!(
+            command_program(
+                "if [ ! -e $lib -o ! -e $lib.TOC ]; then /nix/store/x/bin/cc -shared \
+                 -o lib/libpkcs11testmodule.so; else :; fi"
+            ),
+            Some("/nix/store/x/bin/cc")
+        );
     }
 }
 
