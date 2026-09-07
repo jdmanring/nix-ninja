@@ -12540,16 +12540,25 @@ mod self_rss_tests {
     }
 }
 
+/// $out and the other outer output variables are PROCESS globals and cargo
+/// runs tests on parallel threads, so every arm that sets them to a
+/// DIFFERENT value races: whichever writes last wins under the others'
+/// assertions. Latent until the sandboxed check phase hit the interleaving
+/// (remove_outer_rpath saw the rewrite-map test's $out and stripped
+/// nothing). Poisoning is survivable: a panicking holder must not fail the
+/// other tests twice.
+///
+/// ONE LOCK, DECLARED WHERE BOTH MODULES CAN REACH IT. It lived inside
+/// ninja_pool_tests, so an arm in another module could not take it and did
+/// not: `a_path_under_the_outer_output_is_not_an_input` set and cleared the
+/// same variables unlocked, which failed the pair inside `nix build` while
+/// every local run passed.
+#[cfg(test)]
+static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod ninja_pool_tests {
-    /// $out/$dev are PROCESS globals and cargo runs tests on parallel
-    /// threads, so the two tests below - which set the same vars to
-    /// DIFFERENT values - race: whichever writes last wins under the
-    /// other's assertions. Latent until the sandboxed check phase hit the
-    /// interleaving (remove_outer_rpath saw the rewrite-map test's $out
-    /// and stripped nothing). Poisoning is survivable: a panicking holder
-    /// must not fail the other test twice.
-    static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::OUT_ENV_LOCK;
 
     /// `scan_lto_flags` with no wrapper baseline, which is the state
     /// `task_is_lto` starts from when the environment sets none. Written as
@@ -14135,6 +14144,9 @@ mod outer_output_input_tests {
     /// `path '...-nss-3.112.5' is not valid`.
     #[test]
     fn a_path_under_the_outer_output_is_not_an_input() {
+        let _env = super::OUT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let store = StoreDir::new(std::path::Path::new("/nix/store")).expect("store dir");
         // AN EXISTING PATH, so the existence check above the guard cannot
         // be what rejects it. nss's own output exists on disk during the
