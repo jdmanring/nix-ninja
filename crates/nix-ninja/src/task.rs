@@ -3269,9 +3269,26 @@ fn build_task_derivation(
     // 2026-09-04). A generator, a `cmake -E` step or a python script
     // gets a 14-path closure; anything naming cc, ld, ar, gfortran and
     // the rest by any spelling keeps it, as does every `deps = gcc`
-    // edge. A script that execs the compiler without naming it on the
-    // command line fails LOUDLY with "cc: not found", never silently.
-    let needs_cc = task.deps.as_deref() == Some("gcc") || command_names_toolchain(cmdline);
+    // edge.
+    //
+    // AND EVERY EDGE THAT WRITES AN OBJECT, whatever its command line says.
+    // A generator can compile without naming a compiler: glib's probe object
+    // comes from `dtrace -G -s gobject_probes.d -o gobject_probes.o`, which
+    // execs gcc from inside systemtap, and the task died in python's
+    // subprocess with "No such file or directory: 'gcc'". The command line
+    // cannot answer this question and the OUTPUT SHAPE can, which is the
+    // discriminator `is_compile_task` already uses for the same population.
+    // Loud, not silent, in that case too, which is why it was findable at
+    // all, but the loudness was the whole remedy and a package cannot build
+    // on it.
+    //
+    // STILL GATED, and the gate is the point: an edge writing anything other
+    // than objects keeps the 14-path closure. Carrying the wrapper
+    // unconditionally re-keys every task and spends 27 store paths on each,
+    // one acquisition of the daemon's store mutex per path at realise.
+    let needs_cc = task.deps.as_deref() == Some("gcc")
+        || command_names_toolchain(cmdline)
+        || object_shaped_outputs(task.outputs.iter().filter_map(|p| p.to_str()));
     if needs_cc {
         drv.inputs
             .insert(SingleDerivedPath::Opaque(tools.require_cc()?.clone()));
