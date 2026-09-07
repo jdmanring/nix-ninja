@@ -356,6 +356,39 @@ The search paths are derived from the command line before outer output paths
 are rewritten to placeholders. A command that names no directory inside its
 own output produces none, and its derivation is unchanged.
 
+A package that stages headers into its own output also writes there, and an
+edge then declares an output inside it. That path is refused for the same
+reason the include was, and it does not relativise under the build
+directory, so the edge cannot be built at all. Such an output is written
+under `.nn-outer` instead, at the output's own layout, and the driver copies
+the result into the real output once the task has run. The two halves share
+one directory: a read finds what was staged in, and a write lands beside it.
+
+The command has to agree with the declared output. It still spells the path
+inside the outer output, and the placeholder rewrite would send that
+spelling to a store path present nowhere in the sandbox, so the task would
+write where the command sent it and be checked somewhere else. The staged
+pairs are applied ahead of the placeholder map, and only for an output that
+moved: a command that merely reads from the outer output keeps the
+placeholder it already had.
+
+Three places derive an output's location from the same graph names, and they
+have to agree. The derivation is built from one, the finished task's outputs
+are resolved through another, and the graph node the caller asked for is
+found through a third. A staged write that reaches only the first is refused
+by the second; one that reaches only the first two resolves to nothing at
+the third.
+
+The placement is the driver's and it is eager. A task in local mode is
+realised when something downstream asks for it, and a header reached through
+an include path is not a declared input of the compile that opens it, so
+nothing asks. The include staging above reads the real output from disk,
+which means the bytes have to be there before the next task is generated.
+
+Where the driver runs inside the outer derivation, the refusal stands: the
+output is submitted as a derivation output rather than held on disk, so a
+staged write has nowhere to be copied back to.
+
 ### Implicit /nix/store references
 
 Some references are to binaries like `g++` but meson generates them without
