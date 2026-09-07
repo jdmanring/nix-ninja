@@ -1101,6 +1101,7 @@ impl Runner {
                     &names,
                     final_derived_path,
                     &label,
+                    !config.is_output_derivation,
                 ) {
                     Ok(v) => v,
                     Err(e) => {
@@ -1620,17 +1621,15 @@ impl Runner {
             // copy back, so staging would move the write and silently drop
             // it. Refusing is what happens today on that path, so it keeps
             // its emission as well as its behaviour.
-            if let Some(staged) = (!self.config.is_output_derivation)
-                .then(|| outer_stage_output_path(&declared))
-                .flatten()
-            {
-                outer_stage_outputs.push((declared, staged.clone()));
-                outputs.push(staged);
-                continue;
+            let placed = staged_or_normalized_output(
+                &self.config.build_dir,
+                declared.clone(),
+                !self.config.is_output_derivation,
+            )?;
+            if placed != declared && outer_stage_output_path(&declared).as_ref() == Some(&placed) {
+                outer_stage_outputs.push((declared, placed.clone()));
             }
-            // See normalize_build_path: an absolute output escapes the
-            // task sandbox via Path::join's prefix-discarding semantics.
-            outputs.push(normalize_build_path(&self.config.build_dir, declared)?);
+            outputs.push(placed);
         }
 
         lap(&NT_WORKLIST_MS);
@@ -8703,6 +8702,32 @@ fn walk_dir_capped_uncached(
 /// top-level ancestor is the package's, however many levels it climbs;
 /// `/etc` and `/nix/store` are not, and this is the same test the referenced
 /// -path admission uses on the input side.
+/// Where an edge's declared output is written, staging or normalizing.
+///
+/// TWO SITES DERIVE THIS FROM THE SAME GRAPH NAMES AND MUST NOT DISAGREE,
+/// which is the rule `store_rel_path` is a function for. `new_task` decides
+/// it when the derivation is built, and `normalized_task_outputs` decides it
+/// again from `task.outs()` when the result comes back. Staging only the
+/// first left the second refusing the path the task had just written, with
+/// the guard's own sentence, so the class read as untouched by a fix that
+/// was working.
+///
+/// `allow_stage` is local mode. On the output-derivation path the outer
+/// output is submitted rather than held, so there is nowhere to copy a
+/// staged write back to and the refusal stands.
+fn staged_or_normalized_output(
+    build_dir: &Path,
+    declared: PathBuf,
+    allow_stage: bool,
+) -> Result<PathBuf> {
+    if allow_stage {
+        if let Some(staged) = outer_stage_output_path(&declared) {
+            return Ok(staged);
+        }
+    }
+    normalize_build_path(build_dir, declared)
+}
+
 fn normalize_build_path(build_dir: &Path, p: PathBuf) -> Result<PathBuf> {
     if p.is_relative() {
         return Ok(p);
@@ -8954,6 +8979,7 @@ mod normalized_task_outputs_tests {
             &["/build/source/bin/Release/libopenfec.so.1.4.2".to_string()],
             &drv(),
             "libopenfec",
+            true,
         )
         .expect("an output in the package's own tree must be accepted");
         assert_eq!(got.len(), 1);
@@ -8970,6 +8996,7 @@ mod normalized_task_outputs_tests {
             &["src/a.o".to_string(), "src/b.o".to_string()],
             &drv(),
             "src/a.o",
+            true,
         )
         .unwrap();
         assert_eq!(got.len(), 2);
@@ -8994,6 +9021,7 @@ mod normalized_task_outputs_tests {
             &["src/a.o".to_string(), "/etc/passwd".to_string()],
             &drv(),
             "src/a.o",
+            true,
         )
         .map(|v| v.len())
         .expect_err("an unplaceable output must fail, not be dropped");
@@ -9017,6 +9045,7 @@ mod normalized_task_outputs_tests {
             &["src/a.o".to_string(), "/etc/passwd".to_string()],
             &drv(),
             "t",
+            true,
         )
         .map(|v| v.len())
         .is_err());
@@ -9040,10 +9069,11 @@ fn normalized_task_outputs(
     names: &[String],
     final_derived_path: &SingleDerivedPath,
     label: &str,
+    allow_stage: bool,
 ) -> Result<Vec<DerivedFile>> {
     let mut out = Vec::with_capacity(names.len());
     for name in names {
-        match normalize_build_path(build_dir, name.clone().into()) {
+        match staged_or_normalized_output(build_dir, name.clone().into(), allow_stage) {
             Ok(p) => out.push(new_built_file(final_derived_path.clone(), p)),
             Err(e) => {
                 return Err(e.context(format!(
@@ -11384,6 +11414,50 @@ mod outer_stage_output_tests {
             ),
             None
         );
+    }
+
+    // THE TWO SITES MUST AGREE, and this arm exists because they did not.
+    // `new_task` decides where an output is written when the derivation is
+    // built; `normalized_task_outputs` decides it again from the graph's own
+    // names when the result comes back. Staging only the first left the
+    // second refusing the very path the task had written, with the guard's
+    // sentence, so a working fix read on configuration B exactly like an
+    // absent one. Both now call `staged_or_normalized_output`, and this
+    // asserts the second site's answer rather than the first's.
+    #[test]
+    fn the_result_side_stages_the_same_output_the_task_side_did() {
+        let _env = super::OUT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("outputs", "out");
+        std::env::set_var("out", OUT);
+        let name = format!("{OUT}/private/nss/basicutil.h");
+        let task_side = super::staged_or_normalized_output(
+            Path::new("/build/source/out/Release"),
+            PathBuf::from(&name),
+            true,
+        )
+        .expect("the task side stages rather than refusing");
+        let result_side = super::normalized_task_outputs(
+            Path::new("/build/source/out/Release"),
+            &[name],
+            &super::SingleDerivedPath::Opaque(
+                "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-x.drv"
+                    .parse()
+                    .expect("store path"),
+            ),
+            "stage",
+            true,
+        )
+        .expect("the result side stages rather than refusing");
+        std::env::remove_var("out");
+        std::env::remove_var("outputs");
+        assert_eq!(
+            task_side,
+            PathBuf::from(".nn-outer/private/nss/basicutil.h")
+        );
+        assert_eq!(result_side.len(), 1);
+        assert_eq!(result_side[0].build_path, task_side);
     }
 
     #[test]
