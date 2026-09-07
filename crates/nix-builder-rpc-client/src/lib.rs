@@ -73,10 +73,23 @@ pub enum Error {
     // monitors grep the LOG for "DaemonStalled", and the log only ever
     // sees this error through Display - a message without the name is a
     // stall the monitoring cannot match.
+    // THE TEXT NAMED A CAUSE THIS SITE CANNOT ESTABLISH. `connect_failures`
+    // counts only where `pool.acquire` fails, so a worker that ACCEPTS the
+    // connection and then dies leaves it at zero and arrives here as a
+    // connection-level IO error; nothing waited, and four crashed workers
+    // exhaust the counter in under a second. "daemon-side wedge" and a
+    // "final allowance" of 4800s together read as a daemon that was busy for
+    // eighty minutes, which is what four aborts of one gate were attributed
+    // to across three sessions while the daemon log recorded segfaults.
+    // The allowance is the ladder's current rung, not a duration anything
+    // spent, and the message now says where the discriminating evidence is.
     #[error(
         "DaemonStalled: no useful daemon reply through {attempts} stall attempts \
-         and {connect_failures} connect failures (final allowance \
-         {last_allowance_s}s); daemon-side wedge"
+         and {connect_failures} connect failures (allowance ladder at \
+         {last_allowance_s}s, a rung rather than a duration anything waited). \
+         A connect that SUCCEEDS and then loses its worker arrives here too, so \
+         this is not evidence the daemon was busy: read /var/log/nix-daemon/current \
+         for 'daemon worker .* crashed' in this window before concluding load"
     )]
     DaemonStalled {
         attempts: u32,
@@ -294,7 +307,15 @@ mod watchdog_policy_tests {
             line.contains("DaemonStalled"),
             "monitor grep would miss: {line}"
         );
-        assert!(line.contains("daemon-side wedge"));
+        // THE MONITORED SUBSTRING IS NOT THE ONLY THING THIS PINS. The
+        // message exists to stop a reader concluding the daemon was busy,
+        // so the pointer to the evidence is part of the contract: a reword
+        // that drops it puts the misdiagnosis back.
+        assert!(line.contains("/var/log/nix-daemon/current"), "{line}");
+        assert!(
+            !line.contains("wedge"),
+            "the text asserts a cause this site cannot establish: {line}"
+        );
     }
 
     /// The polarity that motivated `Patience`: a best-effort call must not
