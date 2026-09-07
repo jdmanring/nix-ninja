@@ -11296,9 +11296,6 @@ fn outer_stage_output_path(declared: &Path) -> Option<PathBuf> {
 }
 
 fn outer_stage_output_path_in(declared: &Path, outer: &[String]) -> Option<PathBuf> {
-    if declared.is_relative() {
-        return None;
-    }
     outer.iter().find_map(|root| {
         let rest = declared.strip_prefix(root).ok()?;
         (rest != Path::new("")).then(|| Path::new(OUTER_STAGE_DIR).join(rest))
@@ -11367,6 +11364,26 @@ mod outer_stage_output_tests {
     #[test]
     fn the_outer_output_itself_is_not_staged() {
         assert_eq!(outer_stage_output_path_in(Path::new(OUT), &outer()), None);
+    }
+
+    // A BUILD-TREE PATH THAT MERELY CONTAINS A STORE PATH IS NOT A MEMBER,
+    // and clang 22.1.8 is the reason this is a test rather than an
+    // assumption. Its resource-header edges declare
+    // `nix/store/<hash>-clang-22.1.8-lib/lib/clang/22/include/<h>` RELATIVE
+    // to the build directory, cmake having composed the install prefix onto
+    // a build-tree path. The file is a build-tree file that happens to carry
+    // a store path inside its name, so staging it would move a write that is
+    // already landing where the build wants it. An outer output root is
+    // absolute and this spelling is not, which is what separates them.
+    #[test]
+    fn a_build_tree_path_carrying_a_store_path_is_not_staged() {
+        assert_eq!(
+            outer_stage_output_path_in(
+                Path::new("nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nss-3.112.5/private/nss/x.h"),
+                &outer()
+            ),
+            None
+        );
     }
 
     #[test]
