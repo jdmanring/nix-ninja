@@ -1274,7 +1274,24 @@ impl Runner {
                 // 2026-08-23). Try the absolute spelling before minting a
                 // new id; the DerivedFile keeps its relative build_path,
                 // which is the one the sandbox layout is built from.
-                let abs_fid = if path_str.starts_with("../") {
+                // A STAGED OUTER-OUTPUT WRITE IS THE SAME PROBLEM WITH A
+                // THIRD SPELLING. An output the edge declares inside the
+                // outer derivation's output is written under
+                // OUTER_STAGE_DIR, so the graph node carries the outer
+                // output's own absolute path and this registration carries
+                // the staged one. Keyed by the staged path the finished
+                // output takes a fresh FileId and the target the caller
+                // asked for resolves to nothing: "Missing derived file".
+                // Only one outer output can own a node, so trying each is
+                // exact rather than a guess.
+                let abs_fid = if let Some(rest) = path_str
+                    .strip_prefix(OUTER_STAGE_DIR)
+                    .and_then(|r| r.strip_prefix('/'))
+                {
+                    outer_output_paths()
+                        .into_iter()
+                        .find_map(|root| files.lookup(&format!("{root}/{rest}")))
+                } else if path_str.starts_with("../") {
                     let mut abs =
                         format!("{}/{}", self.config.build_dir.to_string_lossy(), path_str);
                     canon::canonicalize_path(&mut abs);
