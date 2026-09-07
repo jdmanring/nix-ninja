@@ -3062,13 +3062,40 @@ pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> 
 /// it is the evidence that nothing arrived: the prepend was never the
 /// defect.
 ///
-/// DEFER(a fourth non-NIX_ entry): at four, read the values instead of the
-/// names and forward what is entirely store paths. The trigger was written
-/// at three and reached at three; it is moved rather than discharged because
-/// the value-reading form has a hazard the name form does not, which is that
-/// a python path is likelier than a catalog path to carry an element under
-/// the BUILD DIRECTORY, declared by nothing and failing later and elsewhere.
-/// Two entries decided by their values would settle whether that is real.
+/// XDG_DATA_DIRS is where g-ir-scanner looks for the `.gir` files it
+/// includes. nixpkgs' gobject-introspection setup hook appends `$dep/share`
+/// per build input, meson bakes exactly one `--add-include-path` into
+/// build.ninja and leaves the rest to the variable, so a task sandbox that
+/// inherits no shell environment dies on `Couldn't find include
+/// 'Gio-2.0.gir'` with the file present in glib's dev output. Read from
+/// giscanner (`utils.py` `get_system_data_dirs`, reached from
+/// `transformer.py`), not from the search-path list in the error.
+///
+/// NIX_GOBJECT_INTROSPECTION_DEFAULT_FALLBACK_LIBPATH is the SILENT HALF of
+/// that same class, and it is why the two land together. giscanner's
+/// `_get_default_fallback_libpath` falls back to `outputs`/`lib`/`out`, which
+/// this list deliberately withholds, and then to `""` with its own comment
+/// saying the shared library will not be prepended with a path. So the scan
+/// SUCCEEDS and writes a `.gir` whose `shared-library` has no store path, the
+/// build stays green, and the failure surfaces as a dlopen miss in whatever
+/// later loads the typelib. Fixing the loud half alone arms this one. Its
+/// value IS the outer output, which the placeholder rewrite below is what
+/// makes safe to forward.
+///
+/// GI_TYPELIB_PATH is NOT here, and the elimination is a claim about
+/// giscanner alone: it is set by the same hook, and no file in the scanner
+/// reads it. An edge that RUNS a typelib consumer is a different question and
+/// is unasked.
+///
+/// DEFER(a fourth non-NIX_ entry, and the upgrade path is NOT the one this
+/// note used to give): reading the values and forwarding what is entirely
+/// store paths admits PATH, which inside a build is exactly that, and the
+/// emitted PATH is gated on purpose (`command_names_toolchain`, `require_cc`,
+/// 27 store paths of compiler wrapper against 14 for everything else a task
+/// carries). A rule that hands every task the outer PATH silently retires
+/// that design. The trigger is therefore moved to a name whose value is NOT
+/// entirely store paths, which is the case the name form cannot express and
+/// the only one worth the risk.
 fn forwarded_to_tasks(key: &str) -> bool {
     key.starts_with("NIX_CFLAGS_COMPILE")
         || key.starts_with("NIX_LDFLAGS")
@@ -3077,6 +3104,8 @@ fn forwarded_to_tasks(key: &str) -> bool {
         || key.starts_with("NIX_HARDENING_ENABLE")
         || key == "XML_CATALOG_FILES"
         || key == "PYTHONPATH"
+        || key == "XDG_DATA_DIRS"
+        || key == "NIX_GOBJECT_INTROSPECTION_DEFAULT_FALLBACK_LIBPATH"
 }
 
 /// A test fixture directory, removed when dropped and removed FIRST as
@@ -3149,6 +3178,27 @@ mod forwarded_to_tasks_tests {
         assert!(forwarded_to_tasks("PYTHONPATH"));
     }
 
+    /// g-ir-scanner's include search path, the loud half.
+    #[test]
+    fn the_xdg_data_dirs_are_forwarded() {
+        assert!(forwarded_to_tasks("XDG_DATA_DIRS"));
+    }
+
+    /// The silent half, and the reason it is not a NIX_ PREFIX like the
+    /// wrapper entries above: those are prefixes because they are genuinely
+    /// target-suffixed, and a `starts_with("NIX_GOBJECT")` here would admit
+    /// whatever else that hook later invents, which is the same widening the
+    /// PYTHONPATH case refuses.
+    #[test]
+    fn the_gi_fallback_libpath_is_forwarded() {
+        assert!(forwarded_to_tasks(
+            "NIX_GOBJECT_INTROSPECTION_DEFAULT_FALLBACK_LIBPATH"
+        ));
+        assert!(!forwarded_to_tasks(
+            "NIX_GOBJECT_INTROSPECTION_DEFAULT_FALLBACK_LIBPATH_EXTRA"
+        ));
+    }
+
     /// THE HALF THAT KEEPS THE KEY STILL. `out` and the outer derivation's
     /// other variables move with every edit to it, and forwarding one re-keys
     /// every task in the package on a source change anywhere.
@@ -3161,6 +3211,9 @@ mod forwarded_to_tasks_tests {
             "NIX_BUILD_TOP",
             "XML_CATALOG_FILES_EXTRA",
             "PYTHONPATH_EXTRA",
+            "XDG_DATA_HOME",
+            "XDG_DATA_DIRS_EXTRA",
+            "GI_TYPELIB_PATH",
         ] {
             assert!(!forwarded_to_tasks(k), "{k}");
         }
