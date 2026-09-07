@@ -3286,9 +3286,11 @@ fn build_task_derivation(
     // than objects keeps the 14-path closure. Carrying the wrapper
     // unconditionally re-keys every task and spends 27 store paths on each,
     // one acquisition of the daemon's store mutex per path at realise.
-    let needs_cc = task.deps.as_deref() == Some("gcc")
-        || command_names_toolchain(cmdline)
-        || object_shaped_outputs(task.outputs.iter().filter_map(|p| p.to_str()));
+    let needs_cc = task_needs_cc(
+        task.deps.as_deref(),
+        cmdline,
+        task.outputs.iter().filter_map(|p| p.to_str()),
+    );
     if needs_cc {
         drv.inputs
             .insert(SingleDerivedPath::Opaque(tools.require_cc()?.clone()));
@@ -8986,6 +8988,67 @@ fn normalize_output(output: &str) -> String {
 /// wider input set, which is what every edge had before the gate existed.
 /// A link misread as a compile fails to build; a link correctly excluded
 /// only carries more inputs.
+/// Whether a task's sandbox gets the compiler wrapper.
+///
+/// A FREE FUNCTION SO THE OUTPUT-SHAPE ARM IS REACHABLE BY A TEST. Written as
+/// a three-way disjunction inline, a mutant deleting that arm survived every
+/// unit test and was caught only by a gate that builds, which is the shape
+/// this codebase calls pinning the wiring.
+fn task_needs_cc<'a>(
+    deps: Option<&str>,
+    cmdline: &str,
+    outs: impl Iterator<Item = &'a str>,
+) -> bool {
+    deps == Some("gcc") || command_names_toolchain(cmdline) || object_shaped_outputs(outs)
+}
+
+#[cfg(test)]
+mod task_needs_cc_tests {
+    use super::task_needs_cc;
+
+    /// glib's probe object: a tracing tool that execs the compiler from
+    /// inside its own process, so no toolchain name is on the line.
+    const DTRACE: &str = "/nix/store/x-systemtap/bin/dtrace -G -s ../gobject/gobject_probes.d \
+         -o gobject/libgobject-2.0.so.0.8800.3.p/gobject_probes.o";
+
+    #[test]
+    fn a_generator_writing_an_object_gets_the_compiler() {
+        assert!(task_needs_cc(
+            None,
+            DTRACE,
+            ["gobject/libgobject-2.0.so.0.8800.3.p/gobject_probes.o"].into_iter()
+        ));
+    }
+
+    /// THE NEGATIVE CONTROL, and it is the whole reason the arm is gated:
+    /// the same command writing a non-object output keeps the small closure.
+    #[test]
+    fn the_same_generator_writing_a_stamp_does_not() {
+        assert!(!task_needs_cc(
+            None,
+            DTRACE,
+            ["gobject/probes.stamp"].into_iter()
+        ));
+    }
+
+    /// The two arms that predate the output-shape one, so a mutant deleting
+    /// either is caught here rather than by a gate that builds.
+    #[test]
+    fn a_named_compiler_and_a_gcc_dependency_each_suffice() {
+        assert!(task_needs_cc(
+            None,
+            "gcc -c a.c -o a.o",
+            ["a.o"].into_iter()
+        ));
+        assert!(task_needs_cc(
+            Some("gcc"),
+            "cmake -E touch x",
+            ["x"].into_iter()
+        ));
+        assert!(!task_needs_cc(None, "cmake -E touch x", ["x"].into_iter()));
+    }
+}
+
 fn is_compile_task<'a>(deps: Option<&str>, outs: impl Iterator<Item = &'a str>) -> bool {
     deps == Some("gcc") && object_shaped_outputs(outs)
 }
