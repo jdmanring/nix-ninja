@@ -1323,6 +1323,36 @@ impl Runner {
         self.phony_aliases.contains_key(&fid)
     }
 
+    /// The producing edge's output for a path named inside a `-Wl` group,
+    /// where the graph holds one and another edge writes it.
+    ///
+    /// GRAPH NAMES ARE NINJA SPELLINGS, so an ABSOLUTE candidate cannot
+    /// match a lookup taken on the spelling as written. Both spellings occur
+    /// in the same class: compiler-rt names its version script relative and
+    /// json-c names its absolute, so a reader that skips the relativisation
+    /// resolves one of them and silently falls through to the bytes for the
+    /// other, which is indistinguishable from having no fix at all wherever
+    /// the bytes happen to be present. A path outside the build directory
+    /// has no graph node by construction.
+    fn wl_produced_output(&self, files: &graph::GraphFiles, cand: &str) -> Option<DerivedFile> {
+        let name = if cand.starts_with('/') {
+            Path::new(cand)
+                .strip_prefix(&self.config.build_dir)
+                .ok()?
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            cand.to_string()
+        };
+        let fid = files.lookup(&name)?;
+        // A SOURCE FILE IS NOT A PRODUCED NODE. Without this the reader
+        // would prefer a graph entry for an ordinary checked-in linker
+        // script over its own bytes, which is the same file by a longer
+        // route today and a dangling reference the moment it is not.
+        files.by_id[fid].input?;
+        self.derived_files.get(&fid).cloned()
+    }
+
     fn new_task(&mut self, files: &mut graph::GraphFiles, build: &Build) -> Result<Task> {
         // Section clocks for the serial-resolution bottleneck, read by
         // the heartbeat in start(). Wall time between checkpoints lands
@@ -2355,9 +2385,6 @@ impl Runner {
                 };
                 for cand in wl_file_candidates(group) {
                     let p = Path::new(cand);
-                    if !p.is_file() {
-                        continue;
-                    }
                     // A node an edge produces reaches the task through its
                     // edge, and what is on disk under that name is then a
                     // placement. THAT IS ONLY TRUE WHEN THIS EDGE DECLARES
@@ -2368,16 +2395,23 @@ impl Runner {
                     // `cannot open linker script file`. Prefer the producing
                     // task's own output where it is resolved, and fall
                     // through to the bytes where it is not.
-                    if let Some(fid) = files.lookup(cand) {
-                        if files.by_id[fid].input.is_some() {
-                            if let Some(df) = self.derived_files.get(&fid) {
-                                let df = df.clone();
-                                if !input_set.contains_key(&df.build_path) {
-                                    input_set.insert(df.build_path.clone(), df);
-                                }
-                                continue;
-                            }
+                    //
+                    // THE GRAPH IS ASKED BEFORE THE DISK, and the order is
+                    // the whole fix rather than a tidying. A file another
+                    // edge has not written YET is not on disk, so an
+                    // existence test above this resolution drops it before
+                    // the resolution can run and the produced-node branch
+                    // is reachable only for a file that is already there.
+                    // That is the state compiler-rt's six sanitizers link
+                    // in: the version script's own edge has not run.
+                    if let Some(df) = self.wl_produced_output(files, cand) {
+                        if !input_set.contains_key(&df.build_path) {
+                            input_set.insert(df.build_path.clone(), df);
                         }
+                        continue;
+                    }
+                    if !p.is_file() {
+                        continue;
                     }
                     let up =
                         new_opaque_file(&self.rpc_client, &self.config.build_dir, p.to_path_buf())?;
