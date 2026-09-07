@@ -11090,7 +11090,6 @@ mod normalize_output_tests {
         assert!(name.len() <= MAX_OUTPUT_NAME_LEN);
         assert!(name.is_ascii(), "normalize_output must emit ASCII");
     }
-
 }
 
 /// Discovers C include dependencies from a command line and input files.
