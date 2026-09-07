@@ -150,7 +150,7 @@ fn run_scan_mode(target: Target) -> Result<()> {
     let c_includes = c_include_parser::retrieve_c_includes(
         &target.cmdline,
         vec![target.filename.clone().into()],
-        c_include_parser::VirtualPaths::default(),
+        None,
     )?;
     println!("C include parser method:");
     for include in c_includes {
@@ -178,7 +178,7 @@ fn run_benchmark_mode(targets: Vec<Target>) -> Result<()> {
         c_include_parser::retrieve_c_includes(
             &target.cmdline,
             vec![target.filename.clone().into()],
-            c_include_parser::VirtualPaths::default(),
+            None,
         )?;
     }
     let c_duration = c_start.elapsed();
@@ -209,7 +209,7 @@ fn run_correctness_mode(targets: Vec<Target>) -> Result<()> {
         let mut c_includes = c_include_parser::retrieve_c_includes(
             &target.cmdline,
             vec![target.filename.clone().into()],
-            c_include_parser::VirtualPaths::default(),
+            None,
         )?;
         c_includes = normalize_paths(c_includes, &current_dir);
 

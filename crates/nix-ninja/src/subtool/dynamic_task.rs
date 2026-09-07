@@ -12,7 +12,6 @@ use std::{
 };
 
 use crate::task::discover_c_includes;
-use deps_infer::c_include_parser::VirtualPaths;
 
 pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
     let input_drv = targets
@@ -30,7 +29,7 @@ pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
 
     // Stage 2: Discover dynamic dependencies
     let discovered =
-        discover_dynamic_dependencies(&rpc_client, store_dir, &build_dir, &drv, built_paths, None)?;
+        discover_dynamic_dependencies(&rpc_client, store_dir, &build_dir, &drv, built_paths)?;
 
     // A `..` spelling discovered HERE has to reach the final derivation:
     // this subtool emits the derivation, it does not run the command, so
@@ -182,12 +181,6 @@ pub fn discover_dynamic_dependencies(
     build_dir: &Path,
     drv: &Derivation,
     built_paths: HashMap<PathBuf, PathBuf>,
-    // Every path the build graph produces, or `None` where there is no
-    // graph to consult. THE SANDBOXED `-t dynamic-task` PROCESS IS THAT
-    // CASE: it re-reads one derivation and never loads build.ninja, so it
-    // passes `None` and resolves against its own built inputs alone, which
-    // is what it did before this argument existed.
-    graph_paths: Option<Arc<HashMap<PathBuf, PathBuf>>>,
 ) -> Result<crate::task::Discovered> {
     let cmdline_bytes = drv
         .args
@@ -203,10 +196,7 @@ pub fn discover_dynamic_dependencies(
         build_dir,
         cmdline,
         files,
-        VirtualPaths {
-            primary: Some(built_paths),
-            graph: graph_paths,
-        },
+        Some(built_paths),
         // The dynamic task reconstructs its build dir fresh inside the
         // sandbox, so no prior run's depfile can exist there; the scan is
         // the only source. Upstream #17's read-back applies to the outer,
