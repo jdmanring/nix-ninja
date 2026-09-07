@@ -189,13 +189,20 @@ fn main() -> Result<()> {
     // directory with nothing in it is otherwise absent here. Relative and
     // confined, as the driver emits them; anything else is refused.
     if let Ok(raw) = env::var("NIX_NINJA_EMPTY_DIRS") {
-        // A CLIMBING SPELLING IS ADMITTED WHILE IT STAYS IN THE TREE, and the
-        // categorical refusal of `..` that stood here is what kept glib from
-        // building: a gio compile names `-Isubprojects/gvdb` for the build
-        // tree and `-I../subprojects/gvdb` for the source tree, cc1 resolves
-        // the second literally, and `-Werror=missing-include-dirs` makes its
-        // absence fatal. The predicate is the driver's too, imported rather
-        // than written twice.
+        // A CLIMBING SPELLING IS ADMITTED WHILE IT STAYS IN THE TREE, because
+        // a source tree sits above the build directory and an empty directory
+        // there is as absent from a sandbox as one below it. The categorical
+        // refusal of `..` that stood here made every such spelling
+        // unreachable whatever the driver carried.
+        //
+        // THIS DOES NOT REACH A POPULATED DIRECTORY, and the carrier's name is
+        // the reason: the driver offers directories that exist EMPTY, so a
+        // `-I` naming a source directory full of headers none of which the
+        // compile opens is a different class with a different carrier. glib's
+        // `../subprojects/gvdb` holds thirty entries and is that class.
+        //
+        // The predicate is the driver's too, imported rather than written
+        // twice.
         let cwd = env::current_dir().unwrap_or_default();
         for d in raw.split_whitespace() {
             let p = std::path::Path::new(d);
