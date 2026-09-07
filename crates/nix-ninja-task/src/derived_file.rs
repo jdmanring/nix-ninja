@@ -736,3 +736,92 @@ mod link_tree_tests {
         assert_eq!(fs::read(dst.join("a/b/c.txt")).unwrap(), b"deep");
     }
 }
+
+/// Whether a RELATIVE directory spelling may be created against `cwd`.
+///
+/// A compile resolves `-I../subprojects/gvdb` literally, so the directory has
+/// to exist at that exact climbing path and cannot be remapped the way
+/// `.nn-up` remaps a climbing OUTPUT. The categorical refusal of `..` that
+/// stood here before was the reason glib could not build: the driver names
+/// both spellings and only the build-tree one was ever carried.
+///
+/// LEXICAL ON PURPOSE, no `canonicalize`. Resolving through symlinks would
+/// let a link placed between the check and the `create_dir_all` move the
+/// target out of the tree, and the check has to describe the path that is
+/// actually created.
+///
+/// The bound is the sandbox root, which is `cwd`'s first component: a build
+/// directory is somewhere under it, so a path that pops past it is leaving
+/// the tree rather than addressing a sibling of the build directory. This is
+/// the same discriminator the emitted-output side settled on, where climbing
+/// alone is not the test because openfec legitimately climbs.
+pub fn confined_relative_dir(cwd: &Path, dir: &Path) -> bool {
+    use std::path::Component;
+    // An absolute spelling is refused by the catch-all in the loop, whose
+    // first component is `RootDir`. An `is_absolute` test here as well read
+    // as defence in depth and was none: no input reaches one guard without
+    // reaching the other, so a mutant deleting it survived every arm.
+    let mut parts: Vec<std::ffi::OsString> = cwd
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_owned()),
+            _ => None,
+        })
+        .collect();
+    // The first component is the floor, not a step: popping it leaves the
+    // tree even though the resolved path is still non-empty.
+    const FLOOR: usize = 1;
+    if parts.len() < FLOOR {
+        return false;
+    }
+    for c in dir.components() {
+        match c {
+            Component::Normal(n) => parts.push(n.to_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.len() <= FLOOR {
+                    return false;
+                }
+                parts.pop();
+            }
+            _ => return false,
+        }
+    }
+    parts.len() > FLOOR
+}
+
+#[cfg(test)]
+mod confined_relative_dir_tests {
+    use super::confined_relative_dir;
+    use std::path::Path;
+
+    #[test]
+    fn a_sibling_of_the_build_directory_is_allowed_and_an_escape_is_not() {
+        let cwd = Path::new("/build/source/build");
+        // glib's own spelling, the case that was refused outright.
+        assert!(confined_relative_dir(cwd, Path::new("../subprojects/gvdb")));
+        // Controls, without which a function returning true would pass the
+        // arm above: the build-tree spelling still holds, and each way out of
+        // the tree is refused.
+        assert!(confined_relative_dir(cwd, Path::new("subprojects/gvdb")));
+        assert!(!confined_relative_dir(cwd, Path::new("../../../etc")));
+        assert!(!confined_relative_dir(cwd, Path::new("/etc")));
+        assert!(!confined_relative_dir(cwd, Path::new("../..")));
+        // Popping to exactly the floor is out, since the floor is the
+        // sandbox root and not a directory a build may write into.
+        assert!(!confined_relative_dir(cwd, Path::new("../../")));
+        // A climb that comes back down inside the tree is fine.
+        assert!(confined_relative_dir(cwd, Path::new("../build/gen")));
+        // THE FLOOR IS LOAD BEARING AND THE OTHER ESCAPE CASES DO NOT SHOW
+        // IT. Each of those pops to nothing and then pushes one component,
+        // so the closing length test refuses them whether or not the floor
+        // is checked, and a mutant deleting the floor survived them all.
+        // This one climbs PAST the root and descends far enough to end up
+        // longer than the floor, so only the in-loop check refuses it.
+        assert!(!confined_relative_dir(
+            cwd,
+            Path::new("../../../../nix/store/evil")
+        ));
+        assert!(!confined_relative_dir(cwd, Path::new("../../../../a/b")));
+    }
+}

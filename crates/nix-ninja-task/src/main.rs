@@ -189,12 +189,17 @@ fn main() -> Result<()> {
     // directory with nothing in it is otherwise absent here. Relative and
     // confined, as the driver emits them; anything else is refused.
     if let Ok(raw) = env::var("NIX_NINJA_EMPTY_DIRS") {
+        // A CLIMBING SPELLING IS ADMITTED WHILE IT STAYS IN THE TREE, and the
+        // categorical refusal of `..` that stood here is what kept glib from
+        // building: a gio compile names `-Isubprojects/gvdb` for the build
+        // tree and `-I../subprojects/gvdb` for the source tree, cc1 resolves
+        // the second literally, and `-Werror=missing-include-dirs` makes its
+        // absence fatal. The predicate is the driver's too, imported rather
+        // than written twice.
+        let cwd = env::current_dir().unwrap_or_default();
         for d in raw.split_whitespace() {
             let p = std::path::Path::new(d);
-            if p.is_absolute()
-                || p.components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
+            if !nix_ninja_task::derived_file::confined_relative_dir(&cwd, p) {
                 continue;
             }
             let _ = fs::create_dir_all(p);

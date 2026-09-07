@@ -2621,11 +2621,35 @@ impl Runner {
                 .as_deref()
                 .map(|c| include_dirs_named(c, &self.config.build_dir))
                 .unwrap_or_default();
-            self.empty_dirs
+            let mut carried: Vec<String> = self
+                .empty_dirs
                 .iter()
                 .filter(|d| named.iter().any(|n| n == *d))
                 .cloned()
-                .collect()
+                .collect();
+            // THE WALK CANNOT LIST A DIRECTORY ABOVE ITSELF, so the filter
+            // above can only ever carry the build-tree spelling. glib's gio
+            // compiles name both, and the source-tree one is what cc1 dies
+            // on. Taken from disk rather than from the walk, and only where
+            // the directory really exists and really is empty: inventing one
+            // would turn a missing header into a silent wrong answer, while
+            // a directory that exists empty is exactly what the class is.
+            for n in &named {
+                if carried.iter().any(|c| c == n) || !n.starts_with("..") {
+                    continue;
+                }
+                let abs = self.config.build_dir.join(n);
+                if !confined_relative_dir(&self.config.build_dir, Path::new(n)) {
+                    continue;
+                }
+                let empty = std::fs::read_dir(&abs)
+                    .map(|mut it| it.next().is_none())
+                    .unwrap_or(false);
+                if empty {
+                    carried.push(n.clone());
+                }
+            }
+            carried
         } else {
             self.empty_dirs.clone()
         };
@@ -7851,7 +7875,7 @@ fn prune_line(declared: u64, kept: u64) -> String {
     }
 }
 
-use nix_ninja_task::derived_file::header_like;
+use nix_ninja_task::derived_file::{confined_relative_dir, header_like};
 
 /// dyn's two expensive halves, separated because they have different fixes.
 // Hoisted with RESOLVE_MS, same reason: the end-of-run report needs the
