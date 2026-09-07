@@ -14260,3 +14260,26 @@ mod importable_subpackage_tests {
         assert!(importable_subpackages(missing).is_err());
     }
 }
+
+#[cfg(test)]
+mod staged_output_name_tests {
+    // THE STAGED PATH IS THE FIRST `.nn-outer` SPELLING TO BECOME A
+    // DERIVATION OUTPUT NAME. The include side's staged files are opaque
+    // uploads and never get one, so nothing had asked whether a name
+    // beginning with a period survives the daemon. `normalize_output`
+    // prefixes such a name rather than passing it through, and the
+    // question is whether what it produces parses as an output name at
+    // all: a refusal here would kill every staged output at the point the
+    // derivation is built, which is a long way from this function.
+    #[test]
+    fn a_staged_output_name_is_a_valid_output_name() {
+        let name = super::normalize_output(".nn-outer/private/nss/basicutil.h");
+        assert!(
+            !name.starts_with('.'),
+            "an output name beginning with a period is refused by AddToStore: {name}"
+        );
+        use std::str::FromStr as _;
+        super::OutputName::from_str(&name)
+            .unwrap_or_else(|e| panic!("staged output name {name} does not parse: {e}"));
+    }
+}
