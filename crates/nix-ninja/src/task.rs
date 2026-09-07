@@ -175,9 +175,13 @@ struct Task {
     // Configure-time relative symlinks to recreate in the sandbox; see
     // Runner::alias_symlinks.
     alias_symlinks: Vec<(String, String)>,
-    // Directories that exist EMPTY in the build tree, recreated in the
-    // sandbox of every non-compile task; see Runner::empty_dirs.
-    empty_dirs: Vec<String>,
+    // Directories to create in the sandbox after inputs are placed, as
+    // relative paths. Two populations reach it, which is why it is named for
+    // what the task DOES with them rather than for where they came from: a
+    // non-compile task gets the walk's empty build-tree directories
+    // (Runner::empty_dirs), and a compile gets every include directory its
+    // command names that exists in the tree.
+    make_dirs: Vec<String>,
 }
 
 impl Deref for Task {
@@ -2611,45 +2615,26 @@ impl Runner {
             cmdline
         };
 
-        // A compile gets only the empty directories its command names as
-        // include directories: glib's gio objects carry
-        // `-Isubprojects/gvdb` for a build-tree directory nothing stages,
-        // and `-Werror=missing-include-dirs` makes the absence fatal rather
-        // than silent. Everything else keeps its closure lean, as before.
-        let empty_dirs = if is_gcc_task {
-            let named = cmdline
+        // A COMPILE GETS EVERY INCLUDE DIRECTORY ITS COMMAND NAMES THAT
+        // EXISTS, and the emptiness of that directory is not a term. glib's
+        // gio objects carry `-Isubprojects/gvdb` for a build-tree directory
+        // nothing stages and `-I../subprojects/gvdb` for a source-tree one
+        // holding thirty files, and `-Werror=missing-include-dirs` makes
+        // either absence fatal. A rule that carried only the empty ones read
+        // as a fix because the build-tree spelling happens to be empty, and
+        // the package went on failing on the other.
+        //
+        // EXISTENCE IS THE WHOLE GUARD, and it is what stops a stand-in
+        // hiding a missing header: where a compile really opens a header
+        // under one of these directories the scan declares it and staging
+        // creates the directory, so an invented directory can only ever
+        // satisfy the diagnostic. Inventing one that is not in the tree at
+        // all would turn a typo into a silent search miss.
+        let make_dirs = if is_gcc_task {
+            cmdline
                 .as_deref()
-                .map(|c| include_dirs_named(c, &self.config.build_dir))
-                .unwrap_or_default();
-            let mut carried: Vec<String> = self
-                .empty_dirs
-                .iter()
-                .filter(|d| named.iter().any(|n| n == *d))
-                .cloned()
-                .collect();
-            // THE WALK CANNOT LIST A DIRECTORY ABOVE ITSELF, so the filter
-            // above can only ever carry the build-tree spelling. glib's gio
-            // compiles name both, and the source-tree one is what cc1 dies
-            // on. Taken from disk rather than from the walk, and only where
-            // the directory really exists and really is empty: inventing one
-            // would turn a missing header into a silent wrong answer, while
-            // a directory that exists empty is exactly what the class is.
-            for n in &named {
-                if carried.iter().any(|c| c == n) || !n.starts_with("..") {
-                    continue;
-                }
-                let abs = self.config.build_dir.join(n);
-                if !confined_relative_dir(&self.config.build_dir, Path::new(n)) {
-                    continue;
-                }
-                let empty = std::fs::read_dir(&abs)
-                    .map(|mut it| it.next().is_none())
-                    .unwrap_or(false);
-                if empty {
-                    carried.push(n.clone());
-                }
-            }
-            carried
+                .map(|c| named_dirs_to_create(c, &self.config.build_dir))
+                .unwrap_or_default()
         } else {
             self.empty_dirs.clone()
         };
@@ -2684,7 +2669,7 @@ impl Runner {
             store_srcs,
             outputs,
             alias_symlinks: self.alias_symlinks.clone(),
-            empty_dirs,
+            make_dirs,
         })
     }
 }
@@ -2739,6 +2724,68 @@ fn include_dirs_named(cmdline: &str, build_dir: &Path) -> Vec<String> {
         }
     }
     out
+}
+
+/// The include directories a compile's command names that the task has to
+/// create, as relative paths under `build_dir`.
+///
+/// A FREE FUNCTION SO BOTH GUARDS ARE REACHABLE BY A TEST. Written inline it
+/// was three chained filters inside `new_task`, where a mutant deleting
+/// either one survives every gate: the confinement guard is exercised by no
+/// fixture that builds, and the existence guard only by one that does not.
+fn named_dirs_to_create(cmdline: &str, build_dir: &Path) -> Vec<String> {
+    include_dirs_named(cmdline, build_dir)
+        .into_iter()
+        .filter(|n| confined_relative_dir(build_dir, Path::new(n)))
+        .filter(|n| build_dir.join(n).is_dir())
+        .collect()
+}
+
+#[cfg(test)]
+mod named_dirs_to_create_tests {
+    use super::{named_dirs_to_create, Scratch};
+
+    /// glib's gio shape, with the source-tree directory POPULATED as the
+    /// package's is. Both spellings must be carried, and the emptiness of
+    /// neither is a term.
+    #[test]
+    fn both_spellings_of_a_subproject_are_carried_whatever_they_hold() {
+        let d = Scratch::new(format!("nn-mkdirs-both-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(bd.join("subprojects/gvdb")).unwrap();
+        std::fs::create_dir_all(d.join("subprojects/gvdb/gvdb")).unwrap();
+        std::fs::write(d.join("subprojects/gvdb/gvdb/gvdb-reader.h"), "x").unwrap();
+        let got = named_dirs_to_create(
+            "gcc -Isubprojects/gvdb -I../subprojects/gvdb -c a.c -o a.o",
+            &bd,
+        );
+        assert_eq!(got, vec!["subprojects/gvdb", "../subprojects/gvdb"]);
+    }
+
+    /// THE EXISTENCE GUARD. A directory no part of the tree holds is a typo
+    /// or a stale flag, and creating it turns a missing header into a silent
+    /// search miss rather than a diagnostic.
+    #[test]
+    fn a_directory_that_is_not_in_the_tree_is_not_created() {
+        let d = Scratch::new(format!("nn-mkdirs-absent-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(&bd).unwrap();
+        let got = named_dirs_to_create("gcc -Ino/such/dir -c a.c -o a.o", &bd);
+        assert!(got.is_empty(), "carried {got:?}");
+    }
+
+    /// THE CONFINEMENT GUARD, with its own positive control beside it: a
+    /// sibling of the build directory is admitted and an escape is not, so a
+    /// mutant deleting the guard cannot pass by refusing everything.
+    #[test]
+    fn an_escape_is_refused_while_a_sibling_is_admitted() {
+        let d = Scratch::new(format!("nn-mkdirs-escape-{}", std::process::id()));
+        let bd = d.join("a/b/build");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::create_dir_all(d.join("a/b/src")).unwrap();
+        let got = named_dirs_to_create("gcc -I../src -I../../../.. -c a.c -o a.o", &bd);
+        assert_eq!(got, vec!["../src"]);
+    }
 }
 
 #[cfg(test)]
@@ -3628,13 +3675,14 @@ fn build_task_derivation(
             encoded.join(" ").into_bytes().into(),
         );
     }
-    // Empty build-tree directories (see Runner::empty_dirs), space-separated
-    // relative paths; the walk refused any carrying a space. Inserted only
-    // when non-empty, for the same hash-stability reason as the aliases.
-    if !task.empty_dirs.is_empty() {
+    // Directories to create in the sandbox (see Task::make_dirs),
+    // space-separated relative paths; the walk refused any carrying a space.
+    // Inserted only when non-empty, for the same hash-stability reason as the
+    // aliases.
+    if !task.make_dirs.is_empty() {
         drv.env.insert(
-            b"NIX_NINJA_EMPTY_DIRS"[..].into(),
-            task.empty_dirs.join(" ").into_bytes().into(),
+            b"NIX_NINJA_MAKE_DIRS"[..].into(),
+            task.make_dirs.join(" ").into_bytes().into(),
         );
     }
 
