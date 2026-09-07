@@ -152,15 +152,16 @@ fn prepare_build_environment(store_dir: &StoreDir) -> Result<(PathBuf, HashMap<P
 /// is the shape, and this tree has met it once already.
 /// The seed route is what the round's 189 failures are.
 ///
-/// THE ROOT FIX IS TWO LINES IN `canonicalize_cached` AND IS DECLINED ON
-/// COST, WHICH IS THE ONLY GOOD REASON. Checking the virtual hit for a
-/// directory at both bypasses - the direct probe and the lexically
-/// normalized one below it - covers every route at once. That file is
-/// `crates/deps-infer`, inside `nix-ninja-task`'s fileset, so it re-keys
-/// every banked PLAIN task derivation. Land it when a batch is already
-/// spending that. It would NOT break the generated-header class: a declared
-/// but not yet written header is not a directory, so the guard does not see
-/// it.
+/// THE ROOT FIX LANDED AT `7b60645` AND THIS PARAGRAPH SPENT LONGER SAYING
+/// OTHERWISE THAN THE FIX TOOK. `canonicalize_cached` carries `virtual_hit`,
+/// which refuses a directory at BOTH bypasses, the direct probe and the
+/// lexically normalized one below it, so every route is covered at the
+/// resolution point and any further probe added to that function inherits
+/// the refusal by construction. The text here described the fix as declined
+/// on fileset cost and told a reader to land it with the next batch, which
+/// is a state claim in a place that is read far more often than it is
+/// revised: the state changed, the paragraph did not, and the next reader
+/// pays for the analysis twice.
 ///
 /// Extracted rather than written inline so a test can execute it. Three
 /// defects have been repaired in this tree's placement code and none was
