@@ -1361,34 +1361,9 @@ impl Runner {
         self.phony_aliases.contains_key(&fid)
     }
 
-    /// The producing edge's output for a path named inside a `-Wl` group,
-    /// where the graph holds one and another edge writes it.
-    ///
-    /// GRAPH NAMES ARE NINJA SPELLINGS, so an ABSOLUTE candidate cannot
-    /// match a lookup taken on the spelling as written. Both spellings occur
-    /// in the same class: compiler-rt names its version script relative and
-    /// json-c names its absolute, so a reader that skips the relativisation
-    /// resolves one of them and silently falls through to the bytes for the
-    /// other, which is indistinguishable from having no fix at all wherever
-    /// the bytes happen to be present. A path outside the build directory
-    /// has no graph node by construction.
+    /// The producing edge's output for a path named inside a `-Wl` group.
     fn wl_produced_output(&self, files: &graph::GraphFiles, cand: &str) -> Option<DerivedFile> {
-        let name = if cand.starts_with('/') {
-            Path::new(cand)
-                .strip_prefix(&self.config.build_dir)
-                .ok()?
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            cand.to_string()
-        };
-        let fid = files.lookup(&name)?;
-        // A SOURCE FILE IS NOT A PRODUCED NODE. Without this the reader
-        // would prefer a graph entry for an ordinary checked-in linker
-        // script over its own bytes, which is the same file by a longer
-        // route today and a dangling reference the moment it is not.
-        files.by_id[fid].input?;
-        self.derived_files.get(&fid).cloned()
+        wl_produced_output(&self.config.build_dir, files, &self.derived_files, cand)
     }
 
     fn new_task(&mut self, files: &mut graph::GraphFiles, build: &Build) -> Result<Task> {
@@ -2913,6 +2888,144 @@ mod include_dirs_named_tests {
 ///
 /// Named for what it does rather than when, because it runs at two different
 /// times: the periodic tick and the end of the run.
+/// The producing edge's output for a path named inside a `-Wl` group, where
+/// the graph holds one and another edge writes it.
+///
+/// GRAPH NAMES ARE NINJA SPELLINGS, so an ABSOLUTE candidate cannot match a
+/// lookup taken on the spelling as written. Both spellings occur in the same
+/// class: compiler-rt names its version script relative and cmake emits the
+/// flag absolute, so a reader that skips the relativisation resolves one of
+/// them and silently falls through to the bytes for the other, which is
+/// indistinguishable from having no fix at all wherever the bytes happen to
+/// be present. A path outside the build directory has no graph node by
+/// construction.
+///
+/// FREE RATHER THAN A METHOD so both guards are reachable from a test with no
+/// Runner and no daemon. WHAT A TEST OF IT CANNOT REACH IS THE ORDER: this
+/// resolution runs ABOVE the existence test in `new_task`, and that ordering
+/// is the fix rather than this predicate. The gate arms are its only
+/// instruments, at two revisions on both configurations.
+pub fn wl_produced_output(
+    build_dir: &Path,
+    files: &graph::GraphFiles,
+    derived_files: &HashMap<FileId, DerivedFile>,
+    cand: &str,
+) -> Option<DerivedFile> {
+    let name = if cand.starts_with('/') {
+        Path::new(cand)
+            .strip_prefix(build_dir)
+            .ok()?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        cand.to_string()
+    };
+    let fid = files.lookup(&name)?;
+    // A SOURCE FILE IS NOT A PRODUCED NODE. Without this the reader would
+    // prefer a graph entry for an ordinary checked-in linker script over its
+    // own bytes, which is the same file by a longer route today and a
+    // dangling reference the moment it is not.
+    files.by_id[fid].input?;
+    derived_files.get(&fid).cloned()
+}
+
+#[cfg(test)]
+mod wl_produced_output_tests {
+    //! A `-Wl` GROUP MEMBER THAT ANOTHER EDGE WRITES.
+    //!
+    //! compiler-rt names its sanitizer version script inside
+    //! `-Wl,--version-script,<path>`, an `add_custom_command(OUTPUT)` writes
+    //! it, and nothing declares it to the link.
+    //!
+    //! THESE ASSERTIONS DO NOT REACH THE FIX. The defect was an existence
+    //! test sitting one guard ABOVE this resolution in `new_task`, so a
+    //! script no edge had written yet was dropped before the resolution could
+    //! run; hoisting that test back leaves every assertion here passing. The
+    //! ordering is witnessed by `version-script-generated-repro.sh` arm 2
+    //! (A, FAILS at `2bc9b1e`, BUILDS at `21767b0`) and by
+    //! `version-script-generated-b.sh` under the exact mirror. What is
+    //! covered here is the two guards INSIDE the predicate, both cheap to
+    //! break and one of them invisible on configuration A, which relativises
+    //! the candidate before the reader ever sees it.
+    use super::*;
+    use harmonia_store_path::StorePath;
+    use n2::graph::{BuildId, FileId, GraphFiles};
+
+    const BUILD_DIR: &str = "/build/source/build";
+    const VERS: &str = "lib/nsan/clang_rt.nsan-dynamic-x86_64.vers";
+    const SRC: &str = "src/checked-in.vers";
+
+    fn out(name: &str) -> DerivedFile {
+        DerivedFile {
+            derived_path: SingleDerivedPath::Opaque(
+                StorePath::from_bytes(b"00000000000000000000000000000000-vers")
+                    .expect("fixture store path"),
+            ),
+            build_path: PathBuf::from(name),
+            rel_path: None,
+        }
+    }
+
+    /// The version script as a PRODUCED node and a checked-in script as a
+    /// SOURCE, each with an output the scheduler has already resolved.
+    fn fixture() -> (GraphFiles, HashMap<FileId, DerivedFile>) {
+        let mut files = GraphFiles::default();
+        let produced = files.id_from_canonical(VERS.to_string());
+        files.by_id[produced].input = Some(BuildId::from(0usize));
+        let source = files.id_from_canonical(SRC.to_string());
+        let derived = HashMap::from([(produced, out(VERS)), (source, out(SRC))]);
+        (files, derived)
+    }
+
+    fn ask(cand: &str) -> Option<PathBuf> {
+        let (files, derived) = fixture();
+        wl_produced_output(Path::new(BUILD_DIR), &files, &derived, cand).map(|d| d.build_path)
+    }
+
+    #[test]
+    fn a_relative_candidate_resolves_to_the_producing_edges_output() {
+        assert_eq!(ask(VERS), Some(PathBuf::from(VERS)));
+    }
+
+    #[test]
+    fn an_absolute_candidate_is_relativised_before_the_lookup() {
+        // cmake emits the flag absolute while graph names are ninja
+        // spellings, so without the strip_prefix the lookup misses and the
+        // reader falls through to bytes that do not exist yet.
+        assert_eq!(
+            ask(&format!("{BUILD_DIR}/{VERS}")),
+            Some(PathBuf::from(VERS))
+        );
+    }
+
+    #[test]
+    fn a_source_file_the_graph_holds_is_not_a_produced_node() {
+        // The bytes are the right answer for a checked-in script. Preferring
+        // the graph entry is the same file by a longer route today and a
+        // dangling reference the moment it is not.
+        assert_eq!(ask(SRC), None);
+    }
+
+    #[test]
+    fn a_candidate_outside_the_build_directory_has_no_graph_node() {
+        assert_eq!(ask("/nix/store/aaaa-x.vers"), None);
+    }
+
+    #[test]
+    fn a_produced_node_whose_edge_has_not_run_resolves_to_nothing() {
+        // ZERO CASE WITH ITS CONTROL: `derived_files` holds only edges the
+        // scheduler ran, so a lookup can find the node and still have no
+        // output. Falling through to the bytes is the only available answer;
+        // carrying a hole is not.
+        let (files, _) = fixture();
+        let empty: HashMap<FileId, DerivedFile> = HashMap::new();
+        assert!(wl_produced_output(Path::new(BUILD_DIR), &files, &empty, VERS).is_none());
+        // The control: the same graph WITH the output resolves.
+        let (files, derived) = fixture();
+        assert!(wl_produced_output(Path::new(BUILD_DIR), &files, &derived, VERS).is_some());
+    }
+}
+
 pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> {
     crate::resolve_cache::flush()?;
     crate::resolve_cache::save_nar_stamps(&rpc_client.nar_stamps_snapshot())
