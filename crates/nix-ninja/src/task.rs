@@ -2760,7 +2760,15 @@ fn shared_library_spelling(name: &str) -> bool {
 /// respelled with `..`. glib is not that shape on either route, since meson
 /// emits both of its spellings relative and the compiler drop-in passes the
 /// package's own flags through, so this waits for a witness.
-fn include_dirs_named(cmdline: &str, build_dir: &Path) -> Vec<String> {
+/// The include directories a command names, EXACTLY AS SPELLED.
+///
+/// The primitive under `include_dirs_named`, extracted rather than copied
+/// when the forced-include reader needed the same flags: that reader wants
+/// the search path gcc would use, absolute entries included, while
+/// `include_dirs_named` wants directories under the build tree and drops the
+/// rest. Two readers of one flag set diverge, and this file has paid for that
+/// twice.
+fn include_dirs_as_given(cmdline: &str) -> Vec<String> {
     const FLAGS: [&str; 4] = ["-I", "-iquote", "-isystem", "-idirafter"];
     let words: Vec<String> = shell_words::split(cmdline).unwrap_or_default();
     let mut out = Vec::new();
@@ -2777,7 +2785,16 @@ fn include_dirs_named(cmdline: &str, build_dir: &Path) -> Vec<String> {
             }
         });
         i += 1;
-        let Some(dir) = dir else { continue };
+        if let Some(dir) = dir {
+            out.push(dir);
+        }
+    }
+    out
+}
+
+fn include_dirs_named(cmdline: &str, build_dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in include_dirs_as_given(cmdline) {
         let rel = if dir.starts_with('/') {
             match Path::new(&dir).strip_prefix(build_dir) {
                 Ok(r) => r.to_string_lossy().into_owned(),
@@ -11143,6 +11160,164 @@ fn depfile_read_back(
     Some(out)
 }
 
+/// The files a command line forces into the translation unit with
+/// `-include` and `-imacros`, resolved to paths on disk.
+///
+/// A FORCED INCLUDE APPEARS IN NO SOURCE FILE, which is the whole defect: the
+/// scan reads `#include` directives out of the TU and its headers, and gcc
+/// blames `<command-line>` rather than any file when it cannot find one, so
+/// nothing an include-reading scan produces can name it. meson writes it as
+/// an ordinary `c_args` entry, so every source of the target carries it and
+/// the failure is target-sized (tinysparql 3.11.1, `-include
+/// tracker-private.h` on `libtracker_sparql_private`, 36 tasks in one round).
+/// The header is an ordinary SOURCE file there, shipped in the tarball, and
+/// no edge declares it.
+///
+/// `-imacros` is here because it is the same flag shape reaching the same
+/// preprocessor state, and finding one member of a class without its sibling
+/// is how this file grows a second entry a month later.
+///
+/// THE RESOLUTION IS GCC'S: the preprocessor's working directory first, which
+/// for a task is the build directory, then the `-I` chain in order. The first
+/// existing file wins, and a name that resolves nowhere yields NOTHING rather
+/// than a guess, because inventing a path here would turn a typo into a
+/// silently missing input instead of the compiler's own error.
+///
+/// IT IS A SCAN SEED AND NOT AN INPUT BOLTED ON: handing it to the scanner
+/// declares the header AND everything it includes, which is what a header
+/// forced into every TU of a library needs. A PCH header named this way is
+/// already a seed, since the graph declares it, so this adds nothing there
+/// and the dedup below is what keeps that true.
+fn forced_include_seeds(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut toks = cmdline.split_whitespace().peekable();
+    while let Some(t) = toks.next() {
+        if t == "-include" || t == "-imacros" {
+            if let Some(n) = toks.next() {
+                names.push(n);
+            }
+        }
+    }
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let dirs = include_dirs_as_given(cmdline);
+    let mut out: Vec<PathBuf> = Vec::new();
+    for name in names {
+        let cand = Path::new(name);
+        let resolved = if cand.is_absolute() {
+            cand.is_file().then(|| cand.to_path_buf())
+        } else {
+            std::iter::once(build_dir.join(cand))
+                .chain(dirs.iter().map(|d| {
+                    let d = Path::new(d);
+                    if d.is_absolute() {
+                        d.join(cand)
+                    } else {
+                        build_dir.join(d).join(cand)
+                    }
+                }))
+                .find(|p| p.is_file())
+        };
+        if let Some(r) = resolved {
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod forced_include_seeds_tests {
+    use super::{forced_include_seeds, Scratch};
+    use std::fs;
+
+    /// tinysparql's own shape: the header is a SOURCE file in a directory the
+    /// command names with -I, and the flag spells it bare.
+    #[test]
+    fn a_bare_name_resolves_through_the_include_chain() {
+        let d = Scratch::new(format!("nn-fi-chain-{}", std::process::id()));
+        let src = d.join("src");
+        let build = d.join("build");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::write(src.join("tracker-private.h"), "#define P 1\n").unwrap();
+        let cmd = format!(
+            "gcc -I{} -include tracker-private.h -c a.c -o a.o",
+            src.display()
+        );
+        assert_eq!(
+            forced_include_seeds(&cmd, &build),
+            vec![src.join("tracker-private.h")]
+        );
+    }
+
+    /// GCC LOOKS IN THE WORKING DIRECTORY FIRST, which for a task is the
+    /// build directory, so a build-tree copy wins over a source-tree one of
+    /// the same name. Both exist here, and the assertion is WHICH.
+    #[test]
+    fn the_build_directory_wins_over_the_include_chain() {
+        let d = Scratch::new(format!("nn-fi-order-{}", std::process::id()));
+        let src = d.join("src");
+        let build = d.join("build");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::write(src.join("cfg.h"), "1\n").unwrap();
+        fs::write(build.join("cfg.h"), "2\n").unwrap();
+        let cmd = format!("gcc -I{} -include cfg.h -c a.c", src.display());
+        assert_eq!(
+            forced_include_seeds(&cmd, &build),
+            vec![build.join("cfg.h")]
+        );
+    }
+
+    /// -imacros reaches the same preprocessor state through the same flag
+    /// shape, and a class with one member recorded is how the second one
+    /// arrives a month later.
+    #[test]
+    fn imacros_is_read_the_same_way() {
+        let d = Scratch::new(format!("nn-fi-imacros-{}", std::process::id()));
+        let build = d.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("m.h"), "#define M 1\n").unwrap();
+        let cmd = "gcc -imacros m.h -c a.c";
+        assert_eq!(forced_include_seeds(cmd, &build), vec![build.join("m.h")]);
+    }
+
+    /// THE ZERO CASE WITH ITS CONTROL. A name that resolves nowhere yields
+    /// nothing rather than a composed path, because inventing one turns a
+    /// typo into a silently missing input instead of the compiler's own
+    /// error. The control is the same command over a fixture where the file
+    /// exists, so an empty answer cannot come from the reader being inert.
+    #[test]
+    fn a_name_that_resolves_nowhere_yields_nothing() {
+        let d = Scratch::new(format!("nn-fi-zero-{}", std::process::id()));
+        let build = d.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let cmd = "gcc -include absent.h -c a.c";
+        assert!(forced_include_seeds(cmd, &build).is_empty());
+        fs::write(build.join("absent.h"), "1\n").unwrap();
+        assert_eq!(
+            forced_include_seeds(cmd, &build),
+            vec![build.join("absent.h")]
+        );
+    }
+
+    /// A SUBSTRING IS NOT A FLAG, the same trap the PCH predicate records:
+    /// -includedir= and a source file whose name ends in -include must read
+    /// as neither.
+    #[test]
+    fn a_flag_that_merely_starts_with_include_is_not_one() {
+        let d = Scratch::new(format!("nn-fi-substr-{}", std::process::id()));
+        let build = d.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("x.h"), "1\n").unwrap();
+        assert!(forced_include_seeds("gcc --includedir=x.h -c a.c", &build).is_empty());
+        assert!(forced_include_seeds("gcc -c a.c -o a.o", &build).is_empty());
+    }
+}
+
 /// Whether this command line compiles against a precompiled header.
 ///
 /// `-include <header>` is how gcc is pointed at one: it looks for
@@ -11834,6 +12009,16 @@ pub fn discover_c_includes(
     // Behind an env var and never on by default: at 16,000 tasks this is
     // 16,000 lines.
     let explain = std::env::var_os("NIX_NINJA_DEBUG_DISCOVERY").is_some();
+    // AHEAD OF BOTH ANSWERS, not only the scan. A depfile records the forced
+    // include, so a read-back already carries it, and seeding here keeps the
+    // two paths agreeing on run one and run two rather than fixing whichever
+    // one the reproduction happened to take.
+    let mut files = files;
+    for seed in forced_include_seeds(cmdline, build_dir) {
+        if !files.contains(&seed) {
+            files.push(seed);
+        }
+    }
     let seed = files
         .first()
         .map(|p| p.display().to_string())
