@@ -4591,10 +4591,93 @@ pub fn rewrite_str(s: &str, map: &[(String, String)]) -> String {
     let mut out = s.to_string();
     for (from, to) in map {
         if out.contains(from.as_str()) {
-            out = out.replace(from.as_str(), to);
+            out = replace_occurrences_that_name_the_path(&out, from, to);
         }
     }
     out
+}
+
+/// Does the occurrence of a store path at byte offset `at` NAME that path, or
+/// is it embedded in a longer path that merely contains it?
+///
+/// llvm/clang 22.1.8 is the witness for the difference. cmake composes the
+/// install prefix onto a BUILD-TREE path, so a real file in the build
+/// directory is called `<build_dir>/nix/store/<hash>-clang-22.1.8-lib/...`.
+/// A plain substring replace rewrites that occurrence, the command then
+/// writes under a hash nothing declares, and the declared output keeps the
+/// real spelling, so the task is checked somewhere it was never sent.
+/// Normalised against the build directory the two spellings are identical
+/// but for the hash, which is why the command line was twice read as the
+/// outer-output class before anyone opened the derivation.
+///
+/// An absolute store path that NAMES something opens its token or follows a
+/// separator (`-I`, `=`, a quote, a comma, whitespace). One embedded in a
+/// longer path is preceded by a path run that already contains a `/`, and
+/// that is the whole discriminator.
+fn occurrence_names_the_path(s: &str, at: usize) -> bool {
+    s[..at]
+        .chars()
+        .rev()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, '=' | ':' | '"' | '\'' | ',' | ';'))
+        .all(|c| c != '/')
+}
+
+fn replace_occurrences_that_name_the_path(s: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    let mut consumed = 0usize;
+    while let Some(i) = rest.find(from) {
+        let at = consumed + i;
+        out.push_str(&rest[..i]);
+        out.push_str(if occurrence_names_the_path(s, at) {
+            to
+        } else {
+            from
+        });
+        rest = &rest[i + from.len()..];
+        consumed = at + from.len();
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod outer_rewrite_boundary_tests {
+    use super::rewrite_str;
+
+    const REAL: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-clang-22.1.8-lib";
+    const FAKE: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-clang-22.1.8-lib";
+
+    fn map() -> Vec<(String, String)> {
+        vec![(REAL.to_string(), FAKE.to_string())]
+    }
+
+    #[test]
+    fn an_occurrence_that_names_the_outer_output_is_rewritten() {
+        let cmd = format!("clang -I{REAL}/include -c a.c -o a.o");
+        assert!(rewrite_str(&cmd, &map()).contains(FAKE));
+    }
+
+    #[test]
+    fn a_bare_occurrence_at_the_start_of_a_token_is_rewritten() {
+        assert_eq!(rewrite_str(REAL, &map()), FAKE);
+    }
+
+    #[test]
+    fn an_occurrence_inside_a_build_tree_path_is_left_alone() {
+        // llvm/clang 22.1.8: cmake composes the install prefix onto a
+        // BUILD-TREE path, so the file really is
+        // <build_dir>/nix/store/<hash>-clang-22.1.8-lib/... and its NAME
+        // merely contains the outer output. Rewriting that occurrence sends
+        // the command to a path nothing declares, while the declared output
+        // keeps the real spelling, so the task writes one place and is
+        // checked at another. Normalised against the build directory the two
+        // are identical but for the hash, which is why two readings of this
+        // command line were published as the outer-output class before
+        // either session opened the derivation.
+        let cmd = format!("cp x.h /build/source{REAL}/lib/clang/22/include/x.h");
+        assert_eq!(rewrite_str(&cmd, &map()), cmd);
+    }
 }
 
 /// Byte-wise form for file contents, which may be binary.
