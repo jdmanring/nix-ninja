@@ -167,6 +167,20 @@ struct Task {
     // otherwise seeded only from `inputs`. See new_task.
     store_srcs: Vec<PathBuf>,
     outputs: Vec<PathBuf>,
+    // Outputs this edge declares INSIDE the outer derivation's own output,
+    // as (the path the graph declared, the staged build-relative path the
+    // task writes instead). Empty for every edge of every package that does
+    // not write into its own `$out` mid-build, which is what keeps this off
+    // every other task's emission.
+    //
+    // IT IS ALSO THE PREDICATE, and that is the reason it is carried rather
+    // than recomputed. The command's outer-output spelling must be sent to
+    // the stage directory wherever an OUTPUT moved there, and only there: a
+    // command that merely READS from the outer output (nss carries
+    // `-I$out/private/nss` on every compile) is the population the include
+    // staging already serves, and re-routing those commands would put a
+    // verified half back in play to reach this one.
+    outer_stage_outputs: Vec<(PathBuf, PathBuf)>,
     /// Ninja's `-v`. A task's command runs inside its own derivation, so its
     /// output reaches the driver only by being an OUTPUT. Under this flag the
     /// edge declares one more, and the task writes the command's transcript
@@ -1589,14 +1603,34 @@ impl Runner {
         }
 
         let mut outputs: Vec<PathBuf> = Vec::new();
+        let mut outer_stage_outputs: Vec<(PathBuf, PathBuf)> = Vec::new();
         for fid in build.outs() {
             let file = &files.by_id[*fid];
+            let declared = PathBuf::from(&file.name);
+            // An output the package writes into its own outer output is
+            // staged rather than refused. The real path is not a valid
+            // store path while the build producing it runs, so declaring it
+            // to the daemon fails, and it is not under the build directory,
+            // so normalize_build_path refuses it. The task writes to the
+            // stage directory and the driver copies the result into the
+            // real output once the task has run.
+            // LOCAL MODE ONLY, and the refusal stands where the driver runs
+            // INSIDE the outer derivation: there the output is handed to the
+            // consumer as a derivation output and nothing holds its bytes to
+            // copy back, so staging would move the write and silently drop
+            // it. Refusing is what happens today on that path, so it keeps
+            // its emission as well as its behaviour.
+            if let Some(staged) = (!self.config.is_output_derivation)
+                .then(|| outer_stage_output_path(&declared))
+                .flatten()
+            {
+                outer_stage_outputs.push((declared, staged.clone()));
+                outputs.push(staged);
+                continue;
+            }
             // See normalize_build_path: an absolute output escapes the
             // task sandbox via Path::join's prefix-discarding semantics.
-            outputs.push(normalize_build_path(
-                &self.config.build_dir,
-                PathBuf::from(&file.name),
-            )?);
+            outputs.push(normalize_build_path(&self.config.build_dir, declared)?);
         }
 
         lap(&NT_WORKLIST_MS);
@@ -2668,6 +2702,7 @@ impl Runner {
             inputs,
             store_srcs,
             outputs,
+            outer_stage_outputs,
             alias_symlinks: self.alias_symlinks.clone(),
             make_dirs,
         })
@@ -3149,10 +3184,32 @@ fn build_task_derivation(
         .iter()
         .map(|(_, staged)| format!("-I{}", staged.display()))
         .collect();
-    let cmdline = &if lto_raw {
+    // THE COMMAND AND THE DECLARED OUTPUT MUST NAME ONE PATH. An output
+    // staged under OUTER_STAGE_DIR moved; the command still spells it inside
+    // the outer output, and the placeholder rewrite below would send that
+    // spelling to a store path that exists nowhere in the sandbox. The task
+    // would then write where the command sent it and be checked somewhere
+    // else, which is exactly the "declared output was not written by the
+    // command" failure this class produces.
+    //
+    // The pairs go FIRST, so the whole output path is redirected to the
+    // stage directory while every other occurrence of the outer output -
+    // an include path, a prefix in an argument - still takes the
+    // placeholder from the map below. Applied on the LTO arm too: that arm
+    // skips the placeholder rewrite, but the declared output moved there
+    // just the same.
+    let mut cmd_rewrite: Vec<(String, String)> = task
+        .outer_stage_outputs
+        .iter()
+        .map(|(real, staged)| (real.display().to_string(), staged.display().to_string()))
+        .collect();
+    if !lto_raw {
+        cmd_rewrite.extend(outer_rewrite_map());
+    }
+    let cmdline = &if cmd_rewrite.is_empty() {
         cmdline.to_string()
     } else {
-        rewrite_str(cmdline, &outer_rewrite_map())
+        rewrite_str(cmdline, &cmd_rewrite)
     };
     let cmdline = &if outer_mirror.is_empty() {
         cmdline.clone()
@@ -4582,6 +4639,7 @@ fn handle_derivation_result(
                 std::sync::atomic::Ordering::Relaxed,
             );
             DYN_ADDDRV_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            place_outer_stage_outputs(rpc_client, config, &task, &drv_path)?;
             Ok(SingleDerivedPath::Opaque(drv_path))
         }
     } else {
@@ -4606,8 +4664,68 @@ fn handle_derivation_result(
             std::sync::atomic::Ordering::Relaxed,
         );
         DYN_PLAIN_ADDDRV_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        place_outer_stage_outputs(rpc_client, config, &task, &drv_path)?;
         Ok(SingleDerivedPath::Opaque(drv_path))
     }
+}
+
+/// Copy an output the edge declared inside the outer derivation's own output
+/// out of the store and into that output, once the task has written it.
+///
+/// THE TASK CANNOT DO THIS AND NEITHER CAN DISCOVERY, for the same reason
+/// the include side stages from the driver: the outer output does not exist
+/// inside a task sandbox, and a task writing there would be writing into a
+/// path the daemon has not registered. The driver has it on disk.
+///
+/// EAGER ON PURPOSE. A local-mode task is realised when something downstream
+/// asks for it, and the package's own compiles reach these headers through
+/// an include path rather than through a declared input, so nothing asks.
+/// The include staging reads the real outer output off the driver's disk, so
+/// the bytes have to be there before the next task is generated. The
+/// population is edges that declare an output inside the outer output, which
+/// is empty for every package that does not do this.
+///
+/// LOCAL MODE ONLY, and that is a gap rather than a choice: on the output
+/// derivation path the driver runs inside the outer derivation and the same
+/// staging has nowhere to copy to. Recorded in
+/// local/pending/nss-outer-output-write.md.
+fn place_outer_stage_outputs(
+    rpc_client: &Arc<BuilderRpcClient>,
+    config: &RunnerConfig,
+    task: &Task,
+    drv_path: &StorePath,
+) -> Result<()> {
+    if task.outer_stage_outputs.is_empty() {
+        return Ok(());
+    }
+    let files: Vec<DerivedFile> = task
+        .outer_stage_outputs
+        .iter()
+        .map(|(_, staged)| {
+            new_built_file(SingleDerivedPath::Opaque(drv_path.clone()), staged.clone())
+        })
+        .collect();
+    let built = local::build_derived_files(rpc_client, &config.store_dir, &files)?;
+    for (real, staged) in &task.outer_stage_outputs {
+        let Some(src) = built.get(staged) else {
+            return Err(anyhow!(
+                "staged outer output {} was not realised",
+                staged.display()
+            ));
+        };
+        if let Some(parent) = real.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        // A store object is read only and the destination may already hold
+        // an earlier copy, so replace rather than write through.
+        if real.exists() {
+            std::fs::remove_file(real).with_context(|| format!("replacing {}", real.display()))?;
+        }
+        std::fs::copy(src, real)
+            .with_context(|| format!("copying {} to {}", src.display(), real.display()))?;
+    }
+    Ok(())
 }
 
 pub fn which_store_path(store_dir: &StoreDir, binary_name: &str) -> Result<StorePath> {
@@ -11158,6 +11276,133 @@ fn files_under(dir: &Path, cap: usize) -> Vec<PathBuf> {
 /// in the build directory. One directory, so the extra include paths a task
 /// carries mirror the outer output's own layout under it.
 pub const OUTER_STAGE_DIR: &str = ".nn-outer";
+
+/// Where an output the edge declares INSIDE the outer derivation's own
+/// output is written instead, or `None` for every other output.
+///
+/// nss's gyp build sets `-Dnss_dist_dir=$out` and copies headers there
+/// during the build, so an edge declares `$out/private/nss/basicutil.h`.
+/// That path cannot be declared to the daemon (the outer output is not a
+/// valid store path while the build producing it runs) and does not
+/// relativise under the build directory, so it was refused. Staging it
+/// beside the headers the include side already carries gives both halves
+/// one directory: a read finds what was staged in, a write lands beside it.
+///
+/// A path EQUAL to an outer output root is not a member. The empty
+/// remainder would name the stage directory itself, which is a directory
+/// rather than a file and would collide with every other staged output.
+fn outer_stage_output_path(declared: &Path) -> Option<PathBuf> {
+    outer_stage_output_path_in(declared, &outer_output_paths())
+}
+
+fn outer_stage_output_path_in(declared: &Path, outer: &[String]) -> Option<PathBuf> {
+    if declared.is_relative() {
+        return None;
+    }
+    outer.iter().find_map(|root| {
+        let rest = declared.strip_prefix(root).ok()?;
+        (rest != Path::new("")).then(|| Path::new(OUTER_STAGE_DIR).join(rest))
+    })
+}
+
+#[cfg(test)]
+mod outer_stage_output_tests {
+    use super::{outer_stage_output_path_in, rewrite_str};
+    use std::path::{Path, PathBuf};
+
+    const OUT: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nss-3.112.5";
+
+    fn outer() -> Vec<String> {
+        vec![OUT.to_string()]
+    }
+
+    #[test]
+    fn an_output_inside_the_outer_output_is_staged() {
+        assert_eq!(
+            outer_stage_output_path_in(
+                &PathBuf::from(format!("{OUT}/private/nss/basicutil.h")),
+                &outer()
+            ),
+            Some(PathBuf::from(".nn-outer/private/nss/basicutil.h"))
+        );
+    }
+
+    // THE ZERO CASE, and it is what keeps every other package's emission
+    // where it is: an ordinary relative output is the whole population of
+    // every graph that does not write into its own output.
+    #[test]
+    fn an_ordinary_output_is_not_staged() {
+        assert_eq!(
+            outer_stage_output_path_in(Path::new("src/main.c.o"), &outer()),
+            None
+        );
+        assert_eq!(
+            outer_stage_output_path_in(Path::new("../bin/Release/libopenfec.so.1"), &outer()),
+            None
+        );
+    }
+
+    // An absolute output OUTSIDE the outer output keeps the refusal
+    // normalize_build_path exists for. Staging /etc/passwd would relocate a
+    // path that has no business being an output at all, which is the
+    // behaviour that guard was written to stop.
+    #[test]
+    fn an_absolute_output_elsewhere_is_not_staged() {
+        assert_eq!(
+            outer_stage_output_path_in(Path::new("/etc/passwd"), &outer()),
+            None
+        );
+        assert_eq!(
+            outer_stage_output_path_in(
+                Path::new("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-other/lib/x.h"),
+                &outer()
+            ),
+            None
+        );
+    }
+
+    // The root itself is not a member. An empty remainder names the stage
+    // directory, which every other staged output sits under, so a rule that
+    // admitted it would declare a directory against all of them.
+    #[test]
+    fn the_outer_output_itself_is_not_staged() {
+        assert_eq!(outer_stage_output_path_in(Path::new(OUT), &outer()), None);
+    }
+
+    #[test]
+    fn no_outer_output_means_no_staging() {
+        assert_eq!(
+            outer_stage_output_path_in(&PathBuf::from(format!("{OUT}/private/nss/x.h")), &[]),
+            None
+        );
+    }
+
+    // THE AGREEMENT, in the order build_task_derivation applies it: the
+    // declared output's own spelling reaches the stage directory, and every
+    // OTHER occurrence of the outer output still takes the placeholder. A
+    // map with the placeholder first would send the output to a store path
+    // that exists nowhere in the sandbox, which is the failure this class
+    // produces.
+    #[test]
+    fn the_output_spelling_wins_and_an_include_still_placeholders() {
+        let placeholder = "/nix/store/60lhwhc2lcsbbyaqplsdaw483lv9fzc1-nss-3.112.5";
+        let map = vec![
+            (
+                format!("{OUT}/private/nss/basicutil.h"),
+                ".nn-outer/private/nss/basicutil.h".to_string(),
+            ),
+            (OUT.to_string(), placeholder.to_string()),
+        ];
+        let out = rewrite_str(
+            &format!("cp x.h {OUT}/private/nss/basicutil.h -I{OUT}/private/nss"),
+            &map,
+        );
+        assert_eq!(
+            out,
+            format!("cp x.h .nn-outer/private/nss/basicutil.h -I{placeholder}/private/nss")
+        );
+    }
+}
 
 pub struct Discovered {
     pub deps: Vec<DerivedFile>,
