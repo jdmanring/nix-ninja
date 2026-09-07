@@ -2692,6 +2692,12 @@ fn shared_library_spelling(name: &str) -> bool {
 /// absolute directory under the build dir (the exact mirror keeps them
 /// absolute) is relativised so it can match the walk's spelling; one
 /// outside it is dropped, since the walk cannot have listed it.
+/// DEFER(a package whose build system writes absolute include paths above the
+/// build directory): an absolute spelling is relativised with `strip_prefix`
+/// alone, so one naming a directory above `build_dir` is dropped rather than
+/// respelled with `..`. glib is not that shape on either route, since meson
+/// emits both of its spellings relative and the compiler drop-in passes the
+/// package's own flags through, so this waits for a witness.
 fn include_dirs_named(cmdline: &str, build_dir: &Path) -> Vec<String> {
     const FLAGS: [&str; 4] = ["-I", "-iquote", "-isystem", "-idirafter"];
     let words: Vec<String> = shell_words::split(cmdline).unwrap_or_default();
