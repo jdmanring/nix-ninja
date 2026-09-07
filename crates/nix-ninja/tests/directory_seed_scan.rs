@@ -33,6 +33,7 @@
 //! to buy coverage that never runs inside a build. It reaches the same
 //! `pub` function from outside the allowlist, which is the worked example
 //! `crates/nix-ninja/tests/rpath_assembly.rs` already sets.
+use deps_infer::c_include_parser::VirtualPaths;
 use std::fs;
 
 /// A directory in the seed set is REFUSED before the read, and the message
@@ -57,7 +58,7 @@ fn a_directory_in_the_seed_set_is_refused_before_the_read() {
     let ok = deps_infer::c_include_parser::retrieve_c_includes_checked(
         "gcc -c tu.c -o tu.o",
         vec![d.join("tu.c")],
-        None,
+        VirtualPaths::default(),
     );
     // Same reason as below: `Scan` is not Debug, so the control reports its
     // error text rather than the whole Result.
@@ -68,7 +69,7 @@ fn a_directory_in_the_seed_set_is_refused_before_the_read() {
     let got = deps_infer::c_include_parser::retrieve_c_includes_checked(
         "gcc -c tu.c -o tu.o",
         vec![d.join("tu.c"), d.join("include/llvm")],
-        None,
+        VirtualPaths::default(),
     );
     // `Scan` is not Debug, so `expect_err` cannot be used on this Result.
     let err = match got {
@@ -135,7 +136,7 @@ fn a_virtual_path_resolving_to_a_directory_falls_through_clean() {
     let got = deps_infer::c_include_parser::retrieve_c_includes_checked(
         &format!("gcc -c {} -o tu.o", tu.display()),
         vec![tu.clone()],
-        Some(virtual_paths),
+        VirtualPaths::from_primary(Some(virtual_paths)),
     );
     // The DISCRIMINATOR is which failure is absent. A clean scan here is
     // only meaningful because the same call errors when either probe loses
@@ -202,7 +203,7 @@ fn a_directory_that_is_both_seed_and_virtual_key_is_refused_at_the_hit() {
     let got = deps_infer::c_include_parser::retrieve_c_includes_checked(
         "gcc -c x.c -o x.o",
         built_paths.keys().cloned().collect(),
-        Some(built_paths),
+        VirtualPaths::from_primary(Some(built_paths)),
     );
     match got {
         Ok(_) => panic!("expected the directory output to be refused"),
@@ -266,7 +267,7 @@ fn a_directory_reached_through_the_normalized_probe_is_refused_too() {
     let got = deps_infer::c_include_parser::retrieve_c_includes_checked(
         &format!("gcc -c {} -o tu.o", tu.display()),
         vec![tu.clone()],
-        Some(virtual_paths),
+        VirtualPaths::from_primary(Some(virtual_paths)),
     );
     if let Err(e) = got {
         panic!("the normalized probe must refuse the directory, got: {e:#}");

@@ -3,6 +3,7 @@ use crate::relative_from::relative_from;
 use crate::subtool::dynamic_task;
 use anyhow::{anyhow, Context, Error, Result};
 use deps_infer::c_include_parser;
+use deps_infer::c_include_parser::VirtualPaths;
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
 use harmonia_store_derivation::derivation::{Derivation, DerivationOutput};
 use harmonia_store_derivation::derived_path::{OutputName, SingleDerivedPath};
@@ -207,6 +208,23 @@ pub struct BuildResult {
 #[derive(Clone)]
 pub struct RunnerConfig {
     pub system: String,
+    /// Every path the build graph produces, mapped to itself, shared by
+    /// every task rather than copied into each one.
+    ///
+    /// A GENERATED HEADER MAY INCLUDE A GENERATED SIBLING NO EDGE DECLARES,
+    /// and this is the only map that can resolve one. The compile declares
+    /// the includer; the sibling is declared by nothing, so it is absent
+    /// from the task's own inputs and absent from disk at discovery time.
+    /// Real ninja survives that because both targets are in `all` and the
+    /// tree is shared; a narrowed sandbox does not. glib 2.88.3 is the
+    /// witness (`objectmanager-gen.h` including
+    /// `gdbus-example-objectmanager-visibility.h`, neither declaring the
+    /// other), and mesa 26.2.1 is a second and wider one at 112 paths.
+    ///
+    /// `None` where no graph was loaded. This is NOT the whole answer to
+    /// what a task may read: it says only that some edge writes the path,
+    /// which is what distinguishes a generated sibling from a typo.
+    pub produced_paths: Option<Arc<HashMap<PathBuf, PathBuf>>>,
     pub build_dir: PathBuf,
     pub store_dir: StoreDir,
     pub is_output_derivation: bool,
@@ -3385,7 +3403,7 @@ fn build_task_derivation(
                 &task.build_dir,
                 cmdline,
                 files,
-                Some(virtual_paths),
+                VirtualPaths::from_primary(Some(virtual_paths)),
                 task.depfile.as_deref().map(Path::new),
             )?;
 
@@ -4518,6 +4536,7 @@ fn handle_derivation_result(
                 &config.build_dir,
                 &drv,
                 built_paths,
+                config.produced_paths.clone(),
             )?;
             declare_dotdot_dirs(&mut drv, &config.build_dir, &dotdot_dirs);
             DYN_DISCOVER_MS.fetch_add(
@@ -9959,7 +9978,7 @@ mod depfile_read_back_tests {
             Path::new("/nonexistent-store"),
             Some(PathBuf::from("a.o.d").as_path()),
             &[PathBuf::from("a.c")],
-            None,
+            &deps_infer::c_include_parser::VirtualPaths::default(),
         )
         .unwrap();
         assert_eq!(got, vec![PathBuf::from("a.c"), PathBuf::from("hdr/one.h")]);
@@ -9970,7 +9989,7 @@ mod depfile_read_back_tests {
             Path::new("/nonexistent-store"),
             Some(PathBuf::from("a.o.d").as_path()),
             &[PathBuf::from("a.c")],
-            None
+            &deps_infer::c_include_parser::VirtualPaths::default()
         )
         .is_none());
         // A HEADER newer than the depfile is stale too, and checking only
@@ -10005,7 +10024,7 @@ mod depfile_read_back_tests {
                 Path::new("/nonexistent-store"),
                 Some(PathBuf::from("a.o.d").as_path()),
                 &[PathBuf::from("a.c")],
-                None
+                &deps_infer::c_include_parser::VirtualPaths::default()
             )
             .is_some(),
             "with everything older than the depfile the read-back must fire"
@@ -10018,7 +10037,7 @@ mod depfile_read_back_tests {
                 Path::new("/nonexistent-store"),
                 Some(PathBuf::from("a.o.d").as_path()),
                 &[PathBuf::from("a.c")],
-                None
+                &deps_infer::c_include_parser::VirtualPaths::default()
             )
             .is_none(),
             "a header newer than the depfile must fall back to the scan"
@@ -10043,7 +10062,7 @@ mod depfile_read_back_tests {
                 &fake_store,
                 Some(PathBuf::from("linked.o.d").as_path()),
                 &[],
-                None
+                &deps_infer::c_include_parser::VirtualPaths::default()
             )
             .is_none(),
             "a depfile resolving into the store must be refused, not compared"
@@ -10057,7 +10076,7 @@ mod depfile_read_back_tests {
                 Path::new("/nonexistent-store"),
                 Some(PathBuf::from("linked.o.d").as_path()),
                 &[],
-                None
+                &deps_infer::c_include_parser::VirtualPaths::default()
             )
             .is_some(),
             "outside the store the same depfile must be read"
@@ -10070,11 +10089,18 @@ mod depfile_read_back_tests {
             Path::new("/nonexistent-store"),
             Some(PathBuf::from("a.o.d").as_path()),
             &[],
-            None
+            &deps_infer::c_include_parser::VirtualPaths::default()
         )
         .is_none());
         // No depfile declared: the scan is the only source.
-        assert!(depfile_read_back(&d, Path::new("/nonexistent-store"), None, &[], None).is_none());
+        assert!(depfile_read_back(
+            &d,
+            Path::new("/nonexistent-store"),
+            None,
+            &[],
+            &deps_infer::c_include_parser::VirtualPaths::default()
+        )
+        .is_none());
     }
 }
 
@@ -10480,7 +10506,7 @@ mod depfile_applies_here_tests {
             Path::new("/nonexistent-store"),
             Some(Path::new("a.o.d")),
             &[PathBuf::from("a.c")],
-            None,
+            &deps_infer::c_include_parser::VirtualPaths::default(),
         )
         .is_none());
     }
@@ -10501,7 +10527,7 @@ mod depfile_applies_here_tests {
             Path::new("/nonexistent-store"),
             Some(Path::new("a.o.d")),
             &[PathBuf::from("a.c")],
-            Some(&declared),
+            &deps_infer::c_include_parser::VirtualPaths::from_primary(Some(declared.clone())),
         );
         assert_eq!(
             got,
@@ -10533,14 +10559,14 @@ mod depfile_applies_here_tests {
             Path::new("/nonexistent-store"),
             Some(Path::new("a.o.d")),
             &[PathBuf::from("a.c")],
-            None,
+            &deps_infer::c_include_parser::VirtualPaths::default(),
         );
         let with = depfile_read_back(
             &d,
             Path::new("/nonexistent-store"),
             Some(Path::new("a.o.d")),
             &[PathBuf::from("a.c")],
-            Some(&declared),
+            &deps_infer::c_include_parser::VirtualPaths::from_primary(Some(declared.clone())),
         );
         assert_ne!(without, with, "the map argument must not be inert");
         assert!(without.is_none(), "no map means no evidence, so refuse");
@@ -10568,7 +10594,7 @@ mod depfile_applies_here_tests {
             &store,
             Some(Path::new("a.o.d")),
             &[PathBuf::from("a.c")],
-            None,
+            &deps_infer::c_include_parser::VirtualPaths::default(),
         )
         .is_some());
     }
@@ -10582,7 +10608,7 @@ fn depfile_read_back(
     store_dir: &Path,
     depfile: Option<&Path>,
     sources: &[PathBuf],
-    virtual_declared: Option<&HashMap<PathBuf, PathBuf>>,
+    virtual_declared: &VirtualPaths,
 ) -> Option<Vec<PathBuf>> {
     let d = depfile?;
     let d = if d.is_absolute() {
@@ -10776,7 +10802,11 @@ mod generated_not_yet_written_tests {
         let g = PathBuf::from("src/nix/nix.p/unpack-channel.nix.gen.hh");
         let mut vp = HashMap::new();
         vp.insert(g.clone(), g.clone());
-        assert!(generated_not_yet_written(&bd, &g, Some(&vp)));
+        assert!(generated_not_yet_written(
+            &bd,
+            &g,
+            &deps_infer::c_include_parser::VirtualPaths::from_primary(Some(vp.clone()))
+        ));
     }
 
     /// NEGATIVE CONTROL ONE: absent but never declared virtual. This is a
@@ -10787,8 +10817,16 @@ mod generated_not_yet_written_tests {
         let bd = std::env::temp_dir();
         let vp: HashMap<PathBuf, PathBuf> = HashMap::new();
         let missing = PathBuf::from("no-such-header-anywhere.h");
-        assert!(!generated_not_yet_written(&bd, &missing, Some(&vp)));
-        assert!(!generated_not_yet_written(&bd, &missing, None));
+        assert!(!generated_not_yet_written(
+            &bd,
+            &missing,
+            &deps_infer::c_include_parser::VirtualPaths::from_primary(Some(vp.clone()))
+        ));
+        assert!(!generated_not_yet_written(
+            &bd,
+            &missing,
+            &deps_infer::c_include_parser::VirtualPaths::default()
+        ));
     }
 
     /// NEGATIVE CONTROL TWO, and it is the one that would silently corrupt
@@ -10803,7 +10841,11 @@ mod generated_not_yet_written_tests {
         std::fs::write(bd.join(&rel), b"#pragma once\n").unwrap();
         let mut vp = HashMap::new();
         vp.insert(rel.clone(), rel.clone());
-        assert!(!generated_not_yet_written(&bd, &rel, Some(&vp)));
+        assert!(!generated_not_yet_written(
+            &bd,
+            &rel,
+            &deps_infer::c_include_parser::VirtualPaths::from_primary(Some(vp.clone()))
+        ));
         std::fs::remove_dir_all(&bd).ok();
     }
 }
@@ -10815,7 +10857,7 @@ mod generated_not_yet_written_tests {
 fn generated_not_yet_written(
     build_dir: &Path,
     include: &Path,
-    virtual_declared: Option<&HashMap<PathBuf, PathBuf>>,
+    virtual_declared: &VirtualPaths,
 ) -> bool {
     // ONE PREDICATE, SHARED WITH THE SCANNER, not a second copy of it. This
     // was hand-written twice in two crates and the copies diverged within a
@@ -11171,12 +11213,12 @@ pub fn discover_c_includes(
     build_dir: &Path,
     cmdline: &str,
     files: Vec<PathBuf>,
-    virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+    virtual_paths: VirtualPaths,
     depfile: Option<&Path>,
 ) -> Result<Discovered> {
     // The virtual set is consumed by the scan below; the UPLOAD filter
     // further down needs it too, so keep a copy. See generated_not_yet_written.
-    let virtual_declared: Option<HashMap<PathBuf, PathBuf>> = virtual_paths.clone();
+    let virtual_declared: VirtualPaths = virtual_paths.clone();
     // UPSTREAM #17, THE READ-BACK HALF: a depfile already on disk is the
     // COMPILER'S OWN answer to the question the BFS scan approximates, so
     // when one exists and is FRESH it replaces the scan outright. Fresh
@@ -11231,13 +11273,13 @@ pub fn discover_c_includes(
     // run, where the sandbox is fresh again. Deriving this only inside the
     // scan branch would fix run one and break run two, which is a shape this
     // project has shipped before.
-    let dotdot_dirs = c_include_parser::seed_dotdot_dirs(cmdline, &files, virtual_paths.as_ref());
+    let dotdot_dirs = c_include_parser::seed_dotdot_dirs(cmdline, &files, &virtual_paths);
     let c_includes = match depfile_read_back(
         build_dir,
         AsRef::<Path>::as_ref(store_dir),
         depfile,
         &files,
-        virtual_declared.as_ref(),
+        &virtual_declared,
     ) {
         Some(deps) => {
             // NAMING THE FILE, because "a read-back happened" leaves the
@@ -11441,7 +11483,7 @@ pub fn discover_c_includes(
         // derivation of the edge that generates it. Uploading it as an
         // opaque source would be a second, contentless spelling of an input
         // the task already has.
-        if generated_not_yet_written(build_dir, &include, virtual_declared.as_ref()) {
+        if generated_not_yet_written(build_dir, &include, &virtual_declared) {
             continue;
         }
 
@@ -13020,7 +13062,7 @@ mod create_symlink_undeclared_output_tests {
         let got = deps_infer::c_include_parser::retrieve_c_includes(
             "gcc -I. -g -O2 -c -o q.o quotearg.c",
             vec![PathBuf::from("quotearg.c")],
-            None,
+            deps_infer::c_include_parser::VirtualPaths::default(),
         );
         std::env::set_current_dir(prev).unwrap();
         let got = got.unwrap();

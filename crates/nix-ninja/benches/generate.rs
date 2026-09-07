@@ -194,6 +194,11 @@ fn include_scan_64_tus_shared_header() {
     let files: Vec<PathBuf> = (0..64).map(|i| dir.join(format!("tu{i}.c"))).collect();
     let cmdline = format!("cc -I{} -c x.c -o x.o", dir.join("include").display());
     divan::black_box(
-        deps_infer::c_include_parser::retrieve_c_includes(&cmdline, files, None).unwrap(),
+        deps_infer::c_include_parser::retrieve_c_includes(
+            &cmdline,
+            files,
+            deps_infer::c_include_parser::VirtualPaths::default(),
+        )
+        .unwrap(),
     );
 }

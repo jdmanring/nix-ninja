@@ -13,6 +13,7 @@
 //! task binary and every output a consumer has already built against it.
 
 use deps_infer::c_include_parser::extract_includes;
+use deps_infer::c_include_parser::VirtualPaths;
 use std::path::PathBuf;
 
 #[test]
@@ -31,7 +32,8 @@ fn a_directory_shadowing_a_header_name_is_skipped() {
     std::fs::write(&src, "#include <memory>\n").unwrap();
 
     let dirs = vec![first.clone(), second.clone()];
-    let (got, _dotdot) = extract_includes(&src, &src, &dirs, None).expect("scan must not fail");
+    let (got, _dotdot) =
+        extract_includes(&src, &src, &dirs, &VirtualPaths::default()).expect("scan must not fail");
 
     assert!(
         !got.iter().any(|p| p.ends_with("first/memory")),

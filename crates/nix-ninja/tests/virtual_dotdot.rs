@@ -20,6 +20,7 @@
 //! it; dav1d, p11-kit and svt-av1 are the same class one spelling out.
 
 use deps_infer::c_include_parser::canonicalize_cached;
+use deps_infer::c_include_parser::VirtualPaths;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -31,7 +32,7 @@ fn a_dotdot_spelling_resolves_to_its_declared_generated_header() {
 
     // What a compile edge in `/b/coregrind` does with `#include "../config.h"`.
     let probed = PathBuf::from("/b/coregrind/../config.h");
-    let got = canonicalize_cached(probed, Some(&vp)).unwrap();
+    let got = canonicalize_cached(probed, &VirtualPaths::from_primary(Some(vp.clone()))).unwrap();
 
     assert_eq!(
         got,
@@ -47,7 +48,11 @@ fn a_dot_spelling_resolves_to_its_declared_generated_header() {
     let mut vp = HashMap::new();
     vp.insert(declared.clone(), declared.clone());
 
-    let got = canonicalize_cached(PathBuf::from("./gen/version.h"), Some(&vp)).unwrap();
+    let got = canonicalize_cached(
+        PathBuf::from("./gen/version.h"),
+        &VirtualPaths::from_primary(Some(vp.clone())),
+    )
+    .unwrap();
     assert_eq!(got, Some(declared), "a leading `./` missed the virtual map");
 }
 
@@ -70,7 +75,7 @@ fn a_preprocessed_fortran_source_declares_the_original_it_was_made_from() {
     let got = retrieve_c_includes(
         &format!("gfortran -fpreprocessed -c {}", pp.display()),
         vec![pp.clone()],
-        None,
+        VirtualPaths::default(),
     )
     .unwrap();
 
@@ -102,7 +107,7 @@ fn a_preprocessed_fortran_source_declares_the_original_it_was_made_from() {
     let got = retrieve_c_includes(
         &format!("gfortran -c {}", plain.display()),
         vec![plain],
-        None,
+        VirtualPaths::default(),
     )
     .unwrap();
     assert!(

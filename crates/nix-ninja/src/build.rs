@@ -94,11 +94,43 @@ pub fn build(
     // the dyndep pass still needs it to realise the dyndep files.
     let store_dir = config.store_dir.clone();
 
+    // EVERY PATH THE GRAPH PRODUCES, TAKEN ONCE AND SHARED.
+    //
+    // `File.input` is `Some` exactly for a file some edge writes, which is
+    // the same discriminator the build-directory walk uses to skip a
+    // produced node. Keyed by the graph's own name, which is the convention
+    // `DerivedFile::build_path` already follows, so an entry here is
+    // interchangeable with one from `local::build_derived_files`.
+    //
+    // TAKEN BEFORE DYNDEP RUNS, WHICH IS A KNOWN FLOOR RATHER THAN AN
+    // OVERSIGHT: the dyndep pass below amends the graph with implicit
+    // inputs and outputs, and a file that only a dyndep file declares is
+    // absent from this map. Fortran modules are that shape. They resolve
+    // through the dyndep edge itself, which is why nothing waits on it.
+    // DEFER(a generated sibling first declared by a dyndep file): move this
+    // after the dyndep fold, which needs the map built from a graph the
+    // scheduler has already borrowed.
+    let produced_paths: Arc<HashMap<PathBuf, PathBuf>> = Arc::new({
+        use n2::densemap::Index as _;
+        let files = &loader.graph.files.by_id;
+        let mut m = HashMap::new();
+        for i in 0..files.next_id().index() {
+            let Some(f) = files.lookup(n2::graph::FileId::from(i)) else {
+                continue;
+            };
+            if f.input.is_some() {
+                m.insert(PathBuf::from(&f.name), PathBuf::from(&f.name));
+            }
+        }
+        m
+    });
+
     let mut runner = task::Runner::new(
         tools,
         rpc_client.clone(),
         task::RunnerConfig {
             system: host_nix_system(),
+            produced_paths: Some(produced_paths),
             build_dir: config.build_dir,
             store_dir: config.store_dir,
             is_output_derivation: config.is_output_derivation,

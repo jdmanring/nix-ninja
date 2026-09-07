@@ -11,10 +11,67 @@ use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
+/// The maps an include spelling resolves against, in probe order.
+///
+/// TWO MAPS RATHER THAN ONE MERGED MAP, AND THE ORDER IS THE WHOLE POINT.
+/// `primary` maps a build path to the path whose BYTES the scan reads, which
+/// for a materialized input is its store path; `graph` can only ever map a
+/// path to itself, because the file it names has not been written. A union
+/// would have to pick a winner per key, and picking the graph's identity
+/// entry over a materialized path sends the walk to a file that does not
+/// exist. So `primary` answers first and `graph` is reached only on a miss.
+///
+/// `graph` IS SHARED AND `primary` IS NOT, which is a cost decision rather
+/// than a style one. `primary` is a task's own inputs, tens of entries,
+/// cloned per call as it always was. `graph` is every path the build graph
+/// produces, and an earlier attempt at this merged the two per task: hashing
+/// over exactly that kind of growing `PathBuf` map was measured at 25-32% of
+/// driver CPU on the qtwebengine graph. An `Arc` clone is a refcount bump.
+///
+/// A DIRECTORY IS REFUSED ON BOTH, and by construction rather than by a
+/// second guard: every hit leaves through `virtual_hit`, so a probe added
+/// here inherits the refusal. See `canonicalize_cached`.
+#[derive(Clone, Default)]
+pub struct VirtualPaths {
+    /// The caller's own resolved inputs. Build path -> the path to read.
+    pub primary: Option<HashMap<PathBuf, PathBuf>>,
+    /// Every path the build graph produces, mapped to itself.
+    pub graph: Option<Arc<HashMap<PathBuf, PathBuf>>>,
+}
+
+impl VirtualPaths {
+    /// Probe `primary`, then `graph` only on a miss.
+    pub fn get(&self, key: &Path) -> Option<&PathBuf> {
+        if let Some(p) = self.primary.as_ref().and_then(|m| m.get(key)) {
+            return Some(p);
+        }
+        self.graph.as_ref().and_then(|m| m.get(key))
+    }
+
+    /// True when either map declares the path.
+    pub fn contains(&self, key: &Path) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// The caller's own map alone, for a caller that has no graph.
+    pub fn from_primary(primary: Option<HashMap<PathBuf, PathBuf>>) -> Self {
+        Self {
+            primary,
+            graph: None,
+        }
+    }
+
+    /// True when neither map can answer anything.
+    pub fn is_empty(&self) -> bool {
+        self.primary.as_ref().is_none_or(|m| m.is_empty())
+            && self.graph.as_ref().is_none_or(|m| m.is_empty())
+    }
+}
+
 pub fn retrieve_c_includes(
     cmdline: &str,
     files: Vec<PathBuf>,
-    virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+    virtual_paths: VirtualPaths,
 ) -> Result<Vec<PathBuf>> {
     Ok(retrieve_c_includes_checked(cmdline, files, virtual_paths)?.includes)
 }
@@ -43,7 +100,7 @@ pub struct Scan {
 pub fn retrieve_c_includes_checked(
     cmdline: &str,
     files: Vec<PathBuf>,
-    virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+    virtual_paths: VirtualPaths,
 ) -> Result<Scan> {
     let includes = gcc_include_parser::parse_include_dirs(cmdline)?;
     bfs_parse_includes(files, &includes, virtual_paths)
@@ -53,7 +110,7 @@ pub fn retrieve_c_includes_checked(
 fn bfs_parse_includes(
     files: Vec<PathBuf>,
     include_dirs: &[PathBuf],
-    virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+    virtual_paths: VirtualPaths,
 ) -> Result<Scan> {
     // Set by any file carrying a directive this parser cannot expand.
     let mut incomplete = false;
@@ -90,7 +147,7 @@ fn bfs_parse_includes(
         let sources_with_includes = all_sources_and_includes(
             current_batch.into_iter().map(Ok::<_, std::io::Error>),
             include_dirs,
-            virtual_paths.as_ref(),
+            &virtual_paths,
         )?;
 
         // Process each source's includes
@@ -143,11 +200,11 @@ fn bfs_parse_includes(
                 // (the build root), and joining the includer dir instead
                 // fabricated mips/contrib/... - a path that exists nowhere
                 // and hard-failed the upload (2026-08-23).
-                let hit = try_resolve(dir, &tail, virtual_paths.as_ref())
+                let hit = try_resolve(dir, &tail, &virtual_paths)
                     .map(|p| (dir.clone(), p))
                     .or_else(|| {
                         include_dirs.iter().find_map(|i| {
-                            try_resolve(i, &tail, virtual_paths.as_ref()).map(|p| (i.clone(), p))
+                            try_resolve(i, &tail, &virtual_paths).map(|p| (i.clone(), p))
                         })
                     });
                 if let Some((head, p)) = hit {
@@ -199,14 +256,14 @@ pub struct SourceWithIncludes {
 pub fn all_sources_and_includes<I, E>(
     paths: I,
     includes: &[PathBuf],
-    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+    virtual_paths: &VirtualPaths,
 ) -> Result<Vec<SourceWithIncludes>>
 where
     I: Iterator<Item = Result<PathBuf, E>>,
     E: Debug,
 {
     let includes = Arc::new(Vec::from(includes));
-    let virtual_paths = Arc::new(virtual_paths.cloned());
+    let virtual_paths = Arc::new((*virtual_paths).clone());
     let mut handles = Vec::new();
 
     for entry in paths {
@@ -220,7 +277,7 @@ where
         // spelling and the sandbox compile died at the dist one.
         let (spelled, path) = match entry {
             Ok(value) => {
-                let canon = canonicalize_cached(value.clone(), virtual_paths.as_ref().as_ref())
+                let canon = canonicalize_cached(value.clone(), virtual_paths.as_ref())
                     .map_err(|e| anyhow!("{:?}", e))?
                     .ok_or(anyhow!(
                         "Required file not found {}",
@@ -235,8 +292,7 @@ where
 
         handles.push(std::thread::spawn(move || {
             let (mut includes, dotdot_dirs) =
-                match extract_includes(&path, &spelled, &includes, virtual_paths.as_ref().as_ref())
-                {
+                match extract_includes(&path, &spelled, &includes, virtual_paths.as_ref()) {
                     Ok(value) => value,
                     Err(e) => {
                         return Err(e);
@@ -528,17 +584,14 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
 /// assuming the identity mapping, which is the caller's choice and not this
 /// module's contract. Linear over the values only on a read failure, which
 /// is rare by construction.
-pub fn is_declared_virtual(path: &Path, virtual_paths: Option<&HashMap<PathBuf, PathBuf>>) -> bool {
-    let Some(vp) = virtual_paths else {
-        return false;
-    };
+pub fn is_declared_virtual(path: &Path, virtual_paths: &VirtualPaths) -> bool {
     // KEY LOOKUP ONLY. The caller builds this map as build_path -> build_path
     // and `canonicalize_cached` returns the VALUE for a key hit, so the path
     // the BFS queues is literally a key here. A `values().any()` fallback
     // looked defensive and was an O(V) scan over the same map whose pairwise
     // scanning was once measured at 25% of driver CPU - see
     // canonicalize_cached. Defensive code on a hot map is not free.
-    vp.contains_key(path)
+    virtual_paths.contains(path)
 }
 
 /// The original source a preprocessed Fortran file was made from.
@@ -612,7 +665,7 @@ pub fn extract_includes(
     path: &Path,
     spelled: &Path,
     include_dirs: &[PathBuf],
-    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+    virtual_paths: &VirtualPaths,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     // A GENERATED HEADER IS RESOLVABLE BEFORE IT EXISTS, AND SCANNING IT
     // IS WHAT KILLED THE FIRST REAL PACKAGE TO CARRY ONE. `virtual_paths`
@@ -750,7 +803,7 @@ pub fn extract_includes(
 pub fn seed_dotdot_dirs(
     cmdline: &str,
     files: &[PathBuf],
-    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+    virtual_paths: &VirtualPaths,
 ) -> Vec<PathBuf> {
     let Ok(include_dirs) = gcc_include_parser::parse_include_dirs(cmdline) else {
         return Vec::new();
@@ -803,8 +856,115 @@ pub fn dotdot_prefix(raw: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+mod virtual_paths_probe_order_tests {
+    use super::{canonicalize_cached, VirtualPaths};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn graph_of(entries: &[&str]) -> Option<Arc<HashMap<PathBuf, PathBuf>>> {
+        Some(Arc::new(
+            entries
+                .iter()
+                .map(|e| (PathBuf::from(e), PathBuf::from(e)))
+                .collect(),
+        ))
+    }
+
+    /// THE CAPABILITY: a path no caller declared still resolves when the
+    /// graph produces it.
+    ///
+    /// This is the generated-sibling class. A compile declares the header it
+    /// includes; that header includes a sibling that no edge declares to
+    /// this task, so the sibling is absent from `primary` AND absent from
+    /// disk, and before the graph probe existed it resolved to nothing.
+    #[test]
+    fn a_sibling_only_the_graph_knows_about_resolves() {
+        let vp = VirtualPaths {
+            primary: Some(HashMap::new()),
+            graph: graph_of(&["gen/visibility.h"]),
+        };
+        let got = canonicalize_cached(PathBuf::from("gen/visibility.h"), &vp)
+            .expect("the graph probe must not error")
+            .expect("a path the graph produces resolves before it is written");
+        assert_eq!(got, PathBuf::from("gen/visibility.h"));
+    }
+
+    /// THE ORDER, WHICH IS THE WHOLE REASON THESE ARE TWO MAPS.
+    ///
+    /// `primary` maps a build path to the path whose BYTES are read, which
+    /// for a materialized input is its store path. The graph can only map a
+    /// path to itself. Both hold the same KEY here and only one answer sends
+    /// the walk to real bytes, so a merged map that let the graph win would
+    /// pass every other test in this module and read an unwritten file.
+    #[test]
+    fn the_materialised_path_wins_over_the_graphs_identity_entry() {
+        let build = PathBuf::from("gen/version.h");
+        let store = PathBuf::from("/nix/store/deadbeef-version.h");
+        let vp = VirtualPaths {
+            primary: Some(HashMap::from([(build.clone(), store.clone())])),
+            graph: graph_of(&["gen/version.h"]),
+        };
+        let got = canonicalize_cached(build, &vp).unwrap().unwrap();
+        assert_eq!(
+            got, store,
+            "the graph's identity entry displaced the materialised path"
+        );
+    }
+
+    /// THE HAZARD THE GRAPH PROBE COULD HAVE RE-OPENED.
+    ///
+    /// An edge may declare a DIRECTORY as its output, and a directory
+    /// answered from a virtual map used to bypass the filesystem lookup's
+    /// own directory guard: the walk then read it and the task died with
+    /// `Is a directory (os error 21)`, 189 occurrences in one round across
+    /// rdma-core and llvm-tblgen. Widening the map to every produced path
+    /// widens that population, so the refusal is asserted on the GRAPH side
+    /// specifically rather than assumed from where it sits in the code.
+    #[test]
+    fn a_directory_the_graph_produces_is_refused() {
+        let d = tempdir();
+        let dir = d.join("include");
+        std::fs::create_dir_all(&dir).unwrap();
+        let vp = VirtualPaths {
+            primary: Some(HashMap::new()),
+            graph: Some(Arc::new(HashMap::from([(dir.clone(), dir.clone())]))),
+        };
+        assert!(
+            canonicalize_cached(dir, &vp).unwrap().is_none(),
+            "a directory resolved through the graph probe; the walk will read it"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// THE NEGATIVE CONTROL. A path neither map declares must still miss,
+    /// or the probe is answering yes to everything and the three tests
+    /// above pass for no reason.
+    #[test]
+    fn an_undeclared_path_is_still_a_miss() {
+        let vp = VirtualPaths {
+            primary: Some(HashMap::new()),
+            graph: graph_of(&["gen/visibility.h"]),
+        };
+        assert!(canonicalize_cached(PathBuf::from("gen/absent.h"), &vp)
+            .unwrap()
+            .is_none());
+    }
+
+    fn tempdir() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "nn-probe-order-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+}
+
+#[cfg(test)]
 mod virtual_lookup_agreement_tests {
-    use super::{canonicalize_cached, is_declared_virtual};
+    use super::{canonicalize_cached, is_declared_virtual, VirtualPaths};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
@@ -828,20 +988,24 @@ mod virtual_lookup_agreement_tests {
         let vp: HashMap<PathBuf, PathBuf> = HashMap::from([(declared.clone(), declared.clone())]);
 
         let probe = PathBuf::from("gen/sub/../version.h");
-        let resolved = canonicalize_cached(probe.clone(), Some(&vp))
-            .expect("the normalized probe must resolve")
-            .expect("a declared virtual path resolves without existing");
+        let resolved =
+            canonicalize_cached(probe.clone(), &VirtualPaths::from_primary(Some(vp.clone())))
+                .expect("the normalized probe must resolve")
+                .expect("a declared virtual path resolves without existing");
 
         // The resolver answers with the DECLARED spelling, which is the one
         // the upload filter recognises.
         assert_eq!(resolved, declared);
-        assert!(is_declared_virtual(&resolved, Some(&vp)));
+        assert!(is_declared_virtual(
+            &resolved,
+            &VirtualPaths::from_primary(Some(vp.clone()))
+        ));
 
         // The PROBE is not a key, which is the asymmetry. Asking with it
         // would declare a header and then try to upload a file that never
         // existed - the shape of svt-av1's canonicalize failure.
         assert!(
-            !is_declared_virtual(&probe, Some(&vp)),
+            !is_declared_virtual(&probe, &VirtualPaths::from_primary(Some(vp.clone()))),
             "the asymmetry is gone; the resolver's second probe is now redundant"
         );
     }
@@ -867,13 +1031,22 @@ mod virtual_lookup_agreement_tests {
     fn only_a_leading_dot_and_dotdot_are_different_keys() {
         let vp: HashMap<PathBuf, PathBuf> =
             HashMap::from([(PathBuf::from("gen/x.h"), PathBuf::from("gen/x.h"))]);
-        assert!(is_declared_virtual(Path::new("gen/./x.h"), Some(&vp)));
-        assert!(!is_declared_virtual(Path::new("gen/sub/../x.h"), Some(&vp)));
+        assert!(is_declared_virtual(
+            Path::new("gen/./x.h"),
+            &VirtualPaths::from_primary(Some(vp.clone()))
+        ));
+        assert!(!is_declared_virtual(
+            Path::new("gen/sub/../x.h"),
+            &VirtualPaths::from_primary(Some(vp.clone()))
+        ));
 
         let root: HashMap<PathBuf, PathBuf> =
             HashMap::from([(PathBuf::from("x.h"), PathBuf::from("x.h"))]);
         assert!(
-            !is_declared_virtual(Path::new("./x.h"), Some(&root)),
+            !is_declared_virtual(
+                Path::new("./x.h"),
+                &VirtualPaths::from_primary(Some(root.clone()))
+            ),
             "a leading dot is a different key, which is why a header at the \
              build root with -I. needed the normalizing probe"
         );
@@ -888,12 +1061,19 @@ mod virtual_lookup_agreement_tests {
             PathBuf::from("gen/version.h"),
             PathBuf::from("gen/version.h"),
         )]);
-        let got = canonicalize_cached(PathBuf::from("gen/other.h"), Some(&vp)).unwrap();
+        let got = canonicalize_cached(
+            PathBuf::from("gen/other.h"),
+            &VirtualPaths::from_primary(Some(vp.clone())),
+        )
+        .unwrap();
         assert!(
             got.is_none(),
             "an undeclared absent header must not resolve"
         );
-        assert!(!is_declared_virtual(Path::new("gen/other.h"), Some(&vp)));
+        assert!(!is_declared_virtual(
+            Path::new("gen/other.h"),
+            &VirtualPaths::from_primary(Some(vp.clone()))
+        ));
     }
 }
 
@@ -961,11 +1141,7 @@ fn lexical_normalize(p: &Path) -> PathBuf {
     out
 }
 
-fn try_resolve(
-    head: &Path,
-    tail: &Path,
-    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
-) -> Option<PathBuf> {
+fn try_resolve(head: &Path, tail: &Path, virtual_paths: &VirtualPaths) -> Option<PathBuf> {
     canonicalize_cached(head.join(tail), virtual_paths).ok()?
 }
 
@@ -977,7 +1153,7 @@ static PATH_CACHE: LazyLock<PathCache> = LazyLock::new(Default::default);
 
 pub fn canonicalize_cached<P>(
     path: P,
-    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+    virtual_paths: &VirtualPaths,
 ) -> Result<Option<PathBuf>, std::io::Error>
 where
     P: AsRef<Path>,
@@ -998,14 +1174,16 @@ where
         (!actual_path.is_dir()).then(|| actual_path.to_path_buf())
     }
 
-    // Check virtual paths first if provided. Keyed lookup, not a pairwise
-    // scan: PathBuf's Hash agrees with the Eq the scan used, and the map
+    // Check virtual paths first. BOTH MAPS ARE PROBED HERE THROUGH
+    // `VirtualPaths::get`, which asks the caller's own inputs before the
+    // graph's produced set; see that type for why the order is not
+    // interchangeable. Keyed lookup, not a pairwise scan: PathBuf's Hash agrees with the Eq the scan used, and the map
     // grows with every materialized output, so the scan made each include
     // lookup O(V) - measured 25% of driver CPU in Components::next_back at
     // task 10,500 of the qtwebengine graph, the superlinear resolve climb.
-    if let Some(virtual_paths) = virtual_paths {
+    {
         let key: &Path = path.as_ref();
-        if let Some(actual_path) = virtual_paths.get::<Path>(key) {
+        if let Some(actual_path) = virtual_paths.get(key) {
             return Ok(virtual_hit(actual_path));
         }
         // THE KEY IS A SPELLING AND THE MAP HOLDS GRAPH PATHS, so probing it
@@ -1025,7 +1203,7 @@ where
         // already keyed, so a normalized path is built only when it misses.
         let normalized = lexical_normalize(key);
         if normalized != key {
-            if let Some(actual_path) = virtual_paths.get::<Path>(normalized.as_path()) {
+            if let Some(actual_path) = virtual_paths.get(normalized.as_path()) {
                 return Ok(virtual_hit(actual_path));
             }
         }
@@ -1131,9 +1309,10 @@ mod tests {
             "#include \"kwsysPrivate.h\"\n#include KWSYS_HEADER(Directory.hxx)\n",
         )
         .unwrap();
-        let incomplete = bfs_parse_includes(vec![d.join("Directory.cxx")], &[], None)
-            .unwrap()
-            .incomplete;
+        let incomplete =
+            bfs_parse_includes(vec![d.join("Directory.cxx")], &[], VirtualPaths::default())
+                .unwrap()
+                .incomplete;
         assert!(
             incomplete,
             "a function-like computed include must report the scan incomplete, \
@@ -1155,7 +1334,7 @@ mod tests {
             includes: got2,
             incomplete: incomplete2,
             ..
-        } = bfs_parse_includes(vec![d.join("plain.c")], &[], None).unwrap();
+        } = bfs_parse_includes(vec![d.join("plain.c")], &[], VirtualPaths::default()).unwrap();
         assert!(
             !incomplete2,
             "an ordinary source must NOT trigger the preprocessor fallback: {got2:?}"
@@ -1180,7 +1359,7 @@ mod tests {
             "#include \"config.h\"\n#include \"body.h\"\n",
         )
         .unwrap();
-        let got = bfs_parse_includes(vec![d.join("main.c")], &[], None)
+        let got = bfs_parse_includes(vec![d.join("main.c")], &[], VirtualPaths::default())
             .unwrap()
             .includes;
         assert!(
@@ -1191,7 +1370,7 @@ mod tests {
         // The negative control: a use whose macro is never defined stays
         // undeclared rather than inventing a path.
         std::fs::write(d.join("main2.c"), "#include NEVER_DEFINED\n").unwrap();
-        let got2 = bfs_parse_includes(vec![d.join("main2.c")], &[], None)
+        let got2 = bfs_parse_includes(vec![d.join("main2.c")], &[], VirtualPaths::default())
             .unwrap()
             .includes;
         assert_eq!(got2.len(), 1, "only the source itself: {:?}", got2);
@@ -1221,7 +1400,7 @@ mod tests {
         .unwrap();
         std::fs::write(d.join("root_cm.ch"), "\n").unwrap();
         std::fs::write(d.join("body_cm.ch"), "\n").unwrap();
-        let got = bfs_parse_includes(vec![d.join("root.c")], &[], None)
+        let got = bfs_parse_includes(vec![d.join("root.c")], &[], VirtualPaths::default())
             .unwrap()
             .includes;
         let names: Vec<String> = got
@@ -1254,9 +1433,13 @@ mod tests {
             "#define F \"contrib/x.c\"\n#include F\n",
         )
         .unwrap();
-        let got = bfs_parse_includes(vec![d.join("mips/init.c")], std::slice::from_ref(&d), None)
-            .unwrap()
-            .includes;
+        let got = bfs_parse_includes(
+            vec![d.join("mips/init.c")],
+            std::slice::from_ref(&d),
+            VirtualPaths::default(),
+        )
+        .unwrap()
+        .includes;
         let names: Vec<String> = got
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
@@ -1385,7 +1568,7 @@ mod tests {
         let got = bfs_parse_includes(
             vec![PathBuf::from("strlen.c")],
             &[PathBuf::from("../dist/include/nspr")],
-            None,
+            VirtualPaths::default(),
         );
         std::env::set_current_dir(prev).unwrap();
         let got = got.unwrap().includes;
@@ -1419,9 +1602,13 @@ mod tests {
         std::os::unix::fs::symlink(d.join("ccan/str.h"), d.join("build/include/ccan/str.h"))
             .unwrap();
         std::fs::write(d.join("ccan/str.c"), "#include <ccan/str.h>\n").unwrap();
-        let got = bfs_parse_includes(vec![d.join("ccan/str.c")], &[d.join("build/include")], None)
-            .unwrap()
-            .includes;
+        let got = bfs_parse_includes(
+            vec![d.join("ccan/str.c")],
+            &[d.join("build/include")],
+            VirtualPaths::default(),
+        )
+        .unwrap()
+        .includes;
         assert!(
             got.contains(&d.join("build/include/ccan/str.h")),
             "absolute spelled path missing: {got:?}"
@@ -1478,9 +1665,17 @@ mod tests {
     fn virtual_path_lookup_matches_scan_semantics() {
         let mut vp = HashMap::new();
         vp.insert(PathBuf::from("gen/a/b.h"), PathBuf::from("/store/x-b.h"));
-        let hit = canonicalize_cached(PathBuf::from("gen/./a/b.h"), Some(&vp)).unwrap();
+        let hit = canonicalize_cached(
+            PathBuf::from("gen/./a/b.h"),
+            &VirtualPaths::from_primary(Some(vp.clone())),
+        )
+        .unwrap();
         assert_eq!(hit, Some(PathBuf::from("/store/x-b.h")));
-        let miss = canonicalize_cached(PathBuf::from("gen/a/c.h"), Some(&vp)).unwrap();
+        let miss = canonicalize_cached(
+            PathBuf::from("gen/a/c.h"),
+            &VirtualPaths::from_primary(Some(vp.clone())),
+        )
+        .unwrap();
         assert_eq!(miss, None);
     }
 
@@ -1499,13 +1694,21 @@ mod tests {
         let mut vp = HashMap::new();
         vp.insert(root.join("gen/a/b.h"), PathBuf::from("/store/x-b.h"));
 
-        let hit = canonicalize_cached(root.join("gen/a/b.h"), Some(&vp)).unwrap();
+        let hit = canonicalize_cached(
+            root.join("gen/a/b.h"),
+            &VirtualPaths::from_primary(Some(vp.clone())),
+        )
+        .unwrap();
         assert_eq!(
             hit,
             Some(PathBuf::from("/store/x-b.h")),
             "absent on disk, answered by the map"
         );
-        let miss = canonicalize_cached(root.join("gen/a/c.h"), Some(&vp)).unwrap();
+        let miss = canonicalize_cached(
+            root.join("gen/a/c.h"),
+            &VirtualPaths::from_primary(Some(vp.clone())),
+        )
+        .unwrap();
         assert_eq!(
             miss,
             Some(root.join("gen/a/c.h").canonicalize().unwrap()),
@@ -1633,9 +1836,13 @@ mod tests {
 
         // The includer resolves it and DECLARES it: that half must keep
         // working, or the generated header never reaches the sandbox.
-        let (includes, _) =
-            super::extract_includes(&tu, &tu, std::slice::from_ref(&d), Some(&virtual_paths))
-                .unwrap();
+        let (includes, _) = super::extract_includes(
+            &tu,
+            &tu,
+            std::slice::from_ref(&d),
+            &VirtualPaths::from_primary(Some(virtual_paths.clone())),
+        )
+        .unwrap();
         assert!(
             includes.contains(&generated),
             "the generated header must still be declared an input: {includes:?}"
@@ -1646,7 +1853,7 @@ mod tests {
             &generated,
             &generated,
             std::slice::from_ref(&d),
-            Some(&virtual_paths),
+            &VirtualPaths::from_primary(Some(virtual_paths.clone())),
         )
         .unwrap();
         assert!(
@@ -1671,12 +1878,23 @@ mod tests {
 
         let empty = std::collections::HashMap::new();
         assert!(
-            super::extract_includes(&absent, &absent, std::slice::from_ref(&d), Some(&empty))
-                .is_err(),
+            super::extract_includes(
+                &absent,
+                &absent,
+                std::slice::from_ref(&d),
+                &VirtualPaths::from_primary(Some(empty.clone()))
+            )
+            .is_err(),
             "an undeclared missing file must still be an error"
         );
         assert!(
-            super::extract_includes(&absent, &absent, std::slice::from_ref(&d), None).is_err(),
+            super::extract_includes(
+                &absent,
+                &absent,
+                std::slice::from_ref(&d),
+                &VirtualPaths::default()
+            )
+            .is_err(),
             "and with no virtual map at all"
         );
 
