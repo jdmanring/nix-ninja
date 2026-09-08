@@ -246,12 +246,21 @@ pub fn update_derivation_with_discoveries(
     // identical build path `config.h`, which is what says the collision is
     // here and not in the grouping key.
     //
-    // THE EXISTING CLAIMANT WINS, and it is the only available order: this
-    // function holds no rpc client, so it cannot re-read the file the way
-    // the static pass does, and on an LTO task the declared input was
-    // chosen deliberately over the rewritten one. A file that really
-    // changed mid-scan therefore keeps the older bytes here rather than
-    // failing, which is what the static pass would call stale.
+    // THE EXISTING CLAIMANT WINS WHERE THERE IS ONE, and it is the only
+    // available order: this function holds no rpc client, so it cannot
+    // re-read the file the way the static pass does, and on an LTO task the
+    // declared input was chosen deliberately over the rewritten one. A file
+    // that really changed mid-scan therefore keeps the older bytes here
+    // rather than failing, which is what the static pass would call stale.
+    //
+    // WHERE BOTH CLAIMANTS ARE OFFERS there is no declared input to prefer
+    // and the first the scan emitted wins, which is arbitrary but total.
+    // Said explicitly because the sentence above does not cover it, and a
+    // reader would otherwise take a guarantee this site cannot give.
+    //
+    // `discovered_store_paths` needs no seat here: an include resolving
+    // inside the store takes that branch and returns, so the two vectors
+    // are disjoint, and such an input carries no build path to collide on.
     let mut claimed: HashSet<String> = input_set
         .iter()
         .map(|e| encoded_build_path(e).to_string())
@@ -458,6 +467,43 @@ mod tests {
         assert!(
             emitted.contains(raw),
             "the declared claimant is the one kept: {emitted}"
+        );
+    }
+
+    /// TWO OFFERS AND NO DECLARED INPUT, which the case above cannot reach
+    /// and the guard's comment claims nothing about beyond totality. The
+    /// merge has no bytes to compare and no client to re-read with, so the
+    /// first offer wins; what matters is that exactly one survives.
+    #[test]
+    fn two_offers_for_one_build_path_resolve_to_one() {
+        let store_dir = StoreDir::new(std::path::Path::new("/nix/store")).unwrap();
+        let mut drv = Derivation::new(
+            "ninja-build".parse().unwrap(),
+            b"x86_64-linux"[..].into(),
+            b"/nn-task/bin/nix-ninja-task"[..].into(),
+        );
+
+        let offer = |path: &str| DerivedFile {
+            derived_path: SingleDerivedPath::Opaque(store_dir.parse(path).unwrap()),
+            build_path: PathBuf::from("config.h"),
+            rel_path: None,
+        };
+        let first = offer("/nix/store/f6m77zjnky9zy1vsiwfz3d9886x4pn3b-config.h");
+        let second = offer("/nix/store/hz96sb8291vrix4ln92a6jbacypqh8qb-config.h");
+
+        let new_deps = update_derivation_with_discoveries(
+            &mut drv,
+            vec![first.clone(), second.clone()],
+            Vec::new(),
+            &store_dir,
+        )
+        .unwrap();
+
+        assert_eq!(new_deps.len(), 1, "exactly one offer survives");
+        assert!(
+            drv.inputs.contains(&first.derived_path) && !drv.inputs.contains(&second.derived_path),
+            "the first offer is the one kept: {:?}",
+            drv.inputs
         );
     }
 
