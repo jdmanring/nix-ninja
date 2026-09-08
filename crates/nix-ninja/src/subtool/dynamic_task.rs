@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::task::discover_c_includes;
+use crate::task::{discover_c_includes, encoded_build_path};
 
 pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
     let input_drv = targets
@@ -231,12 +231,46 @@ pub fn update_derivation_with_discoveries(
         .map(|s| s.to_string())
         .collect();
 
+    // ONE BUILD PATH, ONE CLAIMANT, ON THE MERGE PATH TOO. The set above
+    // dedupes whole ENCODED entries, so a second upload of one file under a
+    // different store path is added beside the first and the task dies in
+    // sandbox setup: "Two different files claim one build path." The pass
+    // that exists for this in `build_task_derivation` groups by build path,
+    // but it runs over the STATIC input set and never sees this merge, so
+    // local mode (the compiler route) has no guard at all.
+    //
+    // Witnessed on virglrenderer 1.3.0: an LTO task's `config.h` is swapped
+    // for a RAW re-upload naming the real outer output, discovery then
+    // re-uploads the same file through the placeholder rewrite, and the two
+    // spellings of one content reach one task. Both entries carry the
+    // identical build path `config.h`, which is what says the collision is
+    // here and not in the grouping key.
+    //
+    // THE EXISTING CLAIMANT WINS, and it is the only available order: this
+    // function holds no rpc client, so it cannot re-read the file the way
+    // the static pass does, and on an LTO task the declared input was
+    // chosen deliberately over the rewritten one. A file that really
+    // changed mid-scan therefore keeps the older bytes here rather than
+    // failing, which is what the static pass would call stale.
+    let mut claimed: HashSet<String> = input_set
+        .iter()
+        .map(|e| encoded_build_path(e).to_string())
+        .collect();
+
     let mut new_deps = Vec::new();
     for derived_file in discovered_deps {
         let encoded = derived_file.to_encoded(store_dir);
 
         // Skip if already in input set
         if input_set.contains(&encoded) {
+            continue;
+        }
+
+        let bp = encoded_build_path(&encoded).to_string();
+        if !claimed.insert(bp.clone()) {
+            eprintln!(
+                "nix-ninja: {bp} is already claimed by a declared input; keeping that one and dropping the discovered upload"
+            );
             continue;
         }
 
@@ -344,6 +378,87 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ONE BUILD PATH REACHES THE MERGED TASK UNDER ONE STORE PATH.
+    ///
+    /// The fixture is the real pair, from a round that failed 110 tasks on
+    /// it: `config.h` declared as the RAW re-upload naming virglrenderer's
+    /// own outer output, and discovery offering the same build path as the
+    /// upload carrying the outer-output placeholder. Both spell the build
+    /// path `config.h`, so the collision is not a second spelling and the
+    /// grouping key in `build_task_derivation`'s pass is not the defect;
+    /// that pass never ran, because it does not cover this merge.
+    ///
+    /// THE SECOND ASSERTION IS THE CONTROL. A function that added nothing
+    /// would satisfy the first, and that is the failure mode this merge
+    /// already has in the other direction, so an unclaimed build path has
+    /// to arrive in the same call.
+    #[test]
+    fn a_claimed_build_path_takes_no_second_upload() {
+        let store_dir = StoreDir::new(std::path::Path::new("/nix/store")).unwrap();
+        let mut drv = Derivation::new(
+            "ninja-build".parse().unwrap(),
+            b"x86_64-linux"[..].into(),
+            b"/nn-task/bin/nix-ninja-task"[..].into(),
+        );
+
+        let raw = "/nix/store/hz96sb8291vrix4ln92a6jbacypqh8qb-config.h";
+        drv.env.insert(
+            b"NIX_NINJA_INPUTS"[..].into(),
+            format!("{raw}:config.h:").into_bytes().into(),
+        );
+
+        let offer = |path: &str, bp: &str| DerivedFile {
+            derived_path: SingleDerivedPath::Opaque(store_dir.parse(path).unwrap()),
+            build_path: PathBuf::from(bp),
+            rel_path: None,
+        };
+        let rewritten = offer(
+            "/nix/store/f6m77zjnky9zy1vsiwfz3d9886x4pn3b-config.h",
+            "config.h",
+        );
+        let fresh = offer(
+            "/nix/store/fixs6b76qaj5m5h3xbyjzkgwlqcd5480-prog.h",
+            "src/prog.h",
+        );
+
+        let new_deps = update_derivation_with_discoveries(
+            &mut drv,
+            vec![rewritten.clone(), fresh.clone()],
+            Vec::new(),
+            &store_dir,
+        )
+        .unwrap();
+
+        assert!(
+            !drv.inputs.contains(&rewritten.derived_path),
+            "the second claimant of config.h must not become an input"
+        );
+        assert!(
+            drv.inputs.contains(&fresh.derived_path),
+            "an unclaimed build path must still be added: {:?}",
+            drv.inputs
+        );
+        assert_eq!(new_deps.len(), 1, "only the unclaimed offer is a new dep");
+
+        let emitted = std::str::from_utf8(
+            drv.env
+                .iter()
+                .find(|(k, _)| k.as_ref() == b"NIX_NINJA_INPUTS")
+                .map(|(_, v)| v.as_ref())
+                .expect("NIX_NINJA_INPUTS"),
+        )
+        .unwrap()
+        .to_owned();
+        let claimants = split_encoded_list(&emitted)
+            .filter(|e| encoded_build_path(e) == "config.h")
+            .count();
+        assert_eq!(claimants, 1, "one claimant of config.h survives: {emitted}");
+        assert!(
+            emitted.contains(raw),
+            "the declared claimant is the one kept: {emitted}"
+        );
     }
 
     /// THE TRANSITIVE HALF OF THE KEYING KNOB, and it is the only property

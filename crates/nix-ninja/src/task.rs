@@ -12523,7 +12523,7 @@ pub fn discover_c_includes(
 }
 
 /// The build-path field of an encoded `store:build_path:rel` input.
-fn encoded_build_path(e: &str) -> &str {
+pub(crate) fn encoded_build_path(e: &str) -> &str {
     e.split(':').nth(1).unwrap_or(e)
 }
 
