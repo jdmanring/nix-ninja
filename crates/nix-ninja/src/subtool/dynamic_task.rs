@@ -261,6 +261,16 @@ pub fn update_derivation_with_discoveries(
     // `discovered_store_paths` needs no seat here: an include resolving
     // inside the store takes that branch and returns, so the two vectors
     // are disjoint, and such an input carries no build path to collide on.
+    //
+    // THE ONE LEGITIMATE COLLISION INSIDE `discovered_deps` IS SAFE AND WAS
+    // CHECKED RATHER THAN ASSUMED, because dropping it would take nss's
+    // staged headers with it. A header found inside the outer output is
+    // re-staged with a COMPOSED build path under `.nn-outer`, and the same
+    // header can also be scanned at that mirrored path on disk. Both then
+    // claim one build path under two store paths, since the upload name
+    // comes from the path asked about, so before this guard such a task
+    // refused with exactly the message above. The bytes are the same file,
+    // so keeping either is correct.
     let mut claimed: HashSet<String> = input_set
         .iter()
         .map(|e| encoded_build_path(e).to_string())
