@@ -438,6 +438,31 @@ fn reorder_misses(miss_slots: &[usize], len: usize) -> Vec<usize> {
     v
 }
 
+/// Indices of `paths` grouped by the DERIVATION they name, in first-seen
+/// order; every opaque path is its own group. The groups partition
+/// `0..paths.len()` and each group's indices are ascending, which is what
+/// lets the caller write results back by index without a second pass.
+fn split_by_derivation(store_dir: &StoreDir, paths: &[SingleDerivedPath]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for (i, p) in paths.iter().enumerate() {
+        let key = match p {
+            SingleDerivedPath::Opaque(path) => format!("opaque:{i}:{path}"),
+            SingleDerivedPath::Built { drv_path, .. } => {
+                format!("drv:{}", store_dir.display(drv_path.as_ref()))
+            }
+        };
+        match index.get(&key) {
+            Some(&g) => groups[g].push(i),
+            None => {
+                index.insert(key, groups.len());
+                groups.push(vec![i]);
+            }
+        }
+    }
+    groups
+}
+
 /// Put freshly realised paths back into the slots their requests came from.
 ///
 /// Extracted and generic so it can be tested: the daemon-facing half of the
@@ -532,6 +557,56 @@ impl Drop for RealiseTimer {
 /// connections still needs a runtime that can run the request that says so.
 fn rpc_worker_threads(pool_max: usize) -> usize {
     pool_max.max(1)
+}
+
+#[cfg(test)]
+mod split_by_derivation_tests {
+    use super::split_by_derivation;
+    use harmonia_store_derivation::derived_path::{OutputName, SingleDerivedPath};
+    use harmonia_store_path::StoreDir;
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    fn built(sd: &StoreDir, drv: &str, out: &str) -> SingleDerivedPath {
+        SingleDerivedPath::Built {
+            drv_path: Arc::new(SingleDerivedPath::Opaque(sd.parse(drv).unwrap())),
+            output: OutputName::from_str(out).unwrap(),
+        }
+    }
+
+    /// Two derivations never share a request; two outputs of one do; an
+    /// opaque path is its own group. Order is first-seen and every index
+    /// lands in exactly one group, which is what the write-back relies on.
+    #[test]
+    fn two_derivations_are_two_groups_and_one_derivation_stays_batched() {
+        let sd = StoreDir::new("/nix/store").unwrap();
+        let a = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fail-a.drv";
+        let b = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fail-b.drv";
+        let paths = vec![
+            built(&sd, a, "out"),
+            built(&sd, b, "out"),
+            built(&sd, a, "dev"),
+            SingleDerivedPath::Opaque(
+                sd.parse("/nix/store/cccccccccccccccccccccccccccccccc-src")
+                    .unwrap(),
+            ),
+        ];
+        let groups = split_by_derivation(&sd, &paths);
+        assert_eq!(groups, vec![vec![0, 2], vec![1], vec![3]]);
+        let mut all: Vec<usize> = groups.concat();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3], "a partition of the request");
+    }
+
+    /// THE COMMON CASE IS ONE GROUP, and the caller keeps the single
+    /// request for it, so a per-task realise is unchanged by the split.
+    #[test]
+    fn a_single_derivation_request_is_one_group() {
+        let sd = StoreDir::new("/nix/store").unwrap();
+        let a = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-one.drv";
+        let groups = split_by_derivation(&sd, &[built(&sd, a, "out"), built(&sd, a, "out.d")]);
+        assert_eq!(groups.len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -1044,7 +1119,43 @@ impl BuilderRpcClient {
             return Ok(out.into_iter().map(|o| o.expect("all hits")).collect());
         }
 
-        let built = self.build_paths_uncached(store_dir, &misses, patience)?;
+        // ONE DERIVATION PER REQUEST, and the reason is a daemon bug this
+        // client cannot see past. nix 2.36.0pre segfaults a worker in
+        // DerivationBuilderImpl::cleanupBuild whenever ONE
+        // BuildPathsWithResults names two or more derivations that both
+        // FAIL: the goal set's teardown after the first failure clears a
+        // pointer the second failed goal's cleanup then reads. Isolated
+        // 2026-09-19 with examples/failing_build.rs, every arm read off the
+        // daemon's crash count: one failing derivation of any kind never
+        // crashes, two in one request always do, two through plain
+        // `nix build --keep-going` do not. The retry arm below then costs
+        // one worker per attempt, which is the four-in-a-row signature the
+        // DaemonStalled abort reports as a wedge.
+        //
+        // So a request naming more than one DERIVATION is split by
+        // derivation. Opaque paths and the outputs of one derivation stay
+        // batched, since the merge below is what keys results correctly
+        // for those. The cost is one round trip per derivation at the sites
+        // that ask for several at once, which are the placement passes at
+        // the end of a run; the per-task realise path asks for one.
+        let groups = split_by_derivation(store_dir, &misses);
+        let built = if groups.len() <= 1 {
+            self.build_paths_uncached(store_dir, &misses, patience)?
+        } else {
+            let mut by_slot: Vec<Option<StorePath>> = vec![None; misses.len()];
+            for group in groups {
+                let subset: Vec<SingleDerivedPath> =
+                    group.iter().map(|&i| misses[i].clone()).collect();
+                let got = self.build_paths_uncached(store_dir, &subset, patience)?;
+                for (&i, sp) in group.iter().zip(got) {
+                    by_slot[i] = Some(sp);
+                }
+            }
+            by_slot
+                .into_iter()
+                .map(|o| o.expect("every miss belongs to exactly one group"))
+                .collect()
+        };
         {
             let mut cache = self.realised.lock().unwrap();
             for (&slot, sp) in miss_slots.iter().zip(built.iter()) {
