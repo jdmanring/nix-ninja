@@ -11594,11 +11594,30 @@ mod forced_include_wiring_tests {
             }
         }
         let scan =
-            deps_infer::c_include_parser::retrieve_c_includes_checked(&cmd, files, None).unwrap();
+            deps_infer::c_include_parser::retrieve_c_includes_checked(&cmd, files.clone(), None)
+                .unwrap();
         assert!(
             scan.includes.iter().any(|p| p.ends_with("inner.h")),
             "the header reached only through the forced include must be declared: {:?}",
             scan.includes
+        );
+        // AND THE FORCED HEADER ITSELF MUST REACH THE UPLOAD. The walk
+        // returns the seeds among its includes, and `discover_c_includes`
+        // skips every path that is a declared input. The forced seed sat in
+        // the seed list and was skipped with them, so the task got inner.h
+        // and never forced.h: the first gate verdict measured exactly that.
+        // Model the filter the way the site now builds it and assert the
+        // forced header survives it.
+        let forced = forced_include_seeds(&cmd, &build);
+        let declared = super::declared_skip_set(files.clone(), &forced);
+        let uploaded: Vec<_> = scan
+            .includes
+            .iter()
+            .filter(|p| !declared.contains(*p))
+            .collect();
+        assert!(
+            uploaded.iter().any(|p| p.ends_with("forced.h")),
+            "the forced header must be among the uploads, not filtered as declared: {uploaded:?}"
         );
 
         // THE CONTROL: the same TU with no forced include declares nothing
@@ -11662,6 +11681,15 @@ mod generated_not_yet_written_tests {
         assert!(!generated_not_yet_written(&bd, &rel, Some(&vp)));
         std::fs::remove_dir_all(&bd).ok();
     }
+}
+
+/// The paths the upload loop skips as ALREADY DECLARED: the scan's seeds
+/// minus the forced-include headers among them. A forced header is seeded
+/// so its includes are walked and is declared by no edge, so it must reach
+/// the upload like anything else the walk found. One function so the test
+/// runs the filter the site runs, not a copy of it.
+fn declared_skip_set(seeds: Vec<PathBuf>, forced: &[PathBuf]) -> HashSet<PathBuf> {
+    seeds.into_iter().filter(|f| !forced.contains(f)).collect()
 }
 
 /// A discovered include that the caller declared virtual and that nothing
@@ -12244,10 +12272,26 @@ pub fn discover_c_includes(
     // include, so a read-back already carries it, and seeding here keeps the
     // two paths agreeing on run one and run two rather than fixing whichever
     // one the reproduction happened to take.
+    // THE SEED IS ALSO AN INPUT, AND IT WAS SKIPPED AS ONE. `files` is the
+    // task's DECLARED inputs, already carried, and the upload loop below
+    // skips every path in it on the reasoning that a declared input needs
+    // no second upload. A forced header is not declared by any edge; it
+    // was pushed into `files` so the walk would open it, and the same
+    // membership then skipped its upload, so the task received the
+    // header's INCLUDES and not the header. `<command-line>: fatal error:
+    // tracker-private.h` on the tree that carried the fix, measured the
+    // first time the gate produced a verdict (2026-09-19, once the daemon
+    // crash that had swallowed every earlier run was split away). Five
+    // unit tests and a wiring test all stopped at the scan.
+    //
+    // So the forced seeds are kept apart: seeded for the scan, and then
+    // treated as DISCOVERED so they are uploaded like anything else the
+    // walk found.
+    let forced: Vec<PathBuf> = forced_include_seeds(cmdline, build_dir);
     let mut files = files;
-    for seed in forced_include_seeds(cmdline, build_dir) {
-        if !files.contains(&seed) {
-            files.push(seed);
+    for seed in &forced {
+        if !files.contains(seed) {
+            files.push(seed.clone());
         }
     }
     let seed = files
@@ -12411,8 +12455,9 @@ pub fn discover_c_includes(
     // declared. See the upload guard below.
     let mut absent: Vec<PathBuf> = Vec::new();
 
-    // Convert input files to a set for filtering
-    let input_files: HashSet<PathBuf> = files.into_iter().collect();
+    // Convert input files to a set for filtering. A forced-include seed is
+    // NOT a declared input and must not be filtered as one; see above.
+    let input_files = declared_skip_set(files, &forced);
 
     // Declared-and-opened, deduped: a header reached twice in one preprocess
     // is one input kept, and counting occurrences could push the numerator
