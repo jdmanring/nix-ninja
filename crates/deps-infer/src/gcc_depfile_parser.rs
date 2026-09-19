@@ -103,12 +103,20 @@ pub fn create_deps_command(cmdline: &str, config: &DepsConfig) -> Result<Command
                 i += 1;
             }
         }
-        // Handle system include paths
-        else if arg.starts_with("-isystem") {
-            if arg.len() > 8 {
+        // Handle the other include-path flags. `-iquote` was dropped here
+        // while the scanner honoured it, so a TU whose only route to a
+        // header was a quote dir preprocessed against a narrower search
+        // path than the compile uses and failed for a reason that was not
+        // the TU's: qemu's `-iquote .` is where every `<target>-config-
+        // target.h` lives.
+        else if let Some(flag) = ["-isystem", "-iquote", "-idirafter"]
+            .iter()
+            .find(|f| arg.starts_with(*f))
+        {
+            if arg.len() > flag.len() {
                 include_flags.push(arg.clone());
             } else if i + 1 < args.len() {
-                include_flags.push(format!("-isystem{}", args[i + 1]));
+                include_flags.push(format!("{flag}{}", args[i + 1]));
                 i += 1;
             }
         }
@@ -215,6 +223,12 @@ mod tests {
                 input: "g++ -Iinclude -I. -Wall -O2 -std=c++14 -DDEBUG -o output.o -c src/main.cpp",
                 config: DepsConfig::default(),
                 expected: Ok("g++ -Iinclude -I. -std=c++14 -DDEBUG -MM -MF deps.d src/main.cpp"),
+            },
+            TestCase {
+                name: "quote and after dirs are forwarded, attached and separate",
+                input: "gcc -iquote . -iquote/src/include -idirafter /sys -I. -c cpu.c",
+                config: DepsConfig::default(),
+                expected: Ok("gcc -iquote. -iquote/src/include -idirafter/sys -I. -MM -MF deps.d cpu.c"),
             },
             TestCase {
                 name: "spaces in include paths",

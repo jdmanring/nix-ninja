@@ -46,14 +46,98 @@ pub fn retrieve_c_includes_checked(
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
 ) -> Result<Scan> {
     let includes = gcc_include_parser::parse_include_dirs(cmdline)?;
-    bfs_parse_includes(files, &includes, virtual_paths)
+    let defines = cmdline_path_defines(cmdline);
+    bfs_parse_includes_with_defines(files, &includes, virtual_paths, defines)
 }
 
-/// Recursively collect all dependencies using BFS
+/// Object-like macros the COMMAND LINE defines to a string literal.
+///
+/// A GENERATED HEADER NAMED ONLY BY A `-D` VALUE IS UNREACHABLE BY ANY READ
+/// OF THE SOURCES, and the preprocessor fallback cannot save it. qemu 10.x
+/// compiles every emulator TU with `-DCONFIG_TARGET="i386-softmmu-config-target.h"`
+/// and the source says `#include CONFIG_TARGET`; the file name exists as a
+/// macro value and appears as a literal in no file. The walk records the use
+/// and finds no define, so it reports itself incomplete, and the fallback
+/// preprocesses the TU on the OUTER tree, where the generating edge has not
+/// run yet: gcc prints `<command-line>: fatal error: ...: No such file or
+/// directory`, the driver keeps the scan's answer by design, and the task
+/// dies on the same sentence in a sandbox that holds no such file.
+///
+/// The command line is the third place a path-shaped define can live, next
+/// to the same-file and cross-file forms this walk already resolves, and it
+/// is handed to the walk exactly as those are: as a define whose uses resolve
+/// through the includer's directory and the include dirs, against the virtual
+/// map, so a not-yet-written header is DECLARED rather than read. Both
+/// spellings the shell hands gcc are accepted, `-DX="a.h"` after shell
+/// quoting and `-D X=...` split across two arguments; a define whose body is
+/// not one quoted literal is not path shaped and is left to the preprocessor.
+fn cmdline_path_defines(cmdline: &str) -> Vec<(String, String)> {
+    let Ok(args) = shell_words::split(cmdline) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        let body: Option<&str> = if let Some(rest) = a.strip_prefix("-D") {
+            if rest.is_empty() {
+                i += 1;
+                args.get(i).map(|s| s.as_str())
+            } else {
+                Some(rest)
+            }
+        } else {
+            None
+        };
+        i += 1;
+        let Some(body) = body else { continue };
+        let Some((name, val)) = body.split_once('=') else {
+            continue;
+        };
+        if name.is_empty()
+            || name.contains('(')
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        // THE SHELL SPLIT ALREADY ATE THE QUOTES. `-DX="a.h"` reaches gcc
+        // as the single argument `X=a.h`, and that is what shell_words hands
+        // back too, so the body of a string-literal define is bare here. A
+        // body that still opens and closes with a quote came through an
+        // escaped spelling (`\"a.h\"` in a build.ninja) and is unwrapped
+        // the same way. What makes it path shaped is that gcc will
+        // stringify it as one literal; a body carrying whitespace, a
+        // remaining quote, or nothing at all is not one and is left to the
+        // preprocessor.
+        let val = val.trim();
+        let val = val
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(val);
+        if val.is_empty() || val.contains(char::is_whitespace) || val.contains('"') {
+            continue;
+        }
+        out.push((name.to_string(), val.to_string()));
+    }
+    out
+}
+
+/// Recursively collect all dependencies using BFS. The tests call this
+/// form; production always arrives with the command line's defines.
+#[cfg(test)]
 fn bfs_parse_includes(
     files: Vec<PathBuf>,
     include_dirs: &[PathBuf],
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+) -> Result<Scan> {
+    bfs_parse_includes_with_defines(files, include_dirs, virtual_paths, Vec::new())
+}
+
+fn bfs_parse_includes_with_defines(
+    files: Vec<PathBuf>,
+    include_dirs: &[PathBuf],
+    virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+    cmdline_defines: Vec<(String, String)>,
 ) -> Result<Scan> {
     // Set by any file carrying a directive this parser cannot expand.
     let mut incomplete = false;
@@ -70,6 +154,15 @@ fn bfs_parse_includes(
     // the safe direction). Uses are kept for the whole walk so a value
     // arriving after the use still resolves; `resolved` dedups the pairs.
     let mut tu_defines: rustc_hash::FxHashMap<String, Vec<String>> = Default::default();
+    // The command line's defines are in force before any file is read, so
+    // they seed the map; a same-name define in a file is a second candidate
+    // and both are declared, the walk's usual over-declaring polarity.
+    for (k, v) in cmdline_defines {
+        let vals = tu_defines.entry(k).or_default();
+        if !vals.contains(&v) {
+            vals.push(v);
+        }
+    }
     let mut pending_uses: Vec<(PathBuf, String)> = Vec::new();
     let mut resolved: rustc_hash::FxHashSet<(PathBuf, String, String)> = Default::default();
 
@@ -1159,6 +1252,81 @@ mod tests {
         assert!(
             !incomplete2,
             "an ordinary source must NOT trigger the preprocessor fallback: {got2:?}"
+        );
+    }
+
+    /// qemu's shape: the header's name exists only as a `-D` value, and the
+    /// header itself is GENERATED, so it is declared virtual and absent.
+    #[test]
+    fn computed_include_through_a_cmdline_define_is_declared() {
+        let _g = scan_lock();
+        let _scratch = Scratch::new("nn-cmdline-define");
+        let d = _scratch.0.clone();
+        std::fs::write(d.join("cpu.c"), "#include CONFIG_TARGET\n").unwrap();
+        let gen = d.join("i386-softmmu-config-target.h");
+        // NOT WRITTEN: the generating edge has not run. Only the virtual
+        // map can answer for it, which is the half the preprocessor
+        // fallback cannot take.
+        let mut vp = HashMap::new();
+        vp.insert(gen.clone(), gen.clone());
+        let cmd = format!(
+            "gcc -I{} -DCONFIG_TARGET=\"i386-softmmu-config-target.h\" -c cpu.c",
+            d.display()
+        );
+        let Scan {
+            includes,
+            incomplete,
+            ..
+        } = retrieve_c_includes_checked(&cmd, vec![d.join("cpu.c")], Some(vp)).unwrap();
+        assert!(
+            includes.contains(&gen),
+            "the -D-named generated header must be declared: {includes:?}"
+        );
+        assert!(
+            !incomplete,
+            "with the define read off the command line the scan is complete"
+        );
+
+        // THE SPLIT SPELLING, `-D NAME=...` as two arguments.
+        let cmd2 = format!(
+            "gcc -I{} -D CONFIG_TARGET=\"i386-softmmu-config-target.h\" -c cpu.c",
+            d.display()
+        );
+        let mut vp2 = HashMap::new();
+        vp2.insert(gen.clone(), gen.clone());
+        let got2 = retrieve_c_includes_checked(&cmd2, vec![d.join("cpu.c")], Some(vp2)).unwrap();
+        assert!(got2.includes.contains(&gen), "{:?}", got2.includes);
+
+        // NEGATIVE CONTROL: with no -D the use is undefined and the scan
+        // must still say so, or the fallback that covers every other
+        // computed include stops firing.
+        let cmd3 = format!("gcc -I{} -c cpu.c", d.display());
+        let mut vp3 = HashMap::new();
+        vp3.insert(gen.clone(), gen.clone());
+        let got3 = retrieve_c_includes_checked(&cmd3, vec![d.join("cpu.c")], Some(vp3)).unwrap();
+        assert!(!got3.includes.contains(&gen));
+        assert!(
+            got3.incomplete,
+            "an undefined macro use is still incomplete"
+        );
+
+        // A define with no body, a function-like define, and a body that is
+        // not one token are not path shaped. `FOO=1` IS read, and that is
+        // fine: a use of it resolves against a file named `1` that does not
+        // exist and declares nothing, the same as any macro whose value is
+        // not a header.
+        assert_eq!(
+            cmdline_path_defines("gcc -DBAR -DF(x)=q.h -DTWO='a b' -c a.c"),
+            Vec::<(String, String)>::new()
+        );
+        // The shell strips the quotes before gcc sees them; an escaped
+        // spelling keeps them and is unwrapped.
+        assert_eq!(
+            cmdline_path_defines("gcc -DX=\"a.h\" -DY='\"b.h\"' -c a.c"),
+            vec![
+                ("X".to_string(), "a.h".to_string()),
+                ("Y".to_string(), "b.h".to_string())
+            ]
         );
     }
 
