@@ -23,6 +23,11 @@ struct BuildImplicitVars<'a> {
     // absent here, so commands like `--definitions ${rspfile}` (GN
     // emits these for every action) silently lost the argument.
     rspfile_path: Option<String>,
+    /// Shell-escape `$in`/`$out` expansions. Ninja does this for `command`
+    /// alone (`EdgeEnv::kShellEscape` in `Edge::EvaluateCommand`); every
+    /// other binding, `description` and `depfile` among them, reads the
+    /// names bare (`kDoNotEscape`).
+    shell_escape: bool,
 }
 impl<'a> BuildImplicitVars<'a> {
     fn file_list(&self, ids: &[FileId], sep: char) -> String {
@@ -31,11 +36,48 @@ impl<'a> BuildImplicitVars<'a> {
             if !out.is_empty() {
                 out.push(sep);
             }
-            out.push_str(&self.graph.file(id).name);
+            if self.shell_escape {
+                shell_escape_into(&self.graph.file(id).name, &mut out);
+            } else {
+                out.push_str(&self.graph.file(id).name);
+            }
         }
         out
     }
 }
+
+/// Whether `ch` can reach a POSIX shell unquoted. The set is ninja's own
+/// `IsKnownShellSafeCharacter` (src/util.cc): alphanumerics and `_+-./`.
+fn shell_safe(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '+' | '-' | '.' | '/')
+}
+
+/// Append `path` to `out` the way ninja's `GetShellEscapedString` does: a
+/// path made only of safe characters is appended bare; anything else is
+/// wrapped in single quotes with each embedded quote spelled `'\''`.
+///
+/// Ninja escapes `$in` and `$out` when it evaluates `command` (the
+/// `kShellEscape` `EdgeEnv` in `Edge::EvaluateCommand`), so a build path
+/// containing a space or a quote reaches the shell as one argument. This
+/// expansion appended the raw name, and a meson target directory named
+/// after its target (`test/khronos typedefs.p/`, libepoxy 1.5.10) split
+/// `-o test/khronos typedefs.p/x.o` into two arguments at the shell.
+fn shell_escape_into(path: &str, out: &mut String) {
+    if path.chars().all(shell_safe) {
+        out.push_str(path);
+        return;
+    }
+    out.push('\'');
+    for ch in path.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+}
+
 impl<'a> eval::Env for BuildImplicitVars<'a> {
     fn get_var(&self, var: &str) -> Option<EvalString<Cow<str>>> {
         let string_to_evalstring =
@@ -148,6 +190,7 @@ impl Loader {
             graph: &self.graph,
             build: &build,
             rspfile_path: None,
+            shell_escape: false,
         };
         let build_vars = &b.vars;
         let pre_lookup = |key: &str| -> Option<String> {
@@ -163,21 +206,29 @@ impl Loader {
         let implicit_vars = BuildImplicitVars {
             graph: &self.graph,
             build: &build,
+            rspfile_path: rspfile_path_early.clone(),
+            shell_escape: false,
+        };
+        // `command` is the one binding whose expansion reaches a shell, so
+        // it is the one where `$in`/`$out` are quoted, as ninja quotes them.
+        let command_vars = BuildImplicitVars {
+            graph: &self.graph,
+            build: &build,
             rspfile_path: rspfile_path_early,
+            shell_escape: true,
         };
 
-        let lookup = |key: &str| -> Option<String> {
+        let lookup_with = |vars: &BuildImplicitVars, key: &str| -> Option<String> {
             // Look up `key = ...` binding in build and rule block.
             // See "Variable scope" in the design notes.
             Some(match build_vars.get(key) {
                 Some(val) => val.evaluate(env),
-                None => rule
-                    .get(key)?
-                    .evaluate(&chain(&[&implicit_vars, build_vars], env)),
+                None => rule.get(key)?.evaluate(&chain(&[vars, build_vars], env)),
             })
         };
+        let lookup = |key: &str| lookup_with(&implicit_vars, key);
 
-        let cmdline = lookup("command");
+        let cmdline = lookup_with(&command_vars, "command");
         let desc = lookup("description");
         let depfile = lookup("depfile");
         let deps = match lookup("deps").as_deref() {
@@ -355,6 +406,36 @@ pub fn read(build_filename: &str) -> anyhow::Result<State> {
 }
 
 /// Parse a single file's content.
+#[cfg(test)]
+mod shell_escape_tests {
+    use super::shell_escape_into;
+
+    fn esc(p: &str) -> String {
+        let mut s = String::new();
+        shell_escape_into(p, &mut s);
+        s
+    }
+
+    /// Ninja's own cases: a safe path is bare, a space is quoted, an
+    /// embedded quote is spelled `'\''`, and the safe set is exactly
+    /// alphanumerics plus `_+-./`, so a non-ASCII name is quoted too.
+    #[test]
+    fn in_out_are_escaped_as_ninja_escapes_them() {
+        assert_eq!(
+            esc("test/khronos_typedefs.c.o"),
+            "test/khronos_typedefs.c.o"
+        );
+        assert_eq!(esc("a+b-c.d/e_f"), "a+b-c.d/e_f");
+        assert_eq!(
+            esc("test/khronos typedefs.p/x.o"),
+            "'test/khronos typedefs.p/x.o'"
+        );
+        assert_eq!(esc("it's.o"), "'it'\\''s.o'");
+        assert_eq!(esc("a=b"), "'a=b'");
+        assert_eq!(esc("reykjav\u{ed}k.md"), "'reykjav\u{ed}k.md'");
+    }
+}
+
 #[cfg(test)]
 pub fn parse(name: &str, mut content: Vec<u8>) -> anyhow::Result<graph::Graph> {
     content.push(0);

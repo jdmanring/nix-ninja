@@ -177,6 +177,9 @@ rule echo
     )?;
     space.write("reykjavík.md", "")?;
     let out = space.run_expect(&mut n2_command(vec!["out"]))?;
+    // The description reads the name bare; the command receives it
+    // shell-quoted (a non-ASCII byte is outside ninja's safe set), and the
+    // shell strips the quotes before echo sees it.
     assert_output_contains(&out, "unicode variable: reykjavík.md");
     assert_output_contains(&out, "unicode command line: reykjavík.md");
 
@@ -328,5 +331,28 @@ fn missing_command() -> anyhow::Result<()> {
         // /bin/sh prints "not found", so just look for that substring.
         assert_output_contains(&out, "not found");
     }
+    Ok(())
+}
+
+/// A build path containing a space reaches the shell as ONE argument.
+/// meson names a target directory after its target (libepoxy 1.5.10,
+/// `test/khronos typedefs.p/`), and `$out` expanded bare split `-o` in two.
+/// Ninja escapes `$in` and `$out` inside `command`; so must this.
+#[test]
+fn out_with_a_space_is_one_shell_argument() -> anyhow::Result<()> {
+    let space = TestSpace::new()?;
+    space.write(
+        "build.ninja",
+        &[
+            "rule cp",
+            "  command = cp $in $out",
+            "build sub$ dir/out$ file: cp in$ file",
+            "",
+        ]
+        .join("\n"),
+    )?;
+    space.write("in file", "payload")?;
+    space.run_expect(&mut n2_command(vec!["sub dir/out file"]))?;
+    assert_eq!(space.read("sub dir/out file")?, b"payload");
     Ok(())
 }
