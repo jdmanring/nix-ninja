@@ -11565,6 +11565,60 @@ fn merge_scan_and_preprocessor(scanned: Vec<PathBuf>, preprocessed: Vec<PathBuf>
 }
 
 #[cfg(test)]
+mod forced_include_wiring_tests {
+    //! THE WIRING, NOT THE RULE. `forced_include_seeds` has three tests of
+    //! its own and a mutant deleting the CALL to it in `discover_c_includes`
+    //! survived all of them: nothing proved the seed reaches the scan. This
+    //! drives the same seeding the way that site does and asserts the walk
+    //! declares a header reachable ONLY through the forced one.
+    use super::{forced_include_seeds, Scratch};
+    use std::fs;
+
+    #[test]
+    fn a_forced_include_seeds_the_scan() {
+        let d = Scratch::new(format!("nn-fi-wire-{}", std::process::id()));
+        let src = d.join("src");
+        let build = d.join("build");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::write(src.join("forced.h"), "#include \"inner.h\"\n").unwrap();
+        fs::write(src.join("inner.h"), "#define INNER 1\n").unwrap();
+        // The TU names NOTHING: inner.h is reachable only via forced.h.
+        fs::write(src.join("a.c"), "int a(void){return INNER;}\n").unwrap();
+        let cmd = format!("gcc -I{} -include forced.h -c a.c -o a.o", src.display());
+
+        let mut files = vec![src.join("a.c")];
+        for seed in forced_include_seeds(&cmd, &build) {
+            if !files.contains(&seed) {
+                files.push(seed);
+            }
+        }
+        let scan =
+            deps_infer::c_include_parser::retrieve_c_includes_checked(&cmd, files, None).unwrap();
+        assert!(
+            scan.includes.iter().any(|p| p.ends_with("inner.h")),
+            "the header reached only through the forced include must be declared: {:?}",
+            scan.includes
+        );
+
+        // THE CONTROL: the same TU with no forced include declares nothing
+        // beyond itself, so the assertion above cannot pass by accident.
+        let cmd2 = format!("gcc -I{} -c a.c -o a.o", src.display());
+        let scan2 = deps_infer::c_include_parser::retrieve_c_includes_checked(
+            &cmd2,
+            vec![src.join("a.c")],
+            None,
+        )
+        .unwrap();
+        assert!(
+            !scan2.includes.iter().any(|p| p.ends_with("inner.h")),
+            "without the flag nothing reaches inner.h: {:?}",
+            scan2.includes
+        );
+    }
+}
+
+#[cfg(test)]
 mod generated_not_yet_written_tests {
     use super::generated_not_yet_written;
     use std::collections::HashMap;
