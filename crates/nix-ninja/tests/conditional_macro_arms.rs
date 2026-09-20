@@ -156,3 +156,81 @@ fn the_arm_gcc_takes_is_declared_when_it_resolves() {
         "the resolving arm must be declared: {got:?}"
     );
 }
+
+/// THE `#undef`-SEPARATED SPELLING OF THE SAME DEFECT (gperftools 2.17.2,
+/// `src/stacktrace.cc`).
+///
+/// Mesa writes its arms as one `#if/#elif` chain. gperftools writes them as
+/// a flat sequence of `#define` / `#include` / `#undef` pairs, ten of them,
+/// each arm guarded by its own `#if`:
+///
+///     #if HAVE_DECL_BACKTRACE
+///     #define STACKTRACE_INL_HEADER "stacktrace_generic-inl.h"
+///     #include "stacktrace_impl_setup-inl.h"
+///     #undef STACKTRACE_INL_HEADER
+///     #endif
+///     #ifdef HAVE_UNWIND_BACKTRACE
+///     #define STACKTRACE_INL_HEADER "stacktrace_libgcc-inl.h"
+///     #include "stacktrace_impl_setup-inl.h"
+///     #undef STACKTRACE_INL_HEADER
+///     #endif
+///     ... eight more, ending on stacktrace_win32-inl.h
+///
+/// The consumer reported this one as "defined ONCE, a single arm", and the
+/// shape it actually has decides the answer: the last arm is win32, the arm
+/// gcc takes under `HAVE_UNWIND_BACKTRACE` is the libgcc one, and the fix
+/// is the same. Measured on the real file, the generated libgcc header is
+/// declared at `04539e8` and absent at `37672a4`.
+///
+/// WHY THIS IS A SEPARATE TEST. The mechanism is the same map, but the
+/// failure mode a later change would introduce is different: an
+/// implementation that treated `#undef` as "this name is gone" would satisfy
+/// the mesa test (no `#undef` in an if/elif chain) and silently drop every
+/// arm before the last here. The assertion below is that an `#undef`
+/// BETWEEN arms does not clear the arms already collected.
+#[test]
+fn an_undef_between_arms_does_not_discard_earlier_arms() {
+    let _s = Scratch::new("nn-cond-arms-undef");
+    let d = &_s.0;
+    fs::write(d.join("stacktrace.cc"), "#include \"setup.h\"\n").unwrap();
+    fs::write(
+        d.join("setup.h"),
+        "#ifdef A\n\
+         #define INL_H \"arm_a-inl.h\"\n\
+         #include INL_H\n\
+         #undef INL_H\n\
+         #endif\n\
+         #ifdef B\n\
+         #define INL_H \"arm_b-inl.h\"\n\
+         #include INL_H\n\
+         #undef INL_H\n\
+         #endif\n\
+         #ifdef C\n\
+         #define INL_H \"arm_c-inl.h\"\n\
+         #include INL_H\n\
+         #undef INL_H\n\
+         #endif\n",
+    )
+    .unwrap();
+    // Every arm is generated, so only the collected defines can declare any
+    // of them and each `#include` is answered from the arms list alone.
+    let mut vp = HashMap::new();
+    for a in ["arm_a-inl.h", "arm_b-inl.h", "arm_c-inl.h"] {
+        let p = d.join(a);
+        vp.insert(p.clone(), p);
+    }
+
+    let got = scan(
+        &format!("g++ -I{} -c stacktrace.cc", d.display()),
+        d.join("stacktrace.cc"),
+        vp,
+    );
+
+    for a in ["arm_a-inl.h", "arm_b-inl.h", "arm_c-inl.h"] {
+        assert!(
+            got.contains(&d.join(a)),
+            "an arm followed by #undef is still a candidate the walk carries, \
+             and resolution is the filter; {a} is missing from {got:?}"
+        );
+    }
+}
