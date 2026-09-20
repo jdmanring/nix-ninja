@@ -518,7 +518,19 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
     let data = std::fs::read(path)
         .map_err(|e| anyhow!("Failed to read file {}: {}", path.display(), e))?;
     let mut directives = Vec::new();
-    let mut macro_paths: std::collections::HashMap<String, String> = Default::default();
+    // EVERY ARM'S VALUE, NOT THE LAST ONE. A macro defined once per
+    // `#if DETECT_ARCH_*` arm keeps one candidate per arm, in file order.
+    // This map held a single String, so the LAST `#define` silently replaced
+    // the earlier ones and only that arm could ever be declared: mesa 25.x
+    // defines `_GLAPI_ENTRY_ARCH_TLS_H` three times in `glapi_priv.h`, the
+    // ppc64le arm is checked in and the x86 arm the compiler takes is
+    // generated, so the scan declared the header for another architecture
+    // and the task died on the one gcc asked for (consumer round
+    // 20260920-040429, `glapi/entry_x86_tls.h: No such file or directory`).
+    // The walk already over-declares deliberately - an extra input is
+    // harmless, a missing one kills the task - so keeping every arm is the
+    // shape it wants.
+    let mut macro_paths: std::collections::HashMap<String, Vec<String>> = Default::default();
     let mut macro_uses: Vec<String> = Vec::new();
     let mut computed_unresolvable: Vec<String> = Vec::new();
     for raw in data.split(|&b| b == b'\n') {
@@ -556,18 +568,26 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
                     && val.ends_with('"')
                     && !name.contains('(')
                 {
-                    macro_paths.insert(name.to_string(), val[1..val.len() - 1].to_string());
+                    let vals = macro_paths.entry(name.to_string()).or_default();
+                    let v = val[1..val.len() - 1].to_string();
+                    if !vals.contains(&v) {
+                        vals.push(v);
+                    }
                 }
             }
             continue;
         }
         if let Some(rest) = directive_rest(line, "include") {
             let token = rest.trim();
-            if let Some(path) = macro_paths.get(token) {
-                directives.push(Directive {
-                    quoted: true,
-                    name: PathBuf::from(path),
-                });
+            if let Some(paths) = macro_paths.get(token) {
+                // One directive per arm, so a checked-in arm and a generated
+                // arm both reach the walk and resolution decides.
+                for path in paths {
+                    directives.push(Directive {
+                        quoted: true,
+                        name: PathBuf::from(path),
+                    });
+                }
                 // AND still a use for the walk. A same-file define is often
                 // a GUARDED DEFAULT (#if !defined ... #define ... "x.ch")
                 // that the TU's root file overrides two files up, so the
@@ -598,7 +618,10 @@ pub fn scan_directives(path: &Path) -> Result<Arc<ScanResult>> {
 
     let directives = Arc::new(ScanResult {
         directives,
-        path_defines: macro_paths.into_iter().collect(),
+        path_defines: macro_paths
+            .into_iter()
+            .flat_map(|(k, vs)| vs.into_iter().map(move |v| (k.clone(), v)))
+            .collect(),
         macro_uses,
         computed_unresolvable,
     });
