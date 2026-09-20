@@ -2862,14 +2862,55 @@ mod named_dirs_to_create_tests {
     /// THE CONFINEMENT GUARD, with its own positive control beside it: a
     /// sibling of the build directory is admitted and an escape is not, so a
     /// mutant deleting the guard cannot pass by refusing everything.
+    ///
+    /// THE CLIMB IS COUNTED FROM THE TREE, NOT WRITTEN AS A LITERAL. The
+    /// guard's floor is the build directory's FIRST component, so how many
+    /// `..` reach it is a property of where the scratch directory happens to
+    /// sit, and a literal is a statement about the caller's TMPDIR instead of
+    /// about the guard. Measured: with `TMPDIR=/tmp` (a build dir five
+    /// components deep) a literal `../../../..` is refused and this test
+    /// passed; under `nix develop`, whose TMPDIR is `/tmp/nix-shell.XXXX` and
+    /// therefore one component deeper, the same literal lands one component
+    /// inside the floor and is ADMITTED, and the test failed. It failed that
+    /// way in this tree while a run outside the dev shell reported it green.
+    ///
+    /// What is asserted is the contract, and it holds at any depth: a climb
+    /// that reaches the floor is refused, and a climb that stops inside the
+    /// tree is admitted. Both spellings resolve to directories that EXIST, so
+    /// the refusal below is the guard's and not the existence filter's.
     #[test]
     fn an_escape_is_refused_while_a_sibling_is_admitted() {
         let d = Scratch::new(format!("nn-mkdirs-escape-{}", std::process::id()));
         let bd = d.join("a/b/build");
         std::fs::create_dir_all(&bd).unwrap();
         std::fs::create_dir_all(d.join("a/b/src")).unwrap();
-        let got = named_dirs_to_create("gcc -I../src -I../../../.. -c a.c -o a.o", &bd);
-        assert_eq!(got, vec!["../src"]);
+        let depth = bd
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .count();
+        assert!(depth >= 3, "the fixture needs a build dir to climb out of");
+
+        // ONE STEP SHORT OF THE FLOOR: lands on the root, which exists and is
+        // still refused, because popping the first component leaves the tree.
+        let to_floor = vec![".."; depth - 1].join("/");
+        assert!(
+            bd.join(&to_floor).is_dir(),
+            "the escape must EXIST, or the refusal below would be the \
+             existence filter rather than the guard"
+        );
+        let got = named_dirs_to_create(&format!("gcc -I../src -I{to_floor} -c a.c -o a.o"), &bd);
+        assert_eq!(got, vec!["../src"], "a climb to the floor is an escape");
+
+        // AND THE POSITIVE CONTROL: one step less stops inside the tree and is
+        // admitted, so a mutant refusing every climb cannot pass by refusing
+        // everything.
+        let inside = vec![".."; depth - 2].join("/");
+        let got = named_dirs_to_create(&format!("gcc -I{inside} -c a.c -o a.o"), &bd);
+        assert_eq!(
+            got,
+            vec![inside.as_str()],
+            "a climb that stays inside the tree is admitted"
+        );
     }
 }
 
