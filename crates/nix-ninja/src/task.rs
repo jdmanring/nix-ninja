@@ -5787,12 +5787,123 @@ mod compile_artifact_shaped_tests {
     #[test]
     fn a_header_is_header_shaped() {
         for n in ["genre.h", "id3tag.h", "cmake_pch.hxx", "x.inl"] {
-            assert!(
-                header_like(Path::new(n)),
-                "{n} must be carried as a header"
-            );
+            assert!(header_like(Path::new(n)), "{n} must be carried as a header");
         }
     }
+}
+
+/// THE HEADER A MULTI-ARM MACRO RESOLVES TO, READ FROM THE FILE THAT
+/// DEFINES IT.
+///
+/// `#include NAME` where NAME is defined in several `#if/#elif` arms is
+/// resolved by the scanner against the arms it collected while WALKING, and
+/// that walk keeps only the last `#define` of a name. mesa 25.x defines
+/// `_GLAPI_ENTRY_ARCH_TLS_H` three times in `glapi_priv.h` - x86, x86-64,
+/// ppc64le - and the compiler takes the FIRST arm while the walk kept the
+/// LAST, so the task carried `entry_ppc64le_tls.h` and died on
+/// `glapi/entry_x86_tls.h`. gperftools is the same shape with ten
+/// `#define`/`#undef` pairs.
+///
+/// THIS READS THE DEFINING FILE DIRECTLY, WHICH IS WHY IT CAN LIVE HERE.
+/// The driver already has the defining header in its input list - the scan
+/// declares it, and `glapi_priv.h` is in the failing task's own
+/// `NIX_NINJA_INPUTS` - so the arms are reachable without asking the frozen
+/// crate to keep them. A change to `crates/deps-infer` would move the task
+/// binary, which is the `builder` of every banked plain task derivation;
+/// this reader is in the driver, which sits in no task derivation at all.
+///
+/// EVERY RESOLVING ARM IS RETURNED, not the one the compiler would take.
+/// The arms are not evaluated here, deliberately, and for the same reason
+/// the scanner does not evaluate them: an extra input costs one upload
+/// while a missing one kills the task. A file that exists is carried; one
+/// that does not is left to the walk's own resolution.
+/// How many already-declared headers one task will read back for macro
+/// arms. A translation unit carrying more than this is not the shape the
+/// reader was written for, and the walk is bounded rather than linear in
+/// the package's whole include set.
+const MACRO_ARM_SCAN_CAP: usize = 4096;
+
+fn macro_arm_headers(
+    build_dir: &Path,
+    include_dirs: &[PathBuf],
+    defining_headers: &[PathBuf],
+) -> Vec<PathBuf> {
+    use std::collections::HashMap;
+
+    // Every arm of every string-valued object-like macro, per define site.
+    let mut arms: HashMap<String, Vec<String>> = HashMap::new();
+    for header in defining_headers {
+        let Ok(bytes) = std::fs::read(header) else {
+            continue;
+        };
+        for raw in bytes.split(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(raw);
+            let line = line.trim_start();
+            let Some(rest) = line.strip_prefix('#') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let Some(rest) = rest.strip_prefix("define") else {
+                continue;
+            };
+            // A directive is `define` followed by SPACE; `defined` and
+            // `definex` are other tokens that share the prefix.
+            if !rest.starts_with(|c: char| c.is_whitespace()) {
+                continue;
+            }
+            // TRIMMED, not split as-is: ` A_H "x.h"` splits on its leading
+            // space and yields an empty name, which read as no arms at all
+            // and made the reader a no-op on the exact file it was written
+            // for. Measured in this file's own tests first.
+            let mut it = rest.trim_start().splitn(2, char::is_whitespace);
+            let (Some(name), Some(val)) = (it.next(), it.next()) else {
+                continue;
+            };
+            let val = val.trim();
+            // A function-like macro is not an include spelling, and only a
+            // one-literal body can name a file.
+            if name.contains('(') || val.len() < 3 || !val.starts_with('"') || !val.ends_with('"') {
+                continue;
+            }
+            let path = &val[1..val.len() - 1];
+            let entry = arms.entry(name.to_string()).or_default();
+            if !entry.iter().any(|e| e == path) {
+                entry.push(path.to_string());
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (_name, paths) in arms {
+        // One arm is the ordinary case and the walk already resolved it.
+        if paths.len() < 2 {
+            continue;
+        }
+        for path in paths {
+            let p = PathBuf::from(&path);
+            let resolved = if p.is_absolute() {
+                p
+            } else {
+                // Against the include chain, then the includer's directory.
+                let mut hit = None;
+                for dir in include_dirs {
+                    let cand = dir.join(&p);
+                    if cand.exists() {
+                        hit = Some(cand);
+                        break;
+                    }
+                }
+                match hit {
+                    Some(h) => h,
+                    None => build_dir.join(&p),
+                }
+            };
+            if resolved.exists() && !out.contains(&resolved) {
+                out.push(resolved);
+            }
+        }
+    }
+    out
 }
 
 fn is_tree_path(p: &Path) -> bool {
@@ -11052,6 +11163,33 @@ pub fn discover_c_includes(
             }
         }
     };
+    // EVERY ARM OF A MULTI-ARM MACRO, RESOLVED FROM THE FILE THAT DEFINES
+    // IT. The walk keeps one arm per name and the compiler may take another,
+    // so the arms the walk dropped are added here. This runs in the DRIVER
+    // and reads headers the task already carries, which is why it can close
+    // the class without the frozen scanner keeping the arms: a scanner
+    // change would move the task binary, and that path is the `builder` of
+    // every banked plain task derivation.
+    //
+    // Gated on the arms being REACHABLE, which is the whole cost control: a
+    // translation unit whose macros have one arm each pays a walk over its
+    // already-declared headers and nothing else.
+    let c_includes = {
+        let mut v = c_includes;
+        let declaring: Vec<PathBuf> = v.iter().filter(|p| p.exists()).cloned().collect();
+        if declaring.len() <= MACRO_ARM_SCAN_CAP {
+            let dirs: Vec<PathBuf> = include_dirs_named(cmdline, build_dir)
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+            for extra in macro_arm_headers(build_dir, &dirs, &declaring) {
+                if !v.contains(&extra) {
+                    v.push(extra);
+                }
+            }
+        }
+        v
+    };
     let c_include_count = c_includes.len();
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
@@ -13486,5 +13624,101 @@ mod importable_subpackage_tests {
         // message names the wrong cause.
         let missing = std::path::Path::new("/nonexistent-dir-for-this-test/x");
         assert!(importable_subpackages(missing).is_err());
+    }
+}
+
+#[cfg(test)]
+mod macro_arm_headers_tests {
+    use super::macro_arm_headers;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("nn-armhdr-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).expect("scratch");
+        p
+    }
+
+    /// MESA 25.x, THE REAL FILE. `glapi_priv.h` defines
+    /// `_GLAPI_ENTRY_ARCH_TLS_H` once per `#if DETECT_ARCH_*` arm, and the
+    /// compiler takes the FIRST while the walk kept the LAST. The two arms
+    /// that are on disk must both come back.
+    #[test]
+    fn every_arm_of_mesa_macro_is_returned() {
+        let d = scratch("mesa");
+        let glapi = d.join("glapi");
+        fs::create_dir_all(&glapi).unwrap();
+        fs::write(
+            glapi.join("glapi_priv.h"),
+            "#if DETECT_ARCH_X86\n\
+             #define _GLAPI_ENTRY_ARCH_TLS_H \"glapi/entry_x86_tls.h\"\n\
+             #elif DETECT_ARCH_X86_64\n\
+             #define _GLAPI_ENTRY_ARCH_TLS_H \"glapi/entry_x86-64_tls.h\"\n\
+             #elif DETECT_ARCH_PPC_64\n\
+             #define _GLAPI_ENTRY_ARCH_TLS_H \"glapi/entry_ppc64le_tls.h\"\n\
+             #endif\n",
+        )
+        .unwrap();
+        // The arm gcc takes, and the last arm: both present on disk.
+        fs::write(glapi.join("entry_x86_tls.h"), "\n").unwrap();
+        fs::write(glapi.join("entry_ppc64le_tls.h"), "\n").unwrap();
+
+        let got = macro_arm_headers(
+            &d,
+            &[d.clone(), d.join("..")],
+            &[glapi.join("glapi_priv.h")],
+        );
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"entry_x86_tls.h".to_string()),
+            "the arm the compiler takes must be returned; got {names:?}"
+        );
+        assert!(
+            names.contains(&"entry_ppc64le_tls.h".to_string()),
+            "every resolving arm is returned, not only the taken one: {names:?}"
+        );
+    }
+
+    /// THE CONTROL. A macro defined ONCE is the ordinary case and the walk
+    /// already resolved it; the reader must add nothing, or every TU in
+    /// every package pays for a class it is not in.
+    #[test]
+    fn a_single_arm_macro_adds_nothing() {
+        let d = scratch("single");
+        fs::write(d.join("one.h"), "#define SIMD_HEADER \"simd-sse2.h\"\n").unwrap();
+        fs::write(d.join("simd-sse2.h"), "\n").unwrap();
+        let got = macro_arm_headers(&d, std::slice::from_ref(&d), &[d.join("one.h")]);
+        assert!(
+            got.is_empty(),
+            "a one-arm macro is the walk's own answer: {got:?}"
+        );
+    }
+
+    /// An arm that does not resolve is NOT invented. The reader carries a
+    /// file that exists and leaves a missing one to the walk, so a wrong
+    /// spelling cannot become an input.
+    #[test]
+    fn an_arm_that_does_not_exist_is_not_returned() {
+        let d = scratch("absent");
+        fs::write(
+            d.join("two.h"),
+            "#define A_H \"present.h\"\n#define A_H \"absent.h\"\n",
+        )
+        .unwrap();
+        fs::write(d.join("present.h"), "\n").unwrap();
+        let got = macro_arm_headers(&d, std::slice::from_ref(&d), &[d.join("two.h")]);
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"present.h".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"absent.h".to_string()),
+            "a missing arm is not an input: {names:?}"
+        );
     }
 }
