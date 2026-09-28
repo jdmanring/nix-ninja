@@ -2247,7 +2247,7 @@ impl Runner {
             // A SWIG RUN RESOLVES ITS OWN `%include` TARGETS. Same family and
             // same reader placement as the ones around it.
             if let Some(files) = &swig_i {
-                for p in swig_referenced_paths(&self.config.build_dir, &cd_dir, files) {
+                                for p in swig_referenced_paths(&self.config.build_dir, &cd_dir, files) {
                     referenced.push(p);
                 }
             }
@@ -7308,14 +7308,16 @@ mod its_and_swig_reader_tests {
     }
 }
 
-fn swig_referenced_paths(build_dir: &Path, cd_dir: &Path, args: &[String]) -> Vec<String> {
-    if !args.iter().any(|a| a.rsplit('/').next() == Some("swig")) {
-        return Vec::new();
-    }
+fn swig_referenced_paths(build_dir: &Path, cd_dir: &Path, files: &[String]) -> Vec<String> {
+    // THE TRIGGER IS NOT REPEATED HERE. This function receives the FILES the
+    // trigger found, not the argv, so testing for the program name against
+    // them answered no for every real invocation and the reader returned
+    // empty while its own unit test passed - the test drove the trigger
+    // helper only. One predicate, in `swig_invocation`.
     let root = build_dir.join(cd_dir);
     let mut out = Vec::new();
-    for a in args {
-        if a.starts_with('-') || !a.ends_with(".i") {
+    for a in files {
+        if !a.ends_with(".i") {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(root.join(a)) else {
@@ -7386,34 +7388,17 @@ fn msgfmt_invocation(args: &[String]) -> Option<Vec<String>> {
     Some(out)
 }
 
-fn msgfmt_its_referenced_paths(
-    build_dir: &Path,
-    cd_dir: &Path,
-    args: &[String],
-) -> Vec<String> {
-    if !args
-        .iter()
-        .any(|a| a.rsplit('/').next() == Some("msgfmthelper"))
-    {
-        return Vec::new();
-    }
+fn msgfmt_its_referenced_paths(build_dir: &Path, cd_dir: &Path, dirs: &[String]) -> Vec<String> {
+    // The trigger and the flag parse both live in `msgfmt_invocation`; this
+    // receives the DATADIR VALUES only. See the note in
+    // `swig_referenced_paths` for what repeating the trigger cost.
     let root = build_dir.join(cd_dir);
     let mut out = Vec::new();
-    let mut it = args.iter().peekable();
-    while let Some(a) = it.next() {
-        let datadir = if let Some(v) = a.strip_prefix("--datadirs=") {
-            Some(v.to_string())
-        } else if a == "--datadirs" {
-            it.next().cloned()
-        } else {
-            None
-        };
-        let Some(datadir) = datadir else { continue };
+    for datadir in dirs {
         if datadir.is_empty() {
             continue;
         }
-        let dir = root.join(&datadir);
-        let its_dir = dir.join("its");
+        let its_dir = root.join(datadir).join("its");
         let Ok(entries) = std::fs::read_dir(&its_dir) else {
             continue;
         };
@@ -7432,17 +7417,18 @@ fn msgfmt_its_referenced_paths(
             let Ok(text) = std::fs::read_to_string(&p) else {
                 continue;
             };
-            let mut push = |rel: PathBuf| {
+            // The spelling the command resolves, relative to the build dir.
+            let mut emit = |name: &str| {
+                let rel = Path::new(datadir).join("its").join(name);
                 let s = rel.to_string_lossy().into_owned();
                 if !out.contains(&s) {
                     out.push(s);
                 }
             };
-            push(Path::new(&datadir).join("its").join(name));
+            emit(name);
             for target in its_rule_targets(&text) {
-                let candidate = its_dir.join(&target);
-                if candidate.is_file() {
-                    push(Path::new(&datadir).join("its").join(&target));
+                if its_dir.join(&target).is_file() {
+                    emit(&target);
                 }
             }
         }
