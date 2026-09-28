@@ -1740,6 +1740,8 @@ impl Runner {
             let xinclude_docs = xinclude_invocation(&args);
             let rst_docs = rst_invocation(&args);
             let gresource = gresource_invocation(&args);
+            let msgfmt_dirs = msgfmt_invocation(&args);
+            let swig_i = swig_invocation(&args);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -2240,6 +2242,18 @@ impl Runner {
                 let root = self.config.build_dir.join(&cd_dir);
                 for p in gresource_referenced_files(&root, docs, dirs) {
                     referenced.push(p.to_string_lossy().into_owned());
+                }
+            }
+            // A SWIG RUN RESOLVES ITS OWN `%include` TARGETS. Same family and
+            // same reader placement as the ones around it.
+            if let Some(files) = &swig_i {
+                for p in swig_referenced_paths(&self.config.build_dir, &cd_dir, files) {
+                    referenced.push(p);
+                }
+            }
+            if let Some(dirs) = &msgfmt_dirs {
+                for p in msgfmt_its_referenced_paths(&self.config.build_dir, &cd_dir, dirs) {
+                    referenced.push(p);
                 }
             }
             if let Some(script) = &cmake_p_script {
@@ -7213,12 +7227,250 @@ fn rst_include_closure(root: &Path, docs: &[PathBuf], cap: usize) -> Vec<PathBuf
     out
 }
 
-/// The `.gresource.xml` manifests a `glib-compile-resources` run reads, and
-/// the `--sourcedir` directories it resolves their contents against.
+
+/// The `.i` files a swig invocation names, or None if the command is not a
+/// swig run. Kept separate from the reader so the trigger is testable without
+/// a filesystem.
+fn swig_invocation(args: &[String]) -> Option<Vec<String>> {
+    if !args.iter().any(|a| a.rsplit('/').next() == Some("swig")) {
+        return None;
+    }
+    Some(
+        args.iter()
+            .filter(|a| !a.starts_with('-') && a.ends_with(".i"))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// A SWIG RUN RESOLVES `%include` ITSELF, AND NOTHING ON THE COMMAND LINE
+/// NAMES THE RESULT. `nvme.i:1256` is `%include "../src/nvme/types.h"`, and the
+/// task carries `../libnvme/nvme.i` and nothing else, so the run dies with
+/// `Error: Unable to find '../src/nvme/types.h'`.
 ///
-/// KEYED ON THE TOOL, for the reason `tablegen_invocation` records: a
-/// `.xml` token names a document on many command lines and only this tool
-/// makes the file list inside it readable.
+/// RESOLVED AGAINST THE CWD, NOT THE `.i`'s DIRECTORY, and the arms say so:
+/// with the header at `<cwd>/src/nvme/` the run passes, at `<cwd>/libnvme/
+/// src/nvme/` it fails, and absent it fails. It also COMPOSES WITH THE CLIMB -
+/// a deeper cwd naming `../libnvme/nvme.i` still passes - so the target is
+/// emitted relative to the build dir and the caller rebases it.
+///
+/// A `%{ %}` BLOCK IS COPIED VERBATIM BY SWIG AND IS NOT A REFERENCE, which is
+/// why only `%include` is read: an `#include` inside a preamble is text for
+/// whatever COMPILES the generated wrapper, a different edge with its own
+/// inputs, and reading it here would declare the wrong task's inputs.
+
+#[cfg(test)]
+mod its_and_swig_reader_tests {
+    use super::{its_rule_targets, msgfmt_invocation, swig_invocation};
+
+    /// The locating rule is the ONLY place the `.its` name appears, so the
+    /// reader has to take it from there rather than assume a name.
+    #[test]
+    fn a_locating_rule_names_its_target() {
+        let loc = "<?xml version=\"1.0\"?>\n<locatingRules>\n  <locatingRule name=\"Icp\" pattern=\"*.iccprofile.xml\">\n    <documentRule localName=\"profile\" target=\"colord.its\"/>\n  </locatingRule>\n</locatingRules>\n";
+        assert_eq!(its_rule_targets(loc), vec!["colord.its".to_string()]);
+    }
+
+    /// A rule with no `target`, and a document with none at all, contribute
+    /// nothing rather than a guessed name.
+    #[test]
+    fn a_rule_without_a_target_contributes_nothing() {
+        assert!(its_rule_targets("<locatingRules/>").is_empty());
+        assert!(its_rule_targets("<locatingRule pattern=\"x\"/>").is_empty());
+    }
+
+    /// BOTH spellings of the flag, because meson emits the joined one and a
+    /// hand-written edge emits the separated one.
+    #[test]
+    fn msgfmt_datadirs_is_read_in_both_spellings() {
+        let joined = vec!["msgfmthelper".into(), "--datadirs=/d/p".into()];
+        assert_eq!(msgfmt_invocation(&joined), Some(vec!["/d/p".to_string()]));
+        let sep = vec!["msgfmthelper".into(), "--datadirs".into(), "/d/p".into()];
+        assert_eq!(msgfmt_invocation(&sep), Some(vec!["/d/p".to_string()]));
+    }
+
+    /// THE TRIGGER IS THE PROGRAM, not a coincidental flag: a command that
+    /// merely mentions `--datadirs` without running the helper is not one.
+    #[test]
+    fn a_command_that_is_not_msgfmthelper_is_not_an_invocation() {
+        assert_eq!(msgfmt_invocation(&["gcc".into(), "--datadirs=/d".into()]), None);
+        assert_eq!(swig_invocation(&["gcc".into(), "x.i".into()]), None);
+    }
+
+    /// The `.i` is named by a POSITIONAL argument, and a flag value that
+    /// happens to end in `.i` is not one.
+    #[test]
+    fn swig_names_its_input_file_positionally() {
+        let a = vec!["swig".into(), "-python".into(), "-o".into(), "w.c".into(), "../libnvme/nvme.i".into()];
+        assert_eq!(swig_invocation(&a), Some(vec!["../libnvme/nvme.i".to_string()]));
+        let b = vec!["swig".into(), "--out=x.i".into()];
+        assert_eq!(swig_invocation(&b), Some(vec![]));
+    }
+}
+
+fn swig_referenced_paths(build_dir: &Path, cd_dir: &Path, args: &[String]) -> Vec<String> {
+    if !args.iter().any(|a| a.rsplit('/').next() == Some("swig")) {
+        return Vec::new();
+    }
+    let root = build_dir.join(cd_dir);
+    let mut out = Vec::new();
+    for a in args {
+        if a.starts_with('-') || !a.ends_with(".i") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(root.join(a)) else {
+            continue;
+        };
+        // The `.i`'s own directory is where a RELATIVE `%include` is written
+        // from, so a target is joined there first; the arms above show swig
+        // resolves it against the cwd, and a target that only exists relative
+        // to the `.i` is still a file the run needs.
+        let i_dir = Path::new(a).parent().unwrap_or(Path::new(""));
+        for line in text.lines() {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix("%include") else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let quote = rest.chars().next().unwrap_or('"');
+            if quote != '"' && quote != '\'' {
+                continue;
+            }
+            let rest = &rest[quote.len_utf8()..];
+            let Some(j) = rest.find(quote) else { continue };
+            let target = &rest[..j];
+            if target.is_empty() {
+                continue;
+            }
+            // The relative spelling the command would resolve, emitted as the
+            // build dir sees it. Only what EXISTS is carried: an unresolvable
+            // reference is dropped, so the worst case is an input nobody
+            // needed and never a path that fails a read.
+            let candidate = i_dir.join(target);
+            let exists_here = root.join(&candidate).is_file() || root.join(target).is_file();
+            if !exists_here {
+                continue;
+            }
+            let spelled = Path::new(a).parent().map(|d| d.join(target)).unwrap_or_else(|| PathBuf::from(target));
+            let s = spelled.to_string_lossy().into_owned();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+fn msgfmt_invocation(args: &[String]) -> Option<Vec<String>> {
+    if !args
+        .iter()
+        .any(|a| a.rsplit('/').next() == Some("msgfmthelper"))
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--datadirs=") {
+            if !v.is_empty() {
+                out.push(v.to_string());
+            }
+        } else if a == "--datadirs" {
+            if let Some(v) = it.next() {
+                if !v.is_empty() {
+                    out.push(v.clone());
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+fn msgfmt_its_referenced_paths(
+    build_dir: &Path,
+    cd_dir: &Path,
+    args: &[String],
+) -> Vec<String> {
+    if !args
+        .iter()
+        .any(|a| a.rsplit('/').next() == Some("msgfmthelper"))
+    {
+        return Vec::new();
+    }
+    let root = build_dir.join(cd_dir);
+    let mut out = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        let datadir = if let Some(v) = a.strip_prefix("--datadirs=") {
+            Some(v.to_string())
+        } else if a == "--datadirs" {
+            it.next().cloned()
+        } else {
+            None
+        };
+        let Some(datadir) = datadir else { continue };
+        if datadir.is_empty() {
+            continue;
+        }
+        let dir = root.join(&datadir);
+        let its_dir = dir.join("its");
+        let Ok(entries) = std::fs::read_dir(&its_dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".loc") {
+                continue;
+            }
+            // The locating rule, read as text: the `target` of a rule whose
+            // `pattern` matches is the `.its` beside it. Every target named in
+            // the file is carried, which over-declares on purpose - an extra
+            // input is harmless and a missing one kills the task.
+            let Ok(text) = std::fs::read_to_string(&p) else {
+                continue;
+            };
+            let mut push = |rel: PathBuf| {
+                let s = rel.to_string_lossy().into_owned();
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            };
+            push(Path::new(&datadir).join("its").join(name));
+            for target in its_rule_targets(&text) {
+                let candidate = its_dir.join(&target);
+                if candidate.is_file() {
+                    push(Path::new(&datadir).join("its").join(&target));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `target="..."` values of a `.loc` locating rule, in file order.
+fn its_rule_targets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(i) = line.find("target=") else { continue };
+        let rest = &line[i + "target=".len()..];
+        let quote = rest.chars().next().unwrap_or('"');
+        if quote != '"' && quote != '\'' {
+            continue;
+        }
+        let rest = &rest[quote.len_utf8()..];
+        if let Some(j) = rest.find(quote) {
+            let name = &rest[..j];
+            if !name.is_empty() && !out.contains(&name.to_string()) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn gresource_invocation(args: &[String]) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
     if !args
         .iter()
