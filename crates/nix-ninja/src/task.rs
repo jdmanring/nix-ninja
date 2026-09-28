@@ -2247,7 +2247,7 @@ impl Runner {
             // A SWIG RUN RESOLVES ITS OWN `%include` TARGETS. Same family and
             // same reader placement as the ones around it.
             if let Some(files) = &swig_i {
-                                for p in swig_referenced_paths(&self.config.build_dir, &cd_dir, files) {
+                for p in swig_referenced_paths(&self.config.build_dir, &cd_dir, files) {
                     referenced.push(p);
                 }
             }
@@ -7227,7 +7227,6 @@ fn rst_include_closure(root: &Path, docs: &[PathBuf], cap: usize) -> Vec<PathBuf
     out
 }
 
-
 /// The `.i` files a swig invocation names, or None if the command is not a
 /// swig run. Kept separate from the reader so the trigger is testable without
 /// a filesystem.
@@ -7242,22 +7241,6 @@ fn swig_invocation(args: &[String]) -> Option<Vec<String>> {
             .collect(),
     )
 }
-
-/// A SWIG RUN RESOLVES `%include` ITSELF, AND NOTHING ON THE COMMAND LINE
-/// NAMES THE RESULT. `nvme.i:1256` is `%include "../src/nvme/types.h"`, and the
-/// task carries `../libnvme/nvme.i` and nothing else, so the run dies with
-/// `Error: Unable to find '../src/nvme/types.h'`.
-///
-/// RESOLVED AGAINST THE CWD, NOT THE `.i`'s DIRECTORY, and the arms say so:
-/// with the header at `<cwd>/src/nvme/` the run passes, at `<cwd>/libnvme/
-/// src/nvme/` it fails, and absent it fails. It also COMPOSES WITH THE CLIMB -
-/// a deeper cwd naming `../libnvme/nvme.i` still passes - so the target is
-/// emitted relative to the build dir and the caller rebases it.
-///
-/// A `%{ %}` BLOCK IS COPIED VERBATIM BY SWIG AND IS NOT A REFERENCE, which is
-/// why only `%include` is read: an `#include` inside a preamble is text for
-/// whatever COMPILES the generated wrapper, a different edge with its own
-/// inputs, and reading it here would declare the wrong task's inputs.
 
 #[cfg(test)]
 mod its_and_swig_reader_tests {
@@ -7293,7 +7276,10 @@ mod its_and_swig_reader_tests {
     /// merely mentions `--datadirs` without running the helper is not one.
     #[test]
     fn a_command_that_is_not_msgfmthelper_is_not_an_invocation() {
-        assert_eq!(msgfmt_invocation(&["gcc".into(), "--datadirs=/d".into()]), None);
+        assert_eq!(
+            msgfmt_invocation(&["gcc".into(), "--datadirs=/d".into()]),
+            None
+        );
         assert_eq!(swig_invocation(&["gcc".into(), "x.i".into()]), None);
     }
 
@@ -7301,13 +7287,37 @@ mod its_and_swig_reader_tests {
     /// happens to end in `.i` is not one.
     #[test]
     fn swig_names_its_input_file_positionally() {
-        let a = vec!["swig".into(), "-python".into(), "-o".into(), "w.c".into(), "../libnvme/nvme.i".into()];
-        assert_eq!(swig_invocation(&a), Some(vec!["../libnvme/nvme.i".to_string()]));
+        let a = vec![
+            "swig".into(),
+            "-python".into(),
+            "-o".into(),
+            "w.c".into(),
+            "../libnvme/nvme.i".into(),
+        ];
+        assert_eq!(
+            swig_invocation(&a),
+            Some(vec!["../libnvme/nvme.i".to_string()])
+        );
         let b = vec!["swig".into(), "--out=x.i".into()];
         assert_eq!(swig_invocation(&b), Some(vec![]));
     }
 }
 
+/// A SWIG RUN RESOLVES `%include` ITSELF, AND NOTHING ON THE COMMAND LINE
+/// NAMES THE RESULT. `nvme.i:1256` is `%include "../src/nvme/types.h"`, and the
+/// task carries `../libnvme/nvme.i` and nothing else, so the run dies with
+/// `Error: Unable to find '../src/nvme/types.h'`.
+///
+/// RESOLVED AGAINST THE CWD, NOT THE `.i`'s DIRECTORY, and the arms say so:
+/// with the header at `<cwd>/src/nvme/` the run passes, at `<cwd>/libnvme/
+/// src/nvme/` it fails, and absent it fails. It also COMPOSES WITH THE CLIMB -
+/// a deeper cwd naming `../libnvme/nvme.i` still passes - so the target is
+/// emitted relative to the build dir and the caller rebases it.
+///
+/// A `%{ %}` BLOCK IS COPIED VERBATIM BY SWIG AND IS NOT A REFERENCE, which is
+/// why only `%include` is read: an `#include` inside a preamble is text for
+/// whatever COMPILES the generated wrapper, a different edge with its own
+/// inputs, and reading it here would declare the wrong task's inputs.
 fn swig_referenced_paths(build_dir: &Path, cd_dir: &Path, files: &[String]) -> Vec<String> {
     // THE TRIGGER IS NOT REPEATED HERE. This function receives the FILES the
     // trigger found, not the argv, so testing for the program name against
@@ -7353,7 +7363,10 @@ fn swig_referenced_paths(build_dir: &Path, cd_dir: &Path, files: &[String]) -> V
             if !exists_here {
                 continue;
             }
-            let spelled = Path::new(a).parent().map(|d| d.join(target)).unwrap_or_else(|| PathBuf::from(target));
+            let spelled = Path::new(a)
+                .parent()
+                .map(|d| d.join(target))
+                .unwrap_or_else(|| PathBuf::from(target));
             let s = spelled.to_string_lossy().into_owned();
             if !out.contains(&s) {
                 out.push(s);
@@ -7440,7 +7453,9 @@ fn msgfmt_its_referenced_paths(build_dir: &Path, cd_dir: &Path, dirs: &[String])
 fn its_rule_targets(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
-        let Some(i) = line.find("target=") else { continue };
+        let Some(i) = line.find("target=") else {
+            continue;
+        };
         let rest = &line[i + "target=".len()..];
         let quote = rest.chars().next().unwrap_or('"');
         if quote != '"' && quote != '\'' {
