@@ -3866,8 +3866,7 @@ fn build_task_derivation(
             .collect();
         let bps: Vec<PathBuf> = all.iter().map(|i| i.build_path.clone()).collect();
         let keys: Vec<String> = all.iter().map(|i| i.derived_path.to_string()).collect();
-        for group in collision_groups(&bps, &keys) {
-            let bp = normalize_build_path_lexical(&all[group[0]].build_path);
+        for (bp, group) in collision_groups(&bps, &keys) {
             let members: Vec<&DerivedFile> = group.iter().map(|g| all[*g]).collect();
             eprintln!(
                 "nix-ninja: {} was uploaded at {} different contents in one task                  (regenerated mid-build?); re-reading it now and using that alone",
@@ -7050,10 +7049,12 @@ fn normalize_build_path_lexical(p: &Path) -> PathBuf {
 ///
 /// `bps` are the raw build paths, `contents` the identity of what each input
 /// holds (the encoded derived path), and both are parallel to the caller's
-/// input list. A group is returned only when it has two or more members that do
-/// NOT all share one content - i.e. one path, two different files. Indices are
-/// into the caller's list.
-fn collision_groups(bps: &[PathBuf], contents: &[String]) -> Vec<Vec<usize>> {
+/// input list. Returns, per collision, the KEY that was grouped by TOGETHER
+/// WITH the member indices - the key travels with the group so the caller
+/// cannot re-derive a different spelling for the re-read. A group is returned
+/// only when it has two or more members that do NOT all share one content,
+/// i.e. one path, two different files.
+fn collision_groups(bps: &[PathBuf], contents: &[String]) -> Vec<(PathBuf, Vec<usize>)> {
     let mut by_key: HashMap<PathBuf, Vec<usize>> = HashMap::new();
     for (idx, bp) in bps.iter().enumerate() {
         by_key
@@ -7075,7 +7076,7 @@ fn collision_groups(bps: &[PathBuf], contents: &[String]) -> Vec<Vec<usize>> {
         if group.iter().all(|g| &contents[*g] == first) {
             continue;
         }
-        out.push(group.clone());
+        out.push((k.clone(), group.clone()));
     }
     out
 }
@@ -16035,11 +16036,12 @@ mod build_path_collision_key_tests {
         v.iter().map(PathBuf::from).collect()
     }
 
-    /// libpq's DEFECT, driven through the DETECTOR rather than the helper.
-    /// `src/port/../include/pg_config_os.h` and `src/include/pg_config_os.h` are
-    /// one file spelled two ways, carrying two different contents; the raw
-    /// keying put them in different groups, no collision fired, and the task
-    /// died at emit. The detector must return exactly that one group.
+    /// libpq's DEFECT, driven through the DETECTOR rather than the helper. The
+    /// two spellings are one file carrying two contents; the raw keying put
+    /// them in different groups, so nothing fired and the task died at emit.
+    /// The detector must return that one group AND the normalized key, because
+    /// the caller re-reads through the key: a group returned without it lets
+    /// the call site invent a different spelling.
     #[test]
     fn two_spellings_of_one_file_are_detected_as_a_collision() {
         let got = collision_groups(
@@ -16052,12 +16054,15 @@ mod build_path_collision_key_tests {
                 "/nix/store/bbb-y".to_string(),
             ],
         );
-        assert_eq!(got, vec![vec![0, 1]], "the collision was not detected");
+        assert_eq!(
+            got,
+            vec![(PathBuf::from("src/include/pg_config_os.h"), vec![0, 1])],
+            "collision not detected, or the key is not the normalized spelling"
+        );
     }
 
-    /// THE CONTROL, and the one the helper-only test could not give: a
-    /// detector that grouped by the FIRST path component, or that returned one
-    /// group always, would pass the arm above and fail here by merging two
+    /// THE CONTROL: a detector that grouped by the FIRST component, or returned
+    /// one group always, would pass the arm above and fail here by merging
     /// unrelated files and dropping one.
     #[test]
     fn different_files_are_not_a_collision() {
@@ -16071,8 +16076,8 @@ mod build_path_collision_key_tests {
         assert!(got.is_empty(), "unrelated files were merged: {got:?}");
     }
 
-    /// ONE PATH, ONE CONTENT IS NOT A COLLISION. The same file uploaded twice
-    /// at the same bytes is the ordinary case and must not trigger a re-read.
+    /// ONE PATH, ONE CONTENT IS NOT A COLLISION. The ordinary duplicate upload
+    /// must not trigger a re-read.
     #[test]
     fn one_path_one_content_is_not_a_collision() {
         let got = collision_groups(
@@ -16092,9 +16097,8 @@ mod build_path_collision_key_tests {
         assert!(got.is_empty());
     }
 
-    /// The normalizer itself, kept because it documents the `..` semantics the
-    /// detector relies on: a climb past the start is PRESERVED (the caller
-    /// rebases it), and `.` disappears.
+    /// The normalizer's semantics, which the detector relies on: a climb past
+    /// the start is PRESERVED (the caller rebases it), and `.` disappears.
     #[test]
     fn the_normalizer_pops_and_preserves_correctly() {
         assert_eq!(
@@ -16108,6 +16112,39 @@ mod build_path_collision_key_tests {
         assert_eq!(
             normalize_build_path_lexical(Path::new("a/./b/c.h")),
             Path::new("a/b/c.h")
+        );
+    }
+}
+
+/// THE RETURNED KEY IS THE SPELLING THE TASK WILL PLACE. The grouper detects by
+/// a normalized key and the caller re-reads through `new_opaque_file`, whose
+/// `build_path` is `relative_from(path, build_dir)`. If that round trip did not
+/// return the normalized spelling, the task would still place the file at the
+/// `..` path and the collision would survive the fix that detected it.
+#[cfg(test)]
+mod collision_emitter_agrees_with_grouper_tests {
+    use super::{collision_groups, relative_from};
+    use std::path::PathBuf;
+
+    /// Drive the REAL detector to get the key, then the REAL round trip the
+    /// emitter uses, so both halves of the agreement are exercised.
+    #[test]
+    fn the_detected_key_survives_the_emitter_round_trip() {
+        let build_dir = std::path::Path::new("/build/pkg/build");
+        let got = collision_groups(
+            &[
+                PathBuf::from("src/port/../include/pg_config_os.h"),
+                PathBuf::from("src/include/pg_config_os.h"),
+            ],
+            &["aaa".to_string(), "bbb".to_string()],
+        );
+        assert_eq!(got.len(), 1, "the fixture did not collide");
+        let (key, _) = &got[0];
+        let emitted = relative_from(&build_dir.join(key), build_dir);
+        assert_eq!(
+            emitted,
+            Some(PathBuf::from("src/include/pg_config_os.h")),
+            "the key the grouper returned emits an unnormalized build_path"
         );
     }
 }
