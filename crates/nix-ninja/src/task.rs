@@ -1742,6 +1742,7 @@ impl Runner {
             let gresource = gresource_invocation(&args);
             let msgfmt_dirs = msgfmt_invocation(&args);
             let swig_i = swig_invocation(&args);
+            let gir_filelists = gir_filelist_invocation(&args);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -2253,6 +2254,15 @@ impl Runner {
             }
             if let Some(dirs) = &msgfmt_dirs {
                 for p in msgfmt_its_referenced_paths(&self.config.build_dir, &cd_dir, dirs) {
+                    referenced.push(p);
+                }
+            }
+            // A `g-ir-scanner` READS ITS SOURCES FROM A FILELIST IT NAMES, so
+            // the file is on the command line and the files it LISTS are not.
+            // colord's gir edge dies `Invalid filelist entry`, same family as
+            // the swig and msgfmt readers above.
+            if let Some(filelists) = &gir_filelists {
+                for p in gir_filelist_referenced_paths(&self.config.build_dir, &cd_dir, filelists) {
                     referenced.push(p);
                 }
             }
@@ -3835,32 +3845,38 @@ fn build_task_derivation(
     // opaque inputs by build path; on a collision, upload the file AS IT
     // NOW STANDS and keep only that spelling - failing toward a fresh
     // read, never toward picking one of two stale spellings.
+    //
+    // THE KEY IS THE NORMALIZED PATH, NOT THE RAW SPELLING. libpq's link
+    // declares `src/port/../include/pg_config_os.h` while another input names
+    // `src/include/pg_config_os.h`: ONE file, TWO spellings, and keying on the
+    // raw string put them in different groups so no collision fired and the
+    // task died at emit with "Two different files claim one build path". The
+    // normalization is LEXICAL (`lexical_join` pops `..` against the path's
+    // own components), because the file need not exist yet at this point and
+    // `canonicalize` would fail on exactly the generated files this guards.
+    // One group per normalized build path; the emitted spelling is left as the
+    // inputs carry it, since the grouper's job is to DETECT the collision, not
+    // to rewrite what the task places.
     {
-        let mut by_bp: HashMap<PathBuf, Vec<DerivedFile>> = HashMap::new();
-        for i in task.inputs.iter().chain(discovered_inputs.iter()) {
-            if matches!(i.derived_path, SingleDerivedPath::Opaque(_)) {
-                by_bp
-                    .entry(i.build_path.clone())
-                    .or_default()
-                    .push(i.clone());
-            }
-        }
-        for (bp, group) in by_bp {
-            if group.len() < 2
-                || group
-                    .iter()
-                    .all(|g| g.derived_path == group[0].derived_path)
-            {
-                continue;
-            }
+        let all: Vec<&DerivedFile> = task
+            .inputs
+            .iter()
+            .chain(discovered_inputs.iter())
+            .filter(|i| matches!(i.derived_path, SingleDerivedPath::Opaque(_)))
+            .collect();
+        let bps: Vec<PathBuf> = all.iter().map(|i| i.build_path.clone()).collect();
+        let keys: Vec<String> = all.iter().map(|i| i.derived_path.to_string()).collect();
+        for group in collision_groups(&bps, &keys) {
+            let bp = normalize_build_path_lexical(&all[group[0]].build_path);
+            let members: Vec<&DerivedFile> = group.iter().map(|g| all[*g]).collect();
             eprintln!(
                 "nix-ninja: {} was uploaded at {} different contents in one task                  (regenerated mid-build?); re-reading it now and using that alone",
                 bp.display(),
-                group.len(),
+                members.len(),
             );
             let abs = task.build_dir.join(&bp);
             let fresh = new_opaque_file(rpc_client, &task.build_dir, abs)?;
-            for stale in &group {
+            for stale in &members {
                 input_set.remove(&stale.to_encoded(&task.store_dir));
                 drv.inputs.remove(&stale.derived_path);
             }
@@ -7014,6 +7030,56 @@ fn lexical_join(base: &Path, rel: &Path) -> PathBuf {
     stack.iter().map(|c| c.as_os_str()).collect()
 }
 
+/// A build path with its `..` and `.` components resolved LEXICALLY, so two
+/// spellings of one file compare equal. `lexical_join` against the empty base
+/// does exactly that: each `ParentDir` pops a preceding `Normal` component,
+/// and `src/port/../include/pg_config_os.h` becomes `src/include/pg_config_os.h`.
+///
+/// WHY LEXICAL AND NOT `canonicalize`. This KEYS a collision check, and the
+/// files it compares are frequently GENERATED - they do not exist when the
+/// check runs, so `canonicalize` would fail on precisely the inputs the check
+/// exists for. The caller joins the result to the build dir when it needs a
+/// real path.
+fn normalize_build_path_lexical(p: &Path) -> PathBuf {
+    lexical_join(Path::new(""), p)
+}
+
+/// THE COLLISION DETECTOR, split out so the KEYING is testable rather than only
+/// the normalize helper. Two inputs that spell one build path differently must
+/// land in ONE group; a group of unrelated files must not.
+///
+/// `bps` are the raw build paths, `contents` the identity of what each input
+/// holds (the encoded derived path), and both are parallel to the caller's
+/// input list. A group is returned only when it has two or more members that do
+/// NOT all share one content - i.e. one path, two different files. Indices are
+/// into the caller's list.
+fn collision_groups(bps: &[PathBuf], contents: &[String]) -> Vec<Vec<usize>> {
+    let mut by_key: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    for (idx, bp) in bps.iter().enumerate() {
+        by_key
+            .entry(normalize_build_path_lexical(bp))
+            .or_default()
+            .push(idx);
+    }
+    let mut out = Vec::new();
+    // SORTED, so a test can assert a deterministic answer rather than a
+    // HashMap order that changes run to run.
+    let mut keys: Vec<PathBuf> = by_key.keys().cloned().collect();
+    keys.sort();
+    for k in keys {
+        let group = &by_key[&k];
+        if group.len() < 2 {
+            continue;
+        }
+        let first = &contents[group[0]];
+        if group.iter().all(|g| &contents[*g] == first) {
+            continue;
+        }
+        out.push(group.clone());
+    }
+    out
+}
+
 /// The `-D<NAME>=<VALUE>` definitions on a command line.
 ///
 /// Both spellings, because CMake accepts the value joined to the flag and
@@ -7240,6 +7306,99 @@ fn swig_invocation(args: &[String]) -> Option<Vec<String>> {
             .cloned()
             .collect(),
     )
+}
+
+/// A `g-ir-scanner` RUN READS ITS SOURCES FROM A FILE IT NAMES ON THE COMMAND
+/// LINE, and nothing else declares them. The trigger returns the `--filelist`
+/// VALUE (the file the scanner opens), not the sources: a separate function
+/// reads that file, the way `gresource_referenced_files` reads its manifest.
+fn gir_filelist_invocation(args: &[String]) -> Option<Vec<String>> {
+    if !args
+        .iter()
+        .any(|a| a.rsplit('/').next() == Some("g-ir-scanner"))
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--filelist=") {
+            if !v.is_empty() {
+                out.push(v.to_string());
+            }
+        } else if a == "--filelist" {
+            if let Some(v) = it.next() {
+                if !v.is_empty() {
+                    out.push(v.clone());
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The source paths INSIDE a `--filelist` file. One path per line, blank lines
+/// and `#` comments skipped. The scanner resolves each against the process
+/// CWD, and the filelist g-ir-scanner WRITES (via meson) holds paths that are
+/// absolute or build-relative, so both spellings are carried unchanged and the
+/// caller rebases.
+fn gir_filelist_sources(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Resolve a `g-ir-scanner --filelist` into the SOURCE files the scanner will
+/// read. colord's gir edge carries `--filelist=<build>/...Colord_1_0_gir_filelist`,
+/// the scanner opens it, and every entry it lists is a source file the task
+/// never received, so the run dies `Invalid filelist entry-no such file or
+/// directory`. Entries are emitted as the RELATIVE spelling the wiring keeps
+/// (see `swig_referenced_paths` for why an absolute one is dropped), and only
+/// files that exist are carried.
+fn gir_filelist_referenced_paths(
+    build_dir: &Path,
+    cd_dir: &Path,
+    filelists: &[String],
+) -> Vec<String> {
+    let root = build_dir.join(cd_dir);
+    let mut out = Vec::new();
+    for fl in filelists {
+        let fl_abs = if Path::new(fl).is_absolute() {
+            PathBuf::from(fl)
+        } else {
+            root.join(fl)
+        };
+        let Ok(text) = std::fs::read_to_string(&fl_abs) else {
+            continue;
+        };
+        for src in gir_filelist_sources(&text) {
+            let abs = if Path::new(&src).is_absolute() {
+                PathBuf::from(&src)
+            } else {
+                root.join(&src)
+            };
+            if !abs.is_file() {
+                continue;
+            }
+            // The spelling the command resolves, relative to the build dir. A
+            // source under the build dir comes back build-relative; one above
+            // it keeps the `..` climb the caller rebases.
+            let rel = match abs.strip_prefix(&root) {
+                Ok(p) => p.to_path_buf(),
+                Err(_) => match abs.strip_prefix(build_dir) {
+                    Ok(p) => p.to_path_buf(),
+                    Err(_) => PathBuf::from(&src),
+                },
+            };
+            let s = rel.to_string_lossy().into_owned();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -15863,6 +16022,92 @@ mod macro_arm_headers_tests {
         assert!(
             !names.contains(&"absent.h".to_string()),
             "a missing arm is not an input: {names:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_path_collision_key_tests {
+    use super::{collision_groups, normalize_build_path_lexical};
+    use std::path::{Path, PathBuf};
+
+    fn bps(v: &[&str]) -> Vec<PathBuf> {
+        v.iter().map(PathBuf::from).collect()
+    }
+
+    /// libpq's DEFECT, driven through the DETECTOR rather than the helper.
+    /// `src/port/../include/pg_config_os.h` and `src/include/pg_config_os.h` are
+    /// one file spelled two ways, carrying two different contents; the raw
+    /// keying put them in different groups, no collision fired, and the task
+    /// died at emit. The detector must return exactly that one group.
+    #[test]
+    fn two_spellings_of_one_file_are_detected_as_a_collision() {
+        let got = collision_groups(
+            &bps(&[
+                "src/port/../include/pg_config_os.h",
+                "src/include/pg_config_os.h",
+            ]),
+            &[
+                "/nix/store/aaa-x".to_string(),
+                "/nix/store/bbb-y".to_string(),
+            ],
+        );
+        assert_eq!(got, vec![vec![0, 1]], "the collision was not detected");
+    }
+
+    /// THE CONTROL, and the one the helper-only test could not give: a
+    /// detector that grouped by the FIRST path component, or that returned one
+    /// group always, would pass the arm above and fail here by merging two
+    /// unrelated files and dropping one.
+    #[test]
+    fn different_files_are_not_a_collision() {
+        let got = collision_groups(
+            &bps(&["src/include/pg_config_os.h", "src/include/linux.h"]),
+            &[
+                "/nix/store/aaa-x".to_string(),
+                "/nix/store/bbb-y".to_string(),
+            ],
+        );
+        assert!(got.is_empty(), "unrelated files were merged: {got:?}");
+    }
+
+    /// ONE PATH, ONE CONTENT IS NOT A COLLISION. The same file uploaded twice
+    /// at the same bytes is the ordinary case and must not trigger a re-read.
+    #[test]
+    fn one_path_one_content_is_not_a_collision() {
+        let got = collision_groups(
+            &bps(&["src/a.h", "src/a.h"]),
+            &[
+                "/nix/store/aaa-x".to_string(),
+                "/nix/store/aaa-x".to_string(),
+            ],
+        );
+        assert!(got.is_empty(), "an identical duplicate fired: {got:?}");
+    }
+
+    /// A LONE INPUT IS NOT A COLLISION, whatever it spells.
+    #[test]
+    fn a_single_input_is_never_a_collision() {
+        let got = collision_groups(&bps(&["src/port/../include/x.h"]), &["c".to_string()]);
+        assert!(got.is_empty());
+    }
+
+    /// The normalizer itself, kept because it documents the `..` semantics the
+    /// detector relies on: a climb past the start is PRESERVED (the caller
+    /// rebases it), and `.` disappears.
+    #[test]
+    fn the_normalizer_pops_and_preserves_correctly() {
+        assert_eq!(
+            normalize_build_path_lexical(Path::new("src/port/../include/x.h")),
+            Path::new("src/include/x.h")
+        );
+        assert_eq!(
+            normalize_build_path_lexical(Path::new("../a/../b.h")),
+            Path::new("../b.h")
+        );
+        assert_eq!(
+            normalize_build_path_lexical(Path::new("a/./b/c.h")),
+            Path::new("a/b/c.h")
         );
     }
 }
