@@ -7244,7 +7244,10 @@ fn swig_invocation(args: &[String]) -> Option<Vec<String>> {
 
 #[cfg(test)]
 mod its_and_swig_reader_tests {
-    use super::{its_rule_targets, msgfmt_invocation, swig_invocation};
+    use super::{
+        its_rule_targets, msgfmt_invocation, msgfmt_its_referenced_paths, swig_invocation,
+        swig_referenced_paths,
+    };
 
     /// The locating rule is the ONLY place the `.its` name appears, so the
     /// reader has to take it from there rather than assume a name.
@@ -7300,6 +7303,95 @@ mod its_and_swig_reader_tests {
         );
         let b = vec!["swig".into(), "--out=x.i".into()];
         assert_eq!(swig_invocation(&b), Some(vec![]));
+    }
+
+    /// THE EMITTED SPELLING, which the trigger tests above cannot see. A reader
+    /// that emits an ABSOLUTE path is dropped by the two filters downstream of
+    /// `referenced` and its fix lands in silence, which is a control whose arms
+    /// cannot differ. So the spelling is part of the contract and is pinned
+    /// here: libnvme's real geometry, an `.i` under `../libnvme/` naming
+    /// `../src/nvme/types.h`, must come back as the RELATIVE join of the two.
+    #[test]
+    fn a_swig_include_is_emitted_relative_to_the_build_dir() {
+        use super::Scratch;
+        use std::path::Path;
+        let d = Scratch::new(format!("nn-swig-emit-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::create_dir_all(d.join("libnvme")).unwrap();
+        std::fs::create_dir_all(d.join("src/nvme")).unwrap();
+        std::fs::write(d.join("src/nvme/types.h"), "int x;\n").unwrap();
+        // The `.i` is carried at `../libnvme/nvme.i`, so it sits beside the
+        // build dir; the include it names climbs back out of the `.i`'s own
+        // directory and into `src/nvme/`, exactly as libnvme writes it.
+        std::fs::write(
+            d.join("libnvme/nvme.i"),
+            "%module nvme\n%include \"../src/nvme/types.h\"\n",
+        )
+        .unwrap();
+        let got = swig_referenced_paths(&bd, Path::new(""), &["../libnvme/nvme.i".into()]);
+        assert_eq!(
+            got,
+            vec!["../libnvme/../src/nvme/types.h".to_string()],
+            "the reader must emit a RELATIVE spelling or the wiring drops it"
+        );
+        assert!(
+            !got.iter().any(|p| Path::new(p).is_absolute()),
+            "an absolute candidate is dropped silently by starts_with(store_dir)"
+        );
+    }
+
+    /// A `%include` naming a file that is NOT there contributes nothing. The
+    /// guard is what keeps the worst case at "an input nobody needed" rather
+    /// than a path that fails a read. The `.i` itself is placed where the
+    /// reader looks, so this exercises the include guard and not the
+    /// absent-`.i` early return above it.
+    #[test]
+    fn a_swig_include_that_does_not_exist_is_dropped() {
+        use super::Scratch;
+        use std::path::Path;
+        let d = Scratch::new(format!("nn-swig-absent-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(bd.join("x.i"), "%include \"nowhere/nope.h\"\n").unwrap();
+        let got = swig_referenced_paths(&bd, Path::new(""), &["x.i".into()]);
+        assert!(got.is_empty(), "carried {got:?}");
+    }
+
+    /// The `.loc` and the `.its` it names, both relative to the build dir and
+    /// both RELATIVE spellings for the same reason as the swig arm. colord's
+    /// data dir is named by `--datadirs`; the `.its` name appears ONLY inside
+    /// the locating rule, which is why the reader has to open the `.loc`.
+    #[test]
+    fn msgfmt_emits_the_loc_and_the_its_it_names() {
+        use super::Scratch;
+        use std::path::Path;
+        let d = Scratch::new(format!("nn-msgfmt-emit-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(bd.join("data/profiles/its")).unwrap();
+        std::fs::write(
+            bd.join("data/profiles/its/colord.loc"),
+            "<locatingRules>\n  <locatingRule pattern=\"*.iccprofile.xml\">\n    \
+             <documentRule localName=\"profile\" target=\"colord.its\"/>\n  </locatingRule>\n\
+             </locatingRules>\n",
+        )
+        .unwrap();
+        // Both files are checked in and neither is declared; the `.its` guard
+        // is an existence test, so it must be present for the target to carry.
+        std::fs::write(bd.join("data/profiles/its/colord.its"), "<its/>\n").unwrap();
+        let got = msgfmt_its_referenced_paths(&bd, Path::new(""), &["data/profiles".into()]);
+        assert!(
+            got.contains(&"data/profiles/its/colord.loc".to_string()),
+            "the .loc itself is read by the command: {got:?}"
+        );
+        assert!(
+            got.contains(&"data/profiles/its/colord.its".to_string()),
+            "the target named in the locating rule is read too: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|p| Path::new(p).is_absolute()),
+            "an absolute candidate is dropped silently"
+        );
     }
 }
 
