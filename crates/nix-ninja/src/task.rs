@@ -6756,7 +6756,15 @@ fn macro_arm_headers(
                     None => build_dir.join(&p),
                 }
             };
-            if resolved.exists() && !out.contains(&resolved) {
+            // A FILE, not a name that merely exists. which 2.25's sys.h defines
+            // `SLASHES` and `DEFAULT_HOMEDIR` once per platform and the
+            // non-Windows arm of each is `"/"`: absolute, existing, and the
+            // root - so it came back as a header, the upload added `/` as a
+            // tree, and the walk died on the recursive-nix socket under
+            // /build. A directory arm in the build tree is the same defect
+            // without the socket. The arms this reader was written for, mesa's
+            // generated headers, are regular files and survive `is_file`.
+            if resolved.is_file() && !out.contains(&resolved) {
                 out.push(resolved);
             }
         }
@@ -16023,6 +16031,38 @@ mod macro_arm_headers_tests {
         assert!(
             !names.contains(&"absent.h".to_string()),
             "a missing arm is not an input: {names:?}"
+        );
+    }
+
+    /// AN ARM THAT NAMES A DIRECTORY IS NOT A HEADER. which 2.25's sys.h
+    /// defines `SLASHES` and `DEFAULT_HOMEDIR` once per platform, and the
+    /// non-Windows arm of each is `"/"`. That arm is absolute and `/` exists,
+    /// so it came back as an include, and the upload added the root as a tree
+    /// and died on the recursive-nix socket under /build. A directory arm in
+    /// the build tree is the same defect without the socket.
+    #[test]
+    fn an_arm_naming_a_directory_is_not_returned() {
+        let d = scratch("dir-arm");
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(
+            d.join("sys.h"),
+            "#ifdef WIN32\n#define SLASHES \"\\\\/\"\n#define HOME \"sub\"\n\
+             #else\n#define SLASHES \"/\"\n#define HOME \"real.h\"\n#endif\n",
+        )
+        .unwrap();
+        fs::write(d.join("real.h"), "\n").unwrap();
+        let got = macro_arm_headers(&d, std::slice::from_ref(&d), &[d.join("sys.h")]);
+        assert!(
+            !got.iter().any(|p| p.as_os_str() == "/"),
+            "the root is never a header: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|p| p.is_dir()),
+            "a directory arm is never a header: {got:?}"
+        );
+        assert!(
+            got.iter().any(|p| p.ends_with("real.h")),
+            "a file arm beside a directory arm still comes back: {got:?}"
         );
     }
 }
