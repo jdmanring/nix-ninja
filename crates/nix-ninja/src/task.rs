@@ -13352,6 +13352,36 @@ pub fn discover_c_includes(
             absent.push(include.clone());
         }
 
+        // A HOST PATH IS NOT THIS BUILD'S TO CARRY, AND DECLARING IT COSTS
+        // THE WHOLE SOURCE TREE. The scanner reads the BODIES of string
+        // macros, so a header that names a host file declares one: c-ares'
+        // `ares_private.h` defines `PATH_HOSTS "/etc/hosts"` and
+        // `PATH_RESOLV_CONF "/etc/resolv.conf"`, and both arrived here as
+        // absolute includes. Declared, they are spelled from the build dir as
+        // `../../../etc/hosts`, which climbs past `/build` - and the task's
+        // own deepening guard then reads that as a cwd error and moves the
+        // working directory one level down, after which ALL THIRTY-FIVE
+        // legitimate inputs resolve a name too deep and the package's sources
+        // and every `-I` directory vanish together:
+        //
+        //   ../../c-ares-1.34.8/src/lib/util/ares_threads.c
+        //     from /build/c-ares-1.34.8/build       -> .../src/lib/util/ares_threads.c  RIGHT
+        //     from /build/c-ares-1.34.8/build/nnd0  -> .../c-ares-1.34.8/src/lib/...    one name too many
+        //
+        // THE PREDICATE ALREADY EXISTS AND IS TESTED. `same_project_tree`
+        // rules that a target sharing only the root with the build directory
+        // (`/etc/...` against `/build/...`) is "outside the project tree and
+        // not ours to upload", and its own test asserts `/etc/passwd` is
+        // refused. The discovery path simply never asked. A store path is
+        // handled above and a declared file is skipped above, so this is the
+        // one gap: an absolute include that is neither.
+        //
+        // ABSOLUTE ONLY. A relative include is resolved against the build
+        // directory above, so it is already this tree's by construction.
+        if host_path_not_this_trees_to_carry(build_dir, &include) {
+            continue;
+        }
+
         // Regular file: queued for a batched store add below.
         to_upload.push(include);
     }
@@ -13609,6 +13639,33 @@ fn absolute_file_candidate(arg: &str) -> Option<&str> {
         .filter(|v| v.starts_with('/'))
 }
 
+/// Whether an include the scanner found is a HOST PATH this build must not
+/// carry, rather than a file belonging to the tree being compiled.
+///
+/// THE SCANNER READS THE BODIES OF STRING MACROS, so a header that names a
+/// host file declares one. c-ares' `ares_private.h` carries
+/// `PATH_HOSTS "/etc/hosts"` and `PATH_RESOLV_CONF "/etc/resolv.conf"`, and
+/// both arrived as absolute includes. Declared, they were spelled from the
+/// build dir as `../../../etc/hosts` - a climb past the root - so
+/// `nix-ninja-task`'s deepening guard read that as a cwd error, moved the
+/// working directory to `build/nnd0`, and then every one of the package's
+/// thirty-five REAL inputs resolved a name too deep. The source tree and all
+/// three `-I` directories vanished together, and the compile died on
+/// `util/ares_threads.c: No such file or directory` with the file present in
+/// the input set.
+///
+/// ABSOLUTE ONLY, and that is the whole of the added predicate. A relative
+/// include was resolved against the build directory by the caller, so it
+/// already belongs to this tree by construction; only an absolute spelling
+/// can name something outside it. `same_project_tree` is the test, and it
+/// already carried the rule - a target sharing only the root with the build
+/// directory is "outside the project tree and not ours to upload" - with a
+/// test asserting `/etc/passwd` is refused. What was missing was a caller
+/// asking it, which is what this function is.
+fn host_path_not_this_trees_to_carry(build_dir: &Path, include: &Path) -> bool {
+    include.is_absolute() && !same_project_tree(build_dir, include)
+}
+
 /// Whether `target` sits in the same top-level tree as `base` (their
 /// first real path component agrees) - a target sharing only the root
 /// (`/etc/...` against `/build/...`) is outside the project tree and not
@@ -13756,6 +13813,72 @@ mod target_resolution_tests {
         // Sharing only the root is outside the project tree.
         assert!(!super::same_project_tree(base, Path::new("/etc/passwd")));
         assert!(super::same_project_tree(base, Path::new("/build/source/x")));
+    }
+
+    /// C-ARES' GEOMETRY, AND THE REASON THE CALLER NEEDED ITS OWN PREDICATE.
+    ///
+    /// The scanner reads the BODIES of string macros, so a header declaring a
+    /// host file declares it as an include. `ares_private.h` carries
+    /// `PATH_HOSTS "/etc/hosts"` and `PATH_RESOLV_CONF "/etc/resolv.conf"`,
+    /// and both arrived as ABSOLUTE includes. Declared, they were spelled
+    /// from the build dir as `../../../etc/hosts` - a climb past the root -
+    /// so the task's deepening guard read that as a cwd error, moved the
+    /// working directory to `build/nnd0`, and every one of the package's
+    /// thirty-five real inputs then resolved a name too deep. The whole
+    /// source tree and all three `-I` directories vanished together.
+    ///
+    /// THIS EXERCISES THE FUNCTION THE CALLER CALLS, not the rule beneath it.
+    /// An earlier shape of this test asserted `same_project_tree` and the
+    /// climb arithmetic, both of which are true whether or not the caller
+    /// asks - a control whose arms cannot differ, which is the defect this
+    /// whole class keeps producing. Mutating the caller's guard away must
+    /// fail HERE.
+    #[test]
+    fn a_host_path_include_is_not_carried_and_cannot_outrun_the_build_dir() {
+        let build_dir = Path::new("/build/c-ares-1.34.8/build");
+        let carry = |s: &str| super::host_path_not_this_trees_to_carry(build_dir, Path::new(s));
+
+        // NOT CARRIED: the two the package actually produces, plus a third
+        // shape, all absolute and outside the tree.
+        for host in ["/etc/hosts", "/etc/resolv.conf", "/dev/null"] {
+            assert!(carry(host), "{host} must not be this tree's to carry");
+        }
+
+        // CARRIED: the package's own sources and headers, absolute or not.
+        // An absolute path INSIDE the tree stays, and a relative one is the
+        // caller's business rather than this predicate's - it returned
+        // `false` here, so the caller keeps it.
+        for own in [
+            "/build/c-ares-1.34.8/src/lib/util/ares_threads.c",
+            "/build/c-ares-1.34.8/include/ares.h",
+            "../../c-ares-1.34.8/src/lib/util/ares_threads.c",
+            "ares_config.h",
+        ] {
+            assert!(
+                !carry(own),
+                "{own} belongs to this tree and must be carried"
+            );
+        }
+
+        // AND THE CLIMB THE OMISSION PRODUCED, which is why carrying a host
+        // path costs the tree: spelling `/etc/hosts` from a two-deep build
+        // dir needs three `..`, one more than the dir is deep, so the input
+        // is exactly the one the task's deepening guard fires on.
+        let below_build = build_dir
+            .strip_prefix("/build")
+            .map(|r| r.components().count())
+            .unwrap_or(usize::MAX);
+        assert_eq!(below_build, 2, "the real build dir is two below /build");
+        let climb = |s: &str| {
+            Path::new(s)
+                .components()
+                .take_while(|c| matches!(c, std::path::Component::ParentDir))
+                .count()
+        };
+        assert_eq!(climb("../../../etc/hosts"), 3);
+        assert!(climb("../../../etc/hosts") > below_build);
+        // The package's own sources climb only to the build dir's own depth.
+        assert!(climb("../../c-ares-1.34.8/src/lib/util/ares_threads.c") <= below_build);
     }
 
     #[test]
