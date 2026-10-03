@@ -4267,11 +4267,17 @@ fn build_task_derivation(
             b"NIX_NINJA_RSPFILE_PATH"[..].into(),
             rsp_path.to_string_lossy().into_owned().into_bytes().into(),
         );
+        // Raw on the raw arm like the command line it extends: CMake moves
+        // long compile and link lines here, and a placeholder that rides in
+        // one reaches an object the restore cannot repair.
+        let rsp_content = if lto_raw {
+            rsp_content.clone()
+        } else {
+            rewrite_str(rsp_content, &outer_rewrite_map())
+        };
         drv.env.insert(
             b"NIX_NINJA_RSPFILE_CONTENT"[..].into(),
-            rewrite_str(rsp_content, &outer_rewrite_map())
-                .into_bytes()
-                .into(),
+            rsp_content.into_bytes().into(),
         );
         pass_as_file.push_str(" NIX_NINJA_RSPFILE_CONTENT");
     }
@@ -5442,8 +5448,9 @@ const RESIDUE_WINDOW: usize = 8;
 /// ponytail: 8-byte window; a split into 4-byte immediates slips under it,
 /// shrink the window if one is ever witnessed (shorter windows false-match).
 pub fn placeholder_residue(data: &[u8], restore: &[(String, String)]) -> Option<String> {
-    let mut windows: std::collections::HashMap<[u8; RESIDUE_WINDOW], &str> =
-        std::collections::HashMap::new();
+    // Fx, not SipHash: every byte of every placed file is one lookup. 588
+    // against 83 MB/s on a 210 MB libLLVM.so.
+    let mut windows: rustc_hash::FxHashMap<[u8; RESIDUE_WINDOW], &str> = Default::default();
     for (placeholder, _) in restore {
         let Some(hash) = placeholder
             .rsplit_once('/')

@@ -216,12 +216,14 @@ pub fn symlink_derived_files(
             symlink_files.push(df.clone());
         }
     }
-    create_symlinks(prefix, store_dir, symlink_files.clone(), true)?;
-    refresh_placed_mtimes(prefix, store_dir, &symlink_files);
-
+    // Residue outranks a placement error: the re-exec it triggers places
+    // everything again, and returning the other error would lose the finding.
+    let placed = create_symlinks(prefix, store_dir, symlink_files.clone(), true);
     if !residue.is_empty() {
         return Err(PlaceholderResidue(residue).into());
     }
+    placed?;
+    refresh_placed_mtimes(prefix, store_dir, &symlink_files);
     Ok(())
 }
 

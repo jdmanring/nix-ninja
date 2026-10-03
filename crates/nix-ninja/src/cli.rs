@@ -466,7 +466,18 @@ pub fn run() -> Result<()> {
                         .exec();
                     return Err(anyhow!("re-exec for real outer paths: {err}"));
                 }
-                _ => return Err(e),
+                // The raw arm was already on and still did not reach the
+                // bytes: an input carried the placeholder past it.
+                Some(_) => {
+                    return Err(e.context(format!(
+                        "{} was already set; a placeholder reached the task \
+                         through an input the raw arm does not swap (a locally \
+                         discovered header, an outer-stage header, or a memoised \
+                         upload)",
+                        crate::task::RAW_OUTER_PATHS_ENV
+                    )))
+                }
+                None => return Err(e),
             }
         }
 
