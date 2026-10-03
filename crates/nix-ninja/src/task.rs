@@ -5021,6 +5021,9 @@ fn place_outer_stage_outputs(
         })
         .collect();
     let built = local::build_derived_files(rpc_client, &config.store_dir, &files)?;
+    // The placeholders the task was given, back to the real outer paths. Built
+    // once: it reads the environment and is the same for every output here.
+    let restore = outer_restore_map();
     for (real, staged) in &task.outer_stage_outputs {
         let Some(src) = built.get(staged) else {
             return Err(anyhow!(
@@ -5037,9 +5040,64 @@ fn place_outer_stage_outputs(
         if real.exists() {
             std::fs::remove_file(real).with_context(|| format!("replacing {}", real.display()))?;
         }
-        std::fs::copy(src, real)
+        copy_restoring(src, real, &restore)
             .with_context(|| format!("copying {} to {}", src.display(), real.display()))?;
     }
+    Ok(())
+}
+
+/// Copy a staged store object into the outer output, turning the outer-output
+/// PLACEHOLDERS the task wrote back into the real paths first.
+///
+/// THE PLAIN COPY THIS REPLACES SHIPPED THE PLACEHOLDER VERBATIM. A task runs
+/// in a sandbox where the outer output does not exist, so it is given
+/// placeholders; `symlink_derived_files` restores them for every output it
+/// PLACES, and this path, which copies an output the edge declared INSIDE the
+/// outer output, restored nothing at all. A generated file naming the install
+/// prefix therefore reached `$out` carrying a `/nix/store/<placeholder>-...`
+/// path that does not exist, and nothing downstream looks. That is the
+/// llvm-config symptom (`c6040a0`) reached by a second path, and it was the
+/// worse of the two: there a whole path was swapped and only a compiler-SPLIT
+/// one survived, here not even a whole path was swapped.
+///
+/// The map is non-empty exactly when the driver runs inside the outer
+/// derivation, which is also the only time this function has a real output to
+/// copy into, so the two conditions coincide.
+///
+/// PERMISSIONS ARE THE COPY'S. `std::fs::copy` carries the source's bits and
+/// the destination is inside `$out`, so writing a different mode would move
+/// the outer derivation's own output; the rewritten arm restores them.
+/// THIS IS THE OPPOSITE CHOICE FROM `local::write_restored`, DELIBERATELY.
+/// That one ORs `0o200` because it writes into the BUILD TREE, which the build
+/// has to keep writing to; this writes into the outer OUTPUT, where an added
+/// mode bit is a different output. The two look alike enough that a reader
+/// reconciling them would otherwise correct whichever they read second.
+///
+/// THE RE-EXEC DOES NOT REACH HERE, so residue on this path is LOUD rather
+/// than recovered. `cli::run` decides to re-run with real outer paths from the
+/// error `symlink_derived_files` returns, and this runs inside the build, from
+/// `handle_derivation_result`, so the same error type aborts instead. That is
+/// the right way round for now: the whole-path swap above is what the plain
+/// copy was missing, and a SPLIT placeholder reaching an outer-stage output is
+/// unwitnessed. Route it to the re-exec when a package produces one, rather
+/// than building a second recovery path for a state nothing has reached.
+fn copy_restoring(src: &Path, dst: &Path, restore: &[(String, String)]) -> Result<()> {
+    if !restore.is_empty() {
+        let data = std::fs::read(src)?;
+        let rewritten = rewrite_bytes(&data, restore);
+        // Residue is refused rather than copied: a file carrying a placeholder
+        // into the outer output is wrong in a way nothing downstream detects.
+        let after = rewritten.as_deref().unwrap_or(&data);
+        if let Some(p) = placeholder_residue(after, restore) {
+            return Err(crate::local::PlaceholderResidue(vec![(dst.to_path_buf(), p)]).into());
+        }
+        if let Some(rewritten) = rewritten {
+            std::fs::write(dst, &rewritten)?;
+            std::fs::set_permissions(dst, std::fs::metadata(src)?.permissions())?;
+            return Ok(());
+        }
+    }
+    std::fs::copy(src, dst)?;
     Ok(())
 }
 
@@ -5509,6 +5567,74 @@ mod placeholder_residue_tests {
     fn no_map_and_clean_bytes_are_not_residue() {
         assert_eq!(placeholder_residue(REAL.as_bytes(), &restore()), None);
         assert_eq!(placeholder_residue(FAKE.as_bytes(), &[]), None);
+    }
+
+    /// THE OUTER-STAGE COPY IS THE SECOND PLACEHOLDER PATH AND IT RESTORED
+    /// NOTHING. These pin the restore, the refusal and the file mode; the
+    /// first fails outright if `copy_restoring` is reverted to `fs::copy`.
+    mod copy_restoring_tests {
+        use super::super::copy_restoring;
+        use super::{restore, FAKE, REAL};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn store_object(name: &str, bytes: &[u8]) -> (crate::task::Scratch, std::path::PathBuf) {
+            let d = crate::task::Scratch::new(format!(
+                "nn-copy-restoring-{name}-{}",
+                std::process::id()
+            ));
+            let src = d.join("staged");
+            std::fs::write(&src, bytes).unwrap();
+            // A store object is read only, and the copy carries that mode into
+            // the outer output.
+            std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o444)).unwrap();
+            (d, src)
+        }
+
+        #[test]
+        fn a_whole_placeholder_is_restored_into_the_outer_output() {
+            let (d, src) = store_object("whole", format!("prefix={FAKE}/bin\n").as_bytes());
+            let dst = d.join("out-header.h");
+            copy_restoring(&src, &dst, &restore()).expect("copied");
+            let got = std::fs::read_to_string(&dst).unwrap();
+            assert!(got.contains(REAL), "the real outer path must reach $out");
+            assert!(
+                !got.contains(FAKE),
+                "a plain copy ships the placeholder: {got}"
+            );
+            assert_eq!(
+                std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+                0o444,
+                "a different mode in $out moves the outer derivation's output"
+            );
+        }
+
+        #[test]
+        fn a_split_placeholder_is_refused_rather_than_copied() {
+            let mut bytes = b"\x48\xb8/nix/store/hjbdq8s5j5dkn2a110sy8".to_vec();
+            bytes
+                .extend_from_slice(b"\x48\x89\x44\x24\x08\x48\xb810sy8zlhfcs4lxsx-llvm-22.1.8/bin");
+            let (d, src) = store_object("split", &bytes);
+            let dst = d.join("out-split.bin");
+            let err = copy_restoring(&src, &dst, &restore()).expect_err("residue is refused");
+            assert!(
+                err.downcast_ref::<crate::local::PlaceholderResidue>()
+                    .is_some(),
+                "the re-exec decision reads this type, got {err:?}"
+            );
+            assert!(!dst.exists(), "a file carrying residue must not be placed");
+        }
+
+        #[test]
+        fn an_empty_map_is_a_byte_copy() {
+            let (d, src) = store_object("plain", b"no outer path here\n");
+            let dst = d.join("out-plain.txt");
+            copy_restoring(&src, &dst, &[]).expect("copied");
+            assert_eq!(std::fs::read(&dst).unwrap(), b"no outer path here\n");
+            assert_eq!(
+                std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
     }
 }
 
