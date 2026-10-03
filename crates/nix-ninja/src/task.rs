@@ -4681,7 +4681,8 @@ fn report_progress(n_tasks: u64) {
         "nix-ninja-stats {{\"tasks\":{},\"resolve_ms\":{},\"dyn_ms\":{},\
          \"dyn_realise_ms\":{},\"dyn_discover_ms\":{},\"dyn_adddrv_ms\":{},\
          \"dyn_adddrv_calls\":{},\"plain_adddrv_ms\":{},\"plain_adddrv_calls\":{},\
-         \"sandbox_adddrv_ms\":{},\"sandbox_adddrv_calls\":{},\"rss_mib\":{}}}",
+         \"sandbox_adddrv_ms\":{},\"sandbox_adddrv_calls\":{},\
+         \"outer_stage_placed\":{},\"outer_stage_restored\":{},\"rss_mib\":{}}}",
         n_tasks,
         RESOLVE_MS.load(Ordering::Relaxed),
         DYN_MS.load(Ordering::Relaxed),
@@ -4693,6 +4694,8 @@ fn report_progress(n_tasks: u64) {
         DYN_PLAIN_ADDDRV_N.load(Ordering::Relaxed),
         DYN_SANDBOX_ADDDRV_MS.load(Ordering::Relaxed),
         DYN_SANDBOX_ADDDRV_N.load(Ordering::Relaxed),
+        OUTER_STAGE_PLACED_N.load(Ordering::Relaxed),
+        OUTER_STAGE_RESTORED_N.load(Ordering::Relaxed),
         self_rss_mib(),
     );
     // Persist resolve-cache entries computed since the last tick;
@@ -5042,6 +5045,7 @@ fn place_outer_stage_outputs(
         }
         copy_restoring(src, real, &restore)
             .with_context(|| format!("copying {} to {}", src.display(), real.display()))?;
+        OUTER_STAGE_PLACED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
 }
@@ -5094,6 +5098,7 @@ fn copy_restoring(src: &Path, dst: &Path, restore: &[(String, String)]) -> Resul
         if let Some(rewritten) = rewritten {
             std::fs::write(dst, &rewritten)?;
             std::fs::set_permissions(dst, std::fs::metadata(src)?.permissions())?;
+            OUTER_STAGE_RESTORED_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
     }
@@ -5594,7 +5599,19 @@ mod placeholder_residue_tests {
         fn a_whole_placeholder_is_restored_into_the_outer_output() {
             let (d, src) = store_object("whole", format!("prefix={FAKE}/bin\n").as_bytes());
             let dst = d.join("out-header.h");
+            // THE COUNTER MUST BE ABLE TO LEAVE ZERO, or a round reporting
+            // `outer_stage_restored: 0` is the instrument rather than the
+            // population, which is the reading this whole pair exists to
+            // replace. Compared before and after rather than to a literal,
+            // because the counter is process-wide and tests run in parallel.
+            let before =
+                super::super::OUTER_STAGE_RESTORED_N.load(std::sync::atomic::Ordering::Relaxed);
             copy_restoring(&src, &dst, &restore()).expect("copied");
+            assert!(
+                super::super::OUTER_STAGE_RESTORED_N.load(std::sync::atomic::Ordering::Relaxed)
+                    > before,
+                "the restore ran but the counter did not move"
+            );
             let got = std::fs::read_to_string(&dst).unwrap();
             assert!(got.contains(REAL), "the real outer path must reach $out");
             assert!(
@@ -9410,6 +9427,17 @@ static DYN_SANDBOX_ADDDRV_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 static DYN_SANDBOX_ADDDRV_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_PLAIN_ADDDRV_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_PLAIN_ADDDRV_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// OUTPUTS COPIED INTO THE OUTER OUTPUT, and how many of those needed a
+// placeholder restored. THE POPULATION OF THIS PATH WAS UNCOUNTABLE BEFORE
+// THESE: `place_outer_stage_outputs` prints nothing when it succeeds, and
+// `OUTER_STAGE_DIR` never reaches a log line, so grepping a round for
+// `.nn-outer` returns zero whether or not an edge staged an output. Two
+// sessions read that zero as "no package does this", which it cannot be
+// evidence for. A round's stats line now says so directly, and the pair
+// discriminates the two cases a round log cannot: placed with restored at
+// zero means the staging path ran and no output carried an outer path.
+static OUTER_STAGE_PLACED_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OUTER_STAGE_RESTORED_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_ADDDRV_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_REALISE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_DISCOVER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
