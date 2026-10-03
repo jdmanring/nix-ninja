@@ -578,6 +578,25 @@ pub fn run() -> Result<()> {
                 ),
             }
         }
+
+        // NINJA'S STATE, AFTER THE DEPFILES IT IS BUILT FROM. Only for the
+        // default manifest: real ninja in this directory reads build.ninja, so
+        // entries from another file (the compiler drop-in's one-edge file)
+        // describe a graph nothing consults. Best effort: a failure leaves
+        // real ninja reading the tree as dirty, which is what it read before.
+        let edges = crate::ninja_state::take_collected();
+        if cli.build_filename == Path::new("build.ninja") && !edges.is_empty() {
+            match crate::ninja_state::write(&build_dir, &edges) {
+                Ok(n) => eprintln!(
+                    "nix-ninja: recorded {n}/{} edge(s) in .ninja_log and .ninja_deps",
+                    edges.len()
+                ),
+                Err(e) => eprintln!(
+                    "nix-ninja: could not write .ninja_log/.ninja_deps ({e}); real \
+                     ninja will report work to do for this tree"
+                ),
+            }
+        }
     }
     Ok(())
 }

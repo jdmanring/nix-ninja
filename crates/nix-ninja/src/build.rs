@@ -1,5 +1,6 @@
 use crate::dyndep;
 use crate::local;
+use crate::ninja_state;
 use crate::task;
 use anyhow::bail;
 use anyhow::{anyhow, Result};
@@ -251,6 +252,42 @@ pub fn build(
         outputs.extend(extra);
     }
     outputs.sort();
+
+    // The edges real ninja would consult for this tree: every non-phony build
+    // whose outputs are ALL in the placed set. The CLI writes ninja's state for
+    // them once placement succeeds (`ninja_state`).
+    let placed: HashSet<&Path> = outputs.iter().map(|df| df.build_path.as_path()).collect();
+    let edges: Vec<ninja_state::Edge> = loader
+        .graph
+        .builds
+        .all_ids()
+        .filter_map(|id| {
+            let b = &loader.graph.builds[id];
+            let cmd = b.cmdline.as_ref()?;
+            let outs: Vec<PathBuf> = b
+                .dependencies
+                .outs()
+                .iter()
+                .map(|f| loader.graph.file(*f).path().to_path_buf())
+                .collect();
+            if outs.is_empty() || !outs.iter().all(|o| placed.contains(o.as_path())) {
+                return None;
+            }
+            let command = match &b.rspfile {
+                Some(r) if !r.content.is_empty() => format!("{cmd};rspfile={}", r.content),
+                _ => cmd.clone(),
+            };
+            let gcc_depfile = (b.deps.as_deref() == Some("gcc"))
+                .then(|| b.depfile.as_ref().map(PathBuf::from))
+                .flatten();
+            Some(ninja_state::Edge {
+                outputs: outs,
+                command,
+                gcc_depfile,
+            })
+        })
+        .collect();
+    ninja_state::collect(edges);
 
     // Every task output by build path, for the placement step: a placed
     // output that is a LINK to a sibling (a versioned library's alias) is

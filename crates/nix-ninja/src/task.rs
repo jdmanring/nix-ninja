@@ -6958,8 +6958,13 @@ fn build_dir_disposition(
     // every blanket-taking task on every local pass, and two consumers of
     // one edge emitted at different moments got different derivations for
     // a byte-identical command (class 27, configuration A).
+    // ninja's two state files are written by the driver after a local build
+    // (`ninja_state`) and change on every one, the same hazard.
     let own_state = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-        n == crate::resolve_cache::FILE_NAME || n == crate::resolve_cache::NAR_FILE
+        n == crate::resolve_cache::FILE_NAME
+            || n == crate::resolve_cache::NAR_FILE
+            || n == ".ninja_log"
+            || n == ".ninja_deps"
     });
     if entry_is_file && !own_state {
         BuildDirDisposition::Upload
