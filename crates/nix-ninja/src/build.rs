@@ -277,13 +277,11 @@ pub fn build(
                 Some(r) if !r.content.is_empty() => format!("{cmd};rspfile={}", r.content),
                 _ => cmd.clone(),
             };
-            let gcc_depfile = (b.deps.as_deref() == Some("gcc"))
-                .then(|| b.depfile.as_ref().map(PathBuf::from))
-                .flatten();
             Some(ninja_state::Edge {
                 outputs: outs,
                 command,
-                gcc_depfile,
+                depfile: b.depfile.as_ref().map(PathBuf::from),
+                deps_gcc: b.deps.as_deref() == Some("gcc"),
             })
         })
         .collect();

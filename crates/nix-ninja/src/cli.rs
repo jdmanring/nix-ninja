@@ -425,6 +425,8 @@ pub fn run() -> Result<()> {
     let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
         resolved_connections(&cli, crate::task::available_gib()),
     ))?);
+    // Before any input is read: ninja's records are stamped with it.
+    crate::ninja_state::mark_start(&build_dir);
     let (derived_files, all_outputs) = build(&cli, &build_dir, &rpc_client)?;
     if cli.is_output_derivation {
         // One output derivation, by construction: $out is a single path, so
@@ -585,8 +587,15 @@ pub fn run() -> Result<()> {
         // describe a graph nothing consults. Best effort: a failure leaves
         // real ninja reading the tree as dirty, which is what it read before.
         let edges = crate::ninja_state::take_collected();
-        if cli.build_filename == Path::new("build.ninja") && !edges.is_empty() {
-            match crate::ninja_state::write(&build_dir, &edges) {
+        let default_manifest = cli
+            .build_filename
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect::<PathBuf>()
+            == Path::new("build.ninja");
+        let start = crate::ninja_state::start();
+        if let (true, false, Some(start)) = (default_manifest, edges.is_empty(), start) {
+            match crate::ninja_state::write(&build_dir, &edges, start) {
                 Ok(n) => eprintln!(
                     "nix-ninja: recorded {n}/{} edge(s) in .ninja_log and .ninja_deps",
                     edges.len()

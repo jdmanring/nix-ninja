@@ -32,12 +32,35 @@ pub struct Edge {
     /// The evaluated command, with `;rspfile=<content>` appended when the
     /// edge has a response file, which is the string ninja hashes.
     pub command: String,
-    /// The edge's depfile when it is `deps = gcc`: ninja keeps its contents
-    /// in the deps log and treats the edge as dirty without a record.
-    pub gcc_depfile: Option<PathBuf>,
+    /// The edge's depfile, if any. ninja reads a plain one from disk on every
+    /// check and keeps a `deps = gcc` one in the deps log, so either way a
+    /// depfile this run did not write would vouch for a stale input list.
+    pub depfile: Option<PathBuf>,
+    pub deps_gcc: bool,
 }
 
 static COLLECTED: Mutex<Vec<Edge>> = Mutex::new(Vec::new());
+static START: Mutex<Option<std::time::SystemTime>> = Mutex::new(None);
+
+/// THE RUN'S START, ON THE FILESYSTEM'S CLOCK, taken before any input is read.
+/// It is what ninja records (`command_start_time_`, from a touched temp file):
+/// an input edited after it is newer than every record and reads dirty. A
+/// stamp taken at the END hid exactly that edit for the whole run. The file's
+/// own mtime, not `SystemTime::now()`, because the kernel stamps files with a
+/// coarse clock that can lag the precise one.
+pub fn mark_start(build_dir: &Path) {
+    let probe = build_dir.join(".ninja_state_start.nn-tmp");
+    let t = std::fs::File::create(&probe)
+        .and_then(|f| f.metadata())
+        .and_then(|m| m.modified())
+        .ok();
+    let _ = std::fs::remove_file(&probe);
+    *START.lock().unwrap() = t;
+}
+
+pub fn start() -> Option<std::time::SystemTime> {
+    *START.lock().unwrap()
+}
 
 pub fn collect(edges: Vec<Edge>) {
     *COLLECTED.lock().unwrap() = edges;
@@ -139,17 +162,22 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Stamp every output with one mtime, then write both files from scratch.
-/// Returns how many edges were recorded.
+/// Stamp every output with the run's START, then write both files from
+/// scratch. Returns how many edges were recorded.
 ///
 /// ONE MTIME, because placement order is not dependency order: a library
 /// placed before its objects would read older than its own inputs. Equal is
-/// not older in ninja's comparison, and a source edited afterwards is newer.
+/// not older in ninja's comparison. It is the START (`mark_start`) so an input
+/// edited during the run is newer than the output built from its old bytes.
 /// ponytail: rewritten whole each run, so an edge built by an earlier run and
 /// not placed by this one loses its record and reads dirty; merge with the
 /// existing files if partial-target runs ever need a clean answer.
-pub fn write(build_dir: &Path, edges: &[Edge]) -> std::io::Result<usize> {
-    let now = std::time::SystemTime::now();
+pub fn write(
+    build_dir: &Path,
+    edges: &[Edge],
+    start: std::time::SystemTime,
+) -> std::io::Result<usize> {
+    let tree = std::fs::canonicalize(build_dir)?;
     let mut log = String::from("# ninja log v7\n");
     let mut deps: Vec<u8> = b"# ninjadeps\n".to_vec();
     deps.extend_from_slice(&4i32.to_le_bytes());
@@ -175,10 +203,30 @@ pub fn write(build_dir: &Path, edges: &[Edge]) -> std::io::Result<usize> {
         if abs.iter().any(|p| !p.exists()) {
             continue;
         }
+        // A placed output must resolve inside the tree: one still linked into
+        // the store would have the store object's mtime rewritten.
+        if abs
+            .iter()
+            .any(|p| std::fs::canonicalize(p).map_or(true, |c| !c.starts_with(&tree)))
+        {
+            continue;
+        }
+        // A depfile this run did not write is the previous run's input list.
+        // The copy into the tree is best effort and leaves the old file in
+        // place when it fails, so freshness is the only proof it is this run's.
+        let depfile = edge.depfile.as_ref().map(|d| build_dir.join(d));
+        if let Some(d) = &depfile {
+            let fresh = std::fs::metadata(d)
+                .and_then(|m| m.modified())
+                .is_ok_and(|m| m >= start);
+            if !fresh {
+                continue;
+            }
+        }
         let mut stamped = Vec::with_capacity(abs.len());
         for p in &abs {
             let ok = std::fs::File::open(p)
-                .and_then(|f| f.set_modified(now))
+                .and_then(|f| f.set_modified(start))
                 .is_ok();
             match mtime_ns(p) {
                 Some(m) if ok => stamped.push(m),
@@ -192,12 +240,10 @@ pub fn write(build_dir: &Path, edges: &[Edge]) -> std::io::Result<usize> {
         for (out, m) in edge.outputs.iter().zip(&stamped) {
             log.push_str(&format!("0\t0\t{m}\t{}\t{hash:x}\n", out.display()));
         }
-        if let Some(depfile) = &edge.gcc_depfile {
-            // deps = gcc is single-output in ninja; a missing or unreadable
-            // depfile leaves no record, which ninja reads as dirty.
-            if let (Some(inputs), [out]) =
-                (depfile_inputs(&build_dir.join(depfile)), &edge.outputs[..])
-            {
+        if let (true, Some(depfile)) = (edge.deps_gcc, &depfile) {
+            // deps = gcc is single-output in ninja; an unreadable depfile
+            // leaves no record, which ninja reads as dirty.
+            if let (Some(inputs), [out]) = (depfile_inputs(depfile), &edge.outputs[..]) {
                 let out_id = id_of(
                     n2::canon::to_owned_canon_path(out.to_string_lossy()),
                     &mut deps,
@@ -223,6 +269,82 @@ pub fn write(build_dir: &Path, edges: &[Edge]) -> std::io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn ns(t: SystemTime) -> i64 {
+        t.duration_since(UNIX_EPOCH).unwrap().as_nanos() as i64
+    }
+
+    fn set_mtime(p: &Path, t: SystemTime) {
+        std::fs::File::open(p).unwrap().set_modified(t).unwrap();
+    }
+
+    fn tree(name: &str) -> crate::task::Scratch {
+        crate::task::Scratch::new(format!("nn-ninja-state-{name}-{}", std::process::id()))
+    }
+
+    /// An input edited DURING the run must read newer than the output built
+    /// from its old bytes, so the stamp and the record are the run's start.
+    #[test]
+    fn records_are_stamped_with_the_run_start_not_its_end() {
+        let d = tree("start");
+        let start = SystemTime::now() - Duration::from_secs(60);
+        std::fs::write(d.join("a.o"), b"obj").unwrap();
+        let edge = Edge {
+            outputs: vec![PathBuf::from("a.o")],
+            command: "cc -c a.c -o a.o".into(),
+            depfile: None,
+            deps_gcc: false,
+        };
+        assert_eq!(write(&d, &[edge], start).unwrap(), 1);
+        assert_eq!(mtime_ns(&d.join("a.o")), Some(ns(start)));
+        let log = std::fs::read_to_string(d.join(".ninja_log")).unwrap();
+        let recorded: i64 = log
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split('\t')
+            .nth(2)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            recorded,
+            ns(start),
+            "an edit 30 s into the run must be newer"
+        );
+    }
+
+    /// The depfile copy is best effort and leaves the previous run's file in
+    /// place; a depfile older than the run must not vouch for the edge.
+    #[test]
+    fn a_depfile_older_than_the_run_leaves_the_edge_unrecorded() {
+        let d = tree("depfile");
+        let start = SystemTime::now() - Duration::from_secs(60);
+        std::fs::write(d.join("a.o"), b"obj").unwrap();
+        std::fs::write(d.join("a.o.d"), "a.o: a.c new.h\n").unwrap();
+        let edge = Edge {
+            outputs: vec![PathBuf::from("a.o")],
+            command: "cc -c a.c -o a.o".into(),
+            depfile: Some(PathBuf::from("a.o.d")),
+            deps_gcc: true,
+        };
+        set_mtime(&d.join("a.o.d"), start - Duration::from_secs(10));
+        assert_eq!(write(&d, std::slice::from_ref(&edge), start).unwrap(), 0);
+        let deps = std::fs::read(d.join(".ninja_deps")).unwrap();
+        assert!(
+            !deps.windows(5).any(|w| w == b"new.h"),
+            "stale depfile recorded"
+        );
+
+        set_mtime(&d.join("a.o.d"), start + Duration::from_secs(1));
+        assert_eq!(write(&d, &[edge], start).unwrap(), 1);
+        let deps = std::fs::read(d.join(".ninja_deps")).unwrap();
+        assert!(
+            deps.windows(5).any(|w| w == b"new.h"),
+            "fresh depfile not recorded"
+        );
+    }
 
     /// Vectors are real ninja 1.13.2's own `.ninja_log` hashes, one per
     /// branch of the length switch, read from logs it wrote.

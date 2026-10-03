@@ -6963,8 +6963,9 @@ fn build_dir_disposition(
     let own_state = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
         n == crate::resolve_cache::FILE_NAME
             || n == crate::resolve_cache::NAR_FILE
-            || n == ".ninja_log"
-            || n == ".ninja_deps"
+            || n.starts_with(".ninja_log")
+            || n.starts_with(".ninja_deps")
+            || n.starts_with(".ninja_state_start")
     });
     if entry_is_file && !own_state {
         BuildDirDisposition::Upload
