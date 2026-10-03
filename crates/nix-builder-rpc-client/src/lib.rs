@@ -2190,9 +2190,20 @@ fn transient_daemon_error(msg: &str) -> bool {
     // .../nix-build-uid-N: File exists" - fftw, 2026-08-23). Both are
     // scoped to the cgroup path so an unrelated File exists (a real
     // output collision) stays a verdict.
+    // THE GROUP CLAUSE IS SCOPED THE WAY THE CGROUP ONE IS, and it was not.
+    // `should not be a member of` alone is an unanchored substring, and this
+    // function is handed daemon error text that CARRIES A FAILING BUILD'S OWN
+    // OUTPUT, so a diagnostic using that phrase would be read as the nixbld
+    // race. The polarity is the dangerous one: a false TRUE here suppresses a
+    // verdict and retries a build that genuinely failed, where a false FALSE
+    // only reports the race as terminal. Unwitnessed, and tightened because
+    // the consumer hit the same shape in an audit arm whose `/nonexistent`
+    // literal matched the English phrase `inactive/nonexistent` in a kernel
+    // UAPI doc comment (2026-10-03). Nix's own text names the user and the
+    // group; a compiler cannot.
     (msg.contains("/sys/fs/cgroup/")
         && (msg.contains("No such file") || msg.contains("File exists")))
-        || msg.contains("should not be a member of")
+        || (msg.contains("should not be a member of") && msg.contains("Nix user"))
 }
 
 #[cfg(test)]
@@ -2222,6 +2233,13 @@ mod transient_error_tests {
         // A File exists OUTSIDE the cgroup path is a real collision.
         assert!(!transient_daemon_error(
             "copying '/build/out' to '/nix/store/x': File exists"
+        ));
+        // THE GROUP PHRASE INSIDE A BUILD'S OWN OUTPUT IS NOT THE RACE. The
+        // daemon's error text carries the failing build's log, so an
+        // unanchored match on the phrase alone retried a real failure.
+        assert!(!transient_daemon_error(
+            "builder failed with exit code 1: error: 'x' should not be a member of \
+             class Y [-Werror]"
         ));
     }
 }
