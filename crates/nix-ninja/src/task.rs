@@ -3475,7 +3475,10 @@ fn build_task_derivation(
     // for an LTO compile, which keeps the real paths everywhere: the
     // placeholder would be baked into checksummed LTO bytecode, so the
     // equal-length byte rewrite that restores it cannot reach it.
-    let lto_raw = task.deps.as_deref() == Some("gcc") && task_is_lto(cmdline, &task.wrapper_vars);
+    // The second arm is the fallback for a restore that cannot reach its bytes
+    // (`placeholder_residue`); unset, the emission is what it was.
+    let lto_raw = (task.deps.as_deref() == Some("gcc") && task_is_lto(cmdline, &task.wrapper_vars))
+        || raw_outer_paths_forced();
     // Mirror any include directory the command names inside the outer
     // derivation's own output. Computed BEFORE the placeholder rewrite,
     // because the rewrite is what makes the outer path unrecognisable, and
@@ -5411,6 +5414,95 @@ pub fn outer_restore_map() -> Vec<(String, String)> {
         .into_iter()
         .map(|(r, p)| (p, r))
         .collect()
+}
+
+/// Set by the driver on itself when a restore left placeholder residue; every
+/// task of the run then takes the LTO arm and sees the real outer paths.
+pub const RAW_OUTER_PATHS_ENV: &str = "NIX_NINJA_RAW_OUTER_PATHS";
+
+pub fn raw_outer_paths_forced() -> bool {
+    std::env::var_os(RAW_OUTER_PATHS_ENV).is_some()
+}
+
+/// Window over a placeholder's hash that a split constant cannot hide.
+const RESIDUE_WINDOW: usize = 8;
+
+/// THE RESTORE IS A BYTE-FOR-BYTE SWAP AND A COMPILER DOES NOT KEEP A STRING
+/// WHOLE. A constant-length copy of a literal into a stack buffer is emitted as
+/// immediate stores, so the path lands in the object as overlapping pieces
+/// with opcode bytes between them. llvm 22.1.8's llvm-config (`SmallString`
+/// from `LLVM_TOOLS_INSTALL_DIR`, gcc 16 `-march=znver4`) shipped the `out`
+/// placeholder this way: `hjbdq8s5j5dkn2a110sy8` then `10sy8zlhfcs4lxsx`, the
+/// full 32 characters nowhere, so `rewrite_bytes` found nothing to swap.
+/// Measured on that shape: 22 of 25 eight-character windows survive vector
+/// stores, 3 of 25 survive 8-byte `movabs` stores (`-mno-sse`), and any
+/// chunking into 8-byte pieces leaves at least three whole.
+/// Returns the placeholder a window of which is still present, read AFTER the
+/// restore, so a path that was swapped whole does not count.
+/// ponytail: 8-byte window; a split into 4-byte immediates slips under it,
+/// shrink the window if one is ever witnessed (shorter windows false-match).
+pub fn placeholder_residue(data: &[u8], restore: &[(String, String)]) -> Option<String> {
+    let mut windows: std::collections::HashMap<[u8; RESIDUE_WINDOW], &str> =
+        std::collections::HashMap::new();
+    for (placeholder, _) in restore {
+        let Some(hash) = placeholder
+            .rsplit_once('/')
+            .and_then(|(_, base)| base.split_once('-'))
+            .map(|(h, _)| h.as_bytes())
+        else {
+            continue;
+        };
+        for w in hash.windows(RESIDUE_WINDOW) {
+            windows.insert(w.try_into().unwrap(), placeholder.as_str());
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    data.windows(RESIDUE_WINDOW)
+        .find_map(|w| windows.get(<&[u8; RESIDUE_WINDOW]>::try_from(w).unwrap()))
+        .map(|p| p.to_string())
+}
+
+#[cfg(test)]
+mod placeholder_residue_tests {
+    use super::{placeholder_residue, rewrite_bytes};
+
+    const FAKE: &str = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-llvm-22.1.8";
+    const REAL: &str = "/nix/store/krcfz8rs35zpkrbwhsgvhlnk7r4hgvdk-llvm-22.1.8";
+
+    fn restore() -> Vec<(String, String)> {
+        vec![(FAKE.to_string(), REAL.to_string())]
+    }
+
+    /// The bytes llvm-config shipped: two overlapping immediates with an
+    /// opcode between, the whole placeholder nowhere.
+    #[test]
+    fn a_split_placeholder_is_residue() {
+        let mut data = b"\x48\xb8/nix/store/hjbdq8s5j5dkn2a110sy8".to_vec();
+        data.extend_from_slice(b"\x48\x89\x44\x24\x08\x48\xb810sy8zlhfcs4lxsx-llvm-22.1.8/bin");
+        assert!(
+            rewrite_bytes(&data, &restore()).is_none(),
+            "the swap must miss it"
+        );
+        assert_eq!(
+            placeholder_residue(&data, &restore()).as_deref(),
+            Some(FAKE)
+        );
+    }
+
+    #[test]
+    fn a_whole_placeholder_restored_is_not_residue() {
+        let data = format!("prefix={FAKE}/bin\0").into_bytes();
+        let restored = rewrite_bytes(&data, &restore()).expect("a whole path is swapped");
+        assert_eq!(placeholder_residue(&restored, &restore()), None);
+    }
+
+    #[test]
+    fn no_map_and_clean_bytes_are_not_residue() {
+        assert_eq!(placeholder_residue(REAL.as_bytes(), &restore()), None);
+        assert_eq!(placeholder_residue(FAKE.as_bytes(), &[]), None);
+    }
 }
 
 /// The outer derivation's output NAMES. A plain derivation exports them as

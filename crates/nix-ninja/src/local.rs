@@ -177,6 +177,7 @@ pub fn symlink_derived_files(
         }
     }
     let mut symlink_files: Vec<DerivedFile> = Vec::new();
+    let mut residue: Vec<(PathBuf, String)> = Vec::new();
     for (df, store_path) in opaque_files.iter().zip(store_paths.iter()) {
         let target = store_path.to_absolute_path(store_dir);
         let mut restored = false;
@@ -189,7 +190,15 @@ pub fn symlink_derived_files(
         };
         if !restore.is_empty() && target.is_file() {
             let data = std::fs::read(&target)?;
-            if let Some(rewritten) = crate::task::rewrite_bytes(&data, &restore) {
+            let rewritten = crate::task::rewrite_bytes(&data, &restore);
+            // A placeholder the swap could not reach is NOT placed: a file
+            // carrying it is wrong in a way nothing downstream detects.
+            let after = rewritten.as_deref().unwrap_or(&data);
+            if let Some(p) = crate::task::placeholder_residue(after, &restore) {
+                residue.push((df.build_path.clone(), p));
+                continue;
+            }
+            if let Some(rewritten) = rewritten {
                 let dest = prefix.join(&df.build_path);
                 if let Some(parent) = dest.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -210,8 +219,30 @@ pub fn symlink_derived_files(
     create_symlinks(prefix, store_dir, symlink_files.clone(), true)?;
     refresh_placed_mtimes(prefix, store_dir, &symlink_files);
 
+    if !residue.is_empty() {
+        return Err(PlaceholderResidue(residue).into());
+    }
     Ok(())
 }
+
+/// Outputs left unplaced because a restore could not reach their placeholder
+/// (`task::placeholder_residue`). `cli::run` answers it by re-running with
+/// every task on the raw arm; only the placement in this file scans, so an
+/// output placed by the dynamic or outer-stage paths is not covered.
+#[derive(Debug)]
+pub struct PlaceholderResidue(pub Vec<(PathBuf, String)>);
+
+impl std::fmt::Display for PlaceholderResidue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "outer-output placeholder survived the restore in")?;
+        for (path, placeholder) in &self.0 {
+            write!(f, " {} ({placeholder})", path.display())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PlaceholderResidue {}
 
 /// Write a restored copy, carrying the store object's mode PLUS owner write.
 ///

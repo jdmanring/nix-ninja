@@ -398,6 +398,8 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
+    // A residue re-exec repeats the argv, whose `-C` may be relative.
+    let launch_dir = std::env::current_dir().context("current_dir")?;
     // Change directory if specified
     if let Some(dir) = &cli.dir {
         std::env::set_current_dir(dir)
@@ -437,13 +439,36 @@ pub fn run() -> Result<()> {
         };
         submit_outer_output(&cli.store_dir, derived_file, &rpc_client)?;
     } else {
-        local::symlink_derived_files(
+        let placed = local::symlink_derived_files(
             &rpc_client,
             &cli.store_dir,
             &build_dir,
             &derived_files,
             &all_outputs,
-        )?;
+        );
+        // A RESTORE THAT CANNOT REACH ITS BYTES IS ANSWERED BY NOT NEEDING ONE.
+        // The run is repeated once with every task on the LTO arm, keyed to
+        // the real outer paths. On the compiler route a run is one TU, so one
+        // object loses its reuse across outer re-derivations; a ninja-route
+        // run repeats the whole graph that way. Residue with the arm already
+        // on is not this mechanism and is refused.
+        if let Err(e) = placed {
+            match e.downcast_ref::<local::PlaceholderResidue>() {
+                Some(r) if !crate::task::raw_outer_paths_forced() => {
+                    use std::os::unix::process::CommandExt as _;
+                    eprintln!("nix-ninja: {r}; rebuilding with real outer paths");
+                    drop(rpc_client);
+                    std::env::set_current_dir(&launch_dir).context("set_current_dir")?;
+                    let exe = std::env::current_exe().context("current_exe")?;
+                    let err = std::process::Command::new(exe)
+                        .args(std::env::args_os().skip(1))
+                        .env(crate::task::RAW_OUTER_PATHS_ENV, "1")
+                        .exec();
+                    return Err(anyhow!("re-exec for real outer paths: {err}"));
+                }
+                _ => return Err(e),
+            }
+        }
 
         // UPSTREAM #17, STEPS TWO AND THREE. Step one made the depfile a
         // declared content-addressed output of each task; this puts those
