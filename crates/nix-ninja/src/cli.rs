@@ -426,7 +426,7 @@ pub fn run() -> Result<()> {
         resolved_connections(&cli, crate::task::available_gib()),
     ))?);
     // Before any input is read: ninja's records are stamped with it.
-    crate::ninja_state::mark_start(&build_dir);
+    let start = crate::ninja_state::mark_start(&build_dir);
     let (derived_files, all_outputs) = build(&cli, &build_dir, &rpc_client)?;
     if cli.is_output_derivation {
         // One output derivation, by construction: $out is a single path, so
@@ -593,7 +593,6 @@ pub fn run() -> Result<()> {
             .filter(|c| !matches!(c, std::path::Component::CurDir))
             .collect::<PathBuf>()
             == Path::new("build.ninja");
-        let start = crate::ninja_state::start();
         if let (true, false, Some(start)) = (default_manifest, edges.is_empty(), start) {
             match crate::ninja_state::write(&build_dir, &edges, start) {
                 Ok(n) => eprintln!(

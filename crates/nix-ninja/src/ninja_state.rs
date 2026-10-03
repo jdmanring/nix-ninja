@@ -40,7 +40,6 @@ pub struct Edge {
 }
 
 static COLLECTED: Mutex<Vec<Edge>> = Mutex::new(Vec::new());
-static START: Mutex<Option<std::time::SystemTime>> = Mutex::new(None);
 
 /// THE RUN'S START, ON THE FILESYSTEM'S CLOCK, taken before any input is read.
 /// It is what ninja records (`command_start_time_`, from a touched temp file):
@@ -48,18 +47,14 @@ static START: Mutex<Option<std::time::SystemTime>> = Mutex::new(None);
 /// stamp taken at the END hid exactly that edit for the whole run. The file's
 /// own mtime, not `SystemTime::now()`, because the kernel stamps files with a
 /// coarse clock that can lag the precise one.
-pub fn mark_start(build_dir: &Path) {
+pub fn mark_start(build_dir: &Path) -> Option<std::time::SystemTime> {
     let probe = build_dir.join(".ninja_state_start.nn-tmp");
     let t = std::fs::File::create(&probe)
         .and_then(|f| f.metadata())
         .and_then(|m| m.modified())
         .ok();
     let _ = std::fs::remove_file(&probe);
-    *START.lock().unwrap() = t;
-}
-
-pub fn start() -> Option<std::time::SystemTime> {
-    *START.lock().unwrap()
+    t
 }
 
 pub fn collect(edges: Vec<Edge>) {
