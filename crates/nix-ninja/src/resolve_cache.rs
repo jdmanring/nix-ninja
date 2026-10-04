@@ -87,6 +87,13 @@ struct Cache {
     store_dir: StoreDir,
     build_dir: PathBuf,
     path: PathBuf,
+    /// Where the NAR stamp file lives, which is NOT always beside the memo:
+    /// inside a sandbox it is under `NIX_BUILD_TOP`, clear of both the
+    /// build-dir walk and nixpkgs' source-tree cleanliness checks.
+    nar_path: PathBuf,
+    /// Whether the RESOLVE memo half is live. The stamp half can be on while
+    /// this is off; see `init`.
+    resolve_memo: bool,
     /// Loaded from disk, not yet validated. Keyed by (kind, dir).
     unvalidated: Mutex<HashMap<(String, PathBuf), Entry>>,
     /// Lines computed this run, awaiting the next flush.
@@ -157,6 +164,49 @@ fn files_fingerprint(build_dir: &Path, key_dir: &Path, paths: &[PathBuf]) -> Opt
 /// which is what the skalibs failure above constrains; NIX_BUILD_TOP is
 /// itself a directory that exists, is writable, dies with the derivation,
 /// and no packaging check inspects it.
+/// WHICH HALVES ARE LIVE, AND WHERE THE STAMP FILE GOES. `None` means the
+/// whole cache is off; otherwise `(resolve_memo, nar_path)`.
+///
+/// THE STAMP HALF SURVIVES THE MEMO'S GATE, AND ONLY INSIDE A SANDBOX. The two
+/// reasons persistence is off in a nix build are both about the DERIVATION
+/// boundary, and the drop-in route has a second boundary inside it: a
+/// compiler-route package is ONE derivation whose build tree thousands of shim
+/// invocations share, each a fresh process with an empty memo, so stamps are
+/// replayable WITHIN it. Measured on the consumer's llvm 2026-10-03: 2,747
+/// invocations every one carrying a SINGLE task, 453,998 NAR sends of 457,424,
+/// a 0.75% hit rate against the ~97% this cache exists to give, and a mean
+/// 14.2 s of thread time per TU under `file adds`.
+///
+/// NIX_BUILD_TOP RATHER THAN THE BUILD DIR, for two separate reasons. The
+/// source tree is ruled out: `.nix-ninja-nar-stamps.v1` there fails nixpkgs'
+/// cleanPackaging check (skalibs, 2026-08-23). And a file in the build dir
+/// would be read by the build-dir WALK, which feeds the implicit-input
+/// blanket, so a growing stamp file could move what every task declares.
+/// `/build` is outside the walk, exists, is writable, and dies with the
+/// derivation.
+///
+/// THE MEMO STAYS OFF THERE ON PURPOSE. It memoises RESOLUTION, so a stale
+/// entry changes a task's discovered inputs, which is what
+/// `resolve-cache-added-input.sh` exists to catch. Stamps only skip
+/// re-uploading bytes whose size and mtime still match, validated per hit
+/// against the live file. Different risk, so a different gate. `=1` keeps its
+/// old meaning exactly, both halves on and the stamp file in the build dir,
+/// so the recorded skalibs hazard is unchanged for anyone forcing it.
+fn cache_homes(
+    setting: Option<&str>,
+    build_top: Option<&Path>,
+    build_dir: &Path,
+) -> Option<(bool, PathBuf)> {
+    if setting == Some("0") {
+        return None;
+    }
+    let resolve_memo = persistence_enabled(setting, build_top.is_some());
+    match (build_top, resolve_memo) {
+        (Some(top), false) => Some((false, top.join(NAR_FILE))),
+        _ => Some((resolve_memo, build_dir.join(NAR_FILE))),
+    }
+}
+
 fn persistence_enabled(setting: Option<&str>, in_nix_build: bool) -> bool {
     match setting {
         Some("0") => false,
@@ -222,11 +272,48 @@ fn parse_persisted(body: &str, expected: &str) -> Option<HashMap<(String, PathBu
 pub fn init(store_dir: StoreDir, build_dir: PathBuf) {
     CACHE.get_or_init(|| {
         let setting = std::env::var("NIX_NINJA_RESOLVE_CACHE").ok();
-        if !persistence_enabled(
-            setting.as_deref(),
-            std::env::var_os("NIX_BUILD_TOP").is_some(),
-        ) {
-            return None;
+        let build_top = std::env::var_os("NIX_BUILD_TOP").map(PathBuf::from);
+        let (resolve_memo, nar_path) =
+            cache_homes(setting.as_deref(), build_top.as_deref(), &build_dir)?;
+        // THE STAMP CACHE SURVIVES THE MEMO'S GATE, AND ONLY INSIDE A SANDBOX.
+        // The two reasons persistence is off in a nix build are both about the
+        // DERIVATION boundary, and the drop-in route has a second boundary
+        // inside it: a compiler-route package is ONE derivation whose build
+        // tree thousands of shim invocations share, each a fresh process with
+        // an empty memo, so stamps are replayable WITHIN it. Measured on the
+        // consumer's llvm 2026-10-03: 2,747 invocations every one carrying a
+        // SINGLE task, 453,998 NAR sends of 457,424, a 0.75% hit rate against
+        // the ~97% this cache exists to give, and a mean 14.2 s of thread time
+        // per TU under `file adds`.
+        //
+        // NIX_BUILD_TOP RATHER THAN THE BUILD DIR, for two separate reasons.
+        // The source tree is ruled out: `.nix-ninja-nar-stamps.v1` there fails
+        // nixpkgs' cleanPackaging check (skalibs, 2026-08-23). And a file in
+        // the build dir would be read by the build-dir WALK, which feeds the
+        // implicit-input blanket, so a growing stamp file could move what
+        // every task declares. `/build` is outside the walk, exists, is
+        // writable, and dies with the derivation.
+        //
+        // THE MEMO STAYS OFF HERE ON PURPOSE. It memoises RESOLUTION, so a
+        // stale entry changes a task's discovered inputs, which is what
+        // `resolve-cache-added-input.sh` exists to catch. Stamps only skip
+        // re-uploading bytes whose size and mtime still match, validated per
+        // hit against the live file. Different risk, so a different gate.
+        if !resolve_memo {
+            eprintln!(
+                "nix-ninja: resolve memo off in this sandbox; NAR stamps persist at {}",
+                nar_path.display()
+            );
+            let path = build_dir.join(FILE_NAME);
+            return Some(Cache {
+                store_dir,
+                build_dir,
+                path,
+                nar_path,
+                resolve_memo,
+                unvalidated: Mutex::new(HashMap::new()),
+                pending: Mutex::new(Vec::new()),
+            });
         }
         let path = build_dir.join(FILE_NAME);
         let mut unvalidated = HashMap::new();
@@ -277,6 +364,8 @@ pub fn init(store_dir: StoreDir, build_dir: PathBuf) {
             store_dir,
             build_dir,
             path,
+            nar_path,
+            resolve_memo,
             unvalidated: Mutex::new(unvalidated),
             pending: Mutex::new(Vec::new()),
         })
@@ -288,6 +377,10 @@ pub fn init(store_dir: StoreDir, build_dir: PathBuf) {
 /// the caller recomputes and re-records.
 pub fn lookup(kind: &str, key: &Path) -> Option<Vec<DerivedFile>> {
     let cache = CACHE.get()?.as_ref()?;
+    // The stamp half can be live while this one is not; see `init`.
+    if !cache.resolve_memo {
+        return None;
+    }
     let entry = cache
         .unvalidated
         .lock()
@@ -319,6 +412,9 @@ pub fn record(kind: &str, key: &Path, files: &[DerivedFile]) {
     let Some(cache) = CACHE.get().and_then(|c| c.as_ref()) else {
         return;
     };
+    if !cache.resolve_memo {
+        return;
+    }
     let rels: Vec<PathBuf> = files.iter().map(|f| f.build_path.clone()).collect();
     let Some(fp) = files_fingerprint(&cache.build_dir, key, &rels) else {
         return;
@@ -345,6 +441,9 @@ pub fn flush() -> Result<()> {
     let Some(cache) = CACHE.get().and_then(|c| c.as_ref()) else {
         return Ok(());
     };
+    if !cache.resolve_memo {
+        return Ok(());
+    }
     let lines: Vec<String> = std::mem::take(&mut *cache.pending.lock().unwrap());
     if lines.is_empty() {
         return Ok(());
@@ -375,7 +474,7 @@ pub fn load_nar_stamps() -> Vec<(PathBuf, u64, u128, StorePath)> {
     let Some(cache) = CACHE.get().and_then(|c| c.as_ref()) else {
         return Vec::new();
     };
-    let path = cache.build_dir.join(NAR_FILE);
+    let path = cache.nar_path.clone();
     let Ok(body) = fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -419,7 +518,7 @@ pub fn save_nar_stamps(entries: &[(PathBuf, u64, u128, StorePath)]) -> Result<()
     let Some(cache) = CACHE.get().and_then(|c| c.as_ref()) else {
         return Ok(());
     };
-    let path = cache.build_dir.join(NAR_FILE);
+    let path = cache.nar_path.clone();
     let tmp = path.with_extension("v1.tmp");
     let mut body = String::from(NAR_HEADER);
     body.push('\n');
@@ -458,6 +557,40 @@ mod tests {
         assert!(persistence_enabled(Some("1"), true));
         assert!(persistence_enabled(Some("junk"), false));
         assert!(!persistence_enabled(Some("junk"), true));
+    }
+
+    /// THE STAMP HALF MUST OUTLIVE THE MEMO'S GATE IN A SANDBOX, and its file
+    /// must leave the build directory when it does. Measured cost of getting
+    /// this wrong, on the consumer's llvm: a 0.75% stamp hit rate over 2,747
+    /// single-task invocations, 453,998 NAR sends, mean 14.2 s per TU.
+    #[test]
+    fn stamps_persist_in_a_sandbox_where_the_memo_does_not() {
+        let top = Path::new("/build");
+        let bd = Path::new("/build/source/out/Release");
+
+        // In a sandbox: memo OFF, stamps ON, and the file is under
+        // NIX_BUILD_TOP rather than in the tree the walk reads.
+        let (memo, nar) = cache_homes(None, Some(top), bd).expect("the cache is not wholly off");
+        assert!(!memo, "the resolve memo must stay off in a sandbox");
+        assert_eq!(nar, top.join(NAR_FILE));
+        assert!(
+            !nar.starts_with(bd),
+            "a stamp file inside the build dir is read by the walk and fails cleanPackaging"
+        );
+
+        // Outside one: both halves on, beside the memo, exactly as before.
+        let (memo, nar) = cache_homes(None, None, bd).expect("on outside a sandbox");
+        assert!(memo);
+        assert_eq!(nar, bd.join(NAR_FILE));
+
+        // `=0` is still off everywhere, and `=1` still means what it meant:
+        // both halves on with the stamp file in the build dir, so the recorded
+        // skalibs hazard is unchanged for anyone forcing it.
+        assert!(cache_homes(Some("0"), Some(top), bd).is_none());
+        assert!(cache_homes(Some("0"), None, bd).is_none());
+        let (memo, nar) = cache_homes(Some("1"), Some(top), bd).expect("forced on");
+        assert!(memo);
+        assert_eq!(nar, bd.join(NAR_FILE));
     }
 
     // One process-wide CACHE means one test may init it; this test owns
