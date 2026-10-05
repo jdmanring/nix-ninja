@@ -193,7 +193,9 @@ fn main() -> Result<()> {
     // it, and a compile names include directories the build declares whose
     // files it opens none of. Relative and confined, as the driver emits
     // them; anything else is refused.
-    if let Ok(raw) = env::var("NIX_NINJA_MAKE_DIRS") {
+    if let Ok(raw) =
+        inline_or_pass_as_file(env::var("NIX_NINJA_MAKE_DIRS").ok(), "NIX_NINJA_MAKE_DIRS")
+    {
         // A CLIMBING SPELLING IS ADMITTED WHILE IT STAYS IN THE TREE, because
         // a source tree sits above the build directory and a directory there
         // is as absent from a sandbox as one below it. The categorical

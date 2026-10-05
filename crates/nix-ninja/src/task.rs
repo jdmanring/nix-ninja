@@ -4070,6 +4070,18 @@ fn build_task_derivation(
     // space-separated relative paths; the walk refused any carrying a space.
     // Inserted only when non-empty, for the same hash-stability reason as the
     // aliases.
+    //
+    // THIS LIST RIDES passAsFile LIKE THE OTHER TWO, and until it did it was
+    // the one that could not be passed at all. It accumulates one entry per
+    // make directory, so it scales with the package rather than with the
+    // command, and libLLVMDemangle's archive edge emitted 132,267 bytes
+    // against the kernel's fixed MAX_ARG_STRLEN of 131,072: execve fails
+    // with "Argument list too long" while argv is four short arguments, so
+    // the error names the argument list and the cause is one env string.
+    // The other eleven variables in that derivation totalled 3,356 bytes.
+    // Measured 2026-10-05 on q1lgaz3v8y6nxcbklns2kjgr3vs3r6x7-ninja-build.drv,
+    // which had survived 11,485 tasks of the same package before this edge.
+    // No sysctl raises the limit; it is a compile-time constant.
     if !task.make_dirs.is_empty() {
         drv.env.insert(
             b"NIX_NINJA_MAKE_DIRS"[..].into(),
@@ -4261,7 +4273,23 @@ fn build_task_derivation(
     // build dir) before spawning the command. Content rides passAsFile
     // beside the input map - rsp files exist precisely because their
     // content is too large for a command line.
+    //
+    // EVERY NAME HERE IS APPENDED CONDITIONALLY, and that is not tidiness:
+    // passAsFile is emitted into EVERY task derivation, so an unconditional
+    // name re-keys every task including every banked compile. Appending only
+    // where the attr is actually present keeps the string - and therefore the
+    // derivation hash - byte identical for every task that does not carry it.
+    // NIX_NINJA_MAKE_DIRS is the newest member and the one that forced the
+    // point: it scales with the package rather than the command and reached
+    // 132,267 bytes on libLLVMDemangle's archive edge, over the kernel's
+    // fixed MAX_ARG_STRLEN of 131,072, so execve failed with "Argument list
+    // too long" over four short argv entries. Measured 2026-10-05 on
+    // q1lgaz3v8y6nxcbklns2kjgr3vs3r6x7-ninja-build.drv, after 11,485 tasks
+    // of the same package. No sysctl raises that limit.
     let mut pass_as_file = String::from("NIX_NINJA_INPUTS NIX_NINJA_OUTPUTS");
+    if !task.make_dirs.is_empty() {
+        pass_as_file.push_str(" NIX_NINJA_MAKE_DIRS");
+    }
     if let Some((rsp_path, rsp_content)) = &task.rspfile {
         drv.env.insert(
             b"NIX_NINJA_RSPFILE_PATH"[..].into(),
