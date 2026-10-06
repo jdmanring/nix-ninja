@@ -4098,14 +4098,15 @@ fn build_task_derivation(
     // gains is a real dependency list per task, which is what #17 wants to
     // read back in place of inference.
     //
-    // GATED ON `deps = gcc`, NOT ON `depfile` ALONE, and the difference is
+    // GATED ON THE COMMAND ASKING FOR A DEPFILE, and the difference is
     // load-bearing. A declared output that the command does not produce
-    // fails the task. `depfile` on its own is a path ninja would read IF the
-    // command wrote one; `deps = gcc` is ninja's own statement that this
-    // command writes a gcc-style depfile there, which is the only form that
-    // guarantees the file exists when the command exits. Anything else stays
-    // on the inference path it is on today, so this cannot turn a building
-    // task into a failing one.
+    // fails the task, so the test is the generation flag: a command carrying
+    // one writes the file, and meson's nasm rule (which names `-MF` and no
+    // flag, writing nothing) stays on the inference path it is on today.
+    // `deps = gcc` is neither necessary (meson's cython rule is
+    // `depfile = $out.dep` with no `deps`, and the cython command really
+    // writes it) nor sufficient (meson's `CUSTOM_COMMAND_DEP` puts the flag
+    // inside `$COMMAND`), so it is not the condition.
     // DEDUPED, BECAUSE A REPEATED OUTPUT COSTS A TASK FAILURE RATHER THAN A
     // WASTED COPY. `drv.outputs` is a map, so a path appearing twice collapses
     // there and the derivation looks correct; this Vec is not, so
@@ -10153,10 +10154,12 @@ fn store_rel_path(build_path: &Path) -> PathBuf {
 /// gate in each is how the two rel_path construction sites drifted before
 /// e9b9f68 folded them together.
 ///
-/// GATED ON `deps = gcc`, NOT ON `depfile` ALONE. A declared output the
-/// command does not produce FAILS the task; `depfile` on its own is a path
-/// ninja would read if one appeared, while `deps = gcc` is ninja's own
-/// statement that the command writes a gcc-style depfile there.
+/// GATED ON THE COMMAND ASKING FOR A DEPFILE, NOT ON `deps = gcc`. A
+/// declared output the command does not produce FAILS the task, so the test
+/// is whether the command carries a generation flag; `deps` only says how
+/// ninja stores the list (and meson's `CUSTOM_COMMAND_DEP` rule is a
+/// counterexample in the other direction, `deps = gcc` with the flag hiding
+/// inside `$COMMAND`).
 #[cfg(test)]
 mod accepted_depfile_output_tests {
     use super::accepted_depfile_output_of;
@@ -10165,23 +10168,26 @@ mod accepted_depfile_output_tests {
     const CC: &str = "cc -MD -MF foo.o.d -c foo.c -o foo.o";
 
     #[test]
-    fn a_gcc_deps_edge_with_a_relative_depfile_is_accepted() {
+    fn a_compile_edge_with_a_relative_depfile_is_accepted() {
         assert_eq!(
-            accepted_depfile_output_of(Some("foo.o.d"), Some("gcc"), Some(CC), None),
+            accepted_depfile_output_of(Some("foo.o.d"), Some(CC), None),
             Some(PathBuf::from("foo.o.d"))
         );
     }
 
-    /// THE GATE THAT COSTS A BUILD IF IT WIDENS. A declared output the
-    /// command does not produce fails the task, and `depfile` without
-    /// `deps = gcc` is a path ninja would read IF one appeared - not a
-    /// promise that anything writes it. meson's nasm rule is the real
-    /// case: `depfile =` and no `deps`.
+    /// THE MESON-PYTHON CASE. meson's cython rule carries `depfile =
+    /// $out.dep` and NO `deps` line; the command is `cython -M $ARGS $in -o
+    /// $out`, which writes `<out>.dep`, and real ninja reads that file from
+    /// disk on every check. Refusing it here left the file out of the task's
+    /// outputs, so it was never placed and the edge could not be recorded:
+    /// `ninja explain: depfile '...pyx.c.dep' is missing` on every tree the
+    /// driver built, however many times it was built.
     #[test]
-    fn a_depfile_without_deps_gcc_is_refused() {
+    fn a_rule_naming_a_generation_flag_needs_no_deps_line() {
+        let cython = "cython -M $ARGS $in -o $out";
         assert_eq!(
-            accepted_depfile_output_of(Some("foo.o.d"), None, Some(CC), None),
-            None
+            accepted_depfile_output_of(Some("t.pyx.c.dep"), Some(cython), None),
+            Some(PathBuf::from("t.pyx.c.dep"))
         );
     }
 
@@ -10190,7 +10196,7 @@ mod accepted_depfile_output_tests {
     #[test]
     fn a_command_that_writes_no_depfile_is_refused() {
         assert_eq!(
-            accepted_depfile_output_of(Some("foo.o.d"), Some("gcc"), Some("cc -c foo.c"), None),
+            accepted_depfile_output_of(Some("foo.o.d"), Some("cc -c foo.c"), None),
             None
         );
     }
@@ -10201,7 +10207,7 @@ mod accepted_depfile_output_tests {
     fn a_depfile_outside_the_build_dir_is_refused() {
         for d in ["/tmp/foo.o.d", "../foo.o.d"] {
             assert_eq!(
-                accepted_depfile_output_of(Some(d), Some("gcc"), Some(CC), None),
+                accepted_depfile_output_of(Some(d), Some(CC), None),
                 None,
                 "{d} must not be adopted as an output"
             );
@@ -10210,10 +10216,7 @@ mod accepted_depfile_output_tests {
 
     #[test]
     fn an_empty_depfile_path_is_refused() {
-        assert_eq!(
-            accepted_depfile_output_of(Some(""), Some("gcc"), Some(CC), None),
-            None
-        );
+        assert_eq!(accepted_depfile_output_of(Some(""), Some(CC), None), None);
     }
 
     /// THE libvmaf REGRESSION. meson's nasm rule is `deps = gcc` with
@@ -10226,7 +10229,7 @@ mod accepted_depfile_output_tests {
         let nasm = "nasm -f elf64 -I ../src/ -MQ src/cpuid.obj \
                     -MF src/cpuid.obj.ndep ../src/x86/cpuid.asm -o src/cpuid.obj";
         assert_eq!(
-            accepted_depfile_output_of(Some("src/cpuid.obj.ndep"), Some("gcc"), Some(nasm), None),
+            accepted_depfile_output_of(Some("src/cpuid.obj.ndep"), Some(nasm), None),
             None,
             "-MF alone must not be read as a promise that anything writes it"
         );
@@ -10239,7 +10242,7 @@ mod accepted_depfile_output_tests {
         let nasm =
             "nasm -f elf64 -MD -MQ src/cpuid.obj -MF src/cpuid.obj.ndep ../src/x86/cpuid.asm";
         assert_eq!(
-            accepted_depfile_output_of(Some("src/cpuid.obj.ndep"), Some("gcc"), Some(nasm), None),
+            accepted_depfile_output_of(Some("src/cpuid.obj.ndep"), Some(nasm), None),
             Some(PathBuf::from("src/cpuid.obj.ndep"))
         );
     }
@@ -10250,7 +10253,6 @@ mod accepted_depfile_output_tests {
         assert_eq!(
             accepted_depfile_output_of(
                 Some("foo.o.d"),
-                Some("gcc"),
                 Some("cc @foo.rsp"),
                 Some("-MD -MF foo.o.d -c foo.c")
             ),
@@ -10266,21 +10268,28 @@ mod accepted_depfile_output_tests {
 fn accepted_depfile_output(task: &Task) -> Option<PathBuf> {
     accepted_depfile_output_of(
         task.depfile.as_deref(),
-        task.deps.as_deref(),
         task.cmdline.as_deref(),
         task.rspfile.as_ref().map(|(_, c)| c.as_str()),
     )
 }
 
+/// A depfile is adopted as a task output when the edge names one AND its
+/// command asks for one to be written. `deps = gcc` is not part of the test:
+/// it says how ninja STORES the list, not whether the command writes it.
+/// meson's cython rule is `depfile = $out.dep` with no `deps` line and the
+/// command `cython -M ... -o $out`, which writes `<out>.dep`; ninja then
+/// reads that file from disk on every check, so a tree without it reads
+/// dirty forever (`depfile '...pyx.c.dep' is missing`), and `ninja_state`
+/// cannot record an edge whose depfile was never carried out of the task.
+/// The flag test is what keeps nasm out: meson's nasm rule names `-MQ` and
+/// `-MF` without a generation flag, nasm writes nothing, and adopting a
+/// path nothing writes fails the task.
 fn accepted_depfile_output_of(
     depfile: Option<&str>,
-    deps: Option<&str>,
     cmdline: Option<&str>,
     rspfile_content: Option<&str>,
 ) -> Option<PathBuf> {
-    let (Some(d), Some("gcc")) = (depfile, deps) else {
-        return None;
-    };
+    let d = depfile?;
     if d.is_empty() || !command_writes_depfile(cmdline, rspfile_content) {
         return None;
     }
