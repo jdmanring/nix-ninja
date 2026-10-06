@@ -792,7 +792,7 @@ impl Runner {
                     {
                         if let Ok(rel) = entry.path().strip_prefix(&self.config.build_dir) {
                             let rel = rel.to_string_lossy();
-                            if !rel.is_empty() && !rel.contains(' ') {
+                            if !rel.is_empty() {
                                 self.empty_dirs.push(rel.into_owned());
                             }
                         }
@@ -4067,8 +4067,7 @@ fn build_task_derivation(
         );
     }
     // Directories to create in the sandbox (see Task::make_dirs), relative
-    // paths joined with ENCODED_LIST_SEP. The walk still refuses any carrying
-    // a space, a leftover from when this list was space-joined.
+    // paths joined with ENCODED_LIST_SEP, so a space in a path is carried.
     // Inserted only when non-empty, for the same hash-stability reason as the
     // aliases.
     //
@@ -4290,6 +4289,14 @@ fn build_task_derivation(
     let mut pass_as_file = String::from("NIX_NINJA_INPUTS NIX_NINJA_OUTPUTS");
     if !task.make_dirs.is_empty() {
         pass_as_file.push_str(" NIX_NINJA_MAKE_DIRS");
+    }
+    // The alias list is the same shape (one entry per configure-time soname
+    // link, so it scales with the package) and was the last encoded list
+    // still passed inline; its largest value across 238,245 task derivations
+    // was 15,333 bytes, an eighth of the limit, so this is ahead of the
+    // failure rather than behind it.
+    if !task.alias_symlinks.is_empty() {
+        pass_as_file.push_str(" NIX_NINJA_ALIASES");
     }
     if let Some((rsp_path, rsp_content)) = &task.rspfile {
         drv.env.insert(

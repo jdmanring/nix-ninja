@@ -60,6 +60,17 @@ fn inline_or_pass_as_file(inline: Option<String>, name: &str) -> Result<String> 
     }
 }
 
+/// An attr that may be absent and may ride passAsFile: `None` only when
+/// neither the variable nor its `Path` twin is set. A `Path` that cannot be
+/// read is an ERROR, not an absent list: read as absent, it drops every
+/// entry in silence and the task fails later naming something else.
+fn optional_inline_or_pass_as_file(name: &str) -> Result<Option<String>> {
+    if env::var_os(name).is_none() && env::var_os(format!("{name}Path")).is_none() {
+        return Ok(None);
+    }
+    inline_or_pass_as_file(env::var(name).ok(), name).map(Some)
+}
+
 fn leading_ups(p: &std::path::Path) -> usize {
     p.components()
         .take_while(|c| matches!(c, std::path::Component::ParentDir))
@@ -193,9 +204,7 @@ fn main() -> Result<()> {
     // it, and a compile names include directories the build declares whose
     // files it opens none of. Relative and confined, as the driver emits
     // them; anything else is refused.
-    if let Ok(raw) =
-        inline_or_pass_as_file(env::var("NIX_NINJA_MAKE_DIRS").ok(), "NIX_NINJA_MAKE_DIRS")
-    {
+    if let Some(raw) = optional_inline_or_pass_as_file("NIX_NINJA_MAKE_DIRS")? {
         // A CLIMBING SPELLING IS ADMITTED WHILE IT STAYS IN THE TREE, because
         // a source tree sits above the build directory and a directory there
         // is as absent from a sandbox as one below it. The categorical
@@ -212,8 +221,9 @@ fn main() -> Result<()> {
             let _ = fs::create_dir_all(p);
         }
     }
-    if let Ok(raw) = env::var("NIX_NINJA_ALIASES") {
-        for pair in split_encoded_list(&raw) {
+    let aliases = optional_inline_or_pass_as_file("NIX_NINJA_ALIASES")?;
+    if let Some(raw) = &aliases {
+        for pair in split_encoded_list(raw) {
             let Some((link, target)) = pair.split_once('=') else {
                 continue;
             };
@@ -633,7 +643,7 @@ fn main() -> Result<()> {
         }
     }
     copy_outputs_to_placeholders(&cli.store_dir, &outputs)?;
-    producer_alias_symlinks(&cli.store_dir, &outputs);
+    producer_alias_symlinks(&cli.store_dir, &outputs, aliases.as_deref());
 
     Ok(())
 }
@@ -652,11 +662,11 @@ fn main() -> Result<()> {
 /// whose (same-dir, single-component) target chain ends at that file,
 /// INSIDE the output object, where the relative link resolves against
 /// the real file sitting beside it.
-fn producer_alias_symlinks(store_dir: &StoreDir, outputs: &[DerivedFile]) {
-    let Ok(raw) = env::var("NIX_NINJA_ALIASES") else {
+fn producer_alias_symlinks(store_dir: &StoreDir, outputs: &[DerivedFile], raw: Option<&str>) {
+    let Some(raw) = raw else {
         return;
     };
-    let aliases = same_dir_aliases(&raw);
+    let aliases = same_dir_aliases(raw);
     if aliases.is_empty() {
         return;
     }
@@ -1485,5 +1495,43 @@ mod dotdot_prefix_tests {
         assert!(dotdot_prefixes("gcc -DFOO=a/../b -c x.c", None).is_empty());
         // No `..` anywhere: nothing to do.
         assert!(dotdot_prefixes("gcc -I/build/source/lib -c x.c", None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod optional_pass_as_file_tests {
+    use super::optional_inline_or_pass_as_file;
+    use std::env;
+
+    // Each test owns its variable names, so parallel tests cannot race.
+    #[test]
+    fn neither_spelling_set_is_absent() {
+        assert_eq!(
+            optional_inline_or_pass_as_file("NN_OPT_T_ABSENT").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unreadable_path_is_an_error_not_an_absent_list() {
+        env::set_var("NN_OPT_T_BADPath", "/nonexistent/nn-opt-t-bad");
+        assert!(optional_inline_or_pass_as_file("NN_OPT_T_BAD").is_err());
+    }
+
+    #[test]
+    fn a_readable_path_and_an_inline_value_are_both_read() {
+        let f = env::temp_dir().join(format!("nn-opt-t-{}", std::process::id()));
+        std::fs::write(&f, "a\nb").unwrap();
+        env::set_var("NN_OPT_T_FILEPath", &f);
+        let got = optional_inline_or_pass_as_file("NN_OPT_T_FILE").unwrap();
+        let _ = std::fs::remove_file(&f);
+        assert_eq!(got.as_deref(), Some("a\nb"));
+        env::set_var("NN_OPT_T_INLINE", "x");
+        assert_eq!(
+            optional_inline_or_pass_as_file("NN_OPT_T_INLINE")
+                .unwrap()
+                .as_deref(),
+            Some("x")
+        );
     }
 }
