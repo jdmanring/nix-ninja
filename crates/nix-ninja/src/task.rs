@@ -4066,8 +4066,9 @@ fn build_task_derivation(
             encoded.join(ENCODED_LIST_SEP).into_bytes().into(),
         );
     }
-    // Directories to create in the sandbox (see Task::make_dirs),
-    // space-separated relative paths; the walk refused any carrying a space.
+    // Directories to create in the sandbox (see Task::make_dirs), relative
+    // paths joined with ENCODED_LIST_SEP. The walk still refuses any carrying
+    // a space, a leftover from when this list was space-joined.
     // Inserted only when non-empty, for the same hash-stability reason as the
     // aliases.
     //
