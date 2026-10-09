@@ -40,8 +40,14 @@ pub struct Tools {
     pub cc: Option<StorePath>,
     pub coreutils: StorePath,
     pub nix: StorePath,
-    pub nix_ninja: StorePath,
-    pub nix_ninja_task: StorePath,
+    /// THE TWO BINARIES ARE RESOLVED ONLY WHERE THEY ARE KEYED. Under a
+    /// stable builder (`NIX_NINJA_TASK_BUILDER`, `NIX_NINJA_DRIVER_BUILDER`)
+    /// the binary is mounted by `sandbox-paths` and its store path is neither
+    /// the builder nor an input, so requiring it on PATH made a caller keep
+    /// the binary in its own key for nothing (the cc route's
+    /// `nativeBuildInputs`). Unset, resolution is as fallible as before.
+    pub nix_ninja: Option<StorePath>,
+    pub nix_ninja_task: Option<StorePath>,
     pub patchelf: StorePath,
     /// THE TEXT FILTERS A GENERATOR EDGE EXECS, resolved lazily and absent
     /// without complaint. See `SCRIPT_TOOLS`.
@@ -112,8 +118,8 @@ impl Tools {
             cc: which_store_path(store_dir, "cc").ok(),
             coreutils: which_store_path(store_dir, "coreutils")?,
             nix: which_store_path(store_dir, "nix")?,
-            nix_ninja: which_store_path(store_dir, "nix-ninja")?,
-            nix_ninja_task: which_store_path(store_dir, "nix-ninja-task")?,
+            nix_ninja: unless_stable(stable_driver_builder(), store_dir, "nix-ninja")?,
+            nix_ninja_task: unless_stable(stable_task_builder(), store_dir, "nix-ninja-task")?,
             patchelf: which_store_path(store_dir, "patchelf")?,
             script_tools: SCRIPT_TOOLS
                 .iter()
@@ -3466,7 +3472,7 @@ fn build_task_derivation(
     let mut drv = Derivation::new(
         "ninja-build".parse()?,
         task.system.clone().into_bytes().into(),
-        task_builder_path(&task.store_dir.display(&tools.nix_ninja_task).to_string())?
+        task_builder_path(&keyed_store_path(&task.store_dir, &tools.nix_ninja_task))?
             .into_bytes()
             .into(),
     );
@@ -3665,8 +3671,9 @@ fn build_task_derivation(
     // than an input, and `task_abi()` is what a person moves when a change
     // really does alter what a task writes.
     if stable_task_builder().is_none() {
-        drv.inputs
-            .insert(SingleDerivedPath::Opaque(tools.nix_ninja_task.clone()));
+        drv.inputs.insert(SingleDerivedPath::Opaque(
+            keyed(&tools.nix_ninja_task)?.clone(),
+        ));
     }
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.patchelf.clone()));
@@ -4543,13 +4550,13 @@ fn build_dynamic_task_derivation(
         // binary's. The same treatment applies, and it has to: closing only
         // the plain half leaves every dynamic task re-keyed by a driver edit
         // and the bank only partly saved.
-        driver_builder_path(&store_dir.display(&tools.nix_ninja).to_string())?
+        driver_builder_path(&keyed_store_path(store_dir, &tools.nix_ninja))?
             .into_bytes()
             .into(),
     );
     if stable_driver_builder().is_none() {
         drv.inputs
-            .insert(SingleDerivedPath::Opaque(tools.nix_ninja.clone()));
+            .insert(SingleDerivedPath::Opaque(keyed(&tools.nix_ninja)?.clone()));
     }
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.nix.clone()));
@@ -6659,6 +6666,34 @@ fn stable_driver_builder() -> Option<String> {
     std::env::var("NIX_NINJA_DRIVER_BUILDER")
         .ok()
         .filter(|v| !v.is_empty())
+}
+
+/// A binary's store path, or `None` when a stable builder replaces it; see
+/// `Tools::nix_ninja`. PURE in the choice so a test can reach both arms.
+fn unless_stable(
+    stable: Option<String>,
+    store_dir: &StoreDir,
+    exe: &str,
+) -> Result<Option<StorePath>> {
+    match stable {
+        Some(_) => Ok(None),
+        None => which_store_path(store_dir, exe).map(Some),
+    }
+}
+
+/// The store path a key needs. Reached only when no stable builder is set,
+/// and then `Tools::new` resolved it, so `None` here is a wiring defect.
+fn keyed(p: &Option<StorePath>) -> Result<&StorePath> {
+    p.as_ref()
+        .ok_or_else(|| anyhow!("a builder's store path is needed in the key but was not resolved"))
+}
+
+/// `builder_path`'s store arm. Under a stable builder it is never used, so an
+/// unresolved binary yields an empty string rather than an error.
+fn keyed_store_path(store_dir: &StoreDir, p: &Option<StorePath>) -> String {
+    p.as_ref()
+        .map(|p| store_dir.display(p).to_string())
+        .unwrap_or_default()
 }
 
 fn driver_builder_path(store_driver: &str) -> Result<String> {
@@ -15091,6 +15126,29 @@ mod create_symlink_undeclared_output_tests {
     /// three arms above are the control this one needs: an unconditional
     /// error satisfies the refusal and fails them, which is what a guard
     /// written as "no ABI, no emission" would be.
+    /// THE BINARY IS NOT REQUIRED ON PATH WHERE IT IS NOT KEYED. A consumer
+    /// that reads the driver through the sandbox mount drops it from its
+    /// inputs, so it is absent from PATH; resolving it anyway failed every
+    /// task. The control arm proves the unset case still resolves, so the
+    /// stable arm passes for the knob and not because nothing ever resolves.
+    #[test]
+    fn a_stable_builder_needs_no_binary_on_path() {
+        let store_dir = StoreDir::default();
+        assert!(unless_stable(
+            Some("/nn-task/bin/nix-ninja-task".into()),
+            &store_dir,
+            "nn-no-such-binary-anywhere"
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            unless_stable(None, &store_dir, "nn-no-such-binary-anywhere").is_err(),
+            "unset, an absent binary must still fail"
+        );
+        assert!(keyed(&None).is_err());
+        assert_eq!(keyed_store_path(&store_dir, &None), "");
+    }
+
     #[test]
     fn a_stable_builder_without_a_generation_is_refused() {
         let e = builder_path(
