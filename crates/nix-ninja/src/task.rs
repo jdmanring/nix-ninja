@@ -5550,11 +5550,25 @@ const RESIDUE_WINDOW: usize = 8;
 /// Measured on that shape: 22 of 25 eight-character windows survive vector
 /// stores, 3 of 25 survive 8-byte `movabs` stores (`-mno-sse`), and any
 /// chunking into 8-byte pieces leaves at least three whole.
-/// Returns the placeholder a window of which is still present, read AFTER the
-/// restore, so a path that was swapped whole does not count.
-/// ponytail: 8-byte window; a split into 4-byte immediates slips under it,
-/// shrink the window if one is ever witnessed (shorter windows false-match).
+/// A COMPILER'S OWN COMPRESSION HIDES A PLACEHOLDER FROM EVERY BYTE SCAN,
+/// including this one and the restore above it. gcc emits `.debug_*` sections
+/// with `SHF_COMPRESSED` set and zlib data (`78 9c`), and a `-D` literal
+/// lands inside them (pkg-config 0.29.2 shipped `B/nix/store/...-pkg
+/// config-0.29.2/lib` this way, 2026-10-09: raw scan zero, one `objcopy
+/// --decompress-debug-sections` and the placeholder stood out). Scan those
+/// sections INFLATED. Read-only: the scan answers "is a placeholder in
+/// here"; recovery is the existing re-exec with real outer paths, so the
+/// compressed bytes are never rewritten (a recompress is not byte stable).
 pub fn placeholder_residue(data: &[u8], restore: &[(String, String)]) -> Option<String> {
+    if let Some(p) = placeholder_residue_plain(data, restore) {
+        return Some(p);
+    }
+    compressed_sections(data)
+        .iter()
+        .find_map(|sec| placeholder_residue_plain(sec, restore))
+}
+
+fn placeholder_residue_plain(data: &[u8], restore: &[(String, String)]) -> Option<String> {
     // Fx, not SipHash: every byte of every placed file is one lookup. 588
     // against 83 MB/s on a 210 MB libLLVM.so.
     let mut windows: rustc_hash::FxHashMap<[u8; RESIDUE_WINDOW], &str> = Default::default();
@@ -5578,9 +5592,91 @@ pub fn placeholder_residue(data: &[u8], restore: &[(String, String)]) -> Option<
         .map(|p| p.to_string())
 }
 
+/// The data of every `SHF_COMPRESSED` zlib section of a 64-bit little-endian
+/// ELF file, inflated; empty for anything else, which the caller has already
+/// scanned raw. Parsed by hand: the ELF header, one section-header walk and
+/// the `Elf64_Chdr` are all it needs, and the file is already in memory.
+fn compressed_sections(data: &[u8]) -> Vec<Vec<u8>> {
+    let u16le = |o: usize| {
+        data.get(o..o + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+    };
+    let u32le = |o: usize| {
+        data.get(o..o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    let u64le = |o: usize| {
+        data.get(o..o + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    };
+    // ELFCLASS64, ELFDATA2LSB: the only shape a task on this platform writes.
+    if data.len() < 0x40 || &data[..4] != b"\x7fELF" || data[4] != 2 || data[5] != 1 {
+        return Vec::new();
+    }
+    let (Some(shoff), Some(shentsize), Some(shnum)) = (u64le(0x28), u16le(0x3a), u16le(0x3c))
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for i in 0..shnum {
+        let sh = shoff as usize + i * shentsize;
+        const SHF_COMPRESSED: u64 = 0x800;
+        let (Some(flags), Some(off), Some(size)) =
+            (u64le(sh + 8), u64le(sh + 0x18), u64le(sh + 0x20))
+        else {
+            break;
+        };
+        if flags & SHF_COMPRESSED == 0 {
+            continue;
+        }
+        let (off, size) = (off as usize, size as usize);
+        // Elf64_Chdr: ch_type (4), reserved (4), ch_size (8), ch_addralign
+        // (8); the stream follows. ELFCOMPRESS_ZLIB is 1. Another type
+        // (zstd, 2) is not inflated, so a placeholder there is still unseen.
+        // DEFER(a residue shipped inside a zstd-compressed section): add zstd.
+        const CHDR: usize = 24;
+        if u32le(off) != Some(1) || size < CHDR {
+            continue;
+        }
+        let Some(stream) = data.get(off + CHDR..off + size) else {
+            continue;
+        };
+        if let Ok(v) = miniz_oxide::inflate::decompress_to_vec_zlib(stream) {
+            out.push(v);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod placeholder_residue_tests {
-    use super::{placeholder_residue, rewrite_bytes};
+    use super::{placeholder_residue, placeholder_residue_plain, rewrite_bytes};
+
+    /// THE SHAPE pkg-config 0.29.2 SHIPPED (2026-10-09): a placeholder that
+    /// exists only inside a zlib-compressed debug section. The fixture is
+    /// `tests/fixtures/zlib_debug_placeholder.rs`, a `gcc -g3 -O2 -gz=zlib`
+    /// build whose macro lands in `.debug_macro` and never in code or
+    /// data, so a raw scan cannot see it. The CONTROL is that raw scan: it
+    /// must MISS, or the fixture does not model the defect and the main
+    /// assertion proves nothing.
+    #[test]
+    fn a_placeholder_inside_a_compressed_debug_section_is_residue() {
+        let obj = &crate::tests::zlib_debug_placeholder::object()[..];
+        let restore = vec![(
+            "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-pkg-config-0.29.2".to_string(),
+            "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-pkg-config-0.29.2".to_string(),
+        )];
+        assert_eq!(
+            placeholder_residue_plain(obj, &restore),
+            None,
+            "control: the raw bytes must not show the placeholder"
+        );
+        assert_eq!(
+            placeholder_residue(obj, &restore).as_deref(),
+            Some(restore[0].0.as_str()),
+            "the inflated debug section carries it and must be reported"
+        );
+    }
 
     const FAKE: &str = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-llvm-22.1.8";
     const REAL: &str = "/nix/store/krcfz8rs35zpkrbwhsgvhlnk7r4hgvdk-llvm-22.1.8";
