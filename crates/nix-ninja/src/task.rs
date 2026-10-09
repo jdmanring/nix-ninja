@@ -2289,6 +2289,16 @@ impl Runner {
                     self.config.build_dir.join(rebase_post_cd(&cd_dir, script))
                 };
                 if let Ok(text) = std::fs::read_to_string(&script_path) {
+                    // THE SCRIPT ITSELF IS AN INPUT, and nothing else declares
+                    // it when configure wrote it: CMake's ExternalProject
+                    // emits `<name>-prefix/tmp/<name>-mkdirs.cmake` at
+                    // configure time, no ninja edge produces it, and the
+                    // mkdir edge reads it by absolute path on its command
+                    // line, so curl-impersonate 2.1.1's task arrived with
+                    // zero inputs and cmake died `Not a file`. Pushed as
+                    // spelled; the filters below drop a store or foreign
+                    // path and keep one inside this tree.
+                    referenced.push(script.clone());
                     referenced.extend(cmake_script_referenced_paths(&text, &cmake_p_defs));
                     referenced.extend(cmake_script_included_modules(&script_path, &text));
                 }
