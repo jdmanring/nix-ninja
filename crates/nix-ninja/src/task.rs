@@ -1749,6 +1749,7 @@ impl Runner {
             let msgfmt_dirs = msgfmt_invocation(&args);
             let swig_i = swig_invocation(&args);
             let gir_filelists = gir_filelist_invocation(&args);
+            let protoc = protoc_invocation(&args);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -2260,6 +2261,20 @@ impl Runner {
             }
             if let Some(dirs) = &msgfmt_dirs {
                 for p in msgfmt_its_referenced_paths(&self.config.build_dir, &cd_dir, dirs) {
+                    referenced.push(p);
+                }
+            }
+            // A PROTOC RUN RESOLVES ITS `import` TARGETS ITSELF through the
+            // `-I` roots, so nothing on the command line declares them (upb
+            // 33.6.0 / 36.2.0, `File not found` on every protoc task of two
+            // desktop rounds). Same family and reader placement as swig.
+            if let Some((incs, protos)) = &protoc {
+                for p in protoc_referenced_paths(
+                    &self.config.build_dir,
+                    &cd_dir,
+                    incs,
+                    protos,
+                ) {
                     referenced.push(p);
                 }
             }
@@ -7728,6 +7743,147 @@ fn rst_include_closure(root: &Path, docs: &[PathBuf], cap: usize) -> Vec<PathBuf
     out
 }
 
+/// A `protoc` RUN RESOLVES ITS IMPORTS ITSELF. The trigger returns the
+/// `-I` roots and the positional `.proto` files, so a separate function can
+/// read the imports (the same split as swig's trigger/reader pair, and for
+/// the same reason: the trigger is testable without a filesystem).
+fn protoc_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    if !args.iter().any(|a| a.rsplit('/').next() == Some("protoc")) {
+        return None;
+    }
+    let mut incs: Vec<String> = Vec::new();
+    let mut protos: Vec<String> = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        if a == "-I" {
+            // `-I <dir>` separated: protoc accepts both spellings and CMake
+            // emits the separated one (upb's failing edges carry `-I .` as
+            // two argv entries). The bare flag must not fall through to the
+            // positional branch or the DIRECTORY would masquerade as a file,
+            // and the joined branch below cannot see it: `strip_prefix("-I")`
+            // on a bare `-I` yields an empty value and returns None, so the
+            // separated check must run FIRST.
+            if let Some(v) = it.next() {
+                if !v.is_empty() {
+                    incs.push(v.clone());
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("-I") {
+            if !v.is_empty() {
+                incs.push(v.to_string());
+            }
+        } else if a == "--proto_path" {
+            if let Some(v) = it.next() {
+                if !v.is_empty() {
+                    incs.push(v.clone());
+                }
+            }
+        } else if !a.starts_with('-') && a.ends_with(".proto") {
+            protos.push(a.clone());
+        }
+    }
+    if incs.is_empty() && protos.is_empty() {
+        return None;
+    }
+    Some((incs, protos))
+}
+
+/// The import targets inside a `.proto` file. `import public "..."` and
+/// `import "..."` are the two spellings protoc resolves against `-I`.
+fn proto_imports(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim_start();
+        let rest = t
+            .strip_prefix("import")
+            .map(|r| r.strip_prefix(" public").unwrap_or(r))
+            .map(|r| r.strip_prefix(" weak").unwrap_or(r));
+        let Some(rest) = rest else { continue };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('"') else { continue };
+        let Some(j) = rest.find('"') else { continue };
+        if j > 0 {
+            out.push(rest[..j].to_string());
+        }
+    }
+    out
+}
+
+/// Resolve a protoc run's `.proto` IMPORT CLOSURE against its `-I` roots and
+/// push each as a build-dir-relative spelling. protoc resolves `import
+/// "a/b.proto"` through `-I` and no ninja edge declares the siblings
+/// (upb 33.6.0 / 36.2.0, 134 protoc tasks failed across two desktop rounds
+/// at pin `348e2cf`, 2026-10-10): the argv proto arrives as an input, its
+/// imports do not, and the sandbox hides them. Recurses through imports
+/// (an imported file may import others), dedups, and carries only targets
+/// that EXIST so an unresolvable reference drops rather than failing a read.
+/// Emitted RELATIVE: the wiring's absolute filters drop a store or foreign
+/// path in silence (see `swig_referenced_paths`).
+fn protoc_referenced_paths(
+    build_dir: &Path,
+    cd_dir: &Path,
+    incs: &[String],
+    protos: &[String],
+) -> Vec<String> {
+    let root = build_dir.join(cd_dir);
+    // Each -I spelling relative to the post-cd cwd, resolved on disk.
+    let roots: Vec<PathBuf> = incs
+        .iter()
+        .map(|d| {
+            if Path::new(d).is_absolute() {
+                PathBuf::from(d)
+            } else {
+                root.join(d)
+            }
+        })
+        .collect();
+    // Seed: the argv protos. A positional proto is itself a declared input
+    // (the edge carries it), but resolving its IMPORTS needs it on disk
+    // here, and one spelled relative to the cwd may exist while a
+    // re-rooted spelling does not.
+    let mut queue: Vec<PathBuf> = protos
+        .iter()
+        .filter_map(|p| {
+            let abs = if Path::new(p).is_absolute() {
+                PathBuf::from(p)
+            } else {
+                root.join(p)
+            };
+            abs.is_file().then_some(abs)
+        })
+        .collect();
+    let mut seen: rustc_hash::FxHashSet<PathBuf> = queue.iter().cloned().collect();
+    let mut out: Vec<String> = Vec::new();
+    while let Some(doc) = queue.pop() {
+        let Ok(text) = std::fs::read_to_string(&doc) else {
+            continue;
+        };
+        for imp in proto_imports(&text) {
+            // protoc's own order: the first -I root holding the target wins.
+            let Some(abs) = roots.iter().find_map(|r| {
+                let c = r.join(&imp);
+                c.is_file().then_some(c)
+            }) else {
+                continue;
+            };
+            if !seen.insert(abs.clone()) {
+                continue;
+            }
+            queue.push(abs.clone());
+            // The spelling the build dir sees: an import under the build dir
+            // comes back relative; one above it keeps the `..` climb the
+            // wiring rebases.
+            let rel = relative_from(&abs, build_dir)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| abs.to_string_lossy().into_owned());
+            if !out.contains(&rel) {
+                out.push(rel);
+            }
+        }
+    }
+    out
+}
+
 /// The `.i` files a swig invocation names, or None if the command is not a
 /// swig run. Kept separate from the reader so the trigger is testable without
 /// a filesystem.
@@ -7839,8 +7995,8 @@ fn gir_filelist_referenced_paths(
 #[cfg(test)]
 mod its_and_swig_reader_tests {
     use super::{
-        its_rule_targets, msgfmt_invocation, msgfmt_its_referenced_paths, swig_invocation,
-        swig_referenced_paths,
+        its_rule_targets, msgfmt_invocation, msgfmt_its_referenced_paths, protoc_invocation,
+        protoc_referenced_paths, proto_imports, swig_invocation, swig_referenced_paths,
     };
 
     /// The locating rule is the ONLY place the `.its` name appears, so the
@@ -7985,6 +8141,111 @@ mod its_and_swig_reader_tests {
         assert!(
             !got.iter().any(|p| Path::new(p).is_absolute()),
             "an absolute candidate is dropped silently"
+        );
+    }
+
+    /// BOTH import spellings and the two flags that name a proto path. The
+    /// reader exists because protoc resolves these itself and no edge
+    /// declares them.
+    #[test]
+    fn proto_imports_reads_public_plain_and_weak() {
+        let text = "import public \"a/b.proto\";\nimport \"c.proto\";\nimport weak \"d.proto\";\noption x = 1;\n";
+        assert_eq!(
+            proto_imports(text),
+            vec!["a/b.proto".to_string(), "c.proto".to_string(), "d.proto".to_string()]
+        );
+    }
+
+    /// Only a protoc run triggers, and ALL THREE include spellings are roots
+    /// (joined `-Isrc`, separated `-I .`, and `--proto_path .`); the first
+    /// version handled only the joined one and the wiring gate caught it,
+    /// because upb's real edges carry the separated form.
+    #[test]
+    fn protoc_invocation_takes_every_include_spelling() {
+        let args: Vec<String> = [
+            "protoc",
+            "--upbdefs_out",
+            ":.",
+            "--plugin=protoc-gen-upbdefs=/b/protoc-gen-upbdefs",
+            "-Isrc",
+            "-I",
+            ".",
+            "--proto_path",
+            ".",
+            "upb/util/def_to_proto_test.proto",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (incs, protos) = protoc_invocation(&args).expect("a protoc run");
+        assert_eq!(
+            incs,
+            vec!["src".to_string(), ".".to_string(), ".".to_string()]
+        );
+        assert_eq!(protos, vec!["upb/util/def_to_proto_test.proto".to_string()]);
+        let not: Vec<String> = ["gcc".into(), "x.proto".into()].to_vec();
+        assert!(protoc_invocation(&not).is_none());
+    }
+
+    /// THE DEFECT ITSELF: a sibling import resolves through `-I` and is
+    /// carried at a RELATIVE spelling; the import closure recurses; an
+    /// unresolvable import drops. Fixture is upb's shape: the positional
+    /// proto sits under the same root an `-I` names.
+    #[test]
+    fn protoc_imports_are_resolved_through_the_include_roots() {
+        use super::Scratch;
+        use std::path::Path;
+        let d = Scratch::new(format!("nn-proto-emit-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(bd.join("upb/util")).unwrap();
+        std::fs::write(
+            bd.join("upb/util/def_to_proto_test.proto"),
+            "import public \"upb/util/def_to_proto_public_import_test.proto\";\nimport \"upb/util/def_to_proto_regular_import_test.proto\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bd.join("upb/util/def_to_proto_public_import_test.proto"),
+            "import \"upb/util/nested.proto\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bd.join("upb/util/def_to_proto_regular_import_test.proto"),
+            "syntax = \"proto2\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bd.join("upb/util/nested.proto"),
+            "import \"upb/util/absent.proto\";\n",
+        )
+        .unwrap();
+        let got = protoc_referenced_paths(
+            &bd,
+            Path::new(""),
+            &[".".to_string()],
+            &["upb/util/def_to_proto_test.proto".to_string()],
+        );
+        for want in [
+            "upb/util/def_to_proto_public_import_test.proto",
+            "upb/util/def_to_proto_regular_import_test.proto",
+            "upb/util/nested.proto",
+        ] {
+            assert!(
+                got.contains(&want.to_string()),
+                "the sandbox must carry {want}: {got:?}"
+            );
+        }
+        assert!(
+            !got.iter().any(|p| p.contains("absent.proto")),
+            "an unresolvable import drops rather than failing a read: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|p| Path::new(p).is_absolute()),
+            "an absolute candidate is dropped silently by starts_with(store_dir)"
+        );
+        assert_eq!(
+            got.len(),
+            3,
+            "each import appears once, deduped against re-roots: {got:?}"
         );
     }
 }
