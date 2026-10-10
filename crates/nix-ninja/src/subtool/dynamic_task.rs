@@ -168,9 +168,38 @@ fn prepare_build_environment(store_dir: &StoreDir) -> Result<(PathBuf, HashMap<P
 pub fn scan_seeds(built_paths: &HashMap<PathBuf, PathBuf>) -> Vec<PathBuf> {
     built_paths
         .iter()
-        .filter(|(_, store_path)| !store_path.is_dir())
+        .filter(|(_, store_path)| seed_readable(store_path))
         .map(|(build_path, _)| build_path.clone())
         .collect()
+}
+
+/// A seed must be OPENABLE AS A FILE, and `is_dir()` is not that predicate.
+///
+/// An ALIAS OUTPUT IS STORED AS LINK TEXT (`alias_link_target`): the .so a
+/// versioned-library edge declares alongside its `libx.so.36.2.0` sibling is
+/// its own store object holding only a relative link, because each declared
+/// output is a separate realisation and the sibling lives in a DIFFERENT
+/// object. Realised on its own, the link dangles. protobuf 36.2's four
+/// protoc link edges each take `libutf8_validity.so` as a built input, the
+/// filter passed it exactly as it passes a real file, and the walk died
+///
+/// ```text
+/// Failed to read file <store>-ninja-build-third_party-utf8_range-
+///   libutf8_validity.so/third_party/utf8_range/libutf8_validity.so:
+///   No such file or directory (os error 2)
+/// ```
+///
+/// 4 task(s) failed under keep-going, KDE round at pin fe4e173, 2026-10-10.
+/// Same class as the directory seed above, one predicate over: the guard
+/// asks the shape and not whether the walk can open it.
+///
+/// `try_exists()` follows the link, so a dangling one is `Ok(false)` here
+/// rather than an error, and an existing real file is `Ok(true)`. The
+/// "does not exist yet" case below the directory guard in `scan_seeds`'s
+/// sibling (task.rs's static seed filter) does not apply HERE: every entry
+/// of this map is a REALISED store object, so nothing is pending.
+fn seed_readable(store_path: &Path) -> bool {
+    !store_path.is_dir() && store_path.try_exists().unwrap_or(false)
 }
 
 /// Stage 2: Discover dynamic dependencies by analyzing built files for includes
@@ -391,6 +420,54 @@ mod tests {
         // and a scan seeded with nothing declares nothing - which is the
         // silent failure this class produces one phase later.
         assert_eq!(seeds.len(), 1, "exactly the file survives: {seeds:?}");
+        assert!(
+            seeds[0].ends_with("verbs.h"),
+            "the real header must be kept: {seeds:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// THE SECOND MEMBER OF THE CLASS, EXECUTED. An alias output's store
+    /// object is a DANGLING LINK (link text naming a sibling in a different
+    /// object), so `is_dir()` passes it and the walk dies ENOENT reading
+    /// it - protobuf 36.2's four protoc link edges, 2026-10-10. Reverting
+    /// `seed_readable` fails here while the directory test above stays
+    /// green, which is what says this arm is real and not a restatement.
+    ///
+    /// THE LINK IS CREATED DANGLING ON PURPOSE and points at a sibling
+    /// that exists NOWHERE in the fixture - not in another store object,
+    /// not in the temp dir. Making it resolvable here would pass both the
+    /// old and new filters and the test would assert nothing, the fake
+    /// pass this corpus has shipped before.
+    #[test]
+    fn scan_seeds_drops_an_alias_output_whose_link_dangles() {
+        let d = std::env::temp_dir().join(format!(
+            "nn-seeds-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // The alias: a store object holding only the link text.
+        let alias_out = d.join("ninja-build-third_party-utf8_range-libutf8_validity.so/third_party/utf8_range/libutf8_validity.so");
+        std::fs::create_dir_all(alias_out.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("libutf8_validity.so.36.2.0", &alias_out).unwrap();
+        let file_out = d.join("ninja-build-verbs/verbs.h");
+        std::fs::create_dir_all(file_out.parent().unwrap()).unwrap();
+        std::fs::write(&file_out, b"#pragma once\n").unwrap();
+
+        let mut built_paths = HashMap::new();
+        built_paths.insert(
+            d.join("build/third_party/utf8_range/libutf8_validity.so"),
+            alias_out,
+        );
+        built_paths.insert(d.join("build/verbs.h"), file_out);
+
+        let seeds = scan_seeds(&built_paths);
+
+        assert_eq!(seeds.len(), 1, "exactly the real file survives: {seeds:?}");
         assert!(
             seeds[0].ends_with("verbs.h"),
             "the real header must be kept: {seeds:?}"
