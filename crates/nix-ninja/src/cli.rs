@@ -716,13 +716,31 @@ fn subtool(
                     cli.targets.len()
                 ));
             }
+            // THE NAMED TARGET'S OWN FILE, OR A SINGLE DERIVATION, OR REFUSE.
+            // A phony target resolves to files with other names, so a miss on
+            // the name is not an error when everything it resolved to comes
+            // from one derivation; it IS when it spans several, and taking
+            // the first would print a derivation the caller did not ask for.
             let named = Path::new(&cli.targets[0]);
-            let Some(derived_file) = derived_files
-                .iter()
-                .find(|d| d.build_path == named)
-                .or(derived_files.first())
-            else {
-                return Err(anyhow!("target {} produced no derivation", named.display()));
+            let derived_file = match derived_files.iter().find(|d| d.build_path == named) {
+                Some(d) => d,
+                None => {
+                    let first = derived_files.first().ok_or_else(|| {
+                        anyhow!("target {} produced no derivation", named.display())
+                    })?;
+                    let root = first.derived_path.root_path();
+                    if derived_files
+                        .iter()
+                        .any(|d| d.derived_path.root_path() != root)
+                    {
+                        return Err(anyhow!(
+                            "target {} resolves to outputs of several derivations; \
+                             name one of its files",
+                            named.display()
+                        ));
+                    }
+                    first
+                }
             };
             let drv_path = derived_file.derived_path.root_path();
             let bytes = rpc_client.clone_drv(store_dir, drv_path).ok_or_else(|| {
