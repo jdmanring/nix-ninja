@@ -199,8 +199,7 @@ fn main() -> Result<()> {
         outputs.iter().map(|o| o.build_path.as_path()).collect();
     let (edit_in_place, inputs): (Vec<DerivedFile>, Vec<DerivedFile>) =
         inputs.into_iter().partition(|i| {
-            declared.contains(i.build_path.as_path())
-                && i.absolute_path(&cli.store_dir).is_dir()
+            declared.contains(i.build_path.as_path()) && i.absolute_path(&cli.store_dir).is_dir()
         });
     create_symlinks(&build_dir, &cli.store_dir, inputs, false)?;
     for tree in &edit_in_place {

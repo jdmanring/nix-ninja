@@ -6710,7 +6710,9 @@ fn external_project_step<'a>(mut outs: impl Iterator<Item = &'a str>) -> bool {
     outs.any(|o| {
         let p = Path::new(o);
         let (Some(dir), Some(file)) = (
-            p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()),
+            p.parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str()),
             p.file_name().and_then(|n| n.to_str()),
         ) else {
             return false;
@@ -6723,9 +6725,10 @@ fn external_project_step<'a>(mut outs: impl Iterator<Item = &'a str>) -> bool {
 /// The destination an ExternalProject `extract-<name>.cmake` names on its own
 /// line, `get_filename_component(directory "<abs>" ABSOLUTE)`.
 fn extract_destination(script_text: &str) -> Option<PathBuf> {
-    let line = script_text
-        .lines()
-        .find(|l| l.trim_start().starts_with("get_filename_component(directory"))?;
+    let line = script_text.lines().find(|l| {
+        l.trim_start()
+            .starts_with("get_filename_component(directory")
+    })?;
     let rest = &line[line.find('"')? + 1..];
     Some(PathBuf::from(&rest[..rest.find('"')?]))
 }
@@ -6764,7 +6767,9 @@ fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf
     // or build step cd's to BINARY_DIR and does not match.
     if toks.first() == Some(&"cd") {
         for t in &toks {
-            let Some(stamp_dir) = Path::new(t).parent() else { continue };
+            let Some(stamp_dir) = Path::new(t).parent() else {
+                continue;
+            };
             if !stamp_dir.to_str().is_some_and(|s| s.ends_with("-stamp")) {
                 continue;
             }
@@ -6784,7 +6789,9 @@ fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf
             else {
                 continue;
             };
-            let Some(src) = extract_destination(&text) else { continue };
+            let Some(src) = extract_destination(&text) else {
+                continue;
+            };
             if normalize_build_path_lexical(&cwd) == normalize_build_path_lexical(&src) {
                 if let Some(rel) = relative_from(&src, build_dir)
                     .filter(|r| r.components().next() != Some(std::path::Component::ParentDir))
@@ -8199,8 +8206,8 @@ fn gir_filelist_referenced_paths(
 #[cfg(test)]
 mod its_and_swig_reader_tests {
     use super::{
-        its_rule_targets, msgfmt_invocation, msgfmt_its_referenced_paths, protoc_invocation,
-        protoc_referenced_paths, proto_imports, swig_invocation, swig_referenced_paths,
+        its_rule_targets, msgfmt_invocation, msgfmt_its_referenced_paths, proto_imports,
+        protoc_invocation, protoc_referenced_paths, swig_invocation, swig_referenced_paths,
     };
 
     /// The locating rule is the ONLY place the `.its` name appears, so the
@@ -15589,12 +15596,18 @@ mod external_project_extract_tests {
     /// configure stamp and the source tree is absent.
     #[test]
     fn external_project_steps_are_stamps() {
-        assert!(external_project_step(["dep-prefix/src/dep-stamp/dep-download"].into_iter()));
-        assert!(external_project_step(["dep-prefix/src/dep-stamp/dep-patch"].into_iter()));
+        assert!(external_project_step(
+            ["dep-prefix/src/dep-stamp/dep-download"].into_iter()
+        ));
+        assert!(external_project_step(
+            ["dep-prefix/src/dep-stamp/dep-patch"].into_iter()
+        ));
         // A plain compile stamp is not an ExternalProject step.
         assert!(!external_project_step(["CMakeFiles/foo.stamp"].into_iter()));
         // A stamp directory with no name prefix is not one either.
-        assert!(!external_project_step(["foo-prefix/src/foo-stamp/stamp"].into_iter()));
+        assert!(!external_project_step(
+            ["foo-prefix/src/foo-stamp/stamp"].into_iter()
+        ));
     }
 
     /// curl-impersonate's download edge, in the shape CMake 4.4 generates:
