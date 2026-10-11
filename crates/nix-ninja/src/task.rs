@@ -15559,12 +15559,12 @@ mod external_project_extract_tests {
     /// configure stamp and the source tree is absent.
     #[test]
     fn external_project_steps_are_stamps() {
-        assert!(external_project_step(["dep-prefix/src/dep-stamp/dep-download"].iter()));
-        assert!(external_project_step(["dep-prefix/src/dep-stamp/dep-patch"].iter()));
+        assert!(external_project_step(["dep-prefix/src/dep-stamp/dep-download"].into_iter()));
+        assert!(external_project_step(["dep-prefix/src/dep-stamp/dep-patch"].into_iter()));
         // A plain compile stamp is not an ExternalProject step.
-        assert!(!external_project_step(["CMakeFiles/foo.stamp"].iter()));
+        assert!(!external_project_step(["CMakeFiles/foo.stamp"].into_iter()));
         // A stamp directory with no name prefix is not one either.
-        assert!(!external_project_step(["foo-prefix/src/foo-stamp/stamp"].iter()));
+        assert!(!external_project_step(["foo-prefix/src/foo-stamp/stamp"].into_iter()));
     }
 
     /// curl-impersonate's download edge, in the shape CMake 4.4 generates:
