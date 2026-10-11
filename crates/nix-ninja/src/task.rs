@@ -6665,6 +6665,63 @@ fn undeclared_trees(outputs: &[PathBuf]) -> Vec<PathBuf> {
 /// ("file INSTALL cannot find .../lib/libQt6Svg.prl", 2026-08-23). The
 /// meta file is configure-time content in the build dir, so it is readable
 /// at planning. One function for both the planning and the result paths.
+/// The `SOURCE_DIR` each ExternalProject `extract-<name>.cmake` script on
+/// this command unpacks into, relative to the build dir. The script names its
+/// destination in its own first statement,
+/// `get_filename_component(directory "<abs>" ABSOLUTE)`, so the target is
+/// read from the file CMake generated rather than inferred from the name.
+fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let mut out = Vec::new();
+    for w in toks.windows(2) {
+        if w[0] != "-P" {
+            continue;
+        }
+        let script = Path::new(w[1]);
+        let is_extract = script
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("extract-") && n.ends_with(".cmake"));
+        if !is_extract {
+            continue;
+        }
+        let path = if script.is_absolute() {
+            script.to_path_buf()
+        } else {
+            build_dir.join(script)
+        };
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(line) = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("get_filename_component(directory"))
+        else {
+            continue;
+        };
+        let Some(q) = line.find('"') else { continue };
+        let rest = &line[q + 1..];
+        let Some(e) = rest.find('"') else { continue };
+        let dir = Path::new(&rest[..e]);
+        let rel = if dir.is_absolute() {
+            match relative_from(dir, build_dir) {
+                Some(r) => r,
+                None => continue,
+            }
+        } else {
+            dir.to_path_buf()
+        };
+        // A destination outside the build tree is not this task's to store.
+        if rel.components().next() == Some(std::path::Component::ParentDir) {
+            continue;
+        }
+        if !out.contains(&rel) {
+            out.push(rel);
+        }
+    }
+    out
+}
+
 fn undeclared_outputs(
     declared: &[PathBuf],
     cmdline: Option<&str>,
@@ -6695,6 +6752,23 @@ fn undeclared_outputs(
                         }
                     }
                 }
+            }
+        }
+        // AN EXTERNALPROJECT DOWNLOAD EXTRACTS INTO `SOURCE_DIR` AND
+        // DECLARES ONLY ITS STAMP. curl-impersonate 2.1.1: the download edge
+        // runs `cmake -P extract-<name>.cmake`, whose FIRST statement is
+        // `get_filename_component(directory "<build>/deps/src/<name>"
+        // ABSOLUTE)`, and unpacks the archive there. The task's store output
+        // holds declared outputs only, so the whole source tree is discarded
+        // and the patch step that follows starts on an empty directory:
+        // `can't find file to patch` for every file in a valid patch (drv
+        // `xhfqi93w`, 2026-10-10). Real ninja shares one filesystem and
+        // never notices. Same family as the `create_symlink` below and as
+        // compiler-rt's `.syms`; here the side effect is a TREE, so it is
+        // carried whole rather than as one path.
+        for dir in external_project_extract_dirs(c, build_dir) {
+            if !v.contains(&dir) {
+                v.push(dir);
             }
         }
         // `cmake -E create_symlink <target> <link>`: cmake's custom-target
@@ -15386,6 +15460,53 @@ mod alias_symlink_tests {
         assert!(!dangling.is_file(), "dangling escape is skipped");
 
         std::fs::remove_dir_all(&d).ok();
+    }
+}
+
+#[cfg(test)]
+mod external_project_extract_tests {
+    use super::*;
+
+    /// curl-impersonate's download edge, in the shape CMake 4.4 generates:
+    /// the `cd` target is `deps/src`, three `-P` scripts run, and only the
+    /// stamp is declared. The extract script names `SOURCE_DIR` on its first
+    /// line, and that tree must come back as an output or the patch step
+    /// sees an empty directory.
+    #[test]
+    fn the_extract_scripts_source_dir_is_an_output() {
+        let d = Scratch::new(format!("nn-ep-extract-{}", std::process::id()));
+        let bd = d.join("b");
+        let stamp = bd.join("boringssl-prefix/src/boringssl-stamp");
+        std::fs::create_dir_all(&stamp).unwrap();
+        let src = bd.join("deps/src/boringssl");
+        std::fs::write(
+            stamp.join("extract-boringssl.cmake"),
+            format!(
+                "# Distributed under the OSI-approved BSD 3-Clause License.\n\nget_filename_component(filename \"{}/x.zip\" ABSOLUTE)\nget_filename_component(directory \"{}\" ABSOLUTE)\n",
+                stamp.display(),
+                src.display()
+            ),
+        )
+        .unwrap();
+        let cmd = format!(
+            "cd {b}/deps/src && cmake -P {s}/download-boringssl.cmake && cmake -P {s}/verify-boringssl.cmake && cmake -P {s}/extract-boringssl.cmake && cmake -E touch {s}/boringssl-download",
+            b = bd.display(),
+            s = stamp.display()
+        );
+        let v = undeclared_outputs(&[], Some(&cmd), &bd);
+        assert!(
+            v.contains(&PathBuf::from("deps/src/boringssl")),
+            "SOURCE_DIR must be an output: {v:?}"
+        );
+        // `filename` is the archive, not the destination; it must not leak.
+        assert!(!v.iter().any(|p| p.ends_with("x.zip")), "{v:?}");
+        // Negative control: the patch step names no extract script.
+        let v = undeclared_outputs(
+            &[],
+            Some(&format!("cd {}/deps/src/boringssl && patch -p1 -i x.patch", bd.display())),
+            &bd,
+        );
+        assert!(!v.contains(&PathBuf::from("deps/src/boringssl")), "{v:?}");
     }
 }
 
