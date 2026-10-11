@@ -3978,6 +3978,7 @@ fn build_task_derivation(
         let rewritten = rewritten_uploads().lock().unwrap().clone();
         if !rewritten.is_empty() {
             let mut swapped = 0usize;
+            let mut real_paths: Vec<String> = Vec::new();
             for i in task.inputs.iter().chain(discovered_inputs.iter()) {
                 if !matches!(i.derived_path, SingleDerivedPath::Opaque(_)) {
                     continue;
@@ -3994,11 +3995,20 @@ fn build_task_derivation(
                 drv.inputs.remove(&i.derived_path);
                 input_set.insert(fresh.to_encoded(&task.store_dir));
                 drv.inputs.insert(fresh.derived_path.clone());
+                real_paths.push(canonical.to_string_lossy().into_owned());
                 swapped += 1;
             }
             if swapped > 0 {
+                // NAME THE PATHS, NOT JUST THE COUNT. The count alone leaves the
+                // consumer's resumability gate refusing a whole family on a
+                // number it cannot act on; the names say which outer outputs
+                // impose the condition, so they can classify per path. Sorted
+                // because the walk order is not stable across runs and an
+                // unsorted list makes two runs of one edge incomparable.
+                real_paths.sort();
+                let listed = real_paths.join(" ");
                 eprintln!(
-                    "nix-ninja: LTO task keeps real outer paths in {swapped} input(s) (resumable only while $out is unchanged)"
+                    "nix-ninja: LTO task keeps real outer paths in {swapped} input(s) (resumable only while $out is unchanged): {listed}"
                 );
             }
         }
