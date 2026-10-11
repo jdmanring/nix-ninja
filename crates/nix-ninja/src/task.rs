@@ -6672,6 +6672,23 @@ fn undeclared_trees(outputs: &[PathBuf]) -> Vec<PathBuf> {
 /// read from the file CMake generated rather than inferred from the name.
 fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    // THE SCRIPT PATH IS RELATIVE TO THE LEADING `cd`, NOT THE BUILD DIR.
+    // CMake emits `cd deps/src && cmake -P ../../<name>-prefix/.../extract-
+    // <name>.cmake`; joined to the build dir that climbs two levels above
+    // it, the read fails, and the reader returns nothing while its unit
+    // test (absolute paths throughout) passes. The gate's real configure
+    // caught this.
+    let cwd = match toks.as_slice() {
+        ["cd", dir, "&&", ..] => {
+            let d = Path::new(dir);
+            if d.is_absolute() {
+                d.to_path_buf()
+            } else {
+                build_dir.join(d)
+            }
+        }
+        _ => build_dir.to_path_buf(),
+    };
     let mut out = Vec::new();
     for w in toks.windows(2) {
         if w[0] != "-P" {
@@ -6688,7 +6705,7 @@ fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf
         let path = if script.is_absolute() {
             script.to_path_buf()
         } else {
-            build_dir.join(script)
+            cwd.join(script)
         };
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
@@ -15479,6 +15496,9 @@ mod external_project_extract_tests {
         let stamp = bd.join("boringssl-prefix/src/boringssl-stamp");
         std::fs::create_dir_all(&stamp).unwrap();
         let src = bd.join("deps/src/boringssl");
+        // The mkdir step creates `deps/src` before download runs, and the
+        // kernel resolves `..` through it, so it must exist here too.
+        std::fs::create_dir_all(bd.join("deps/src")).unwrap();
         std::fs::write(
             stamp.join("extract-boringssl.cmake"),
             format!(
@@ -15497,6 +15517,15 @@ mod external_project_extract_tests {
         assert!(
             v.contains(&PathBuf::from("deps/src/boringssl")),
             "SOURCE_DIR must be an output: {v:?}"
+        );
+        // THE SHAPE CMAKE ACTUALLY EMITS: a RELATIVE `cd` and script paths
+        // relative to it. The first version joined the script onto the
+        // build dir, read nothing, and passed the absolute-path case above.
+        let rel = "cd deps/src && cmake -P ../../boringssl-prefix/src/boringssl-stamp/verify-boringssl.cmake && cmake -P ../../boringssl-prefix/src/boringssl-stamp/extract-boringssl.cmake && cmake -E touch ../../boringssl-prefix/src/boringssl-stamp/boringssl-download";
+        let v = undeclared_outputs(&[], Some(rel), &bd);
+        assert!(
+            v.contains(&PathBuf::from("deps/src/boringssl")),
+            "a cd-relative script must resolve: {v:?}"
         );
         // `filename` is the archive, not the destination; it must not leak.
         assert!(!v.iter().any(|p| p.ends_with("x.zip")), "{v:?}");
