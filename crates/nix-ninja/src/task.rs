@@ -2269,12 +2269,8 @@ impl Runner {
             // 33.6.0 / 36.2.0, `File not found` on every protoc task of two
             // desktop rounds). Same family and reader placement as swig.
             if let Some((incs, protos)) = &protoc {
-                for p in protoc_referenced_paths(
-                    &self.config.build_dir,
-                    &cd_dir,
-                    incs,
-                    protos,
-                ) {
+                let got = protoc_referenced_paths(&self.config.build_dir, &cd_dir, incs, protos);
+                for p in got {
                     referenced.push(p);
                 }
             }
@@ -7788,19 +7784,36 @@ fn protoc_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
     Some((incs, protos))
 }
 
-/// The import targets inside a `.proto` file. `import public "..."` and
-/// `import "..."` are the two spellings protoc resolves against `-I`.
+/// The import targets inside a `.proto` file.
+///
+/// THREE QUALIFIERS ARE IN USE and this function first enumerated two of
+/// them, which silently dropped the third. Over protobuf 36.2's own tree the
+/// population is `import "` 247, `import option "` 33, `import public "` 27;
+/// the first version stripped only ` public` and ` weak`, so `import
+/// option "upb/test/custom_options.proto"` fell through to the quote test
+/// with its `o` still attached and was skipped WITHOUT A WORD. That is the
+/// `edition = "2024"` spelling, and it is the 162-task KDE failure at pin
+/// `29f2f27` (drv `cf8igx44`, 2026-10-10): the reader reported nothing for a
+/// proto whose only imports were `import option`, reading as a wired reader
+/// that found nothing to carry.
+///
+/// So the qualifier is now whatever sits between the keyword and the opening
+/// quote, taken as one token, rather than a list to keep in sync. A future
+/// qualifier costs nothing; the old shape cost this defect.
 fn proto_imports(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
         let t = line.trim_start();
-        let rest = t
-            .strip_prefix("import")
-            .map(|r| r.strip_prefix(" public").unwrap_or(r))
-            .map(|r| r.strip_prefix(" weak").unwrap_or(r));
-        let Some(rest) = rest else { continue };
-        let rest = rest.trim_start();
-        let Some(rest) = rest.strip_prefix('"') else { continue };
+        let Some(after) = t.strip_prefix("import") else {
+            continue;
+        };
+        // `import` must be a whole word: `imports` is not an import.
+        if !after.starts_with([' ', '\t']) {
+            continue;
+        }
+        // Skip the qualifier (`option`, `public`, `weak`, ...) to the quote.
+        let Some(q) = after.find('"') else { continue };
+        let rest = &after[q + 1..];
         let Some(j) = rest.find('"') else { continue };
         if j > 0 {
             out.push(rest[..j].to_string());
@@ -8144,15 +8157,22 @@ mod its_and_swig_reader_tests {
         );
     }
 
-    /// BOTH import spellings and the two flags that name a proto path. The
-    /// reader exists because protoc resolves these itself and no edge
-    /// declares them.
+    /// EVERY import qualifier, and the list is the point: this test named
+    /// two of the three in use and the third (`import option`, the
+    /// `edition = "2024"` spelling, 33 occurrences in protobuf 36.2's own
+    /// tree) was dropped in silence, which is the 162-task KDE failure at
+    /// pin `29f2f27`. `imports` is not an import.
     #[test]
-    fn proto_imports_reads_public_plain_and_weak() {
-        let text = "import public \"a/b.proto\";\nimport \"c.proto\";\nimport weak \"d.proto\";\noption x = 1;\n";
+    fn proto_imports_reads_every_qualifier() {
+        let text = "import public \"a/b.proto\";\nimport \"c.proto\";\nimport weak \"d.proto\";\nimport option \"upb/test/custom_options.proto\";\nimports x = 1;\noption x = 1;\n";
         assert_eq!(
             proto_imports(text),
-            vec!["a/b.proto".to_string(), "c.proto".to_string(), "d.proto".to_string()]
+            vec![
+                "a/b.proto".to_string(),
+                "c.proto".to_string(),
+                "d.proto".to_string(),
+                "upb/test/custom_options.proto".to_string()
+            ]
         );
     }
 
