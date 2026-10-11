@@ -705,12 +705,17 @@ fn subtool(
             ))?);
             let (derived_files, _all_outputs) = build(&cli, build_dir, &rpc_client)?;
             // `drv` prints ONE derivation. Same reasoning as above: refusing
-            // is the only honest answer to several targets here.
-            let [derived_file] = &derived_files[..] else {
+            // is the only honest answer to several targets here. Counted by
+            // DERIVATION, not by file: one target expands to its co-outputs
+            // (an ExternalProject stamp carries the source tree its step
+            // wrote), and those are outputs of the same derivation.
+            let mut by_drv = derived_files.clone();
+            by_drv.dedup_by(|a, b| a.derived_path.root_path() == b.derived_path.root_path());
+            let [derived_file] = &by_drv[..] else {
                 return Err(anyhow!(
-                    "subtool drv shows a single derivation, but {} targets were \
+                    "subtool drv shows a single derivation, but {} derivations were \
                      requested; name one target",
-                    derived_files.len()
+                    by_drv.len()
                 ));
             };
             let drv_path = derived_file.derived_path.root_path();
