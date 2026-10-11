@@ -926,7 +926,8 @@ impl Runner {
                     // recording its edge inputs lets the worklist's phony
                     // expansion materialize them for the consumer.
                     || c.contains("generate_grd.py")
-        }) {
+        }) || external_project_step(build.outs().iter().map(|f| files.by_id[*f].name.as_str()))
+        {
             let ins: Vec<FileId> = build.dirtying_ins().to_vec();
             for fid in build.outs() {
                 self.stamp_inputs.insert(*fid, ins.clone());
@@ -6665,6 +6666,30 @@ fn undeclared_trees(outputs: &[PathBuf]) -> Vec<PathBuf> {
 /// ("file INSTALL cannot find .../lib/libQt6Svg.prl", 2026-08-23). The
 /// meta file is configure-time content in the build dir, so it is readable
 /// at planning. One function for both the planning and the result paths.
+/// AN EXTERNALPROJECT STEP IS A STAMP EDGE. Each step (mkdir, download,
+/// update, patch, configure, build, install) declares only
+/// `<name>-prefix/src/<name>-stamp/<name>-<step>` and depends on the previous
+/// step's stamp; the real products are the trees in SOURCE_DIR and
+/// BINARY_DIR, written on a shared filesystem. The source tree is declared
+/// on the step that writes it (`external_project_extract_dirs`), but the
+/// build step's only input is the configure stamp, so the tree hanging off
+/// the patch stamp never reached it ("No such file" copying
+/// `deps/src/dep/data.txt`, measured on B). Recording these as stamp edges
+/// lets the consumer worklist walk the chain back to every tree it carries.
+fn external_project_step<'a>(mut outs: impl Iterator<Item = &'a str>) -> bool {
+    outs.any(|o| {
+        let p = Path::new(o);
+        let (Some(dir), Some(file)) = (
+            p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()),
+            p.file_name().and_then(|n| n.to_str()),
+        ) else {
+            return false;
+        };
+        dir.strip_suffix("-stamp")
+            .is_some_and(|name| file.starts_with(&format!("{name}-")))
+    })
+}
+
 /// The destination an ExternalProject `extract-<name>.cmake` names on its own
 /// line, `get_filename_component(directory "<abs>" ABSOLUTE)`.
 fn extract_destination(script_text: &str) -> Option<PathBuf> {
@@ -15528,6 +15553,19 @@ mod alias_symlink_tests {
 #[cfg(test)]
 mod external_project_extract_tests {
     use super::*;
+
+    /// An ExternalProject step declares only its stamp; the consumer must
+    /// walk the chain to reach the tree, or the build step names only the
+    /// configure stamp and the source tree is absent.
+    #[test]
+    fn external_project_steps_are_stamps() {
+        assert!(external_project_step(["dep-prefix/src/dep-stamp/dep-download"].iter()));
+        assert!(external_project_step(["dep-prefix/src/dep-stamp/dep-patch"].iter()));
+        // A plain compile stamp is not an ExternalProject step.
+        assert!(!external_project_step(["CMakeFiles/foo.stamp"].iter()));
+        // A stamp directory with no name prefix is not one either.
+        assert!(!external_project_step(["foo-prefix/src/foo-stamp/stamp"].iter()));
+    }
 
     /// curl-impersonate's download edge, in the shape CMake 4.4 generates:
     /// the `cd` target is `deps/src`, three `-P` scripts run, and only the
