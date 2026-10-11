@@ -221,6 +221,13 @@ pub struct BuildResult {
     pub label: String,
     pub derived_path: Option<SingleDerivedPath>,
     pub derived_files: Vec<DerivedFile>,
+    /// ExternalProject source trees among `derived_files`
+    /// (`external_project_extract_dirs`). They have no graph node, so they
+    /// reach a consumer only as co-outputs of the step's stamp, exactly like
+    /// an `is_tree_path` directory. Carried explicitly because the shape test
+    /// cannot know them: `deps/src/<name>` is identified by the command that
+    /// writes it, not by its name.
+    pub undeclared_dirs: Vec<PathBuf>,
     pub err: Option<Error>,
 }
 
@@ -900,6 +907,7 @@ impl Runner {
                     .unwrap_or_else(|| format!("{bid:?}")),
                 derived_path: None,
                 derived_files: Vec::new(),
+                undeclared_dirs: Vec::new(),
                 err: None,
             })
             .context("completing phony build")?;
@@ -1099,6 +1107,7 @@ impl Runner {
             // output is a task failure.
             let mut derived_path = derived_path;
             let mut err = err;
+            let mut undeclared_dirs: Vec<PathBuf> = Vec::new();
             let derived_files = if let Some(ref final_derived_path) = derived_path.clone() {
                 let names: Vec<String> = task
                     .outs()
@@ -1129,6 +1138,14 @@ impl Runner {
                     if !paths.contains(&dir) {
                         drv_outputs.push(new_built_file(final_derived_path.clone(), dir));
                     }
+                }
+                // ONLY the ExternalProject trees ride the co-outputs. The
+                // other undeclared outputs (a `create_symlink` link, a Qt
+                // `.prl`) are files that kept their old wiring; attaching
+                // them here would hand them to new consumers and move those
+                // consumers' emission for a class they never had.
+                if let Some(c) = task.cmdline.as_deref() {
+                    undeclared_dirs = external_project_extract_dirs(c, &config.build_dir);
                 }
                 // UPSTREAM #17: record this task's depfile output. NOT
                 // pushed into drv_outputs - the depfile is not a ninja
@@ -1177,6 +1194,7 @@ impl Runner {
                 label,
                 derived_path,
                 derived_files,
+                undeclared_dirs,
                 err,
             };
             let _ = tx.send(result);
@@ -1228,7 +1246,8 @@ impl Runner {
         let mut fids: Vec<FileId> = Vec::new();
         let mut tree_fids: Vec<FileId> = Vec::new();
         for derived_file in result.derived_files {
-            let is_tree = is_tree_path(&derived_file.build_path);
+            let is_tree = is_tree_path(&derived_file.build_path)
+                || result.undeclared_dirs.contains(&derived_file.build_path);
             let fid = self.add_derived_file(files, derived_file.clone());
             if is_tree {
                 tree_fids.push(fid);
