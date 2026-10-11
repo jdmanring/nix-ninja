@@ -4757,6 +4757,9 @@ pub fn report_progress_final() {
 
 fn report_progress(n_tasks: u64) {
     use std::sync::atomic::Ordering;
+    // Read ONCE: two loads sample two instants and can print a count above
+    // its own monotone total, the same trap the realise/nar counters had.
+    let d = nix_builder_rpc_client::uploaded_drv_bytes();
 
     // Machine-readable counters, in MILLISECONDS, when asked for.
     //
@@ -4788,7 +4791,8 @@ fn report_progress(n_tasks: u64) {
          \"dyn_realise_ms\":{},\"dyn_discover_ms\":{},\"dyn_adddrv_ms\":{},\
          \"dyn_adddrv_calls\":{},\"plain_adddrv_ms\":{},\"plain_adddrv_calls\":{},\
          \"sandbox_adddrv_ms\":{},\"sandbox_adddrv_calls\":{},\
-         \"outer_stage_placed\":{},\"outer_stage_restored\":{},\"rss_mib\":{}}}",
+         \"outer_stage_placed\":{},\"outer_stage_restored\":{},\"rss_mib\":{},\
+         \"drv_entries\":{},\"drv_bytes\":{}}}",
         n_tasks,
         RESOLVE_MS.load(Ordering::Relaxed),
         DYN_MS.load(Ordering::Relaxed),
@@ -4803,6 +4807,8 @@ fn report_progress(n_tasks: u64) {
         OUTER_STAGE_PLACED_N.load(Ordering::Relaxed),
         OUTER_STAGE_RESTORED_N.load(Ordering::Relaxed),
         self_rss_mib(),
+        d.0,
+        d.1,
     );
     // Persist resolve-cache entries computed since the last tick;
     // a killed driver loses at most one tick's worth.

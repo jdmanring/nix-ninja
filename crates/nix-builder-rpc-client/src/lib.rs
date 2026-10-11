@@ -415,6 +415,28 @@ pub fn realise_stats() -> (u64, u64) {
     )
 }
 
+/// `(entries, bytes)` held in the `uploaded_drvs` ATerm map, the process-
+/// lifetime structure whose retention a 2026-10-11 protobuf leaf showed as
+/// rss 90 -> 459 MiB against heap 83 MiB live. The map's own comment forbids
+/// the extrapolated size figure (one was falsified by a falling RSS), so the
+/// instrument reports the map's size directly: the next leaf log answers
+/// whether the retained gap IS this map without a heap dump. The two memos
+/// beside it (realise, nar) hold keys and store paths, not payload bytes,
+/// and their byte cost is bounded by the same count.
+pub fn uploaded_drv_bytes() -> (u64, u64) {
+    (
+        UPLOADED_DRV_ENTRIES.load(std::sync::atomic::Ordering::Relaxed),
+        UPLOADED_DRV_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+// Entries and bytes of `uploaded_drvs`, kept as atomics beside the map rather
+// than summed under its lock on every read: the stats tick reads them and the
+// map is written per task, so a lock-held sum would put the progress tick in
+// contention with the very work it measures.
+static UPLOADED_DRV_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UPLOADED_DRV_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Sort miss slots and return them alongside the same order, so the request
 /// vector rebuilt from them lines up with the daemon's reply.
 ///
@@ -760,6 +782,8 @@ impl BuilderRpcClient {
         // comparing RSS at equal task counts across a round with and without
         // this branch, which is the only reading that isolates it.
         if self.in_drv {
+            UPLOADED_DRV_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            UPLOADED_DRV_BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             self.uploaded_drvs
                 .lock()
                 .unwrap()
