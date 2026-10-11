@@ -1246,9 +1246,20 @@ impl Runner {
         let mut fids: Vec<FileId> = Vec::new();
         let mut tree_fids: Vec<FileId> = Vec::new();
         for derived_file in result.derived_files {
-            let is_tree = is_tree_path(&derived_file.build_path)
-                || result.undeclared_dirs.contains(&derived_file.build_path);
+            let edited_tree = result.undeclared_dirs.contains(&derived_file.build_path);
+            let is_tree = is_tree_path(&derived_file.build_path) || edited_tree;
             let fid = self.add_derived_file(files, derived_file.clone());
+            // A TREE A LATER STEP EDITS IN PLACE SUPERSEDES THE EARLIER COPY.
+            // Registration is first-writer-wins, which is right for a file
+            // two routes discover; for an ExternalProject SOURCE_DIR it kept
+            // the download step's tree and threw away the patch step's, so
+            // the build step compiled UNPATCHED sources (measured on A: the
+            // build step's input named the download's store path). Steps run
+            // in dependency order, so the newest registration is the newest
+            // state of the tree.
+            if edited_tree {
+                self.derived_files.insert(fid, derived_file.clone());
+            }
             if is_tree {
                 tree_fids.push(fid);
             } else {
