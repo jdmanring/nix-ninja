@@ -704,19 +704,25 @@ fn subtool(
                 resolved_connections(&cli, crate::task::available_gib()),
             ))?);
             let (derived_files, _all_outputs) = build(&cli, build_dir, &rpc_client)?;
-            // `drv` prints ONE derivation. Same reasoning as above: refusing
-            // is the only honest answer to several targets here. Counted by
-            // DERIVATION, not by file: one target expands to its co-outputs
-            // (an ExternalProject stamp carries the source tree its step
-            // wrote), and those are outputs of the same derivation.
-            let mut by_drv = derived_files.clone();
-            by_drv.dedup_by(|a, b| a.derived_path.root_path() == b.derived_path.root_path());
-            let [derived_file] = &by_drv[..] else {
+            // `drv` prints ONE derivation: the one producing the NAMED target.
+            // A target expands to its co-outputs, and an ExternalProject stamp
+            // carries the source tree the earlier step wrote, which belongs to
+            // a DIFFERENT derivation; counting the expansion refused a single
+            // named target. Several NAMED targets still refuse.
+            if cli.targets.len() != 1 {
                 return Err(anyhow!(
-                    "subtool drv shows a single derivation, but {} derivations were \
+                    "subtool drv shows a single derivation, but {} targets were \
                      requested; name one target",
-                    by_drv.len()
+                    cli.targets.len()
                 ));
+            }
+            let named = Path::new(&cli.targets[0]);
+            let Some(derived_file) = derived_files
+                .iter()
+                .find(|d| d.build_path == named)
+                .or(derived_files.first())
+            else {
+                return Err(anyhow!("target {} produced no derivation", named.display()));
             };
             let drv_path = derived_file.derived_path.root_path();
             let bytes = rpc_client.clone_drv(store_dir, drv_path).ok_or_else(|| {
