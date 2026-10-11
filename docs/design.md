@@ -187,8 +187,9 @@ derivation needs to do dependency inference and write out another derivation
 that finally runs the ninja build rule with the discovered inputs. Note that
 this can be arbitrarily deep.
 
-For now, we have a `$NIX_NINJA_EXTRA_INPUTS` hack since it's only a small part
-of Nix's build graph:
+The temporary `$NIX_NINJA_EXTRA_INPUTS` workaround this section described is
+REMOVED (see the NOTE above) and appears nowhere in the code today. Its shape
+is kept below only as the historical record of what it replaced:
 
 ```nix
 nixNinjaExtraInputs = [
