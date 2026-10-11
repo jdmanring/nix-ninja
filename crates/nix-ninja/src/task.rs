@@ -6665,6 +6665,16 @@ fn undeclared_trees(outputs: &[PathBuf]) -> Vec<PathBuf> {
 /// ("file INSTALL cannot find .../lib/libQt6Svg.prl", 2026-08-23). The
 /// meta file is configure-time content in the build dir, so it is readable
 /// at planning. One function for both the planning and the result paths.
+/// The destination an ExternalProject `extract-<name>.cmake` names on its own
+/// line, `get_filename_component(directory "<abs>" ABSOLUTE)`.
+fn extract_destination(script_text: &str) -> Option<PathBuf> {
+    let line = script_text
+        .lines()
+        .find(|l| l.trim_start().starts_with("get_filename_component(directory"))?;
+    let rest = &line[line.find('"')? + 1..];
+    Some(PathBuf::from(&rest[..rest.find('"')?]))
+}
+
 /// The `SOURCE_DIR` each ExternalProject `extract-<name>.cmake` script on
 /// this command unpacks into, relative to the build dir. The script names its
 /// destination in its own first statement,
@@ -6690,6 +6700,48 @@ fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf
         _ => build_dir.to_path_buf(),
     };
     let mut out = Vec::new();
+    // A STEP THAT RUNS INSIDE SOURCE_DIR MUTATES IT. ExternalProject's patch
+    // (and update) step is `cd <SOURCE_DIR> && <cmd> && cmake -E touch
+    // <stamp-dir>/<name>-patch`; real ninja leaves the patched tree in place
+    // for configure and build, a sandboxed task discards it. The stamp dir
+    // holds `extract-<name>.cmake`, whose destination is SOURCE_DIR, so a
+    // step whose leading cd lands exactly there writes the tree. A configure
+    // or build step cd's to BINARY_DIR and does not match.
+    if toks.first() == Some(&"cd") {
+        for t in &toks {
+            let Some(stamp_dir) = Path::new(t).parent() else { continue };
+            if !stamp_dir.to_str().is_some_and(|s| s.ends_with("-stamp")) {
+                continue;
+            }
+            let Some(name) = stamp_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix("-stamp"))
+            else {
+                continue;
+            };
+            let stamp_abs = if stamp_dir.is_absolute() {
+                stamp_dir.to_path_buf()
+            } else {
+                cwd.join(stamp_dir)
+            };
+            let Ok(text) = fs::read_to_string(stamp_abs.join(format!("extract-{name}.cmake")))
+            else {
+                continue;
+            };
+            let Some(src) = extract_destination(&text) else { continue };
+            if normalize_build_path_lexical(&cwd) == normalize_build_path_lexical(&src) {
+                if let Some(rel) = relative_from(&src, build_dir)
+                    .filter(|r| r.components().next() != Some(std::path::Component::ParentDir))
+                {
+                    if !out.contains(&rel) {
+                        out.push(rel);
+                    }
+                }
+            }
+            break;
+        }
+    }
     for w in toks.windows(2) {
         if w[0] != "-P" {
             continue;
@@ -6710,23 +6762,16 @@ fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
-        let Some(line) = text
-            .lines()
-            .find(|l| l.trim_start().starts_with("get_filename_component(directory"))
-        else {
+        let Some(dir) = extract_destination(&text) else {
             continue;
         };
-        let Some(q) = line.find('"') else { continue };
-        let rest = &line[q + 1..];
-        let Some(e) = rest.find('"') else { continue };
-        let dir = Path::new(&rest[..e]);
         let rel = if dir.is_absolute() {
-            match relative_from(dir, build_dir) {
+            match relative_from(&dir, build_dir) {
                 Some(r) => r,
                 None => continue,
             }
         } else {
-            dir.to_path_buf()
+            dir
         };
         // A destination outside the build tree is not this task's to store.
         if rel.components().next() == Some(std::path::Component::ParentDir) {
@@ -15529,12 +15574,31 @@ mod external_project_extract_tests {
         );
         // `filename` is the archive, not the destination; it must not leak.
         assert!(!v.iter().any(|p| p.ends_with("x.zip")), "{v:?}");
-        // Negative control: the patch step names no extract script.
-        let v = undeclared_outputs(
-            &[],
-            Some(&format!("cd {}/deps/src/boringssl && patch -p1 -i x.patch", bd.display())),
-            &bd,
+        // THE PATCH STEP MUTATES SOURCE_DIR IN PLACE, so it must also carry
+        // the tree out: real ninja leaves the patched files for configure
+        // and build, a sandboxed task discards them. Measured on B: with
+        // only the download step declaring the tree, patch then built the
+        // build step against the UNPATCHED copy. curl-impersonate's literal
+        // shape: absolute cd into SOURCE_DIR, stamp touch in the stamp dir.
+        let patch = format!(
+            "cd {src} && patch -p1 -i /x/boringssl.patch && cmake -E touch {s}/boringssl-patch",
+            src = src.display(),
+            s = stamp.display()
         );
+        let v = undeclared_outputs(&[], Some(&patch), &bd);
+        assert!(
+            v.contains(&PathBuf::from("deps/src/boringssl")),
+            "the patch step's tree must be an output: {v:?}"
+        );
+        // NEGATIVE CONTROL: the build step cd's to BINARY_DIR and touches a
+        // stamp in the same stamp dir. It reads the source tree, it does not
+        // write it, and declaring it there would make two outputs claim it.
+        let build = format!(
+            "cd {b}/deps/build/boringssl && cmake --build . && cmake -E touch {s}/boringssl-build",
+            b = bd.display(),
+            s = stamp.display()
+        );
+        let v = undeclared_outputs(&[], Some(&build), &bd);
         assert!(!v.contains(&PathBuf::from("deps/src/boringssl")), "{v:?}");
     }
 }

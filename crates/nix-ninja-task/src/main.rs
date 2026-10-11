@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use harmonia_store_path::StoreDir;
 use nix_ninja_task::derived_file::{
-    create_symlinks, split_encoded_list, store_output, DerivedFile,
+    copy_tree, create_symlinks, split_encoded_list, store_output, DerivedFile,
 };
 use nix_ninja_task::patchelf;
 use std::env;
@@ -188,7 +188,25 @@ fn main() -> Result<()> {
     // symlinked while preserving the original directory hierarchy of the
     // sources. This ensures relative includes and other path-dependent
     // references remain valid.
+    // A DIRECTORY THIS TASK BOTH RECEIVES AND DECLARES AS AN OUTPUT is a tree
+    // the command edits in place - ExternalProject's patch step runs `patch`
+    // inside SOURCE_DIR. Placed as links into the read-only store, patch
+    // refuses every file ("is not a regular file -- refusing to patch",
+    // measured on B). Partition those inputs out and COPY them, writable,
+    // after the links, so the command edits real files and the edited tree
+    // is what the output captures.
+    let declared: std::collections::HashSet<&std::path::Path> =
+        outputs.iter().map(|o| o.build_path.as_path()).collect();
+    let (edit_in_place, inputs): (Vec<DerivedFile>, Vec<DerivedFile>) =
+        inputs.into_iter().partition(|i| {
+            declared.contains(i.build_path.as_path())
+                && i.absolute_path(&cli.store_dir).is_dir()
+        });
     create_symlinks(&build_dir, &cli.store_dir, inputs, false)?;
+    for tree in &edit_in_place {
+        let dst = build_dir.join(&tree.build_path);
+        copy_tree(&tree.absolute_path(&cli.store_dir), &dst)?;
+    }
 
     // Configure-time alias symlinks the driver harvested from the build
     // dir (meson SONAME aliases: no ninja edge produces them, so input
