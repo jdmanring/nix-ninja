@@ -1144,8 +1144,17 @@ impl Runner {
                 // `.prl`) are files that kept their old wiring; attaching
                 // them here would hand them to new consumers and move those
                 // consumers' emission for a class they never had.
+                //
+                // BOTH TREES, matching `undeclared_outputs`: the extracted
+                // SOURCE_DIR and the configure step's BINARY_DIR. A step
+                // declares the tree it WRITES, and this is the second half of
+                // the same class - the source half landed first and the
+                // binary half was never built.
                 if let Some(c) = task.cmdline.as_deref() {
-                    undeclared_dirs = external_project_extract_dirs(c, &config.build_dir);
+                    undeclared_dirs = external_project_extract_dirs(c, &config.build_dir)
+                        .into_iter()
+                        .chain(external_project_binary_dir(c, &config.build_dir))
+                        .collect();
                 }
                 // UPSTREAM #17: record this task's depfile output. NOT
                 // pushed into drv_outputs - the depfile is not a ninja
@@ -4578,6 +4587,53 @@ fn build_task_derivation(
                 }
             }
         }
+
+        // AN ExternalProject STEP'S SUB-BUILD RUNS `cmake -GNinja` AND CANNOT
+        // FIND A MAKE PROGRAM. CMake resolves `ninja` from PATH when the
+        // generator is named with no CMAKE_MAKE_PROGRAM, so the sub-build
+        // needs a `ninja` on the emitted PATH - and `ninja` is exactly the one
+        // tool the resolver above cannot supply: `which_store_path_opt` reads
+        // the OUTER PATH, where `ninja` answers `/usr/bin/ninja` on a machine
+        // that has one, so it returns None and no store path is pushed.
+        // curl-impersonate 2.1.1's nghttp2 configure died on
+        // `CMAKE_MAKE_PROGRAM is not set`, and its build and install steps
+        // (`cmake --build`) died next.
+        //
+        // THE STORE NINJA IS ALREADY AN INPUT, which is what makes this one
+        // line rather than a resolver: the sub-build's XDG_DATA_DIRS carries
+        // ninja's `share/`, so `extract_store_paths` put ninja-1.13.2 in
+        // `task.input_srcs` and the sandbox already mounts it. Take the path
+        // from there rather than from `which`, which is the resolver that
+        // fails here by construction.
+        //
+        // GATED ON THE STEP, never on the command or the input set. A gate on
+        // the command would miss the build and install steps (no `-GNinja` in
+        // their argv), and a gate on the input set would fire for every task
+        // whose env carries the same XDG_DATA_DIRS - far more than the defect.
+        // `external_project_step` is the shape that is true for all three
+        // steps and nothing else, and the PATH is emitted, so an ungated entry
+        // re-keys every derivation this driver emits.
+        //
+        // THE NAME IS NOT THE THING, so the candidate is found by asking each
+        // input whether it ships `bin/ninja` (`ninja_input`), not by matching
+        // a name. See that function for the three name rules that were each
+        // wrong on a real path in this store.
+        //
+        // THE SUB-BUILD IS OPAQUE: it runs real ninja, not nix-ninja, so its
+        // objects are not banked per-TU. That is the accepted bound - the
+        // OUTER task is banked and restored whole, and per-TU banking inside
+        // one vendored library's sub-build would need a task class carrying
+        // the recursive-nix grant, the daemon socket and the driver binary,
+        // none of which a plain task has. The upgrade trigger is that sub-build
+        // becoming repeated cost rather than once-per-outer-task.
+        if external_project_step(task.outputs.iter().filter_map(|p| p.to_str())) {
+            if let Some(ninja) = ninja_input(&task.store_dir, &task.input_srcs) {
+                let dir = format!("{}/bin", task.store_dir.display(&ninja));
+                if !path.contains(&dir) {
+                    path.push(dir);
+                }
+            }
+        }
         drv.env
             .insert(b"PATH"[..].into(), path.join(":").into_bytes().into());
     }
@@ -6862,6 +6918,99 @@ fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf
     out
 }
 
+/// The BINARY_DIR a `cmake -B <dir>` CONFIGURE step writes, relative to the
+/// build dir. The second half of the same ExternalProject class
+/// `external_project_extract_dirs` handles: that function declares SOURCE_DIR
+/// on the step that writes it, and nothing ever declared BINARY_DIR - the
+/// module comment above `external_project_step` names both trees and only the
+/// source half was built.
+///
+/// WHAT IT COSTS WHEN MISSING, measured on curl-impersonate 2.1.1's nghttp2 at
+/// pin `6367b52`: the configure step declares only its stamp
+/// (`nghttp2-prefix/src/nghttp2-stamp/nghttp2-configure`) while running
+/// `cmake -B deps/build/nghttp2 -S deps/src/nghttp2`, so the whole CMake
+/// binary directory is a side effect real ninja leaves on disk and a sandboxed
+/// task discards. The build step then carries only the stamps - its
+/// NIX_NINJA_INPUTS holds zero `deps/build` entries - and `cmake --build
+/// deps/build/nghttp2` finds the directory absent. `NIX_NINJA_MAKE_DIRS`
+/// lists it, which is the tell that the driver filed it as a directory to
+/// CREATE EMPTY rather than one to carry.
+///
+/// ONLY THE `-B` SPELLING IS READ, and only from a command that also carries
+/// `-S`: that pair is what a configure invocation is, and it keeps a link's
+/// unrelated `-B` (a linker search path on some toolchains) or a `-D` value
+/// from being declared as a tree. `-DCMAKE_BINARY_DIR=` is deliberately NOT
+/// read - it does not create the directory the way `-B` does, and a
+/// configure-time variable is a different thing from the argument that tells
+/// cmake where to write.
+fn external_project_binary_dir(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    // `-B` TAKES ITS VALUE BOTH JOINED AND SEPARATED, and CMake emits the
+    // SEPARATED form (`cmake -D... -GNinja -S <src> -B <bin>`). The protoc
+    // reader paid for missing the separated spelling once already; read both
+    // here rather than repeating it.
+    let has_source = toks
+        .iter()
+        .any(|t| *t == "-S" || (t.starts_with("-S") && t.len() > 2));
+    if !has_source {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        let dest = if *t == "-B" {
+            toks.get(i + 1).map(|v| v.trim_matches('"'))
+        } else {
+            t.strip_prefix("-B").filter(|v| !v.is_empty())
+        };
+        let Some(dest) = dest else { continue };
+        let p = Path::new(dest);
+        let rel = if p.is_absolute() {
+            match relative_from(p, build_dir) {
+                Some(r) => r,
+                None => continue,
+            }
+        } else {
+            p.to_path_buf()
+        };
+        // Outside the build tree, or this build dir itself, is not a tree to
+        // carry: `-B .` names where the task already runs.
+        if rel.components().next() == Some(std::path::Component::ParentDir)
+            || rel.as_os_str().is_empty()
+        {
+            continue;
+        }
+        if !out.contains(&rel) {
+            out.push(rel);
+        }
+    }
+    out
+}
+
+/// The store path among a task's inputs that IS ninja, found by asking each
+/// candidate whether it ships `bin/ninja` rather than by matching its NAME.
+///
+/// THE NAME IS NOT THE THING, and this tree has paid for that lesson more than
+/// once. Two ninja packages are resident and both are legitimate -
+/// `ninja-1.13.2` and `python3.14-ninja-1.13.2` (python bindings) - plus a
+/// `-dist` variant of the second that is metadata, not the binary. Measured on
+/// this host, the file separates all of them where every name rule does not:
+/// both real ninjas ship `bin/ninja`; the `-dist` variant does not, and
+/// neither do this driver's own `nix-ninja-0.1.0` and `nix-ninja-task-0.1.0` -
+/// which a `contains("ninja-")` would have handed to a package as its make
+/// program, and a `starts_with("ninja-")` would have missed the
+/// python-prefixed one.
+///
+/// THE READ IS CHEAP AND HAPPENS ONCE: this runs only for an ExternalProject
+/// step, over the handful of store paths that step already carries. It is a
+/// single `stat` per candidate, and the answer is the same on every machine
+/// because it is a property of the package's own output.
+fn ninja_input(store_dir: &StoreDir, inputs: &[StorePath]) -> Option<StorePath> {
+    inputs
+        .iter()
+        .find(|sp| sp.to_absolute_path(store_dir).join("bin/ninja").is_file())
+        .cloned()
+}
+
 fn undeclared_outputs(
     declared: &[PathBuf],
     cmdline: Option<&str>,
@@ -6906,7 +7055,15 @@ fn undeclared_outputs(
         // never notices. Same family as the `create_symlink` below and as
         // compiler-rt's `.syms`; here the side effect is a TREE, so it is
         // carried whole rather than as one path.
-        for dir in external_project_extract_dirs(c, build_dir) {
+        //
+        // BOTH ExternalProject trees ride here: the extracted SOURCE_DIR and
+        // the CONFIGURE step's BINARY_DIR (`external_project_binary_dir`).
+        // They are the same class - a tree a step writes and ninja never
+        // declares - and a step carries whichever it writes.
+        for dir in external_project_extract_dirs(c, build_dir)
+            .into_iter()
+            .chain(external_project_binary_dir(c, build_dir))
+        {
             if !v.contains(&dir) {
                 v.push(dir);
             }
@@ -15697,6 +15854,43 @@ mod external_project_extract_tests {
         );
         let v = undeclared_outputs(&[], Some(&build), &bd);
         assert!(!v.contains(&PathBuf::from("deps/src/boringssl")), "{v:?}");
+    }
+
+    /// The CONFIGURE step writes BINARY_DIR, and nothing declared it. The
+    /// command below is curl-impersonate 2.1.1's nghttp2 configure verbatim
+    /// from drv `2jsckba5`, trimmed to the flags that matter: an absolute `cd`
+    /// into the binary dir it is about to write, `-GNinja`, the separated
+    /// `-S <src>`, and the separated `-B <bin>` at the end.
+    #[test]
+    fn the_configure_steps_binary_dir_is_an_output() {
+        let cmd = "cd /build/source/build/deps/build/nghttp2 && /nix/store/x-cmake/bin/cmake -DCMAKE_BUILD_TYPE=Release -GNinja -S /build/source/build/deps/src/nghttp2 -B /build/source/build/deps/build/nghttp2 && /nix/store/x-cmake/bin/cmake -E touch /build/source/build/nghttp2-prefix/src/nghttp2-stamp/nghttp2-configure";
+        let bd = Path::new("/build/source/build");
+        let v = undeclared_outputs(&[], Some(cmd), bd);
+        assert!(
+            v.contains(&PathBuf::from("deps/build/nghttp2")),
+            "the configure step's BINARY_DIR must be an output: {v:?}"
+        );
+        // A RELATIVE -B, and the JOINED spelling, both resolve the same way.
+        let v = undeclared_outputs(
+            &[],
+            Some("cmake -GNinja -S deps/src/x -B deps/build/x"),
+            bd,
+        );
+        assert!(v.contains(&PathBuf::from("deps/build/x")), "{v:?}");
+        let v = undeclared_outputs(&[], Some("cmake -GNinja -Sdeps/src/x -Bdeps/build/x"), bd);
+        assert!(v.contains(&PathBuf::from("deps/build/x")), "{v:?}");
+        // NEGATIVE CONTROL, and it is the one that keeps a linker search path
+        // from being declared as a tree: `-B` with no `-S` is not a configure
+        // invocation. A link naming `-B/opt/foo` must add nothing.
+        let v = undeclared_outputs(
+            &[],
+            Some("/nix/store/y-gcc/bin/ld -o x.so -B/opt/static x.o"),
+            bd,
+        );
+        assert!(!v.iter().any(|p| p == Path::new("opt/static")), "{v:?}");
+        // And a destination outside the build tree is still not this task's.
+        let v = undeclared_outputs(&[], Some("cmake -GNinja -S x -B /elsewhere/bin"), bd);
+        assert_eq!(v, Vec::<PathBuf>::new(), "{v:?}");
     }
 }
 
