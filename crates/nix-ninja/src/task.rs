@@ -6945,6 +6945,22 @@ fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf
 /// cmake where to write.
 fn external_project_binary_dir(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    // THE COMMAND MUST NAME CMAKE, and this is the whole guard rather than a
+    // spelling detail. `-S` is ALSO gcc's compile-to-assembly flag and `-B` is
+    // ALSO a gcc/linker search prefix, so a real compile such as
+    // `gcc -S -Bstatic a.c -o a.s` carries both and a reader matching on the
+    // flags ALONE declares `static` as an output tree. That shipped in
+    // `34038d2` and was caught by a failing test, not by review: the test's
+    // own negative control gave a `-B` with no `-S`, so it never exercised the
+    // two flags together. A `-B` destination is a CMake argument; requiring
+    // the program to be cmake is what makes the flag pair mean what this
+    // reader assumes it means.
+    let names_cmake = toks
+        .iter()
+        .any(|t| t.rsplit('/').next().is_some_and(|b| b.starts_with("cmake")));
+    if !names_cmake {
+        return Vec::new();
+    }
     // `-B` TAKES ITS VALUE BOTH JOINED AND SEPARATED, and CMake emits the
     // SEPARATED form (`cmake -D... -GNinja -S <src> -B <bin>`). The protoc
     // reader paid for missing the separated spelling once already; read both
@@ -15891,6 +15907,24 @@ mod external_project_extract_tests {
         // And a destination outside the build tree is still not this task's.
         let v = undeclared_outputs(&[], Some("cmake -GNinja -S x -B /elsewhere/bin"), bd);
         assert_eq!(v, Vec::<PathBuf>::new(), "{v:?}");
+        // THE NEGATIVE CONTROL ABOVE IS NOT ENOUGH, and that is the lesson this
+        // test was written to record: it gives a `-B` with NO `-S`, so it never
+        // exercises `-S` ALONGSIDE a non-cmake `-B`. `-S` is also gcc's
+        // compile-to-assembly flag and `-B` is also a gcc search prefix, so a
+        // real compile can carry both and the reader would declare a junk
+        // tree. The first version of this reader did exactly that; the guard
+        // is now that the command NAMES CMake.
+        for c in [
+            "/nix/store/y-gcc/bin/gcc -S -Bstatic a.c -o a.s",
+            "/nix/store/y-gcc/bin/gcc -S -Bprefix a.c -o a.s",
+            "/nix/store/y-ld/bin/ld -S -Bstatic -o x.so x.o",
+        ] {
+            let v = undeclared_outputs(&[], Some(c), bd);
+            assert!(
+                !v.iter().any(|p| matches!(p.to_str(), Some("static" | "prefix"))),
+                "a compiler -S with a -B search prefix must declare nothing: {c} -> {v:?}"
+            );
+        }
     }
 }
 
