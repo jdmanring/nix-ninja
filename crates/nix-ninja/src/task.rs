@@ -7076,10 +7076,36 @@ fn undeclared_outputs(
         // the CONFIGURE step's BINARY_DIR (`external_project_binary_dir`).
         // They are the same class - a tree a step writes and ninja never
         // declares - and a step carries whichever it writes.
-        for dir in external_project_extract_dirs(c, build_dir)
-            .into_iter()
-            .chain(external_project_binary_dir(c, build_dir))
-        {
+        //
+        // THE BINARY-DIR READER IS GATED ON THE STEP, and that gate is the
+        // whole correctness argument rather than a performance detail. The
+        // commit that added it CLAIMED both readers were gated on
+        // `external_project_step` and THAT CLAIM WAS FALSE: this function runs
+        // for EVERY task with a cmdline (both call sites below), and only the
+        // PATH/ninja arm carried the gate. The reader matched `-S` with `-B`,
+        // and CMake emits exactly that pair on the REGENERATE edge every
+        // CMake+Ninja project has:
+        //
+        //   cmake --regenerate-during-build -S<src> -B<build>
+        //
+        // so on an ordinary cmake package the reader declared the binary dir
+        // as an undeclared output tree of a NON-ExternalProject task, changing
+        // that task's emission - the opposite of "no other shape moves". Found
+        // by auditing the shipped commit, reproduced from the real edge cmake
+        // writes, not by reasoning about it.
+        //
+        // `external_project_extract_dirs` needs no such gate because it is
+        // SELF-GATING: it fires only where a readable `extract-<name>.cmake`
+        // script is on the command. The flag pair is not self-gating, so the
+        // step shape has to be tested here.
+        let is_step = external_project_step(declared.iter().filter_map(|p| p.to_str()));
+        for dir in external_project_extract_dirs(c, build_dir).into_iter().chain(
+            if is_step {
+                external_project_binary_dir(c, build_dir)
+            } else {
+                Vec::new()
+            },
+        ) {
             if !v.contains(&dir) {
                 v.push(dir);
             }
@@ -15881,19 +15907,24 @@ mod external_project_extract_tests {
     fn the_configure_steps_binary_dir_is_an_output() {
         let cmd = "cd /build/source/build/deps/build/nghttp2 && /nix/store/x-cmake/bin/cmake -DCMAKE_BUILD_TYPE=Release -GNinja -S /build/source/build/deps/src/nghttp2 -B /build/source/build/deps/build/nghttp2 && /nix/store/x-cmake/bin/cmake -E touch /build/source/build/nghttp2-prefix/src/nghttp2-stamp/nghttp2-configure";
         let bd = Path::new("/build/source/build");
-        let v = undeclared_outputs(&[], Some(cmd), bd);
+        // THE STEP SHAPE IS AN INPUT NOW (the reader is gated on it), so the
+        // declared output is the step's stamp, exactly as the real edge has.
+        let step = [PathBuf::from(
+            "nghttp2-prefix/src/nghttp2-stamp/nghttp2-configure",
+        )];
+        let v = undeclared_outputs(&step, Some(cmd), bd);
         assert!(
             v.contains(&PathBuf::from("deps/build/nghttp2")),
             "the configure step's BINARY_DIR must be an output: {v:?}"
         );
         // A RELATIVE -B, and the JOINED spelling, both resolve the same way.
         let v = undeclared_outputs(
-            &[],
+            &step,
             Some("cmake -GNinja -S deps/src/x -B deps/build/x"),
             bd,
         );
         assert!(v.contains(&PathBuf::from("deps/build/x")), "{v:?}");
-        let v = undeclared_outputs(&[], Some("cmake -GNinja -Sdeps/src/x -Bdeps/build/x"), bd);
+        let v = undeclared_outputs(&step, Some("cmake -GNinja -Sdeps/src/x -Bdeps/build/x"), bd);
         assert!(v.contains(&PathBuf::from("deps/build/x")), "{v:?}");
         // NEGATIVE CONTROL, and it is the one that keeps a linker search path
         // from being declared as a tree: `-B` with no `-S` is not a configure
@@ -15905,8 +15936,32 @@ mod external_project_extract_tests {
         );
         assert!(!v.iter().any(|p| p == Path::new("opt/static")), "{v:?}");
         // And a destination outside the build tree is still not this task's.
-        let v = undeclared_outputs(&[], Some("cmake -GNinja -S x -B /elsewhere/bin"), bd);
+        let v = undeclared_outputs(&step, Some("cmake -GNinja -S x -B /elsewhere/bin"), bd);
         assert_eq!(v, Vec::<PathBuf>::new(), "{v:?}");
+        // THE GATE ITSELF, and it is the control the shipped commit lacked:
+        // the SAME command on a task that is NOT an ExternalProject step must
+        // declare nothing. CMake emits this pair on the REGENERATE edge of
+        // every CMake+Ninja project, so without the gate an ordinary cmake
+        // package's regenerate task declares the binary dir as its own output
+        // tree. Measured from cmake 4.4.3's own build.ninja:
+        //   cmake --regenerate-during-build -S<src> -B<build>
+        let regen = "cd /build/source/build && /nix/store/x-cmake/bin/cmake --regenerate-during-build -S/build/source/build/deps/src/x -B/build/source/build/deps/build/x";
+        let v = undeclared_outputs(
+            &[PathBuf::from("build.ninja")],
+            Some(regen),
+            bd,
+        );
+        assert!(
+            !v.iter().any(|p| p == Path::new("deps/build/x")),
+            "a REGENERATE edge on a non-step task must not declare a tree: {v:?}"
+        );
+        // And WITH the step shape the same command DOES declare it, so the
+        // gate keys on the step and not on the command spelling.
+        let v = undeclared_outputs(&step, Some(regen), bd);
+        assert!(
+            v.iter().any(|p| p == Path::new("deps/build/x")),
+            "the same command on a step task must declare the tree: {v:?}"
+        );
         // THE NEGATIVE CONTROL ABOVE IS NOT ENOUGH, and that is the lesson this
         // test was written to record: it gives a `-B` with NO `-S`, so it never
         // exercises `-S` ALONGSIDE a non-cmake `-B`. `-S` is also gcc's
