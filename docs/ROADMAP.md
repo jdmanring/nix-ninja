@@ -219,11 +219,12 @@ the client's, or it fails with a message that blames the client.
 The project also keeps a wider corpus of gate scripts, one per closed class,
 each written to reproduce a defect so that it fails on the revision before the
 fix. That corpus is not yet in this repository: it grew beside a consumer
-distribution and about half of it reaches into trees and paths that are private.
-Publishing it is tracked work, not a claim, and until it is published the corpus
-counts are deliberately not stated here. What the wider corpus enforces is
-worth stating anyway, because the disciplines apply to any test written for this
-project:
+distribution and 11 of its 91 scripts reach into trees and paths that are
+private, with 6 more reaching only for a literal store path. Publishing it is
+tracked work rather than a claim, and the triage under
+[the next concrete work](#the-next-concrete-work-item-by-item), item 1, is what
+decides the order. What the wider corpus enforces is worth stating anyway,
+because the disciplines apply to any test written for this project:
 
 - A negative control must FAIL, and its break must sit where the subject
   executes. A control whose input the subject cannot fail on is not a control.
@@ -462,21 +463,25 @@ provide: what to open, and how to know the change is right.
 ### 1. Publish the wider corpus, cheapest group first
 
 The instrument that verifies every closed class is not in this repository. A
-triage over the whole corpus, measured, splits it three ways, and the section
-above states no count for them:
+triage over the whole corpus, measured rather than asserted, splits 91 gate
+scripts three ways:
 
-1. **Gates that reach only for a literal store path.** Mechanical: each path
-   becomes an attribute or a by-revision lookup, which is what the corpus
-   already does elsewhere. No behavior changes, so each is verifiable by
+1. **Gates that reach only for a literal store path.** 6 scripts, mechanical:
+   each path becomes an attribute or a by-revision lookup, which is what the
+   corpus already does elsewhere. No behavior changes, so each is verifiable by
    running it before and after and getting the same verdict.
-2. **Gates that are self-contained.** A copy into the repository, plus the one
-   path assumption in the runner, which resolves its own directory and then
-   expects the gates beside it.
-3. **Gates coupled to a private tree on the executable path**, judged on the
-   code rather than on a comment, since a gate that merely mentions a consumer
-   path in a comment is not coupled. Each needs its subject turned into a
-   fixture first. Two read a consumer shim by design and report NO ANSWER when
-   it is absent, which is correct and stays.
+2. **Gates that are self-contained.** 74 scripts. A copy into the repository,
+   plus the one path assumption in the runner, which resolves its own directory
+   and then expects the gates beside it.
+3. **Gates coupled to a private tree on the executable path.** 11 scripts,
+   judged on the code rather than on a comment, since a gate that merely
+   mentions a consumer path in a comment is not coupled. Each needs its subject
+   turned into a fixture first. Two read a consumer shim by design and report
+   NO ANSWER when it is absent, which is correct and stays.
+
+The split is exact and exhaustive: 6 + 74 + 11 = 91, and no script falls in two
+groups. A comment that names a consumer path is not coupling, and one script
+does exactly that and is counted in group 2 rather than group 3.
 
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
