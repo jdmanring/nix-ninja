@@ -11,8 +11,24 @@ cold a run was - read `derivations_built` beside it. A failed run is written to
 | file | what it is |
 |---|---|
 | `2026-08-30-example-nix.json` | nix 2.36.0pre built per translation unit: 345 tasks, 446 derivations, 371 s wall |
+| `2026-08-30-backport-example-nix.json` | the same subject on the earlier driver, the run the async store-add work is measured against |
+| `2026-08-31-head-example-nix.json` | the driver after the work: 345 tasks but 155 derivations, because most substituted |
+| `2026-08-31-final-example-nix.json` | the same drive on the final revision of that day, with its `.json.log` beside it |
 | `2026-08-30-example-dynamic-deps.json` | the 4-task example, kept as the small-graph comparison |
+| `2026-08-30-backport-example-hello.json`, `2026-08-31-head-example-hello.json` | the 2-task example, before and after, the smallest comparison the harness holds |
 | `2026-08-30-generate-bench.txt` | `cargo bench -p nix-ninja`, medians of 100 samples, so the figures quoted elsewhere trace to a run |
+
+Three of the runs keep their full `.json.log` beside the record. A record's
+`driver_line` is that log's summary line, so a reader wanting the counters can
+read either; the log is what makes a disputed figure checkable rather than
+merely quoted. The other four records predate the harness keeping its log.
+
+**One set of figures is deliberately not in this directory**, and a reader
+should know which: the distinct-call store-add numbers in the changelog's 0.2.0
+row, 35,435 adds of which 34,371 were cache hits, come from the same September
+runs read with a later counter, and they are stated in the commit that corrected
+them rather than written to a record. They are checkable against that commit and
+not reproducible from here.
 
 ## What the nix run says, beyond wall clock
 

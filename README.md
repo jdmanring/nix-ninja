@@ -163,13 +163,19 @@ pool rather than serially, a NAR streams instead of being built in memory, and a
 stamp map keyed on path, length and mtime skips a file already known, persisting
 across runs in the same build directory.
 
-The instrument that says what those are worth arrived after them. On a 345 task
-project the driver makes 35,435 store adds, of which 34,371 are answered by the
-stamp map for under a second between them, because that path stats the file and
-reads an in-process map without ever reaching the daemon. The measurable time
-belongs to the 1,064 files that genuinely upload, and what they cost depends on
-the state of the store rather than on the shape of the call: 25 s cold against
-4 s warm, at the same number of calls.
+The instrument that says what those are worth arrived after them, and the split
+it measures is in `bench/records/`, alongside the run it came from. On a 345 task
+project the driver offers 35,569 files to the store and the stamp map answers
+34,412 of them, because that path stats the file and reads an in-process map
+without ever reaching the daemon. The measurable time belongs to the 1,157 files
+that genuinely upload, and what they cost depends on the state of the store
+rather than on the shape of the call.
+
+The figures that stand behind the store-add close, measured on the same project
+in September, are a distinct-call reading of the same runs: 35,435 store adds,
+34,371 answered from the cache, 1,064 uploaded. They are stated in the commit
+that corrected them, `7540642`, and not in a record here, so they are checkable
+but not reproducible from this repository.
 
 That split is worth more than the total it comes from, because it says where
 further effort would go and where it would not. Roughly 97 percent of the calls
@@ -220,7 +226,9 @@ not exist. The contract is in the [design notes].
   carries its own Apache-2.0 `LICENSE`, and `vendor-n2/VENDORING.md` records the
   revision it was taken from and the four changes made to it.
 - `bench/` holds the end-to-end and generation benchmarks, and the records they
-  wrote. Every number in the docs traces to a file there.
+  wrote. Numbers quoted in these documents trace to a run under `bench/records/`,
+  whose README names what each record is and which figures it cannot account
+  for.
 - `contrib/` holds a throwaway-store development script, which `CONTRIBUTING.md`
   describes.
 
