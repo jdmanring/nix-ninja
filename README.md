@@ -66,22 +66,31 @@ $ nix config show | grep experimental-features
 experimental-features = ca-derivations dynamic-derivations fetch-tree flakes nix-command recursive-nix
 ```
 
-Then you can try building the examples. From a clone of this repository:
+Then you can try building the examples. The examples are dynamic derivations,
+so they are exposed under `legacyPackages` and only instantiate when
+`dynamic-derivations` is enabled:
 
 ```sh
 # Builds a basic main.cpp.
-nix build .#example-hello
+nix build .#legacyPackages.x86_64-linux.example-hello
 
 # Builds a basic main.cpp with dependency inference for its header.
-nix build .#example-header
+nix build .#legacyPackages.x86_64-linux.example-header
 
 # Builds Nix itself, per translation unit.
-nix build .#example-nix
+nix build .#legacyPackages.x86_64-linux.example-nix
+
+# The CMake route, end to end.
+nix build .#legacyPackages.x86_64-linux.example-cmake-hello
 ```
 
+If a build fails with `does not provide attribute ... example-hello`, the
+experimental features are not enabled in the DAEMON's configuration; the
+`legacyPackages` set is empty without them.
+
 Without cloning, every attribute works through the flake URL
-(`nix build github:jdmanring/nix-ninja#example-hello`); the clone form is used
-throughout because it is what a contributor runs.
+(`nix build github:jdmanring/nix-ninja#legacyPackages.x86_64-linux.example-hello`);
+the clone form is used throughout because it is what a contributor runs.
 
 You can also try running `nix-ninja` outside of Nix, but you'll need both
 `nix-ninja` and `nix-ninja-task` to be in your `$PATH`. Make sure
@@ -96,11 +105,12 @@ export NINJA="${NIX_NINJA}/bin/nix-ninja"
 ```
 
 Point it at any project that emits a ninja file. The examples live under
-`modules/flake/examples/`, and the shortest complete one is the CMake example:
+`modules/flake/examples/`. A few are ORDINARY derivations rather than dynamic
+ones, so they sit under `packages` and build without the feature-gated set:
 
 ```sh
-# Configure, generate, and run it through the driver.
-nix build .#example-cmake-hello
+nix build .#example-fortran-module-recursive
+nix build .#example-dotdot-source-include
 ```
 
 See `modules/flake/overlays.nix` for the full set: `example-hello`,
