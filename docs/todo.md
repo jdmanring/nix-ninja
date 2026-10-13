@@ -87,7 +87,7 @@ issues that came with the project.
     clock plus the driver's own counters as JSON. Its subjects so far are
     `example-hello` and `example-dynamic-deps`; the NixOS/Nix-scale number is
     expected from a full distribution build rather than a dedicated run here.
-- [ ] `inputs.nix` cannot build against a nixpkgs carrying both boost/context
+- [x] `inputs.nix` cannot build against a nixpkgs carrying both boost/context
   patches
   - `packaging/dependencies.nix` in the `nix` input passes `patches` to
     `pkgs.boost.override`. That argument is PREPENDED to the list nixpkgs
@@ -119,12 +119,20 @@ issues that came with the project.
     here never reaches the `pkgs.boost` its `dependencies.nix` calls
     `.override` on. Checked on the forge the same day: NixOS/nix master still
     carries the override, so an input bump does not fix it either.
-  - Consequence to state plainly rather than work around: the six NixOS VM
-    checks CANNOT pass here until upstream nix drops that patches argument or
-    nixpkgs stops carrying `5883212`. The seven code-quality checks are
-    unaffected and pass.
-  - It is nix's bug rather than nixpkgs'. If it survives a bump it belongs
-    upstream at NixOS/nix rather than here.
+  - Consequence to state plainly rather than work around: at the pin of record
+    on 2026-08-29 the six NixOS VM checks could not pass until upstream nix
+    dropped that patches argument or nixpkgs stopped carrying `5883212`, and the
+    seven code-quality checks were unaffected.
+  - THAT CONSEQUENCE IS NO LONGER TRUE, measured 2026-10-13. The nixpkgs pin has
+    moved since (now `494ce7fd23ff`, 2026-10-04), and all ten NixOS VM checks pass
+    both in CI and via `nix flake check`: `nix-build-hello` runs `nix run
+    .#test-nix-build-hello`, boots `qemu-for-vm-tests-11.1.1` and reports `test
+    script finished in 28.00s`. Ten of ten integration jobs are green on the
+    release commit. The mechanism above was measured and is kept because it
+    explains what happened; the CONSEQUENCE was a dated reading that went stale
+    when the pin moved, which is the failure mode this project keeps finding.
+  - It is nix's bug rather than nixpkgs'. If it recurs it belongs upstream at
+    NixOS/nix rather than here.
 - [ ] `dyn` is 82% of a campaign's wall clock and its instrument names none of it
   - `handle_derivation_result`'s four sub-timers - realize, discover, update,
     adddrv - all live INSIDE the `!built_inputs.is_empty()` branch. The

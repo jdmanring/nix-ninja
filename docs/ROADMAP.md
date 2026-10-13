@@ -16,17 +16,37 @@ a plan awaiting ratification.
 The tree is at **0.3.0** (`Cargo.toml`). The version is a milestone, so it moves
 when a criterion below is met and a gate says so, never because time passed.
 
-The state of the tree TODAY, class by class, is a table of 88 rows kept in the
-development notes. This file is the ladder behind it. It exists because the two
-milestones the project inherited stopped at two, and six months of work
-followed that no number named.
+The state of the tree TODAY, class by class, is a table of 88 rows. It is not in
+this repository: it grew beside a private distribution and is development
+material rather than a public document, which is the same reason the gate corpus
+is not here (`0.5`). What this file carries is the part that is publishable now,
+the ladder and its criteria, and what each rung is worth.
 
-## Why this file is long, and what it is for
+## Where this file comes from
 
 The project began when `pdtpartners/nix-ninja` stopped. Work continued here: the
 tree is 643 commits past the last upstream commit of May 2026, and the milestone
 numbering above two is new. `docs/todo.md` records the state of the issues that
 came with the project; this file is what comes after them.
+
+## What this project is not trying to do
+
+Named so a reader does not infer them, and so that a proposal in one of these
+directions can be answered by pointing here rather than by argument.
+
+- **It is not a new build system.** The input is a ninja file. Anything that
+  emits one works, and anything that does not is out of scope. A cargo backend
+  is named in `0.9` as an open question, not as a commitment.
+- **It is not a replacement for ninja.** Real ninja runs the parts the driver
+  cannot serve, and the drop-in routes to it rather than reimplementing it.
+- **It is not a package manager or a distribution.** It builds packages; what
+  goes into them is the consumer's decision.
+- **It does not vendor or fork Nix.** It depends on experimental features and
+  tracks Nix master through its own flake input. Where a defect is in Nix, the
+  fix belongs in Nix, and the project says so rather than patching around it.
+- **It is not a remote-execution protocol.** Distribution is expected to come
+  from Nix's own builders and binary caches rather than from an implementation of
+  `REAPI`, which `0.8` tests rather than builds.
 
 ## 0.1 CORRECTNESS (upstream)
 
@@ -551,6 +571,37 @@ specific. First action: run one real build with a `builders` line naming a secon
 machine and read whether the tasks are scheduled there or refused. The failure
 mode is specific and worth one afternoon, and the answer decides whether `0.8`'s
 third axis is a feature to build or a claim to verify.
+
+## What could stop this
+
+Every milestone above assumes the project keeps moving. These are the ways it
+might not, named so that a stall is visible as one rather than as slow progress.
+None is hypothetical: the first three are why upstream is dormant.
+
+- **The dependency is experimental and moves under the project.** `0.4` exists
+  precisely because an edit anywhere can re-key everything; the same is true of a
+  Nix change the project does not control. This is not hypothetical: `docs/todo.md`
+  records a nixpkgs boost/context patch that blocked all six NixOS VM checks from
+  2026-08-29 until the nixpkgs pin moved in October, at which point they passed
+  again without a change here. A single upstream decision cost six weeks of green
+  checks and could as easily have cost a milestone's worth of work. The only
+  hedge is tracking master closely and reading the failure as its own class
+  rather than as a defect here, which the entry does.
+- **The bus factor is one.** There is one developer and one consumer
+  distribution. `0.9` names adoption by someone else as the mitigation, which is
+  also its exit criterion, so this risk and that milestone are the same problem
+  seen from two directions.
+- **The verification apparatus is private.** The 88-row class table and most of
+  the gate corpus live outside this repository. `0.5` and work item 1 exist to
+  publish them, and until they land, every claim here is checkable only by its
+  author, which is the property that made upstream's work hard to continue.
+- **The scale claim is a projection.** `0.8`'s two slopes are measured at small n
+  and extrapolated to 30,000 translation units. A linear fit over a small range is
+  the classic way to be wrong, and the failure would appear first as a build that
+  is merely slow rather than broken, which is the hardest kind to notice.
+- **The comparison may lose.** `0.7` says so in advance. If total wall clock is
+  worse than plain ninja, the honest response is to publish it and re-aim the
+  claim at substitution and resumability, not to stop measuring.
 
 ## How a milestone ships
 
