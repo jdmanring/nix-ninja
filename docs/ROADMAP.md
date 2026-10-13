@@ -135,9 +135,18 @@ binary had to learn:
   edge is a compile or a link, and the rpath a link carries.
 
 Every one is closed against an instrument that fails on the revision before its
-fix, and most of those instruments are covered by a test in this repository. The
-trap that recurs: a reader emitting an absolute spelling is dropped in silence
-by the wiring filters, so it looks fixed and changes nothing.
+fix. How many of those instruments are in THIS repository is a question the
+gate cell answers differently by how it is read: counting a row whose gate
+names a file under `tests/` or a `*_tests` symbol gives 8 of 89, allowing a
+unit test described in prose gives 11, and allowing "mutation-check" as well
+gives 15. Whichever predicate is used the answer is a small minority, so the
+honest statement is that most classes are verified by the gate corpus, which is
+not published yet, and a reader has this file's word rather than a test they can
+run; closing that is `0.5` and work item 1. This paragraph previously said
+"most of those instruments are covered by a test in this repository", which
+every reading of the count inverts. The trap that recurs: a reader emitting an
+absolute spelling is dropped in silence by the wiring filters, so it looks
+fixed and changes nothing.
 
 EXIT CRITERION: the corpus passes on both configurations, and every class
 carries a gate arm, a named reason it cannot, or a witness on a real package.
@@ -189,9 +198,12 @@ dependency checks, and ten NixOS VM tests that exercise dynamic-derivation
 builds end to end, one per example shape: hello, header, multi-source,
 shared-lib, generated-header, CMake order-only header, the dotdot source
 include, dynamic deps, a run script and the C++20 Fortran-module example.
-`example-nix` has no VM test, because it does not build (below). Each failure
-class that is unit-testable has a test here, and those tests are the ones that
-survive a refactor.
+`example-nix` has no VM test, because it does not build (below). Some closed
+classes also carry a unit test here, and those are the ones that survive a
+refactor; a class whose only instrument is a corpus gate is listed in `0.3` and
+is what work item 1 is about. This sentence previously claimed every
+unit-testable class had a test here, a universal form the count in `0.3` does
+not support.
 
 The counts, measured on a clean tree rather than stated: 17 checks, of which 10
 are VM tests, and 550 Rust tests across the workspace, all passing. A reader who
@@ -652,9 +664,10 @@ None is hypothetical: the first three are why upstream is dormant.
   distribution. `0.9` names adoption by someone else as the mitigation, which is
   also its exit criterion, so this risk and that milestone are the same problem
   seen from two directions.
-- **The verification apparatus is private.** The 89-row class table and most of
-  the gate corpus live outside this repository. `0.5` and work item 1 exist to
-  publish them, and until they land, every claim here is checkable only by its
+- **The verification apparatus is private.** The 89-row class table and the
+  whole gate corpus, all 91 scripts, live outside this repository. `0.5` and
+  work item 1 exist to publish them, and until they land, every claim here is
+  checkable only by its
   author, which is the property that made upstream's work hard to continue.
 - **The scale claim is a projection.** `0.8`'s two slopes are measured at small n
   and extrapolated to 30,000 translation units. A linear fit over a small range is
