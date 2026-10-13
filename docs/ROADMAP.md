@@ -33,6 +33,10 @@ supported past the original scope: aliases expand transitively, a phony over no
 file is tolerated, and a source file the generator also marks as a phony output
 still reaches the task that needs it. MET.
 
+The criterion is upstream's, stated in its README; the milestone is this
+project's to mark MET, and the phony work that finished the last of it landed
+here in September, after upstream stopped.
+
 ## 0.2 PERFORMANCE (upstream)
 
 Benchmarks exist for generation and end-to-end compilation; a configure step is
@@ -40,6 +44,9 @@ cached in its own derivation; a task's depfile is a declared output the driver
 reads back. The store-add path left the critical path: uploads run concurrently,
 a NAR streams, and a stamp map skips a file already known. MET, with its
 measurement in `CHANGELOG.md`.
+
+Same reading as `0.1`: the criterion is upstream's, and the depfile work that
+satisfies it landed here.
 
 ## 0.3 REAL-PACKAGE RESILIENCE
 

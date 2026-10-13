@@ -6,8 +6,16 @@ deliverable is VERIFIED, not when work starts.
 
 Versions are milestones, not calendar releases. The number says how far along
 [the roadmap](docs/ROADMAP.md) the tree is; before 1.0 it says nothing about
-stability. `0.1` and `0.2` came with the project from `pdtpartners/nix-ninja`,
-where they are defined; `0.3` and after are this project's own.
+stability.
+
+`0.1` and `0.2` are `pdtpartners/nix-ninja`'s, defined as correctness and as
+performance in that repository's README. `0.3` and after are this project's own.
+
+A row's version is the milestone whose criterion its work satisfies, not the
+date it landed: work on a `0.1` criterion finished in September is a `0.1.0`
+row, and the roadmap's criterion text is what decides it. A row that satisfies
+no criterion yet is `0.3.0`, which is where driving real packages put most of
+the work.
 
 Every row pins a commit whose subject still matches it. A row naming the wrong
 commit is worse than no row, because it reads as checked.
@@ -25,22 +33,22 @@ the tests `nix flake check` runs. Publishing the rest is tracked in
 | 0.3.0 | 2026-10-10 | `protoc` imports resolve through the include roots, and every qualifier is read. No edge declares a `.proto`'s import siblings, so 134 tasks failed across two desktop rounds. The reader resolves in protoc's own first-root-wins order and recurses the closure; a second commit reads every qualifier up to the opening quote, because `edition = "2024"`'s `import option` was skipped in silence and 162 more tasks failed. (`16a3e01`, `526d293`) | An A gate drives a protoc edge shaped like the failing derivation and asserts every import form reaches the emitted input list, with the pin as control. Population counted rather than assumed: `import "` 247, `import option "` 33, `import public "` 27 |
 | 0.3.0 | 2026-10-09 | A `cmake -P` script no edge declares is carried, including the script itself. An ExternalProject configure writes `<name>-mkdirs.cmake`, and the reader read the script's contents for targets without ever declaring the script, so the task ran with an empty input list and died `Not a file`. A reader that reads a file must declare the file. (`fe4e173`) | An A gate, with a control on the commit before the fix that fails it |
 | 0.3.0 | 2026-10-05 | The make-directory list rides `passAsFile`. `NIX_NINJA_MAKE_DIRS` accumulated one entry per directory and scaled with the package: one archive edge emitted 132,267 bytes against the kernel's fixed 131,072 limit and `execve` refused it over four short argv entries. Intermittent by construction, since it crosses the limit only on the largest subjects. (`731d908`) | An A gate asserts the list is in `passAsFile` exactly where a task carries it and nowhere when it does not, with a control that carries both lists inline. Priced both ways by measurement: appending unconditionally moved all five priced shapes, appending conditionally left them byte identical |
+| 0.3.0 | 2026-09-06 | A linker script another edge writes is carried, and a `-Wl` script is resolved from the graph before the disk. (`e4cb09b`, `21767b0`, `6a35958`) | An A gate, and a B gate on the same shape |
+| 0.3.0 | 2026-09-06 | A generated object reaches the compiler when its edge is a generator, and an include directory named above the build directory is carried rather than dropped. (`3ec8201`, `132b372`) | A gate on the output-shape arm, and the empty and unstaged include-dir arms |
+| 0.3.0 | 2026-09-05 | The file a soname alias points at is carried into a shared-library link; without it the staged library's `DT_NEEDED` is not an input. (`5235867`) | An A gate, red on the revision before the fix |
+| 0.3.0 | 2026-09-05 | A header a package stages into its own output is carried, and edges that also WRITE there are handled. (`cc08008`, `435c1b1`, `48a72e4`) | A B gate that scores the bytes landing in the output, with a control that builds and fails the assertion |
+| 0.3.0 | 2026-09-05 | The files a `.gresource.xml` manifest lists are carried. (`143415f`) | An A gate and a B gate |
+| 0.3.0 | 2026-09-05 | A declared output the command never wrote is named as such rather than left to fail later. (`41de370`) | An A gate covering both halves |
+| 0.3.0 | 2026-09-05 | An edit that removes a source product replaces it, so the next run does not read a stale build tree. (`4ef51fd`, `34f75f5`) | An A gate that pins the behavior, plus the ninja-state gates |
+| 0.3.0 | 2026-09-04 | Three routes by which a later driver pass adopts a placed product as an input are closed. (`f2dba47`) | An A gate running three passes, and a full B build |
+| 0.3.0 | 2026-09-04 | An rst document's `.. include::` fragments are read, for a writer handed one. (`afdfa7c`) | A unit test, and a package driven on B |
+| 0.3.0 | 2026-09-02 | The XML catalog is carried into a task. (`ee27295`) | An A gate |
+| 0.3.0 | 2026-09-02 | A `cmake -P` script is read for the input paths it composes. (`7d6acc9`) | An A gate asserting the alias consumer's inputs |
+| 0.3.0 | 2026-08-29 | `cc` is resolved lazily: a package with no compile targets does not need one. (`7fb756e`) | A gate on the package that exposed it, verified on B |
+| 0.3.0 | 2026-08-27 | The bash PATH gap and generated-header materialization in task derivations. (`2f7b8f2`, `dc296f3`) | The generated-header example, and a package verified on B |
 | 0.2.0 | 2026-09-05 | The second inherited milestone is complete, measured rather than asserted: benchmarks for generation and end-to-end compilation, a configure step cached in its own derivation, and a task's depfile declared as an output the driver reads back so a translation unit reports the headers it opened. The store-add path left the critical path. (`d0e7960`, `68905f1`, `5070d59`, `e0428a6`) | The measurement is in the commit body: on a 345 task project the driver makes 35,435 store adds, 34,371 of them answered by the stamp map for under a second between them; 25 s cold against 4 s warm over the 1,064 that genuinely upload. The figures were re-measured and corrected the same day, because the original counter recorded every upload twice (`7540642`) |
-| 0.2.x | 2026-09-20 | Phony target support past the inherited issue: an empty phony target is a no-op rather than a missing file, multiple CLI targets are supported, a phony guard reads its path against the right working directory, a phony marker over an existing source file stays out of the alias map, and only compiled artifacts are dropped from a compile task's phony closure. (`dcd132a`, `81b67e3`, `2f50617`, `71fdb0b`, `3b2efcc`) | Recorded in the development notes; five tests including chains and empty phonies |
-| 0.2.x | 2026-09-06 | A linker script another edge writes is carried, and a `-Wl` script is resolved from the graph before the disk. (`e4cb09b`, `21767b0`, `6a35958`) | An A gate, and a B gate on the same shape |
-| 0.2.x | 2026-09-06 | A generated object reaches the compiler when its edge is a generator, and an include directory named above the build directory is carried rather than dropped. (`3ec8201`, `132b372`) | A gate on the output-shape arm, and the empty and unstaged include-dir arms |
-| 0.2.x | 2026-09-05 | The file a soname alias points at is carried into a shared-library link; without it the staged library's `DT_NEEDED` is not an input. (`5235867`) | An A gate, red on the revision before the fix |
-| 0.2.x | 2026-09-05 | A header a package stages into its own output is carried, and edges that also WRITE there are handled. (`cc08008`, `435c1b1`, `48a72e4`) | A B gate that scores the bytes landing in the output, with a control that builds and fails the assertion |
-| 0.2.x | 2026-09-05 | The files a `.gresource.xml` manifest lists are carried. (`143415f`) | An A gate and a B gate |
-| 0.2.x | 2026-09-05 | A declared output the command never wrote is named as such rather than left to fail later. (`41de370`) | An A gate covering both halves |
-| 0.2.x | 2026-09-05 | An edit that removes a source product replaces it, so the next run does not read a stale build tree. (`4ef51fd`, `34f75f5`) | An A gate that pins the behavior, plus the ninja-state gates |
-| 0.2.x | 2026-09-04 | Three routes by which a later driver pass adopts a placed product as an input are closed. (`f2dba47`) | An A gate running three passes, and a full B build |
-| 0.2.x | 2026-09-04 | An rst document's `.. include::` fragments are read, for a writer handed one. (`afdfa7c`) | A unit test, and a package driven on B |
-| 0.2.x | 2026-09-02 | The XML catalog is carried into a task. (`ee27295`) | An A gate |
-| 0.2.x | 2026-09-02 | A `cmake -P` script is read for the input paths it composes. (`7d6acc9`) | An A gate asserting the alias consumer's inputs |
-| 0.2.x | 2026-08-30 | Depfile support, the inherited issue, in three parts and exercised end to end. (`c61fcb3`) | Recorded in the development notes with what it still owed at the time |
-| 0.2.x | 2026-08-29 | `cc` is resolved lazily: a package with no compile targets does not need one. (`7fb756e`) | A gate on the package that exposed it, verified on B |
-| 0.2.x | 2026-08-27 | The bash PATH gap and generated-header materialization in task derivations. (`2f7b8f2`, `dc296f3`) | The generated-header example, and a package verified on B |
+| 0.2.0 | 2026-08-30 | Depfile support, the inherited issue, in three parts and exercised end to end. (`c61fcb3`) | Recorded in the development notes with what it still owed at the time |
+| 0.1.0 | 2026-09-20 | Phony target support past the inherited issue: an empty phony target is a no-op rather than a missing file, multiple CLI targets are supported, a phony guard reads its path against the right working directory, a phony marker over an existing source file stays out of the alias map, and only compiled artifacts are dropped from a compile task's phony closure. (`dcd132a`, `81b67e3`, `2f50617`, `71fdb0b`, `3b2efcc`) | Recorded in the development notes; five tests including chains and empty phonies |
 | 0.1.0 | 2026-08-19 | The first inherited milestone: a CMake project builds end to end through the driver, and the Chromium-scale fixes land: store-name grammar, phony aliasing, shell no-op guards, a real `-j` cap, `passAsFile` for oversized attributes, sandbox depth mirroring, and rspfile support through a vendored n2. (`a506a5a`, `22bd862`, `a2c003e`, `52aa6ea`, `8c798e3`) | The inherited issue list marks the milestone's items complete; the corpus and the examples build |
 
 ## How a row is written
