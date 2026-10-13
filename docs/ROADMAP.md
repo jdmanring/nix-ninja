@@ -195,6 +195,27 @@ Named so they are not silently assumed:
   because `src` is an input of the configure derivation. Narrowing it is the
   work.
 
+## What does not work today
+
+Named here because the README sends a reader to this file for the first of
+them, and a roadmap that lists only the work done reads as a claim that
+nothing is outstanding.
+
+- **`example-nix` does not build.** It builds Nix itself per translation unit
+  and it is the largest example; it aborts with `ABORTED: submitting outer
+  output`, caused by a daemon refusal to submit a duplicate output named `out`.
+  The abort is reproducible at revisions before any recent change, so it is not
+  a property of the current tree. What is established: the two claimants are
+  dynamic derivations with no declared inputs and identical names, and their
+  emitted output lists differ, one naming a CMake try-compile scratch edge and
+  the other the real link edge. What is NOT established is the mechanism, and
+  the driver-side fixes for both candidate mechanisms were falsified by
+  measurement before landing, so neither is proposed again. Settling it needs
+  root and a stopped daemon. The README therefore does not offer this example as
+  a command to run.
+- **Four open classes in `0.3`**, whose first actions item 2 below names, and
+  **three inherited items** carried with no diagnosis, in item 6.
+
 ## The next concrete work, item by item
 
 Each item names the artifact it changes and the first action that makes it
@@ -260,6 +281,32 @@ Blocked on hardware, not on code. The emitted platform comes from the host, so
 the aarch64 path can be exercised without an aarch64 machine, but the VM tests
 would need a builder. Do not add a second system to the flake until the checks
 are per-system or a builder exists.
+
+### 6. Open in the inherited issue list
+
+None of these is a milestone item, because none has a diagnosis. They are
+carried here so that the inherited list is not the only record of them.
+
+- **Local-mode derivation caching.** A local drive re-derives instead of
+  reading a persisted graph, so it adopts neither n2's database nor ninja's
+  deps log, and the scheduler does no mtime dirtying. First action: decide
+  whether the local route is worth a cache at all, since the consumer's route
+  is inside a derivation and never sees it.
+- **Where a campaign's wall clock goes.** `dyn` reads 82 percent of it and its
+  instrument names none of that, because three `add_drv_to_store` call sites
+  were untimed. The timers now exist and print `plain adddrv` and
+  `sandbox adddrv`, and no build has produced a number from them yet, so the
+  0.084 s per task figure remains an elimination rather than a measurement.
+  First action: read that number on a real build. Do not choose between the
+  memo and the batch before reading it; this project has twice tuned the wrong
+  one by picking first.
+- **Driver memory that is retained and never released.** Measured at a clean
+  0.074 MiB per task, linear, continuing after NAR uploads and scanning have
+  stopped; about 2.2 GiB projected at 30,000 translation units, in the user
+  session where no cgroup bounds it. Not diagnosed. First action: profile
+  before writing anything, because the named candidates are guesses.
+
+The inherited item on aarch64 hardware is item 5 above.
 
 ## How a milestone ships
 

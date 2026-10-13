@@ -56,8 +56,12 @@ equivalent.*
 
 ## Getting started
 
-First you need to use Nix 2.30 or later (newer than stable) and enable the
-following experimental features:
+These features are unreleased. `dynamic-derivations` and `ca-derivations` are
+experimental and their interface moves, so the tree is developed against Nix
+master, which is what its `nix` flake input pins; read the revision from
+`flake.lock` rather than from a release number. The inherited README named 2.30
+as a floor, which was never re-verified here and is best read as a lower bound.
+Enable the following experimental features:
 
 ```sh
 export NIX_CONFIG="experimental-features = flakes nix-command dynamic-derivations ca-derivations recursive-nix"
@@ -126,14 +130,15 @@ Fortran and C++20 module examples that need `-recursive` variants.
 
 ## Contributing
 
-The work is tracked in [docs/ROADMAP.md](docs/ROADMAP.md), which states each
-milestone's exit criterion and the gate that says whether it is met. Open items
-are issues on this repository.
+Pull requests are the channel. The work is tracked in
+[docs/ROADMAP.md](docs/ROADMAP.md), which states each milestone's exit
+criterion and the gate that says whether it is met, and that file is the list
+of open items; GitHub issue tracking is switched off on this repository, so a
+problem report belongs in a pull request or in the roadmap.
 
-Pull requests are welcome. Consider opening an issue to discuss larger changes
-first, especially when the design space is large. Please read
-[CONTRIBUTING](CONTRIBUTING.md) and the [design notes] so you understand the big
-picture and prior art.
+For a wide design space, open the pull request as a draft and argue the shape
+there before writing much. Please read [CONTRIBUTING](CONTRIBUTING.md) and the
+[design notes] so you understand the big picture and prior art.
 
 ## What works today
 

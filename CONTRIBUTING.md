@@ -3,8 +3,10 @@
 Contributions should be made via pull requests. Pull requests will be reviewed
 by one or more maintainers and merged when acceptable.
 
-Work is tracked in [the roadmap](./docs/ROADMAP.md). Open an issue there before
-a large change, especially when the design space is wide.
+Work is tracked in [the roadmap](./docs/ROADMAP.md), which lists the open items
+and what each one needs before it can be started. GitHub issue tracking is
+switched off on this repository, so a wide design space is argued in the pull
+request itself: open it as a draft before writing much.
 
 ## Project Structure
 

@@ -2,9 +2,10 @@
 
 ## Reporting a vulnerability
 
-Report suspected vulnerabilities privately, not in a public issue. Use
-GitHub's [private vulnerability reporting][advisory] on this repository, or
-email the maintainer at james_manring@yahoo.com.
+Report suspected vulnerabilities privately, not in a public issue, and not in a
+pull request. Email the maintainer at james_manring@yahoo.com. GitHub's private
+vulnerability reporting is switched off on this repository, so email is the
+channel.
 
 Include what you can: the affected revision, a description, and the smallest
 input that reproduces it. A `build.ninja` fragment plus the command that drives
@@ -36,7 +37,8 @@ inside a sandbox. The areas worth scrutiny:
   `ca-derivations` and `recursive-nix`, all unstable by upstream's own
   definition; a defect in them belongs to Nix, not here.
 - Reports about the vendored `vendor-n2/`, which is n2 by Evan Martin and
-  carries its own license. Report those upstream; `vendor-n2/VENDORING.md`
+  carries its own license. Those go to n2's own tracker; `vendor-n2/VENDORING.md`
   records the revision vendored here.
 
-[advisory]: https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability
+Reports are welcome by email even where the answer is that the issue is already
+known.
