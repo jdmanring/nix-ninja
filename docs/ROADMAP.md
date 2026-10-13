@@ -52,10 +52,10 @@ And the supporting sections:
 
 ## Where this file comes from
 
-The project began when `pdtpartners/nix-ninja` stopped. Work continued here: the
-tree is 658 commits past the last upstream commit of May 2026, and the milestone
-numbering above two is new. `docs/todo.md` records the state of the issues that
-came with the project; this file is what comes after them.
+The project began when `pdtpartners/nix-ninja` stopped. Work continued here:
+the tree is more than 650 commits past the last upstream commit of May 2026,
+and the milestone numbering above two is new. `docs/todo.md` records the state
+of the issues that came with the project; this file is what comes after them.
 
 ## What this project is not trying to do
 
