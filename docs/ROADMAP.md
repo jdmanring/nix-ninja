@@ -18,11 +18,10 @@ followed that no number named.
 
 ## Why this file is long, and what it is for
 
-The project began when `pdtpartners/nix-ninja` stopped. Work continued here:
-the tree is several hundred commits past the last upstream commit of May 2026,
-its corpus is 90 gate scripts, and the milestone numbering above two is new.
-`docs/todo.md` records the state of the issues that came with the project; this
-file is what comes after them.
+The project began when `pdtpartners/nix-ninja` stopped. Work continued here: the
+tree is several hundred commits past the last upstream commit of May 2026, and
+the milestone numbering above two is new. `docs/todo.md` records the state of
+the issues that came with the project; this file is what comes after them.
 
 ## 0.1 CORRECTNESS (upstream)
 
@@ -75,9 +74,10 @@ binary had to learn:
 - **Compiler and linker resolution.** Which compiler, which flags, whether an
   edge is a compile or a link, and the rpath a link carries.
 
-Every one is closed against a gate that fails on the revision before its fix.
-The trap that recurs: a reader emitting an absolute spelling is dropped in
-silence by the wiring filters, so it looks fixed and changes nothing.
+Every one is closed against an instrument that fails on the revision before its
+fix, and most of those instruments are covered by a test in this repository. The
+trap that recurs: a reader emitting an absolute spelling is dropped in silence
+by the wiring filters, so it looks fixed and changes nothing.
 
 EXIT CRITERION: the corpus passes on both configurations, and every class
 carries a gate arm, a named reason it cannot, or a witness on a real package.
@@ -85,9 +85,6 @@ THE THIRD FORM IS NOT THE FIRST, and the rows in it are the conversion work
 still owed: a package witness is evidence about the package, while an arm is
 evidence about the revision before the fix, which is what survives the next
 change.
-
-GATE: `local/gates/run-all.sh`, A and B. A green run is a reduction set and not
-a package result; the package result is the consumer's round.
 
 ## 0.4 THE COST OF A CHANGE
 
@@ -118,33 +115,45 @@ EXIT CRITERION: a rebuild or rename of either binary costs the banked outputs
 nothing while its generation is unchanged, and a change that alters what a task
 WRITES moves the generation and pays once, deliberately.
 
-## 0.5 THE INSTRUMENTS
+## 0.5 VERIFICATION
 
-THE CLAIM: every claim this project makes is reproducible on a clean tree in
-minutes, by an instrument that fails when the claim stops being true.
+THE CLAIM: a change that breaks a closed class is caught before it lands, by
+something a reader of this repository can run.
 
-90 gate scripts, of which 66 are invoked by a runner and 24 are excluded with a
-named reason. The corpus is two configurations because a verification is a claim
-about the configuration it was taken on: one runs outside any derivation, the
-other inside an ordinary recursive-nix build.
+What you can run today, from a clone, with nothing else installed:
 
-The disciplines the instruments enforce, each after a cost:
+    nix flake check
+
+That runs the Rust test suite under `cargo-nextest`, the format, clippy and
+dependency checks, and ten NixOS VM tests that exercise dynamic-derivation
+builds end to end, one per example plus the generated-header, CMake order-only
+and Fortran-module shapes. Each failure class that is unit-testable has a test
+here, and those tests are the ones that survive a refactor.
+
+The project also keeps a wider corpus of gate scripts, one per closed class,
+each written to reproduce a defect so that it fails on the revision before the
+fix. That corpus is not yet in this repository: it grew beside a consumer
+distribution and about half of it reaches into trees and paths that are private.
+Publishing it is tracked work, not a claim, and until it is published the corpus
+counts are deliberately not stated here. What the wider corpus enforces is
+worth stating anyway, because the disciplines apply to any test written for this
+project:
 
 - A negative control must FAIL, and its break must sit where the subject
   executes. A control whose input the subject cannot fail on is not a control.
 - A count claim must be exact or not written: "every X" and "all three" are
   counted, and the count is checked against the population.
-- A gate input must survive a garbage collection: no literal store paths.
+- A fixture must survive a garbage collection: no literal store paths.
 - A planted value must be DERIVED from the subject, or the arm goes stale at the
   next change and the arm meant to catch staleness is itself stale.
-- An instrument that fails to BUILD is not a defect in the tree. A runner scores
-  those apart from a FAIL.
+- An instrument that fails to BUILD is not a defect in the tree, and a runner
+  must score it apart from a FAIL.
 - The instrument's own negative must be reachable: a mutation ignoring the
   reading must fail the self-test.
 
-EXIT CRITERION: the corpus runs green on both configurations on a clean tree
-with the machine to itself, and every registered verdict pattern is printed by
-its gate.
+EXIT CRITERION: `nix flake check` passes on a clean clone, and the wider corpus
+is either in the repository or each unported class carries a dated reason it is
+not.
 
 ## 0.6 AND BEYOND
 

@@ -12,6 +12,12 @@ where they are defined; `0.3` and after are this project's own.
 Every row pins a commit whose subject still matches it. A row naming the wrong
 commit is worse than no row, because it reads as checked.
 
+A cell that says "a gate" names an instrument kept beside this project's
+development rather than in this repository, which is why it describes what the
+gate DOES rather than naming its file. The instruments that live in the tree are
+the tests `nix flake check` runs. Publishing the rest is tracked in
+[docs/ROADMAP.md](docs/ROADMAP.md).
+
 | version | date | delivered | verified by |
 |---|---|---|---|
 | (unreleased) | 2026-10-12 | The ExternalProject chain is complete. Five walls, each found by the next step failing: a download step extracting into `SOURCE_DIR` as an undeclared side effect; an `extract-<name>.cmake` resolved against the step's leading `cd`; a patch step running INSIDE `SOURCE_DIR` so the task copies a directory it both receives and declares, writable; step edges made stamp edges with the tree riding the stamp as a co-output; and a later step's tree superseding the earlier registration. (`b0dc02a`, `0922958`, `362d801`, `e657c80`, `ba8ee4e`, `e1101af`) | A B-configuration gate drives a real ExternalProject, store-path archive, patch and build step scored on the bytes it saw; head sees the patched tree, the pin control does not. Mutation-checked in both directions: disabling the supersede gives the original tree, disabling the writable copy aborts the patch step |
