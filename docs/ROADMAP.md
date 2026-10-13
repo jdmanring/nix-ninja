@@ -507,29 +507,34 @@ gate that reads it FAILS SPURIOUSLY there rather than reporting an answer -
 measured by hiding the file and running one, which printed
 `grep: CLAUDE.md: No such file or directory` and then two FAIL lines.
 
-5 of the 91 EXECUTE in a clean clone, checked out with `git clone` and run
-there with `local/` absent. Two of those 5 also assert about this repository's
-own source and are therefore worth publishing as corpus arms:
-`stdout-contract-sweep.sh` exits 0, and `duplicate-predicate-sweep.sh` returns
-its real verdict because a clone carries the git history it reads. The other
-three run but measure something else - `cmake-byproducts-target-expression.sh`
-asserts about CMAKE, `daemon-gap-cpu-probe.sh` about the running machine, and
-`round-intercept-sweep.sh` about a consumer round - so they belong in the
-repository as tools rather than as arms.
+4 of the 91 EXECUTE in a clean clone, checked out with `git clone` and run
+there with `local/` absent, no argument and nothing installed. Two of those 4
+assert about this repository's own source and are therefore worth publishing as
+corpus arms: `stdout-contract-sweep.sh` exits 0, and
+`duplicate-predicate-sweep.sh` returns its real verdict because a clone carries
+the git history it reads. The other two measure something else -
+`cmake-byproducts-target-expression.sh` asserts about CMAKE, and
+`daemon-gap-cpu-probe.sh` about the running machine - so they belong in the
+repository as tools rather than as arms. TWO EARLIER COUNTS OF THIS FIGURE WERE
+WRONG and both are worth keeping: a grep for scripts containing no `nix` call
+said 13, and a probe that scored any non-zero exit as "ran" said 5. The second
+counted `round-intercept-sweep.sh`, which prints a usage line because it needs
+a round log and its live arm reads a retained leaf log from the store.
 
-DONE for the first two: `stdout-contract-sweep.sh` and
-`duplicate-predicate-sweep.sh` are tracked under `gates/` and both run in a
-clone with nothing installed. Each is self-locating, walking up to `Cargo.toml`
-rather than assuming a depth, because the private corpus reaches the same file
-through a symlink one level deeper, so there is one physical copy and no second
-version to diverge.
+DONE for the first four: `stdout-contract-sweep.sh`,
+`duplicate-predicate-sweep.sh`, `cmake-byproducts-target-expression.sh` and
+`daemon-gap-cpu-probe.sh` are tracked under `gates/` and each runs in a clone
+with nothing installed. The first two are self-locating, walking up to
+`Cargo.toml` rather than assuming a depth, because the private corpus reaches
+the same file through a symlink one level deeper, so there is one physical copy
+and no second version to diverge; the other two read nothing in the tree and
+needed no such change.
 
-What remains is 89 scripts: 3 that run but measure something else and belong in
-the repository as tools, and 86 that need a reason stated where they are - the
-78 that invoke nix need the experimental features in the daemon, a working store
-and time, which is the same prerequisite `nix flake check` has and the README
-states, and the remaining 8 need either an argument, a parent gate, or a
-subject turned into a fixture.
+What remains is 87 scripts: each needs a reason stated where it is. The 78 that
+invoke nix need the experimental features in the daemon, a working store and
+time, which is the same prerequisite `nix flake check` has and the README
+states, and the other 9 need either an argument, a parent gate, or a subject
+turned into a fixture.
 
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
