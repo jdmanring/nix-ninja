@@ -1,11 +1,12 @@
 # Roadmap
 
-The path from a driver that builds one project correctly to one that a stranger
-can point at a distribution. Six milestones. `0.1` through `0.5` are about
-whether the driver is right; `0.6` is the one that says where the path ends.
-Each has an exit criterion, the work that satisfies it, and the instrument that
-says whether it is met. No dates: a milestone ships when its criterion is met
-and the named gate says so on a clean tree.
+The path from a driver that builds one project correctly to one a stranger can
+point at a distribution, and then to one that is worth choosing over the
+alternatives. Seven milestones. `0.1` through `0.5` are about whether the driver
+is right, `0.6` says where the path ends and `0.7` is what makes it a choice
+rather than a curiosity. Each has an exit criterion, the work that satisfies it,
+and the instrument that says whether it is met. No dates: a milestone ships when
+its criterion is met and the named gate says so on a clean tree.
 
 `0.1` and `0.2` are upstream's; they came with the project and both are
 complete. From `0.3` on, the numbering is this project's own, and is written
@@ -223,9 +224,57 @@ left to be assumed: multi-arch is blocked on hardware (item 5), and a second
 backend on whether the Nix data structures can come from `snix` at all, which is
 an open question, not scheduled work.
 
-`1.0` is not a further milestone. It is the version this project takes once
-`0.6` has held across a release with no new class appearing, because that is the
-first moment the claim describes the project rather than the last round of work.
+`1.0` is not a further milestone. It is the version this project takes once `0.6`
+has held across a release with no new class appearing and `0.7` has numbers on
+all four axes: the first moment the claim describes the project rather than the
+last round of work, and the first moment a stranger has a reason to choose it
+rather than reach for it out of curiosity. `0.6` alone is adoptable; `0.7` is why
+anyone would.
+
+## 0.7 THE COMPARISON
+
+THE CLAIM: nix-ninja is competitive with other resumable build systems, and the
+comparison is measured rather than asserted.
+
+Nothing in this file or in `README.md` compares this project to any other
+builder. The design notes compare two internal variants of the include scan and
+nothing else. `bench/records/README.md` says of the one end-to-end record set:
+"no comparison against plain ninja, which is the comparison a performance claim
+actually wants. Anyone quoting a speedup from this file is quoting something
+that was not measured."
+
+So the milestone begins by admitting it has no numbers, which is why it is a
+milestone and not a section. Four claims, each measured on its own axis, each
+against a named baseline, because one number cannot answer "is it better".
+
+- **A source edit rebuilds one translation unit.** Against plain ninja on the
+  same tree, same machine. This is the mechanism's central claim: one edge
+  changed, one task re-keyed, the rest substituted from the Nix store. It is also
+  the one most likely to hold, since the granularity is per edge by construction.
+- **A killed build resumes without redoing completed work.** Against a restart
+  from zero. Already true per translation unit, because a completed task is a
+  valid store path, but never measured as a number, and the two desktop editions
+  are currently refused before their first iteration by the consumer's own
+  resumability gate rather than resumed.
+- **A compiled object substitutes across machines and users.** Through an
+  ordinary Nix binary cache, with no remote-execution protocol to implement.
+  This is the capability that is genuinely hard to match without reimplementing
+  `REAPI`, and the most distinctive thing here if it holds.
+- **Total wall clock from scratch.** Against plain ninja, `distcc` and `ccache`.
+  The bench README names this as the comparison a performance claim wants. It is
+  also the axis most likely to lose, because a derivation per translation unit
+  adds driver and store overhead that a plain `ninja` does not pay.
+
+EXIT CRITERION: each of the four axes carries a recorded number against its
+named baseline, produced by a harness in this repository, with the machine,
+the package and the store state recorded beside it. Axes that lose are published
+as losses. THE THIRD FORM IS NOT THE FIRST, as in `0.3`: a number from a machine
+nobody else has is evidence about that machine, and the harness is what makes it
+evidence about the project.
+
+This milestone is deliberately last, and it is the one most likely to change the
+others: a measured loss on total wall clock does not invalidate `0.3`, but it
+would change what the README should claim.
 
 ## What does not work today
 
@@ -245,6 +294,13 @@ nothing is outstanding.
   measurement before landing, so neither is proposed again. Settling it needs
   root and a stopped daemon. The README therefore does not offer this example as
   a command to run.
+- **Nothing here has been compared to another builder.** Not on any axis. This
+  is the largest gap on this page and the one a reader is most likely to assume
+  away, because the mechanism sounds like it must be faster and no number
+  contradicts them. `0.7` names the four axes and item 7 says how each is
+  measured. Until then the honest statement is that the granularity is per
+  translation unit by construction, which is a fact about the design, and that
+  no measurement here says what that is worth.
 - **Four open classes in `0.3`**, whose first actions item 2 below names, and
   **three inherited items** carried with no diagnosis, in item 6.
 
@@ -342,6 +398,36 @@ carried here so that the inherited list is not the only record of them.
   before writing anything, because the named candidates are guesses.
 
 The inherited item on aarch64 hardware is item 5 above.
+
+### 7. Build the comparison harness
+
+`0.7` states four axes and has no instrument for any of them. The first action is
+not a build change, it is a harness: take a real project, build it identically
+under plain ninja and under the driver, on the same machine with the same store
+state recorded beside each, and record both. `bench/e2e.sh` already produces the
+driver's half of such a record and says in its own comments what it does not
+establish; what is missing is the baseline beside it and a way to say which of
+the two the numbers came from.
+
+Do the four in this order, each measured before the next is started, because the
+result of one may change what the next should claim:
+
+1. Incremental edit, against plain ninja. A one-line change to one source file,
+   both builders, wall clock and the count of translation units actually
+   rebuilt. The mechanism predicts one; the measurement is whether the driver
+   adds overhead that eats it.
+2. Resume after interruption. Kill a build partway, restart it, and count work
+   redone rather than resumed. Needs a way to distinguish the two in a log.
+3. Cross-machine substitution. Build on one machine, realise the same derivation
+   on another through a binary cache, and assert the object is the one the first
+   machine produced rather than a rebuild.
+4. Total wall clock from scratch. Last, because it is the axis most likely to
+   lose and the numbers on the other three should exist before this one is run.
+
+The rule from `0.3` applies unchanged: a measurement needs a baseline that can
+fail to differ from it. A plain-ninja run and a driver run that both took the
+same wall clock because neither did any work is not a comparison, and the
+harness has to be able to tell that apart from a real tie.
 
 ## How a milestone ships
 
