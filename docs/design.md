@@ -250,7 +250,7 @@ executing '/nn/bin/nix-ninja-task': No such file or directory
 The entry maps the stable path to the store path, in the daemon's own
 configuration, and the daemon has to be restarted to read it:
 
-    extra-sandbox-paths = /nn/bin/nix-ninja-task=/nix/store/<hash>-nix-ninja-task-0.1.0/bin/nix-ninja-task
+    extra-sandbox-paths = /nn/bin/nix-ninja-task=/nix/store/<hash>-nix-ninja-task-<version>/bin/nix-ninja-task
 
 A sandbox mounts the closure of a `sandbox-paths` entry, so neither binary
 needs a static build; a mapped builder finds its own glibc with no input

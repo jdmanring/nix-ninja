@@ -11,6 +11,9 @@ complete. From `0.3` on, the numbering is this project's own, and is written
 here rather than proposed: it records how the work since has been organized, not
 a plan awaiting ratification.
 
+The tree is at **0.3.0** (`Cargo.toml`). The version is a milestone, so it moves
+when a criterion below is met and a gate says so, never because time passed.
+
 The state of the tree TODAY, class by class, is a table of 88 rows kept in the
 development notes. This file is the ladder behind it. It exists because the two
 milestones the project inherited stopped at two, and six months of work
