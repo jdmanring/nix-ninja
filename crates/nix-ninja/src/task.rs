@@ -3729,8 +3729,23 @@ fn build_task_derivation(
         // The name test above stays deliberately broad, because it also
         // decides the closure; it is the ABORT that must not fire here.
         if !names_only_absolute_toolchain(cmdline) {
-            drv.inputs
-                .insert(SingleDerivedPath::Opaque(tools.require_cc()?.clone()));
+            // THE REFUSAL NAMES THE COMMAND IT REFUSED. Without this the abort
+            // carries the message and nothing else, and the task never emits a
+            // derivation, so the command cannot be recovered afterwards: `nix
+            // derivation show` needs a drv and `nix path-info` needs an output,
+            // and a refused edge produces neither. A reader is then left
+            // guessing which command tripped a predicate over a name list,
+            // which is what this cost on 2026-10-13 (a rustc/LLVM round, 32
+            // tasks, both sides reading a command from a DIFFERENT task that
+            // had succeeded). Truncated because a command can be megabytes and
+            // the part that matters is the head; `-v` reproduces it in full.
+            let shown: String = cmdline.chars().take(400).collect();
+            drv.inputs.insert(SingleDerivedPath::Opaque(
+                tools
+                    .require_cc()
+                    .with_context(|| format!("refused command: {shown}"))?
+                    .clone(),
+            ));
         }
     }
     drv.inputs
