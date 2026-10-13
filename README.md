@@ -36,7 +36,9 @@ equivalent.*
 > `systems = [ "x86_64-linux" ]`, so `nix build .#example-hello` on a Mac fails
 > with `does not provide attribute 'packages.aarch64-darwin.example-hello'`, or
 > the `x86_64-darwin` form on an Intel Mac.
-> See [multi-arch support](docs/ROADMAP.md#06-and-beyond).
+> See [multi-arch support](docs/ROADMAP.md#the-next-concrete-work-item-by-item),
+> item 5, and [the destination](docs/ROADMAP.md#06-the-destination) for what is
+> deliberately outside the scope.
 >
 > If you hit `experimental Nix feature '...' is disabled` while passing
 > `--extra-experimental-features`, that is a separate and not macOS-specific
