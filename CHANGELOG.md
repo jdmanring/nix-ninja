@@ -1,6 +1,6 @@
 # Changelog
 
-Every release this project has made, newest first, each pinned to the commits
+Every milestone the tree has reached, newest first, each pinned to the commits
 that delivered it and to the gate that verified it. A row is added when a
 deliverable is VERIFIED, not when work starts.
 
