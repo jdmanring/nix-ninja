@@ -219,9 +219,8 @@ the client's, or it fails with a message that blames the client.
 The project also keeps a wider corpus of gate scripts, one per closed class,
 each written to reproduce a defect so that it fails on the revision before the
 fix. That corpus is not yet in this repository: it grew beside a consumer
-distribution and 11 of its 91 scripts reach into trees and paths that are
-private, with 6 more reaching only for a literal store path. Publishing it is
-tracked work rather than a claim, and the triage under
+distribution, and 11 of its 91 scripts reach into trees and paths that are
+private. Publishing it is tracked work rather than a claim, and the triage under
 [the next concrete work](#the-next-concrete-work-item-by-item), item 1, is what
 decides the order. What the wider corpus enforces is worth stating anyway,
 because the disciplines apply to any test written for this project:
@@ -467,11 +466,15 @@ The instrument that verifies every closed class is not in this repository. A
 triage over the whole corpus, measured rather than asserted, splits 91 gate
 scripts three ways:
 
-1. **Gates that reach only for a literal store path.** 6 scripts, mechanical:
-   each path becomes an attribute or a by-revision lookup, which is what the
-   corpus already does elsewhere. No behavior changes, so each is verifiable by
-   running it before and after and getting the same verdict.
-2. **Gates that are self-contained.** 74 scripts. A copy into the repository,
+1. **Gates that reach for a store path that can be collected.** ONE script,
+   and it is a documented exception rather than a defect. A first pass counted
+   ten scripts here by matching `/nix/store/<hash>-` in the code, and nine of
+   those hold synthetic fixture paths (`aaaa…-fixture-1.0`) that never exist in
+   a store and cannot be collected. The one real literal is
+   `round-intercept-sweep.sh`'s retained round's leaf log, which is NOT
+   derivable: resolving the same subject by attribute returns a different
+   derivation. It stays, and fails loud when the path is gone.
+2. **Gates that are self-contained.** 79 scripts. A copy into the repository,
    plus the one path assumption in the runner, which resolves its own directory
    and then expects the gates beside it.
 3. **Gates coupled to a private tree on the executable path.** 11 scripts,
@@ -480,9 +483,9 @@ scripts three ways:
    turned into a fixture first. Two read a consumer shim by design and report
    NO ANSWER when it is absent, which is correct and stays.
 
-The split is exact and exhaustive: 6 + 74 + 11 = 91, and no script falls in two
-groups. A comment that names a consumer path is not coupling, and one script
-does exactly that and is counted in group 2 rather than group 3.
+The split is exact and exhaustive: 1 + 79 + 11 = 91, and no script falls in two
+groups. The work is therefore almost entirely group 2, which is a copy and one
+runner assumption, and group 3, which is the real cost.
 
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
