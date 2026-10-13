@@ -42,6 +42,40 @@ jobs:
       - name: Run nix flake check
         run: nix flake check -L
 
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # NO NIX AND NO SETUP: these gates are the ones that run against a clone
+      # with nothing installed, which is the property that makes them worth
+      # publishing. A job that needed the daemon would be testing a different
+      # claim.
+      - name: Run the published gates
+        run: |
+          fail=0
+          # EACH GATE IS MATCHED ON ITS VERDICT TEXT, NOT ON ITS EXIT CODE, and
+          # the reason is `duplicate-predicate-sweep.sh`: it exits 1 by design,
+          # because its pairs are a candidate set to read rather than a tree
+          # failure, so scoring it on status would make every build red for a
+          # documented result. This is the rule the private runner uses, and
+          # this job fails when a pattern stops matching, which is what catches
+          # a gate whose verdict text changed without its caller being updated.
+          check() {  # check <script> <expected verdict regex>
+            printf '%-44s ' "$1"
+            out=$(bash "gates/$1" 2>&1)
+            if printf '%s' "$out" | grep -Eq "$2"; then
+              printf '%s' "$out" | grep -oE "$2" | head -1
+            else
+              echo "VERDICT NOT PRINTED: $(printf '%s' "$out" | tail -1 | cut -c1-58)"
+              fail=1
+            fi
+          }
+          check stdout-contract-sweep.sh              '^PASS: no stdout diagnostic added'
+          check cmake-byproducts-target-expression.sh '^PASS: OUTPUT and BYPRODUCTS refuse'
+          check duplicate-predicate-sweep.sh          '^(FAIL: [0-9]+ pair|PASS: no)'
+          check daemon-gap-cpu-probe.sh               '^(idle now|BUSY)'
+          exit $fail
+
   integration-test:
     runs-on: ubuntu-latest
     strategy:

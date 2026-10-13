@@ -46,6 +46,27 @@ made to it.
 
 ## Developing locally
 
+### The checks that need nothing
+
+`gates/` holds checks that run against a clone with nothing installed, not even
+nix. Run them before opening a pull request; CI runs the same four and fails
+when a verdict changes.
+
+```sh
+gates/stdout-contract-sweep.sh               # stdout writes against the logging contract
+gates/duplicate-predicate-sweep.sh           # any predicate implemented twice
+gates/cmake-byproducts-target-expression.sh  # a cmake legality question
+gates/daemon-gap-cpu-probe.sh                # daemon wedge vs slow reply
+```
+
+Each prints a verdict line. `duplicate-predicate-sweep.sh` exits non-zero when
+it finds pairs: they are a candidate set to READ, not a failure, which is why CI
+matches each gate's verdict text rather than its exit status.
+
+Everything else needs the experimental features, a store and time. The wider
+corpus is not published yet and the roadmap's work item 1 tracks what each
+outstanding check needs.
+
 Currently, the easiest way to develop `nix-ninja` is to use [nix@d904921]
 directly as your nix daemon. This way, you can build `nix-ninja` itself and the
 examples (e.g. when iterating on `nix build .#example-nix`) all in one build.
