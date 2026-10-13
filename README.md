@@ -80,12 +80,15 @@ nix build .#legacyPackages.x86_64-linux.example-hello
 # Builds a basic main.cpp with dependency inference for its header.
 nix build .#legacyPackages.x86_64-linux.example-header
 
-# Builds Nix itself, per translation unit.
-nix build .#legacyPackages.x86_64-linux.example-nix
-
 # The CMake route, end to end.
 nix build .#legacyPackages.x86_64-linux.example-cmake-hello
 ```
+
+`example-nix`, which builds Nix itself per translation unit, is the largest
+example and is currently KNOWN NOT TO BUILD: it aborts on a daemon refusal to
+submit a duplicate output. That is reproducible at revisions before any recent
+change and is not a property of the current tree. See
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
 If a build fails with `does not provide attribute ... example-hello`, the
 experimental features are not enabled in the DAEMON's configuration; the
