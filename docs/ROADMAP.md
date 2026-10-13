@@ -224,22 +224,25 @@ provide: what to open, and how to know the change is right.
 
 ### 1. Publish the wider corpus, cheapest group first
 
-The instrument that verifies every closed class is not in this repository. The
-sequence, measured, is:
+The instrument that verifies every closed class is not in this repository. A
+triage over the whole corpus, measured, splits it three ways, and the section
+above states no count for them:
 
-1. **27 gates that reach only for a literal store path.** Mechanical: each path
+1. **Gates that reach only for a literal store path.** Mechanical: each path
    becomes an attribute or a by-revision lookup, which is what the corpus
    already does elsewhere. No behavior changes, so each is verifiable by
    running it before and after and getting the same verdict.
-2. **49 gates that are self-contained.** A copy into the repository, plus the
-   one path assumption in the runner, which resolves its own directory and then
+2. **Gates that are self-contained.** A copy into the repository, plus the one
+   path assumption in the runner, which resolves its own directory and then
    expects the gates beside it.
-3. **13 gates coupled to a private tree on the executable path.** Each needs its
-   subject turned into a fixture first. Two of them read a consumer shim by
-   design and report NO ANSWER when it is absent, which is correct and stays.
+3. **Gates coupled to a private tree on the executable path**, judged on the
+   code rather than on a comment, since a gate that merely mentions a consumer
+   path in a comment is not coupled. Each needs its subject turned into a
+   fixture first. Two read a consumer shim by design and report NO ANSWER when
+   it is absent, which is correct and stays.
 
-Do them in that order: group 1 proves the corpus can run outside its original
-environment before 49 more files depend on it.
+Do them in that order: the first group proves the corpus can run outside its
+original environment before the second depends on it.
 
 ### 2. Close the four open classes
 
