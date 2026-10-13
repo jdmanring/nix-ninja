@@ -15,11 +15,12 @@ stability.
 `0.1` and `0.2` are `pdtpartners/nix-ninja`'s, defined as correctness and as
 performance in that repository's README. `0.3` and after are this project's own.
 
-A row's version is the milestone whose criterion its work satisfies, not the
+A row's version is the milestone whose criterion its work advances, not the
 date it landed: work on a `0.1` criterion finished in September is a `0.1.0`
-row, and the roadmap's criterion text is what decides it. A row that satisfies
-no criterion yet is `0.3.0`, which is where driving real packages put most of
-the work.
+row, and the roadmap's criterion text is what decides it. Work that advances no
+named criterion yet sits under the milestone currently in progress, which is
+`0.3.0`; that is a statement about where the work belongs, not that the `0.3`
+criterion is met. The roadmap says the same, and names the classes still open.
 
 Every row pins a commit whose subject still matches it. A row naming the wrong
 commit is worse than no row, because it reads as checked.

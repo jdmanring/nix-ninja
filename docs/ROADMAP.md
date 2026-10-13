@@ -13,8 +13,12 @@ complete. From `0.3` on, the numbering is this project's own, and is written
 here rather than proposed: it records how the work since has been organized, not
 a plan awaiting ratification.
 
-The tree is at **0.3.0** (`Cargo.toml`). The version is a milestone, so it moves
-when a criterion below is met and a gate says so, never because time passed.
+The tree is at **0.3.0** (`Cargo.toml`). The version names the milestone the
+work is currently toward, and it advances when the milestone before it is met
+and a gate says so, never because time passed. So `0.3.0` means `0.1` and `0.2`
+are met and `0.3` is in progress rather than finished, which is why its open
+classes are listed below. A reader should not take the number as a claim that
+the milestone it names is complete.
 
 The state of the tree TODAY, class by class, is a table of 88 rows. It is not in
 this repository: it grew beside a private distribution and is development
