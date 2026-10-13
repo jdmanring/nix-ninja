@@ -43,13 +43,22 @@ jobs:
   integration-test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
+        # One entry per registered nixosTest. The lint job's `nix flake check`
+        # runs all of these too; this job exists so a failure names the test
+        # rather than the check set, and so it can run them in parallel.
         test:
           - nix-build-hello
           - nix-build-header
           - nix-build-multi-source
           - nix-build-shared-lib
+          - nix-build-run-script
           - nix-build-dynamic-deps
+          - nix-build-generated-header
+          - nix-build-cmake-order-only-header
+          - nix-build-fortran-module-recursive
+          - nix-build-dotdot-source-include
     steps:
       - uses: actions/checkout@v4
       - name: Setup Nix

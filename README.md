@@ -10,6 +10,10 @@ system that outputs ninja like CMake, meson, premake, gn, etc.
 
 [![Demo](docs/demo.gif)](https://asciinema.org/a/711344)
 
+*An incremental rebuild driven by nix-ninja. The recording is the project's
+original demonstration and shows an earlier layout; `nix build .#example-hello`
+is the current equivalent.*
+
 [Key features](#key-features) •
 [Getting started](#getting-started) •
 [Design notes][design notes] •
