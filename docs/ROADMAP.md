@@ -134,6 +134,12 @@ The counts, measured on a clean tree rather than stated: 17 checks, of which 10
 are VM tests, and 548 Rust tests across the workspace, all passing. A reader who
 wants a different number can run the same command and get it.
 
+Two things to know before running it. The ten VM checks boot a NixOS machine, so
+they need `/dev/kvm` and take a while; on a host without it they fail for that
+reason and not because the tree is broken. And `nix flake check` needs the
+experimental features the README lists, in the DAEMON's configuration as well as
+the client's, or it fails with a message that blames the client.
+
 The project also keeps a wider corpus of gate scripts, one per closed class,
 each written to reproduce a defect so that it fails on the revision before the
 fix. That corpus is not yet in this repository: it grew beside a consumer
