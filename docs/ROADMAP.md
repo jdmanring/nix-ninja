@@ -515,7 +515,10 @@ corpus arms: `stdout-contract-sweep.sh` exits 0, and
 the git history it reads. The other two measure something else -
 `cmake-byproducts-target-expression.sh` asserts about CMAKE, and
 `daemon-gap-cpu-probe.sh` about the running machine - so they belong in the
-repository as tools rather than as arms. TWO EARLIER COUNTS OF THIS FIGURE WERE
+repository as tools rather than as corpus arms. The two are different KINDS of
+tool and that matters for CI: the cmake one prints a verdict and CI asserts on
+it, while the daemon probe samples live workers and prints none, so a runner
+can only run it by hand. TWO EARLIER COUNTS OF THIS FIGURE WERE
 WRONG and both are worth keeping: a grep for scripts containing no `nix` call
 said 13, and a probe that scored any non-zero exit as "ran" said 5. The second
 counted `round-intercept-sweep.sh`, which prints a usage line because it needs
@@ -528,7 +531,9 @@ with nothing installed. The first two are self-locating, walking up to
 `Cargo.toml` rather than assuming a depth, because the private corpus reaches
 the same file through a symlink one level deeper, so there is one physical copy
 and no second version to diverge; the other two read nothing in the tree and
-needed no such change.
+needed no such change. CI runs the THREE that print a verdict, matching each
+gate's verdict text rather than its exit code, because the duplicate-predicate
+sweep exits non-zero by design.
 
 What remains is 87 scripts: each needs a reason stated where it is. The 78 that
 invoke nix need the experimental features in the daemon, a working store and

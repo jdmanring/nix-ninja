@@ -49,19 +49,22 @@ made to it.
 ### The checks that need nothing
 
 `gates/` holds checks that run against a clone with nothing installed, not even
-nix. Run them before opening a pull request; CI runs the same four and fails
-when a verdict changes.
+nix. Run them before opening a pull request; CI runs the three that print a
+verdict and fails when one changes.
 
 ```sh
 gates/stdout-contract-sweep.sh               # stdout writes against the logging contract
 gates/duplicate-predicate-sweep.sh           # any predicate implemented twice
 gates/cmake-byproducts-target-expression.sh  # a cmake legality question
-gates/daemon-gap-cpu-probe.sh                # daemon wedge vs slow reply
+gates/daemon-gap-cpu-probe.sh                # samples a live daemon; no verdict, run by hand
 ```
 
-Each prints a verdict line. `duplicate-predicate-sweep.sh` exits non-zero when
-it finds pairs: they are a candidate set to READ, not a failure, which is why CI
-matches each gate's verdict text rather than its exit status.
+Each of the first three prints a verdict line. `duplicate-predicate-sweep.sh`
+exits non-zero when it finds pairs: they are a candidate set to READ, not a
+failure, which is why CI matches each gate's verdict text rather than its exit
+status. The fourth is a diagnostic tool, not a gate: it samples running
+nix-daemon workers and prints no verdict, so CI cannot judge it and does not
+try.
 
 Everything else needs the experimental features, a store and time. The wider
 corpus is not published yet and the roadmap's work item 1 tracks what each

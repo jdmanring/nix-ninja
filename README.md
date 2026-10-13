@@ -243,13 +243,14 @@ not exist. The contract is in the [design notes].
 - `gates/` holds the checks that can run against a clone with nothing installed.
   `stdout-contract-sweep.sh` reads every stdout write in both binaries and
   classifies it against the logging contract; `duplicate-predicate-sweep.sh`
-  reports any predicate implemented twice; `cmake-byproducts-target-expression.sh`
-  asks the cmake on PATH whether a generator expression is legal in `BYPRODUCTS`;
-  and `daemon-gap-cpu-probe.sh` samples nix-daemon workers to tell a wedge from a
-  slow reply. Each prints a verdict and exits non-zero on failure. Most checks in
-  this project need the experimental features, a store and time, and are not
-  published yet; the roadmap's work item 1 tracks that and names what each
-  outstanding one needs.
+  reports any predicate implemented twice; and
+  `cmake-byproducts-target-expression.sh` asks the cmake on PATH whether a
+  generator expression is legal in `BYPRODUCTS`. Each prints a verdict and CI
+  runs them on every push. `daemon-gap-cpu-probe.sh` also lives here and samples
+  live nix-daemon workers; it is a diagnostic tool that prints no verdict, so it
+  is run by hand. Most checks in this project need the experimental features, a
+  store and time, and are not published yet; the roadmap's work item 1 tracks
+  that and names what each outstanding one needs.
 - `bench/` holds the end-to-end and generation benchmarks, and the records they
   wrote. The measured figures this README quotes trace to a run under
   `bench/records/`, whose README names what each record is and which figures it

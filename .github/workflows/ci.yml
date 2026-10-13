@@ -45,7 +45,13 @@ jobs:
   gates:
     runs-on: ubuntu-latest
     steps:
+      # FULL HISTORY, and it is load-bearing: `duplicate-predicate-sweep.sh`
+      # rebuilds its control from an older revision, and a shallow checkout
+      # (the action's default) cannot read that commit, so the gate reports
+      # NO ANSWER instead of a verdict. Measured on the first run of this job.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       # NO NIX AND NO SETUP: these gates are the ones that run against a clone
       # with nothing installed, which is the property that makes them worth
       # publishing. A job that needed the daemon would be testing a different
@@ -57,9 +63,14 @@ jobs:
           # the reason is `duplicate-predicate-sweep.sh`: it exits 1 by design,
           # because its pairs are a candidate set to read rather than a tree
           # failure, so scoring it on status would make every build red for a
-          # documented result. This is the rule the private runner uses, and
-          # this job fails when a pattern stops matching, which is what catches
-          # a gate whose verdict text changed without its caller being updated.
+          # documented result. Matching the text also fails the job when a
+          # gate's verdict changes without its caller being updated.
+          #
+          # THREE GATES, NOT FOUR. `daemon-gap-cpu-probe.sh` is a diagnostic
+          # tool that samples live nix-daemon workers and prints no verdict, so
+          # there is nothing to assert on and a runner with no daemon would
+          # make a pattern match the wrong line. It is published because it is
+          # useful to run by hand, not because CI can judge it.
           check() {  # check <script> <expected verdict regex>
             printf '%-44s ' "$1"
             out=$(bash "gates/$1" 2>&1)
@@ -73,7 +84,6 @@ jobs:
           check stdout-contract-sweep.sh              '^PASS: no stdout diagnostic added'
           check cmake-byproducts-target-expression.sh '^PASS: OUTPUT and BYPRODUCTS refuse'
           check duplicate-predicate-sweep.sh          '^(FAIL: [0-9]+ pair|PASS: no)'
-          check daemon-gap-cpu-probe.sh               '^(idle now|BUSY)'
           exit $fail
 
   integration-test:
