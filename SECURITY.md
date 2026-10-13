@@ -3,9 +3,9 @@
 ## Reporting a vulnerability
 
 Report suspected vulnerabilities privately, not in a public issue, and not in a
-pull request. Email the maintainer at james_manring@yahoo.com. GitHub's private
-vulnerability reporting is switched off on this repository, so email is the
-channel.
+pull request. Use GitHub's [private vulnerability reporting][advisory] on this
+repository, or email the maintainer at james_manring@yahoo.com if you would
+rather not use GitHub.
 
 Include what you can: the affected revision, a description, and the smallest
 input that reproduces it. A `build.ninja` fragment plus the command that drives
@@ -42,3 +42,5 @@ inside a sandbox. The areas worth scrutiny:
 
 Reports are welcome by email even where the answer is that the issue is already
 known.
+
+[advisory]: https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability

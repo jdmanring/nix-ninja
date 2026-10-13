@@ -138,15 +138,16 @@ Fortran and C++20 module examples that need `-recursive` variants.
 
 ## Contributing
 
-Pull requests are the channel. The work is tracked in
-[docs/ROADMAP.md](docs/ROADMAP.md), which states each milestone's exit
-criterion and the gate that says whether it is met, and that file is the list
-of open items; GitHub issue tracking is switched off on this repository, so a
-problem report belongs in a pull request or in the roadmap.
+The work is tracked in [docs/ROADMAP.md](docs/ROADMAP.md), which states each
+milestone's exit criterion and the gate that says whether it is met. Bugs and
+questions have their own channels: [open an
+issue](https://github.com/jdmanring/nix-ninja/issues/new/choose) for a failure,
+with the failing derivation and its leaf log, or start a
+[discussion](https://github.com/jdmanring/nix-ninja/discussions) for a question
+or a wide design space before writing code.
 
-For a wide design space, open the pull request as a draft and argue the shape
-there before writing much. Please read [CONTRIBUTING](CONTRIBUTING.md) and the
-[design notes] so you understand the big picture and prior art.
+Pull requests are welcome and reviewed. Please read [CONTRIBUTING](CONTRIBUTING.md)
+and the [design notes] so you understand the big picture and prior art.
 
 ## What works today
 
