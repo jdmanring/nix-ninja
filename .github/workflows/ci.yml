@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   pull_request:
     types: [ opened, reopened, labeled, synchronize ]
+  # So a run can be started without a push, which matters while this
+  # repository's fork state is being settled.
+  workflow_dispatch:
 
 jobs:
   build:
