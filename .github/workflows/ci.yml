@@ -71,9 +71,16 @@ jobs:
           # there is nothing to assert on and a runner with no daemon would
           # make a pattern match the wrong line. It is published because it is
           # useful to run by hand, not because CI can judge it.
+          # SHELLS RUN WITH `set -e` HERE (the runner's default is `bash -e`),
+          # and a gate that exits non-zero would kill this script at the
+          # assignment that captures it - before the verdict is read or
+          # printed. That is what the first two runs of this job showed: the
+          # gate name with a BLANK verdict line following it, and a job that
+          # failed for a reason nothing in the output named. `|| true` is what
+          # makes the status a VALUE rather than an exit.
           check() {  # check <script> <expected verdict regex>
             printf '%-44s ' "$1"
-            out=$(bash "gates/$1" 2>&1)
+            out=$(bash "gates/$1" 2>&1 || true)
             if printf '%s' "$out" | grep -Eq "$2"; then
               printf '%s' "$out" | grep -oE "$2" | head -1
             else
