@@ -53,7 +53,7 @@ And the supporting sections:
 ## Where this file comes from
 
 The project began when `pdtpartners/nix-ninja` stopped. Work continued here: the
-tree is 657 commits past the last upstream commit of May 2026, and the milestone
+tree is 658 commits past the last upstream commit of May 2026, and the milestone
 numbering above two is new. `docs/todo.md` records the state of the issues that
 came with the project; this file is what comes after them.
 
@@ -337,16 +337,17 @@ asks whether it is competitive at the size of a build farm, which is where a
 resumable builder either becomes the best in the world or stays a clever local
 tool.
 
-Three measured facts say the current answer is no, and they are already in this
-file's item 6 rather than estimated for this section:
+Three measured facts say the current answer is no. Each is carried with its
+numbers in item 6 below, and is named here without them so that the figures
+live in one place:
 
-- `dyn` reads 82 percent of a campaign's wall clock and its instrument names
-  none of that, because three `add_drv_to_store` call sites were untimed. At
-  0.084 s per task over 30,000 translation units that is most of an hour spent in
-  daemon round trips for work the driver could batch or memoise.
-- The driver retains 0.074 MiB per task and never releases it, linear and
-  continuing after scanning has stopped. Projected to 30,000 units it is about
-  2.2 GiB in a user session where no cgroup bounds it.
+- **Where the wall clock goes.** Most of a campaign's time is unaccounted for by
+  the driver's own instruments, and the term that holds it is a daemon round trip
+  the driver could batch or memoise.
+- **Retained memory.** The driver holds a little more per task than it releases,
+  linearly, and nothing bounds it because it runs outside the build cgroup.
+- **The daemon's serialization point.** Realise latency under a round is
+  libstore's single state mutex, which no amount of local parallelism removes.
 - Realise latency under a round is the daemon's single SQLite state mutex, which
   is a serialization point no amount of local parallelism removes.
 
@@ -537,8 +538,8 @@ carried here so that the inherited list is not the only record of them.
   deps log, and the scheduler does no mtime dirtying. First action: decide
   whether the local route is worth a cache at all, since the consumer's route
   is inside a derivation and never sees it.
-- **Where a campaign's wall clock goes.** `dyn` reads 82 percent of it and its
-  instrument names none of that, because three `add_drv_to_store` call sites
+- **Where a campaign's wall clock goes.** `dyn` read 82 percent of it and its
+  instrument named none of that, because three `add_drv_to_store` call sites
   were untimed. The timers now exist and print `plain adddrv` and
   `sandbox adddrv`, and no build has produced a number from them yet, so the
   0.084 s per task figure remains an elimination rather than a measurement.
@@ -585,18 +586,11 @@ harness has to be able to tell that apart from a real tie.
 
 ### 8. Diagnose the two measured slopes, then fix them
 
-`0.8` states the claim and both limits are already measured as numbers, in item 6
-below. Neither has a cause, and the first action is the same for both: read what
-the instruments already print on a real build before designing anything.
-
-- The `dyn` timer now exists and prints `plain adddrv` and `sandbox adddrv`, and
-  no build has produced a number from it. At 0.084 s per task it is the largest
-  single term in a campaign. The code comment names two candidate fixes, a memo
-  and a batch, which are different shapes; this project has twice tuned the wrong
-  one by choosing before measuring.
-- The retention is 0.074 MiB per task, linear, and the named candidates are
-  guesses. The correct first action is a profile, not a change, and the roadmap
-  says so rather than proposing a fix with no failing case.
+`0.8` states the claim and both limits are already measured as numbers, and both
+are carried in item 6. Neither has a cause, and the first action is the same for
+both: read what the instruments already print on a real build before designing
+anything. The two entries are not restated here, so that a figure that moves
+moves in one place; item 6 is the record.
 
 ### 9. Establish whether a remote builder already works
 
