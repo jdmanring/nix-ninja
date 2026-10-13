@@ -134,6 +134,13 @@ The counts, measured on a clean tree rather than stated: 17 checks, of which 10
 are VM tests, and 548 Rust tests across the workspace, all passing. A reader who
 wants a different number can run the same command and get it.
 
+The examples the README names were each BUILT and their outputs RUN, not merely
+resolved: `example-hello`, `example-header`, `example-cmake-hello` and
+`example-fortran-module-recursive` each produce a program that prints what the
+example is for. This section said "what you can run" for a day before anything
+in it had been run; the distinction between a command that resolves and one that
+works is the whole point of the section.
+
 Two things to know before running it. The ten VM checks boot a NixOS machine, so
 they need `/dev/kvm` and take a while; on a host without it they fail for that
 reason and not because the tree is broken. And `nix flake check` needs the
