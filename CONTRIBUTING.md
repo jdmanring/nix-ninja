@@ -4,9 +4,12 @@ Contributions should be made via pull requests. Pull requests will be reviewed
 by one or more maintainers and merged when acceptable.
 
 Work is tracked in [the roadmap](./docs/ROADMAP.md), which lists the open items
-and what each one needs before it can be started. GitHub issue tracking is
-switched off on this repository, so a wide design space is argued in the pull
-request itself: open it as a draft before writing much.
+and what each one needs before it can be started. For a bug, [open an
+issue](https://github.com/jdmanring/nix-ninja/issues/new/choose); the template
+asks for the failing derivation and its leaf log, which is what turns a report
+into a fix. For a question, or a design space that is still wide, use
+[discussions](https://github.com/jdmanring/nix-ninja/discussions) before writing
+code.
 
 ## Project Structure
 

@@ -1,0 +1,60 @@
+name: Bug report
+description: A build fails, or the driver does something it should not.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The fastest route to a fix is the failing derivation and its leaf log.
+        `nix derivation show <drv>` names what the task actually was, which the
+        error text usually misnames.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran and what it printed. Paste the raw lines.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: The full commit, not a branch.
+      placeholder: "nix flake metadata --json | jq -r .revision"
+    validations:
+      required: true
+  - type: textarea
+    id: drv
+    attributes:
+      label: Failing derivation and leaf log
+      description: |
+        `nix log <drv>` for a task failure. If the failure names a package
+        rather than a derivation, the driver printed an `ABORTED` line naming
+        the derivation it was driving.
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: |
+        Nix, and the experimental features enabled in the DAEMON's config as
+        well as the client's. `nix --version`, `nix config show | grep experimental`.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: ninja
+    attributes:
+      label: Relevant build.ninja fragment
+      description: The edge that failed, if you have it.
+      render: ninja
+    validations:
+      required: false

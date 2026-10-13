@@ -1,0 +1,22 @@
+title: "[Q&A] "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions about building a package through the driver, the emitted
+        derivations, or the cost of a change. For a failure, an issue is a
+        better home than a discussion.
+  - type: textarea
+    id: question
+    attributes:
+      label: The question
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you have tried
+      description: A `build.ninja` fragment or a derivation helps more than a description.
+    validations:
+      required: false

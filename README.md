@@ -2,11 +2,14 @@
 
 # nix-ninja
 
-Incremental compilation of [Ninja build files][ninja-build] using
-[Nix Dynamic Derivations][dynamic-derivations].
+**Every translation unit is a content-addressed Nix derivation.** A killed build
+costs one object. Editing one `.cpp` rebuilds one object. A binary cache
+substitutes the rest, on any machine, for any user.
 
-Choosing ninja as the build graph representation lets us support any build
-system that outputs ninja like CMake, meson, premake, gn, etc.
+Incremental compilation of [Ninja build files][ninja-build] using
+[Nix Dynamic Derivations][dynamic-derivations]. Choosing ninja as the build
+graph representation lets us support any build system that outputs ninja like
+CMake, meson, premake, gn, etc.
 
 [![Demo](docs/demo.gif)](https://asciinema.org/a/711344)
 
@@ -16,10 +19,13 @@ original demonstration and shows an earlier layout;
 equivalent.*
 
 [![CI](https://github.com/jdmanring/nix-ninja/actions/workflows/ci.yml/badge.svg)](https://github.com/jdmanring/nix-ninja/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/jdmanring/nix-ninja)](https://github.com/jdmanring/nix-ninja/releases)
 
 [Key features](#key-features) •
 [Getting started](#getting-started) •
+[Roadmap](docs/ROADMAP.md) •
 [Design notes][design notes] •
+[Ask a question](https://github.com/jdmanring/nix-ninja/discussions) •
 [Contributing](CONTRIBUTING.md)
 
 </div>
