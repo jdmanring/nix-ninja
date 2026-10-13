@@ -1,10 +1,11 @@
 # Roadmap
 
-The path from a driver that builds one project correctly to one that can be
-pointed at a distribution. Milestones, the exit criterion for each, the work
-that satisfies it, and the instrument that says whether it is met. No dates: a
-milestone ships when its criterion is met and the named gate says so on a clean
-tree.
+The path from a driver that builds one project correctly to one that a stranger
+can point at a distribution. Six milestones. `0.1` through `0.5` are about
+whether the driver is right; `0.6` is the one that says where the path ends.
+Each has an exit criterion, the work that satisfies it, and the instrument that
+says whether it is met. No dates: a milestone ships when its criterion is met
+and the named gate says so on a clean tree.
 
 `0.1` and `0.2` are upstream's; they came with the project and both are
 complete. From `0.3` on, the numbering is this project's own, and is written
@@ -22,9 +23,9 @@ followed that no number named.
 ## Why this file is long, and what it is for
 
 The project began when `pdtpartners/nix-ninja` stopped. Work continued here: the
-tree is several hundred commits past the last upstream commit of May 2026, and
-the milestone numbering above two is new. `docs/todo.md` records the state of
-the issues that came with the project; this file is what comes after them.
+tree is 643 commits past the last upstream commit of May 2026, and the milestone
+numbering above two is new. `docs/todo.md` records the state of the issues that
+came with the project; this file is what comes after them.
 
 ## 0.1 CORRECTNESS (upstream)
 
@@ -187,20 +188,44 @@ EXIT CRITERION: `nix flake check` passes on a clean clone, and the wider corpus
 is either in the repository or each unported class carries a dated reason it is
 not.
 
-## 0.6 AND BEYOND
+## 0.6 THE DESTINATION
 
-Named so they are not silently assumed:
+`0.1` through `0.5` answer whether the driver is RIGHT. This one answers whether
+it is ADOPTABLE, which is what decides whether the rest mattered.
 
-- MULTI-ARCH. The flake declares `systems = [ "x86_64-linux" ]`. The hardcoded
-  system string is fixed; the hardware is not.
-- A SECOND BACKEND. Whether the Nix data structures could come from `snix`; the
-  gap is specific and recorded.
-- THE OPEN CLASSES. Two mechanisms across four rows: an output read at a path
-  that is not the one it was written to, and a generator that reads or execs by
-  a name the sandbox does not supply.
-- CONFIGURE CACHING. Built, and it does not yet pay across a source edit,
-  because `src` is an input of the configure derivation. Narrowing it is the
-  work.
+It was missing until now, and its absence is why the numbered list read as
+open-ended. A ladder is not a plan until it says what the top is, and this file
+described five rungs and then a list of things that were not milestones at all.
+Three of the four items it carried were already work items below, restated.
+
+THE CLAIM: someone who is not this project adopts nix-ninja from the published
+repository alone, and points it at a distribution.
+
+The destination is partly reached in one instance. One distribution builds
+through the driver at per-translation-unit granularity, and of its three editions
+that is the server; the two desktop editions are refused before their first
+iteration, by the consumer's own resumability gate rather than by a build
+failure, and the work to clear that refusal is recorded on the consumer's side.
+So even the worked example is not yet a whole distribution through the driver.
+
+What is missing is larger than that: a STRANGER cannot reach the same place. The
+difference is the published apparatus rather than the driver, the corpus, the
+failure signatures, and the record of what is already known to break.
+
+The route is the six items below, which is where each one's first action lives.
+What belongs here is the criterion they add up to.
+
+EXIT CRITERION: a clone of this repository, with nothing installed but an
+experimental Nix, runs `nix flake check` green and runs the wider corpus green,
+and every closed class carries a gate arm rather than a package witness. Two
+things are deliberately outside it, each named with what blocks it rather than
+left to be assumed: multi-arch is blocked on hardware (item 5), and a second
+backend on whether the Nix data structures can come from `snix` at all, which is
+an open question, not scheduled work.
+
+`1.0` is not a further milestone. It is the version this project takes once
+`0.6` has held across a release with no new class appearing, because that is the
+first moment the claim describes the project rather than the last round of work.
 
 ## What does not work today
 
