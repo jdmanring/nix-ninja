@@ -20,7 +20,7 @@ are met and `0.3` is in progress rather than finished, which is why its open
 classes are listed below. A reader should not take the number as a claim that
 the milestone it names is complete.
 
-The state of the tree TODAY, class by class, is a table of 89 rows. It is not in
+The state of the tree TODAY, class by class, is a table of 90 rows. It is not in
 this repository: it grew beside a private distribution and is development
 material rather than a public document, which is the same reason the gate corpus
 is not here (`0.5`). What this file carries is the part that is publishable now,
@@ -684,7 +684,7 @@ None is hypothetical: the first three are why upstream is dormant.
   distribution. `0.9` names adoption by someone else as the mitigation, which is
   also its exit criterion, so this risk and that milestone are the same problem
   seen from two directions.
-- **The verification apparatus is private.** The 89-row class table and the
+- **The verification apparatus is private.** The 90-row class table and the
   whole gate corpus, all 91 scripts, live outside this repository. `0.5` and
   work item 1 exist to publish them, and until they land, every claim here is
   checkable only by its
