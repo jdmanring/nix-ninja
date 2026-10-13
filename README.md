@@ -11,8 +11,11 @@ system that outputs ninja like CMake, meson, premake, gn, etc.
 [![Demo](docs/demo.gif)](https://asciinema.org/a/711344)
 
 *An incremental rebuild driven by nix-ninja. The recording is the project's
-original demonstration and shows an earlier layout; `nix build .#example-hello`
-is the current equivalent.*
+original demonstration and shows an earlier layout;
+`nix build .#legacyPackages.x86_64-linux.example-hello` is the current
+equivalent.*
+
+[![CI](https://github.com/jdmanring/nix-ninja/actions/workflows/ci.yml/badge.svg)](https://github.com/jdmanring/nix-ninja/actions/workflows/ci.yml)
 
 [Key features](#key-features) •
 [Getting started](#getting-started) •
