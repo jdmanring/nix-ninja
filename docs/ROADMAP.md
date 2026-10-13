@@ -489,13 +489,23 @@ runner assumption, and group 3, which is the real cost.
 
 **Publishing is a copy; RUNNING is the cost, and the two are not the same
 size.** Measured over the same corpus: 78 of the 91 scripts invoke nix at all
-(a `build`, an `eval` or a `develop`), and 13 are static and run in seconds with
-nothing installed. So a stranger who clones the repository can run the 13
-immediately, and the other 78 need the experimental features configured in the
-daemon, a working store, and time. That is the same prerequisite `nix flake
-check` already has and the README already states, so it is a documented cost
-rather than a new one, but the exit criterion is about a stranger running the
-corpus and the number to plan against is 78, not 91.
+(a `build`, an `eval` or a `develop`). Of the remaining 13, most read a file
+this tree does not carry: `CLAUDE.md` is gitignored, so a clone has none of it,
+and a gate that reads it FAILS SPURIOUSLY there rather than reporting an answer
+- measured by hiding the file and running one, which printed
+`grep: CLAUDE.md: No such file or directory` and then two FAIL lines. 5
+scripts run standalone in a clean clone with nothing installed, and the rest of
+the non-nix scripts need an argument or a parent gate. So a stranger who clones
+the repository can run `nix flake check` and these 5 immediately, and the
+other 86 need the experimental features configured in the daemon, a working
+store, and time. That prerequisite is the same one `nix flake check` already
+has and the README already states, so it is a documented cost rather than a new
+one, but the exit criterion is about a stranger running the corpus and the
+number to plan against is 85, not 91.
+
+The first publishable step is therefore small and honest: the 5 scripts that
+already run in a clone move into the repository, and each of the other 86
+carries the reason it does not yet, which is what the exit criterion asks for.
 
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
