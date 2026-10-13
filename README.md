@@ -240,6 +240,13 @@ not exist. The contract is in the [design notes].
 - `vendor-n2/` is n2, by Evan Martin, vendored rather than depended on. It
   carries its own Apache-2.0 `LICENSE`, and `vendor-n2/VENDORING.md` records the
   revision it was taken from and the four changes made to it.
+- `gates/` holds the checks that can run against a clone with nothing installed.
+  `stdout-contract-sweep.sh` reads every stdout write in both binaries and
+  classifies it against the logging contract; `duplicate-predicate-sweep.sh`
+  reports any predicate implemented twice. Each prints a verdict and exits
+  non-zero on failure. Most checks in this project need the experimental
+  features, a store and time, and are not published yet; the roadmap's work item
+  1 tracks that and names what each outstanding one needs.
 - `bench/` holds the end-to-end and generation benchmarks, and the records they
   wrote. The measured figures this README quotes trace to a run under
   `bench/records/`, whose README names what each record is and which figures it

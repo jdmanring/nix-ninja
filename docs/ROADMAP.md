@@ -515,16 +515,21 @@ its real verdict because a clone carries the git history it reads. The other
 three run but measure something else - `cmake-byproducts-target-expression.sh`
 asserts about CMAKE, `daemon-gap-cpu-probe.sh` about the running machine, and
 `round-intercept-sweep.sh` about a consumer round - so they belong in the
-repository as tools rather than as arms. All five need only to be placed two
-directories below the repository root, which is the assumption their shared
-runner already makes.
+repository as tools rather than as arms.
 
-So the first published step is bounded and verified rather than estimated: 2
-scripts move in as corpus arms, 3 more as tools, and each of the other 86
-carries the reason it does not yet. Of those 86, the 78 that invoke nix need the
-experimental features in the daemon, a working store and time - the same
-prerequisite `nix flake check` has and the README states - and the remaining 8
-need either an argument, a parent gate, or a subject turned into a fixture.
+DONE for the first two: `stdout-contract-sweep.sh` and
+`duplicate-predicate-sweep.sh` are tracked under `gates/` and both run in a
+clone with nothing installed. Each is self-locating, walking up to `Cargo.toml`
+rather than assuming a depth, because the private corpus reaches the same file
+through a symlink one level deeper, so there is one physical copy and no second
+version to diverge.
+
+What remains is 89 scripts: 3 that run but measure something else and belong in
+the repository as tools, and 86 that need a reason stated where they are - the
+78 that invoke nix need the experimental features in the daemon, a working store
+and time, which is the same prerequisite `nix flake check` has and the README
+states, and the remaining 8 need either an argument, a parent gate, or a
+subject turned into a fixture.
 
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
