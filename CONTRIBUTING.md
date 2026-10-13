@@ -130,10 +130,27 @@ issues, and neither is this repository's. Pass `--repo jdmanring/nix-ninja` on
 every `gh` call, or `gh repo set-default jdmanring/nix-ninja` once. The GitHub
 web UI is unaffected; only the CLI.
 
+## Conventions
+
+- Use proper Rust error handling with `anyhow::Result` types.
+- Each crate declares its own dependencies. The workspace root carries none:
+  it holds `[workspace.dependencies]` for version pinning only, and a version
+  there is inherited, never used at the root.
+- Employ strong typing for concepts like Nix store paths and hashes rather than
+  passing `String` or `PathBuf` around.
+- A deliberate simplification that cuts a real corner is marked in the code as
+  `DEFER(<the trigger that makes it worth doing>): <what was deferred>` or
+  `ponytail: <ceiling and upgrade path>`, never as a bare `TODO`. A deferral
+  without a named trigger is rot, and the two markers are harvested by
+  different commands, so use the one that fits rather than translating between
+  them.
+
 ## Implementation notes
 
 - See [the roadmap] for remaining work.
-- See `TODO:` comments in code for open questions.
+- See `DEFER(...)` and `ponytail:` comments in code for open questions and the
+  conditions that would reopen them; `TODO:` appears twice and is not the
+  mechanism this project uses.
 
 [nix@d904921]: https://github.com/NixOS/nix/commit/d904921eecbc17662fef67e8162bd3c7d1a54ce0
 [the roadmap]: ./docs/ROADMAP.md
