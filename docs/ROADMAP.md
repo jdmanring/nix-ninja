@@ -26,10 +26,34 @@ material rather than a public document, which is the same reason the gate corpus
 is not here (`0.5`). What this file carries is the part that is publishable now,
 the ladder and its criteria, and what each rung is worth.
 
+## Contents
+
+The milestones, in order, each with its claim and exit criterion:
+
+- [0.1 CORRECTNESS (upstream)](#01-correctness-upstream) and
+  [0.2 PERFORMANCE (upstream)](#02-performance-upstream), both MET
+- [0.3 REAL-PACKAGE RESILIENCE](#03-real-package-resilience), the milestone in
+  progress
+- [0.4 THE COST OF A CHANGE](#04-the-cost-of-a-change)
+- [0.5 VERIFICATION](#05-verification)
+- [0.6 THE DESTINATION](#06-the-destination)
+- [0.7 THE COMPARISON](#07-the-comparison)
+- [0.8 SCALE](#08-scale)
+- [0.9 THE ECOSYSTEM](#09-the-ecosystem), after which [`1.0`](#06-the-destination)
+  is a state rather than further work
+
+And the supporting sections:
+
+- [What does not work today](#what-does-not-work-today), the open list
+- [The next concrete work, item by item](#the-next-concrete-work-item-by-item),
+  nine items with a first action each
+- [What could stop this](#what-could-stop-this), the risks
+- [How a milestone ships](#how-a-milestone-ships)
+
 ## Where this file comes from
 
 The project began when `pdtpartners/nix-ninja` stopped. Work continued here: the
-tree is 656 commits past the last upstream commit of May 2026, and the milestone
+tree is 657 commits past the last upstream commit of May 2026, and the milestone
 numbering above two is new. `docs/todo.md` records the state of the issues that
 came with the project; this file is what comes after them.
 
