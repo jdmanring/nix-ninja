@@ -3,23 +3,14 @@
 Contributions should be made via pull requests. Pull requests will be reviewed
 by one or more maintainers and merged when acceptable.
 
-Consider upstreaming anything that is not specific to nix-ninja to reduce
-the amount that needs to be maintained in this repository.
+Work is tracked in [the roadmap](./docs/ROADMAP.md). Open an issue there before
+a large change, especially when the design space is wide.
 
 ## Project Structure
 
-The implementation is split into five crates:
+The implementation is split into four crates, plus a vendored dependency:
 
-1. nix-libstore: Core Nix data structures
-  - Want to use `nix-compat` from [snix] but they only support Nix 2.3 which
-    doesn't include content-addressed derivations and dynamic derivations.
-
-2. nix-tool: Helper to spawn Nix commands
-  - In the future, we can try generating derivations without depending on
-    recursive nix by implementing `nix store add` and `nix derivation add` in
-    Rust.
-
-3. deps-infer: Dependency inference for C/C++
+1. deps-infer: Dependency inference for C/C++
   - Ninja depends on gcc to infer header includes but in Nix we need to know
     explicitly all the header inputs upfront.
   - Parses all the include flags from the ninja build rule
@@ -27,15 +18,26 @@ The implementation is split into five crates:
   - Will include more headers than gcc because we match everything instead of
     processing ifdef, etc.
 
+2. nix-builder-rpc-client: Client for the daemon's `builder-rpc-v0` protocol
+  - The dynamic task reads its own derivation back and resubmits it with the
+    dependencies it discovered, which is what a dynamic derivation build is.
+
+3. nix-ninja: Ninja compatible build system using Nix backend
+  - Translate the Ninja build graph to Nix derivations
+  - Generate individual derivations for each build target
+  - Parse `build.ninja` through the vendored n2, and drive the build
+
 4. nix-ninja-task: Nix derivation builder for `nix-ninja`
   - Since our generated derivations don't depend on `stdenv.mkDerivation` it is
     easier to maintain a builder as a Rust binary.
   - Prepares the source directory, runs the ninja build rule, and copies
     build outputs into Nix placeholders.
 
-5. nix-ninja: Ninja compatible build system using Nix backend
-  - Translate Ninja build graph to Nix derivations
-  - Generate individual derivations for each build target
+`vendor-n2/` is [n2](https://github.com/evmar/n2) by Evan Martin, vendored
+rather than depended on because this project patches it. It is a workspace
+member so it builds with the rest, and it carries its own Apache-2.0 license.
+`vendor-n2/VENDORING.md` records the revision it was taken from and the changes
+made to it.
 
 ## Developing locally
 
@@ -109,8 +111,8 @@ with a message that does not name the cause.
 
 ## Implementation notes
 
-- See [todo] for remaining work.
+- See [the roadmap] for remaining work.
 - See `TODO:` comments in code for open questions.
 
 [nix@d904921]: https://github.com/NixOS/nix/commit/d904921eecbc17662fef67e8162bd3c7d1a54ce0
-[todo]: ./docs/todo.md
+[the roadmap]: ./docs/ROADMAP.md

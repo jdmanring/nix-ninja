@@ -8,7 +8,7 @@ I really liked what LSP did for the editor ecosystem in that it standardized
 how language-specific intelligence communicated with editors so that the work
 didn't have to be repeated for every language <-> editor combination.
 
-In the same vein, since dynamic derivations is somewhat complicated to get
+In the same vein, since dynamic derivations are complicated to get
 right for arbitrary build graphs, I think it'll be wise to standardize on a
 common format like Ninja build files. We won't repeat the work for each build
 system. It would be hard to convince them to accept a Nix backend, but
@@ -114,7 +114,7 @@ was not aimed at, and every emitted derivation is a cache key.
 Ninja build files are not intended to be written by humans, so there are many
 popular build systems that target it like CMake and meson. However, when
 generating these `build.ninja` files, the targets don't have header
-dependencies declared. Instead, they leverage gcc to generate depfiles that it
+dependencies declared. Instead, they use gcc to generate depfiles that it
 later parses to cache the headers it processed:
 
 ```build.ninja
@@ -203,8 +203,8 @@ nixNinjaExtraInputs = [
 
 ### Keying a task on a generation rather than on the builder
 
-This section describes a facility this fork adds; the sections around it
-describe nix-ninja itself.
+This section describes a facility added after the inherited design; the
+sections around it describe nix-ninja itself.
 
 `nix-ninja-task`'s store path appears in every plain task derivation twice,
 as the `builder` string and again among the inputs, and the driver's appears
@@ -280,9 +280,9 @@ stderr, and says nothing when neither builder path is set
 
 ### Environment variables the driver reads
 
-These are additions this fork makes; the sections around them describe
-nix-ninja itself. The three that key a task on a generation are described
-above and are not repeated here.
+These are later additions; the sections around them describe nix-ninja itself.
+The three that key a task on a generation are described above and are not
+repeated here.
 
 | variable | effect |
 |---|---|
@@ -402,7 +402,7 @@ rule STATIC_LINKER
 ```
 
 In the example above `ar` comes a store path that `meson` found in `$PATH`,
-so we need to essentially `shell_words::split` and attempt to `which::which`
+so we need to `shell_words::split` and attempt to `which::which`
 each one to construct the derivation's `$PATH` variable.
 
 In my research, it seems like CMake does generate with absolute paths, so

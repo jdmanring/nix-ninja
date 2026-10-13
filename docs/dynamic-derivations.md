@@ -22,7 +22,7 @@ experimenting.
 
 ## Feature flags
 
-In order to leverage incremental compilation in Nix, we need to enable these
+To use incremental compilation in Nix, we need to enable these
 experimental features:
 
 - [`dynamic-derivations`](https://github.com/NixOS/rfcs/blob/master/rfcs/0092-plan-dynamism.md):
@@ -138,14 +138,16 @@ can check which JSON derivation versions are available to you by running
 `nix --version` and visiting:
 `https://nix.dev/manual/nix/<nix-version>/protocols/json/derivation`.
 
-At the time of writing, `nix-ninja` generates its own unversioned derivations
-(which seem to resemble version 3) using
-[the format defined in `crates/nix-libstore/src/derivation.rs`](https://github.com/pdtpartners/nix-ninja/blob/8da02bd560f8bb406b82ae17ca99375f2b841b12/crates/nix-libstore/src/derivation.rs#L7-L46).
-There is
-[ongoing work to migrate to a community-maintained format](https://github.com/pdtpartners/nix-ninja/pull/40)
-that defines a
-[default version](https://github.com/nix-community/harmonia/blob/77fd6d9fc645f243434dbef3b919c693cc13e07e/harmonia-store-core/src/derivation/basic_derivation.rs#L49-L51)
-used in generating JSON derivations.
+`nix-ninja` generates its own derivations using the
+[community-maintained format][harmonia-derivation] from
+[harmonia][harmonia]. That migration is complete: the driver and the
+builder-rpc client depend on `harmonia-store-derivation`, whose
+[`BasicDerivation`][harmonia-basic] defines the version used when generating
+JSON derivations.
+
+[harmonia]: https://github.com/nix-community/harmonia
+[harmonia-derivation]: https://github.com/nix-community/harmonia/tree/main/harmonia-store-derivation
+[harmonia-basic]: https://github.com/nix-community/harmonia/blob/main/harmonia-store-core/src/derivation/basic_derivation.rs
 
 #### Version 3 Notes
 

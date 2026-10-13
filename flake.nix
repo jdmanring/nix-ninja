@@ -1,5 +1,5 @@
 {
-  description = "Ninja compatible incremental C/C++ build system with Nix ";
+  description = "Ninja compatible incremental C/C++ build system with Nix";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";

@@ -1,8 +1,7 @@
 # Recorded end-to-end runs
 
-Upstream #7 asks for end-to-end compilation benchmarks "for perf work
-upstream". `bench/e2e.sh` produces a record; this is where records live, so a
-number in a document can be traced to a run instead of quoted from memory.
+`bench/e2e.sh` produces a record; this is where records live, so a number in a
+document can be traced to a run instead of quoted from memory.
 
 **A record is only comparable with another record built the same way.** The
 harness does not clean the store, and `target_prebuilt` alone does not say how
@@ -35,6 +34,6 @@ Read the counters rather than the total; the total is one machine on one day.
 
 **What this run does NOT establish.** It is one package, one machine, warm
 store, single run - no variance, no cold-store figure, and no comparison
-against plain ninja, which is the comparison #7's perf work actually wants.
-Anyone quoting a speedup from this file is quoting something that was not
-measured.
+against plain ninja, which is the comparison a performance claim actually
+wants. Anyone quoting a speedup from this file is quoting something that was
+not measured.
