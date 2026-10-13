@@ -170,6 +170,72 @@ Named so they are not silently assumed:
   because `src` is an input of the configure derivation. Narrowing it is the
   work.
 
+## The next concrete work, item by item
+
+Each item names the artifact it changes and the first action that makes it
+checkable. This is the part a contributor needs and an exit criterion does not
+provide: what to open, and how to know the change is right.
+
+### 1. Publish the wider corpus, cheapest group first
+
+The instrument that verifies every closed class is not in this repository. The
+sequence, measured, is:
+
+1. **27 gates that reach only for a literal store path.** Mechanical: each path
+   becomes an attribute or a by-revision lookup, which is what the corpus
+   already does elsewhere. No behavior changes, so each is verifiable by
+   running it before and after and getting the same verdict.
+2. **49 gates that are self-contained.** A copy into the repository, plus the
+   one path assumption in the runner, which resolves its own directory and then
+   expects the gates beside it.
+3. **13 gates coupled to a private tree on the executable path.** Each needs its
+   subject turned into a fixture first. Two of them read a consumer shim by
+   design and report NO ANSWER when it is absent, which is correct and stays.
+
+Do them in that order: group 1 proves the corpus can run outside its original
+environment before 49 more files depend on it.
+
+### 2. Close the four open classes
+
+- **An alias output read at its store path.** What aborts is the include
+  scanner's read, and the row says which task is still unknown. First action:
+  keep the build directory of a failing drive and read `build.ninja` for the
+  edge that consumes the alias. The fix is not in the outputs-into-one-path
+  code, which is correct by design.
+- **An encoded entry that is not an absolute store path.** Two mechanisms print
+  the same text and the derivation name cannot tell them apart. First action:
+  read the RAW value, not the message. Then it is either the split already fixed
+  or a build-directory-relative spelling, which is a different fix.
+- **A generator that execs a tool by bare name.** One member is closed. Members
+  are found by driving real packages, so the action is a sweep of a round's
+  failures for `command not found`, not a code change. Widening the emitted
+  PATH has a measured re-key bill and is a batching decision, not a default.
+- **A generator reading data by its own location.** Package-side; whether the
+  copy rule should grow is the open question. First action: decide whether a
+  generator's own data directory is the driver's to carry, which is a design
+  question before it is a code one.
+
+### 3. Narrow the configure derivation's source
+
+The configure cache is built and does not pay, because `src` is an input, so a
+source edit rebuilds it. First action: split the configure derivation's inputs
+into what configure actually reads, and measure whether a source edit then
+leaves it alone. A measurement, then a change.
+
+### 4. The cost-of-a-change instruments
+
+`0.4` states the claim and the priced shapes. What it does not yet have is a
+pricing instrument in the repository: the pricer lives in the development
+directory with the rest of the corpus. It belongs in group 1 above, and the
+first action is the same as that group's.
+
+### 5. Multi-arch
+
+Blocked on hardware, not on code. The emitted platform comes from the host, so
+the aarch64 path can be exercised without an aarch64 machine, but the VM tests
+would need a builder. Do not add a second system to the flake until the checks
+are per-system or a builder exists.
+
 ## How a milestone ships
 
 1. The work lands on `main` and the class it closes gains a gate that FAILS on

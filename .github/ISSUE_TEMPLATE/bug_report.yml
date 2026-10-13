@@ -1,0 +1,57 @@
+name: Bug report
+description: A package or build fails through nix-ninja
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: a failure inside the Nix daemon's own experimental
+        features belongs to Nix, not here. See docs/ROADMAP.md for what is known
+        to be open.
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: The full commit hash you are on (`git rev-parse HEAD`).
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What fails
+      description: |
+        The failing derivation and the error text. A failing TASK derivation
+        carries no package name, so quote the derivation path and the last
+        lines of its log rather than a round log's summary.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Smallest reproduction
+      description: |
+        The smallest thing that reproduces it. If you can reduce it to a
+        package or an example in the tree, say which. If not, say what you
+        tried.
+    validations:
+      required: true
+  - type: dropdown
+    id: config
+    attributes:
+      label: Configuration
+      description: |
+        A verification is a claim about the configuration it was taken on.
+      options:
+        - A - local mode, outside any derivation
+        - B - local mode inside recursive-nix (the distribution route)
+        - C - DRV mode inside builder-rpc-v0
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: nix version, `nix-ninja --version`, and the experimental features enabled in the DAEMON's config.
+    validations:
+      required: false
