@@ -7582,8 +7582,25 @@ fn macro_arm_headers(
             };
             let val = val.trim();
             // A function-like macro is not an include spelling, and only a
-            // one-literal body can name a file.
-            if name.contains('(') || val.len() < 3 || !val.starts_with('"') || !val.ends_with('"') {
+            // one-literal body can name a file. BOTH SPELLINGS: `"x.h"` is
+            // what mesa's generated headers use, and `<x.h>` is what libclc's
+            // `__CLC_BODY` uses. Matching the quoted form alone dropped every
+            // angle arm in silence, so the header was declared nowhere and the
+            // task died `file not found` on `#include __CLC_BODY`
+            // (mesa-libclc 22.1.8.3). An EMPTY body names no file either way:
+            // `""` and `<>` both strip to nothing and are skipped by the
+            // `len() < 3` test.
+            if name.contains('(') || val.len() < 3 {
+                continue;
+            }
+            // BOTH SPELLINGS, one slice: `"x.h"` and `<x.h>` are each a
+            // quote character around the name, so the path is the body minus
+            // its delimiters whichever delimiter it has. An EMPTY body names
+            // no file either way: `""` and `<>` both strip to nothing and are
+            // already skipped by the `len() < 3` test.
+            let quoted = val.starts_with('"') && val.ends_with('"');
+            let angled = val.starts_with('<') && val.ends_with('>');
+            if !quoted && !angled {
                 continue;
             }
             let path = &val[1..val.len() - 1];
@@ -17619,6 +17636,95 @@ mod macro_arm_headers_tests {
         assert!(
             got.iter().any(|p| p.ends_with("real.h")),
             "a file arm beside a directory arm still comes back: {got:?}"
+        );
+    }
+
+    /// MESA-LIBCLC 22.1.8.3, THE REAL SHAPE. `__CLC_BODY` is defined once per
+    /// `clc_*.h` with an ANGLE-bracket body, and `gentype.inc` includes it by
+    /// name. The reader matched the quoted spelling only, so every angle arm
+    /// was dropped in silence, the header was declared nowhere, and the task
+    /// died `'clc/shared/binary_decl_with_int_second_arg.inc' file not found`
+    /// on the `<scratch space>` expansion of `#include __CLC_BODY`.
+    #[test]
+    fn an_angle_bracket_macro_arm_is_returned() {
+        let d = scratch("angle");
+        let clc = d.join("clc/shared");
+        fs::create_dir_all(&clc).unwrap();
+        // One definition site per arm, as libclc has: each `clc_*.h` names a
+        // different `.inc`, so the reader sees two arms and not one value.
+        fs::write(
+            d.join("a.h"),
+            "#define __CLC_BODY <clc/shared/binary_decl_with_int_second_arg.inc>\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("b.h"),
+            "#define __CLC_BODY <clc/shared/binary_decl_with_int_third_arg.inc>\n",
+        )
+        .unwrap();
+        fs::write(clc.join("binary_decl_with_int_second_arg.inc"), "\n").unwrap();
+        fs::write(clc.join("binary_decl_with_int_third_arg.inc"), "\n").unwrap();
+
+        let got = macro_arm_headers(
+            &d,
+            std::slice::from_ref(&d),
+            &[d.join("a.h"), d.join("b.h")],
+        );
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"binary_decl_with_int_second_arg.inc".to_string()),
+            "an angle-bracket arm names a file and must be returned; got {names:?}"
+        );
+        assert!(
+            names.contains(&"binary_decl_with_int_third_arg.inc".to_string()),
+            "every angle arm is returned, not only one; got {names:?}"
+        );
+    }
+
+    /// THE NEGATIVE CONTROL for the arm above, so it cannot be satisfied by
+    /// accepting any bracketed token. An angle arm resolves exactly as a
+    /// quoted one does: a file that exists is carried, one that does not is
+    /// left to the walk, and an arm naming a DIRECTORY is not a header.
+    #[test]
+    fn an_angle_arm_is_resolved_and_an_absent_one_is_not_invented() {
+        let d = scratch("angle-control");
+        fs::create_dir_all(d.join("clc/shared")).unwrap();
+        fs::write(d.join("clc/shared/present.inc"), "\n").unwrap();
+        fs::create_dir_all(d.join("adir")).unwrap();
+        fs::write(
+            d.join("a.h"),
+            "#define __CLC_BODY <clc/shared/present.inc>\n",
+        )
+        .unwrap();
+        fs::write(
+            d.join("b.h"),
+            "#define __CLC_BODY <clc/shared/absent.inc>\n#define DIR_ARM <adir>\n",
+        )
+        .unwrap();
+
+        let got = macro_arm_headers(
+            &d,
+            std::slice::from_ref(&d),
+            &[d.join("a.h"), d.join("b.h")],
+        );
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"present.inc".to_string()),
+            "an existing angle arm is carried: {names:?}"
+        );
+        assert!(
+            !names.contains(&"absent.inc".to_string()),
+            "a missing angle arm is not invented: {names:?}"
+        );
+        assert!(
+            !got.iter().any(|p| p.is_dir()),
+            "an angle arm naming a directory is never a header: {got:?}"
         );
     }
 }
