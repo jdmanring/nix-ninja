@@ -162,9 +162,12 @@ What you can run today, from a clone, with nothing else installed:
 
 That runs the Rust test suite under `cargo-nextest`, the format, clippy and
 dependency checks, and ten NixOS VM tests that exercise dynamic-derivation
-builds end to end, one per example plus the generated-header, CMake order-only
-and Fortran-module shapes. Each failure class that is unit-testable has a test
-here, and those tests are the ones that survive a refactor.
+builds end to end, one per example shape: hello, header, multi-source,
+shared-lib, generated-header, CMake order-only header, the dotdot source
+include, dynamic deps, a run script and the C++20 Fortran-module example.
+`example-nix` has no VM test, because it does not build (below). Each failure
+class that is unit-testable has a test here, and those tests are the ones that
+survive a refactor.
 
 The counts, measured on a clean tree rather than stated: 17 checks, of which 10
 are VM tests, and 550 Rust tests across the workspace, all passing. A reader who
@@ -175,12 +178,13 @@ The same checks run on every push to `main` and every pull request, through
 commands directly, a `lint` job running `nix flake check`, and one integration
 job per VM test so a failure names the test rather than the check set.
 
-The examples the README names were each BUILT and their outputs RUN, not merely
-resolved: `example-hello`, `example-header`, `example-cmake-hello` and
+Four of the examples the README names were BUILT and their outputs RUN, not
+merely resolved: `example-hello`, `example-header`, `example-cmake-hello` and
 `example-fortran-module-recursive` each produce a program that prints what the
-example is for. This section said "what you can run" for a day before anything
-in it had been run; the distinction between a command that resolves and one that
-works is the whole point of the section.
+example is for. Four more run under the VM tests rather than as a local build,
+and `example-nix` does not build at all (below). This section said "what you
+can run" for a day before anything in it had been run; the distinction between
+a command that resolves and one that works is the whole point of the section.
 
 Two things to know before running it. The ten VM checks boot a NixOS machine, so
 they need `/dev/kvm` and take a while; on a host without it they fail for that
