@@ -46,7 +46,7 @@ We'll get to them later, but first there's some necessary context to go through.
 ## Content-addressed derivations
 
 A derivation can be one of
-[three types](https://book.divnix.com/ch04-00-derivations.html#types-of-derivations):
+[three types](https://github.com/divnix/nix-book/blob/main/src/ch04-00-derivations.md):
 
 1. Input-addressed: These are the default in Nix. Changing any of the inputs to
    the derivation causes the output store path to be recomputed.
@@ -147,7 +147,7 @@ JSON derivations.
 
 [harmonia]: https://github.com/nix-community/harmonia
 [harmonia-derivation]: https://github.com/nix-community/harmonia/tree/main/harmonia-store-derivation
-[harmonia-basic]: https://github.com/nix-community/harmonia/blob/main/harmonia-store-core/src/derivation/basic_derivation.rs
+[harmonia-basic]: https://github.com/nix-community/harmonia/blob/main/harmonia-store-derivation/src/derivation/basic_derivation.rs
 
 #### Version 3 Notes
 
@@ -508,6 +508,6 @@ building using dynamic derivations. Let's summarize the main takeaways:
 - [Cpp Nix source](https://github.com/NixOS/nix/tree/master/src)
 - [Nix manual](https://github.com/NixOS/nix/tree/master/doc/manual/source)
 - [Sandstone - incremental haskell builds with dynamic derivations](https://github.com/obsidiansystems/sandstone)
-- [Haskell Nix source in Obsidian System's fork](https://github.com/obsidiansystems/hnix-store/tree/derivation-work)
+- [Haskell Nix source in Obsidian System's fork](https://github.com/obsidiansystems/hnix-store)
 - [Tvix nix-compat crate source](https://code.tvl.fyi/tree/tvix/nix-compat)
 - [Build Systems a la Carte](https://www.microsoft.com/en-us/research/wp-content/uploads/2018/03/build-systems.pdf)
