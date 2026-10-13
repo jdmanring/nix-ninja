@@ -487,6 +487,16 @@ The split is exact and exhaustive: 1 + 79 + 11 = 91, and no script falls in two
 groups. The work is therefore almost entirely group 2, which is a copy and one
 runner assumption, and group 3, which is the real cost.
 
+**Publishing is a copy; RUNNING is the cost, and the two are not the same
+size.** Measured over the same corpus: 78 of the 91 scripts invoke nix at all
+(a `build`, an `eval` or a `develop`), and 13 are static and run in seconds with
+nothing installed. So a stranger who clones the repository can run the 13
+immediately, and the other 78 need the experimental features configured in the
+daemon, a working store, and time. That is the same prerequisite `nix flake
+check` already has and the README already states, so it is a documented cost
+rather than a new one, but the exit criterion is about a stranger running the
+corpus and the number to plan against is 78, not 91.
+
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
 
