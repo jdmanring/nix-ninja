@@ -3720,8 +3720,18 @@ fn build_task_derivation(
         task.outputs.iter().filter_map(|p| p.to_str()),
     );
     if needs_cc {
-        drv.inputs
-            .insert(SingleDerivedPath::Opaque(tools.require_cc()?.clone()));
+        // The refusal is LOUD only where the task would actually look `cc` up
+        // on PATH. A command naming its toolchain by absolute path exec's that
+        // path and needs no lookup, which is mesa-libclc: 514 tasks ran
+        // `$LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR/clang` and the abort below
+        // killed the package for a `cc` it never invoked.
+        //
+        // The name test above stays deliberately broad, because it also
+        // decides the closure; it is the ABORT that must not fire here.
+        if !names_only_absolute_toolchain(cmdline) {
+            drv.inputs
+                .insert(SingleDerivedPath::Opaque(tools.require_cc()?.clone()));
+        }
     }
     drv.inputs
         .insert(SingleDerivedPath::Opaque(tools.coreutils.clone()));
@@ -4410,7 +4420,9 @@ fn build_task_derivation(
     {
         // Prepare $PATH to have coreutils and bash.
         let mut path: Vec<String> = vec![format!("{}/bin", task.store_dir.display(&tools.bash))];
-        if needs_cc {
+        // Same guard as the input insert: an absolute toolchain path exec's
+        // itself and needs no PATH entry, so this must not abort for one.
+        if needs_cc && !names_only_absolute_toolchain(cmdline) {
             path.push(format!(
                 "{}/bin",
                 task.store_dir.display(tools.require_cc()?)
@@ -4531,6 +4543,12 @@ fn build_task_derivation(
         // and the per-TU bank is the whole point of this tool. `-flto=1` is
         // serial by request and bare `-flto` asks for no parallelism, so
         // neither needs `make`; `auto` and `jobserver` do.
+        //
+        // `require_cc` is INFALLIBLE here on purpose: the refusal it carries is
+        // for a task that will look `cc` up on PATH, and this site only asks
+        // whether an LTO link needs `make`. A task whose toolchain is named by
+        // absolute path (mesa-libclc) has no `cc` and must not abort the whole
+        // emission for it.
         let cc_dir: Option<PathBuf> = needs_cc
             .then(|| tools.require_cc().ok())
             .flatten()
@@ -11441,7 +11459,7 @@ fn task_needs_cc<'a>(
 
 #[cfg(test)]
 mod task_needs_cc_tests {
-    use super::task_needs_cc;
+    use super::{names_only_absolute_toolchain, task_needs_cc};
 
     /// glib's probe object: a tracing tool that execs the compiler from
     /// inside its own process, so no toolchain name is on the line.
@@ -11466,6 +11484,42 @@ mod task_needs_cc_tests {
             DTRACE,
             ["gobject/probes.stamp"].into_iter()
         ));
+    }
+
+    /// mesa-libclc: OpenCL `.cl` to LLVM bitcode, with clang named by ABSOLUTE
+    /// store path out of `LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR`. The task needs
+    /// the compiler CLOSURE (the name test is deliberately broad) but must NOT
+    /// be refused for a `cc` it never invokes.
+    const LIBCLC: &str = "/nix/store/6mdfy351-bin/clang -c -o lib/subnormal_config.cl.bc \
+         lib/spirv/subnormal_config.cl";
+
+    #[test]
+    fn an_absolute_toolchain_path_does_not_demand_a_path_resolved_cc() {
+        // Still carries the name, so the closure choice is unchanged...
+        assert!(task_needs_cc(
+            None,
+            LIBCLC,
+            ["lib/subnormal_config.cl.bc"].into_iter()
+        ));
+        // ...but nothing on the line needs resolving through PATH.
+        assert!(names_only_absolute_toolchain(LIBCLC));
+    }
+
+    /// The other half, so the arm above cannot be satisfied by weakening the
+    /// name test: a BARE `clang` comes from PATH and must still be refused
+    /// when the compiler is absent, which is the loud failure the driver
+    /// wants rather than a task that fails later with `not found`.
+    #[test]
+    fn a_bare_toolchain_name_is_not_only_absolute() {
+        assert!(!names_only_absolute_toolchain(
+            "clang -c -o lib/x.bc lib/x.cl"
+        ));
+        // Mixed: one absolute, one bare. The bare one needs PATH.
+        assert!(!names_only_absolute_toolchain(
+            "/nix/store/x/bin/clang && gcc -c y.c"
+        ));
+        // No toolchain name at all is not "only absolute".
+        assert!(!names_only_absolute_toolchain("python3 gen.py"));
     }
 
     /// The two arms that predate the output-shape one, EACH ISOLATED FROM IT.
@@ -14678,35 +14732,38 @@ fn python_module_candidates(module: &str, roots: &[String]) -> Vec<String> {
 /// named by store path still ends in `/gcc`. The set is the C, C++ and
 /// Fortran drivers plus binutils, which the cc wrapper reaches through
 /// `-B` and a script reaches through PATH.
+/// Programs that make a task need the compiler wrapper and its closure. Named
+/// by basename, in any position and by any spelling (`5a540c7`).
+const TOOLCHAIN_TOOLS: [&str; 26] = [
+    "cc",
+    "c++",
+    "cpp",
+    "gcc",
+    "g++",
+    "gfortran",
+    "f95",
+    "f77",
+    "clang",
+    "clang++",
+    "ld",
+    "ld.bfd",
+    "ld.gold",
+    "ld.lld",
+    "lld",
+    "as",
+    "ar",
+    "nm",
+    "ranlib",
+    "strip",
+    "objcopy",
+    "objdump",
+    "readelf",
+    "gcc-ar",
+    "gcc-nm",
+    "gcc-ranlib",
+];
+
 fn command_names_toolchain(cmdline: &str) -> bool {
-    const TOOLS: [&str; 26] = [
-        "cc",
-        "c++",
-        "cpp",
-        "gcc",
-        "g++",
-        "gfortran",
-        "f95",
-        "f77",
-        "clang",
-        "clang++",
-        "ld",
-        "ld.bfd",
-        "ld.gold",
-        "ld.lld",
-        "lld",
-        "as",
-        "ar",
-        "nm",
-        "ranlib",
-        "strip",
-        "objcopy",
-        "objdump",
-        "readelf",
-        "gcc-ar",
-        "gcc-nm",
-        "gcc-ranlib",
-    ];
     cmdline
         .split(|c: char| {
             c.is_whitespace()
@@ -14717,7 +14774,42 @@ fn command_names_toolchain(cmdline: &str) -> bool {
         })
         .filter(|t| !t.is_empty())
         .map(|t| t.rsplit('/').next().unwrap_or(t))
-        .any(|base| TOOLS.contains(&base))
+        .any(|base| TOOLCHAIN_TOOLS.contains(&base))
+}
+
+/// True when the command names a toolchain program by ABSOLUTE PATH, which
+/// means it is exec'd from that path and needs no PATH lookup.
+///
+/// This is the discriminator mesa-libclc needed and the name test above cannot
+/// express: 514 tasks ran `$LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR/clang` and were
+/// refused with "`cc` is not on PATH, and this task names a compiler or binutils
+/// program" - a compiler the task never used. The name test is deliberately
+/// broad ("by basename, in any position and by any spelling", 5a540c7) and that
+/// breadth is right for choosing the closure. It is the REFUSAL that must not
+/// fire here, and only when nothing on the line needs resolving through PATH.
+fn names_only_absolute_toolchain(cmdline: &str) -> bool {
+    let mut any_tool = false;
+    for tok in cmdline.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '|' | '&' | '(' | ')' | '<' | '>' | '"' | '\'' | '`' | '='
+            )
+    }) {
+        if tok.is_empty() {
+            continue;
+        }
+        let base = tok.rsplit('/').next().unwrap_or(tok);
+        if !TOOLCHAIN_TOOLS.contains(&base) {
+            continue;
+        }
+        any_tool = true;
+        // A tool named without a leading slash has to come from PATH.
+        if !tok.starts_with('/') {
+            return false;
+        }
+    }
+    any_tool
 }
 
 fn command_program(cmdline: &str) -> Option<&str> {
