@@ -86,15 +86,21 @@ so they are exposed under `legacyPackages` and only instantiate when
 `dynamic-derivations` is enabled:
 
 ```sh
-# Builds a basic main.cpp.
+# Builds a basic main.cpp, which prints one line when run.
 nix build .#legacyPackages.x86_64-linux.example-hello
+/nix/store/*-example-hello-hello/hello      # prints: Hello dynamic derivations!
 
 # Builds a basic main.cpp with dependency inference for its header.
 nix build .#legacyPackages.x86_64-linux.example-header
+/nix/store/*-example-header-hello/hello     # prints: Hello header example!
 
 # The CMake route, end to end.
 nix build .#legacyPackages.x86_64-linux.example-cmake-hello
+/nix/store/*-example-cmake-hello-hello/hello  # prints: Hello dynamic derivations!
 ```
+
+Each of the three was built and its binary run on a clean checkout, so a reader
+has a result to compare against rather than a command alone.
 
 `example-nix`, which builds Nix itself per translation unit, is the largest
 example and is currently KNOWN NOT TO BUILD: it aborts on a daemon refusal to
