@@ -29,7 +29,7 @@ the ladder and its criteria, and what each rung is worth.
 ## Where this file comes from
 
 The project began when `pdtpartners/nix-ninja` stopped. Work continued here: the
-tree is 650 commits past the last upstream commit of May 2026, and the milestone
+tree is 656 commits past the last upstream commit of May 2026, and the milestone
 numbering above two is new. `docs/todo.md` records the state of the issues that
 came with the project; this file is what comes after them.
 
