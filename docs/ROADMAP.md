@@ -1,10 +1,10 @@
 # Roadmap
 
-The path from a driver that builds one project correctly to one a stranger can
-point at a distribution, and then to one that is worth choosing over the
-alternatives. Seven milestones. `0.1` through `0.5` are about whether the driver
-is right, `0.6` says where the path ends and `0.7` is what makes it a choice
-rather than a curiosity. Each has an exit criterion, the work that satisfies it,
+The path from a driver that builds one project correctly to the best resumable
+build system in the world. Nine milestones. `0.1` through `0.5` ask whether the
+driver is right, `0.6` whether a stranger can run it, `0.7` whether it is worth
+choosing, `0.8` whether it holds at scale and across machines, and `0.9` whether
+anything depends on it. Each has an exit criterion, the work that satisfies it,
 and the instrument that says whether it is met. No dates: a milestone ships when
 its criterion is met and the named gate says so on a clean tree.
 
@@ -224,12 +224,13 @@ left to be assumed: multi-arch is blocked on hardware (item 5), and a second
 backend on whether the Nix data structures can come from `snix` at all, which is
 an open question, not scheduled work.
 
-`1.0` is not a further milestone. It is the version this project takes once `0.6`
-has held across a release with no new class appearing and `0.7` has numbers on
-all four axes: the first moment the claim describes the project rather than the
-last round of work, and the first moment a stranger has a reason to choose it
-rather than reach for it out of curiosity. `0.6` alone is adoptable; `0.7` is why
-anyone would.
+`1.0` is not a further milestone. It is the version this project takes once
+`0.6` has held across a release with no new class appearing, `0.7` has numbers on
+all four axes, `0.8` has held at distribution scale across two machines, and
+`0.9` has an adopter who is not the consumer. It is the marker for the state
+where the remaining work is maintenance rather than development: the first moment
+the claim describes the project rather than the last round of work, and the first
+moment someone chooses it rather than reaching for it out of curiosity.
 
 ## 0.7 THE COMPARISON
 
@@ -276,6 +277,93 @@ This milestone is deliberately last, and it is the one most likely to change the
 others: a measured loss on total wall clock does not invalidate `0.3`, but it
 would change what the README should claim.
 
+## 0.8 SCALE
+
+`0.7` asks whether the driver is competitive at the size of a package. This one
+asks whether it is competitive at the size of a build farm, which is where a
+resumable builder either becomes the best in the world or stays a clever local
+tool.
+
+Three measured facts say the current answer is no, and they are already in this
+file's item 6 rather than estimated for this section:
+
+- `dyn` reads 82 percent of a campaign's wall clock and its instrument names
+  none of that, because three `add_drv_to_store` call sites were untimed. At
+  0.084 s per task over 30,000 translation units that is most of an hour spent in
+  daemon round trips for work the driver could batch or memoise.
+- The driver retains 0.074 MiB per task and never releases it, linear and
+  continuing after scanning has stopped. Projected to 30,000 units it is about
+  2.2 GiB in a user session where no cgroup bounds it.
+- Realise latency under a round is the daemon's single SQLite state mutex, which
+  is a serialization point no amount of local parallelism removes.
+
+THE CLAIM: nix-ninja builds a distribution the size of a desktop, or larger,
+without the driver becoming the bottleneck, and it does so across more than one
+machine.
+
+Three axes, and the third is the one that separates this from every local
+incremental builder:
+
+- **The driver stops being the bottleneck.** Both measured slopes have to be
+  explained before they can be fixed, and neither is diagnosed. This is the same
+  first action item 6 already names: read the timers on a real build, profile the
+  retention, then decide. A batch and a memo are different shapes and this
+  project has twice tuned the wrong one by picking first.
+- **A build survives the daemon's serialization point.** The mutex is in libstore
+  and is not this project's to remove, so the question is whether the driver can
+  keep the daemon's work queue full enough that the mutex is not the constraint.
+  That is a measurement before it is a design.
+- **A build runs on more than one machine.** Nix already distributes ordinary
+  derivations to remote builders and substitutes them through a binary cache,
+  and every task here IS an ordinary derivation, so this capability should be
+  inherited rather than built. Whether it is, at per-translation-unit
+  granularity, is unmeasured. If it works, this is the claim no other
+  per-translation-unit builder can make without implementing `REAPI`, and if it
+  does not, the reason is a defect worth finding.
+
+EXIT CRITERION: a real distribution builds through the driver with the machine's
+own resources never saturated by the driver, and the same build completes across
+two machines with objects substituted rather than recompiled. Recorded as
+numbers on the same axes `0.7` defines, not as a demonstration.
+
+This milestone is where the project stops being a faster local build and becomes
+infrastructure. It is deliberately after `0.7`: there is no point scaling a build
+whose per-unit cost is unmeasured.
+
+## 0.9 THE ECOSYSTEM
+
+`0.8` makes the builder fast and distributed. This one makes it something other
+people build on, which is the difference between a good tool and the standard.
+
+THE CLAIM: this project is depended on by someone who is not its author, and the
+apparatus that makes its claims checkable by a stranger is public.
+
+Nothing here is required for the driver to be excellent, which is why it is last
+and why each part is separately declinable. It is what "the best resumable build
+system in the world" means beyond this repository's own numbers.
+
+- **A second frontend.** The driver reads ninja files, so it already serves every
+  build system that emits one. A build system that does NOT emit ninja is
+  unreachable, and the honest question is whether that set matters. Named rather
+  than assumed: `cargo` and `go` are the two whose scale would matter most.
+- **A public cache.** Substitution is the mechanism's whole advantage and it
+  currently depends on a cache the consumer runs. What it takes to offer one, and
+  whether it is this project's to run, is a question before it is work.
+- **The failure corpus, published.** `0.5` tracks this. It is the instrument that
+  makes the claims here checkable by someone else, and until it is in the
+  repository the wider corpus is evidence this project has and a reader does not.
+- **Adoption by a distribution that is not the consumer's.** The strongest
+  verification available, and the only one that tests the documents rather than
+  the code, since a stranger has to follow them without the author present.
+
+EXIT CRITERION: at least one build system outside ninja, or one distribution
+outside the consumer's, depends on this project, and the corpus is public enough
+that a third party can run the check that says so.
+
+There is no milestone after this one. A project that is correct, verified,
+competitive, scalable, distributed and adopted is finished in the sense that the
+next work is maintenance, and `1.0` is the marker for that state.
+
 ## What does not work today
 
 Named here because the README sends a reader to this file for the first of
@@ -303,6 +391,15 @@ nothing is outstanding.
   no measurement here says what that is worth.
 - **Four open classes in `0.3`**, whose first actions item 2 below names, and
   **three inherited items** carried with no diagnosis, in item 6.
+- **The driver has never been run at distribution scale on hardware it owns.**
+  The two slopes in item 6, `dyn` at 0.084 s per task and retention at 0.074 MiB
+  per task, both project to large numbers at 30,000 translation units, and
+  neither has been observed at that size, because the machine that would run it
+  is the one the consumer builds on. `0.8` states what has to be true; nothing
+  here has tested it.
+- **Nothing here has ever been built on more than one machine.** The capability
+  is expected to come free from Nix, and an expectation is not a measurement.
+  Item 9 is one afternoon that settles it.
 
 ## The next concrete work, item by item
 
@@ -428,6 +525,32 @@ The rule from `0.3` applies unchanged: a measurement needs a baseline that can
 fail to differ from it. A plain-ninja run and a driver run that both took the
 same wall clock because neither did any work is not a comparison, and the
 harness has to be able to tell that apart from a real tie.
+
+### 8. Diagnose the two measured slopes, then fix them
+
+`0.8` states the claim and both limits are already measured as numbers, in item 6
+below. Neither has a cause, and the first action is the same for both: read what
+the instruments already print on a real build before designing anything.
+
+- The `dyn` timer now exists and prints `plain adddrv` and `sandbox adddrv`, and
+  no build has produced a number from it. At 0.084 s per task it is the largest
+  single term in a campaign. The code comment names two candidate fixes, a memo
+  and a batch, which are different shapes; this project has twice tuned the wrong
+  one by choosing before measuring.
+- The retention is 0.074 MiB per task, linear, and the named candidates are
+  guesses. The correct first action is a profile, not a change, and the roadmap
+  says so rather than proposing a fix with no failing case.
+
+### 9. Establish whether a remote builder already works
+
+The cheapest and most valuable measurement in `0.8`, and it may be a measurement
+rather than work. Nix distributes ordinary derivations to remote builders and
+substitutes them through a binary cache; every task here is an ordinary
+derivation; so the capability is either already present or blocked by something
+specific. First action: run one real build with a `builders` line naming a second
+machine and read whether the tasks are scheduled there or refused. The failure
+mode is specific and worth one afternoon, and the answer decides whether `0.8`'s
+third axis is a feature to build or a claim to verify.
 
 ## How a milestone ships
 
