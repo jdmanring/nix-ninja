@@ -131,8 +131,13 @@ and Fortran-module shapes. Each failure class that is unit-testable has a test
 here, and those tests are the ones that survive a refactor.
 
 The counts, measured on a clean tree rather than stated: 17 checks, of which 10
-are VM tests, and 548 Rust tests across the workspace, all passing. A reader who
+are VM tests, and 550 Rust tests across the workspace, all passing. A reader who
 wants a different number can run the same command and get it.
+
+The same checks run on every push to `main` and every pull request, through
+`.github/workflows/ci.yml`: a `build` job running the format, clippy and test
+commands directly, a `lint` job running `nix flake check`, and one integration
+job per VM test so a failure names the test rather than the check set.
 
 The examples the README names were each BUILT and their outputs RUN, not merely
 resolved: `example-hello`, `example-header`, `example-cmake-hello` and
