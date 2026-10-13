@@ -7099,13 +7099,14 @@ fn undeclared_outputs(
         // script is on the command. The flag pair is not self-gating, so the
         // step shape has to be tested here.
         let is_step = external_project_step(declared.iter().filter_map(|p| p.to_str()));
-        for dir in external_project_extract_dirs(c, build_dir).into_iter().chain(
-            if is_step {
+        for dir in external_project_extract_dirs(c, build_dir)
+            .into_iter()
+            .chain(if is_step {
                 external_project_binary_dir(c, build_dir)
             } else {
                 Vec::new()
-            },
-        ) {
+            })
+        {
             if !v.contains(&dir) {
                 v.push(dir);
             }
@@ -15946,11 +15947,7 @@ mod external_project_extract_tests {
         // tree. Measured from cmake 4.4.3's own build.ninja:
         //   cmake --regenerate-during-build -S<src> -B<build>
         let regen = "cd /build/source/build && /nix/store/x-cmake/bin/cmake --regenerate-during-build -S/build/source/build/deps/src/x -B/build/source/build/deps/build/x";
-        let v = undeclared_outputs(
-            &[PathBuf::from("build.ninja")],
-            Some(regen),
-            bd,
-        );
+        let v = undeclared_outputs(&[PathBuf::from("build.ninja")], Some(regen), bd);
         assert!(
             !v.iter().any(|p| p == Path::new("deps/build/x")),
             "a REGENERATE edge on a non-step task must not declare a tree: {v:?}"
@@ -15976,7 +15973,8 @@ mod external_project_extract_tests {
         ] {
             let v = undeclared_outputs(&[], Some(c), bd);
             assert!(
-                !v.iter().any(|p| matches!(p.to_str(), Some("static" | "prefix"))),
+                !v.iter()
+                    .any(|p| matches!(p.to_str(), Some("static" | "prefix"))),
                 "a compiler -S with a -B search prefix must declare nothing: {c} -> {v:?}"
             );
         }
