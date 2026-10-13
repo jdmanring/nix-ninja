@@ -594,6 +594,11 @@ carried here so that the inherited list is not the only record of them.
   session where no cgroup bounds it. Not diagnosed. First action: profile
   before writing anything, because the named candidates are guesses.
 
+Both figures above come from the distribution builds recorded in `docs/todo.md`,
+which is a development note rather than a `bench/records/` run, so they are
+reproducible from this repository but not from a benchmark record; the README
+says which of its own numbers trace to a record and which do not.
+
 The inherited item on aarch64 hardware is item 5 above.
 
 ### 7. Build the comparison harness

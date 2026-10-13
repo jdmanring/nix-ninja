@@ -235,9 +235,12 @@ not exist. The contract is in the [design notes].
   carries its own Apache-2.0 `LICENSE`, and `vendor-n2/VENDORING.md` records the
   revision it was taken from and the four changes made to it.
 - `bench/` holds the end-to-end and generation benchmarks, and the records they
-  wrote. Numbers quoted in these documents trace to a run under `bench/records/`,
-  whose README names what each record is and which figures it cannot account
-  for.
+  wrote. The measured figures this README quotes trace to a run under
+  `bench/records/`, whose README names what each record is and which figures it
+  cannot account for. Not every number in the project does: the roadmap's two
+  scaling slopes and its 30,000-unit projection come from distribution builds
+  recorded in `docs/todo.md`, which is a development note rather than a bench
+  record.
 - `contrib/` holds a throwaway-store development script, which `CONTRIBUTING.md`
   describes.
 
