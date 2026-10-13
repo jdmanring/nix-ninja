@@ -109,6 +109,22 @@ The selftest also checks that the daemon advertises `builder-rpc-v0`, which
 every dynamic task requires. A daemon without it otherwise fails much later
 with a message that does not name the cause.
 
+### The `gh` CLI reads the wrong repository here
+
+This checkout has two remotes: `origin`, which is this project, and `upstream`,
+the archived original it was forked from. `gh` resolves a repository from the
+remotes it finds and picks `upstream`, so a bare `gh` command answers about the
+archived repository:
+
+    $ gh repo view --json nameWithOwner
+    pdtpartners/nix-ninja      # not this project
+
+That is silent and it is wrong in a way that reads as a real answer: `gh run
+list` shows the archive's workflow history, `gh issue list` the archive's
+issues, and neither is this repository's. Pass `--repo jdmanring/nix-ninja` on
+every `gh` call, or `gh repo set-default jdmanring/nix-ninja` once. The GitHub
+web UI is unaffected; only the CLI.
+
 ## Implementation notes
 
 - See [the roadmap] for remaining work.
