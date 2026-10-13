@@ -25,7 +25,7 @@ the ladder and its criteria, and what each rung is worth.
 ## Where this file comes from
 
 The project began when `pdtpartners/nix-ninja` stopped. Work continued here: the
-tree is 643 commits past the last upstream commit of May 2026, and the milestone
+tree is 650 commits past the last upstream commit of May 2026, and the milestone
 numbering above two is new. `docs/todo.md` records the state of the issues that
 came with the project; this file is what comes after them.
 
@@ -233,7 +233,7 @@ What is missing is larger than that: a STRANGER cannot reach the same place. The
 difference is the published apparatus rather than the driver, the corpus, the
 failure signatures, and the record of what is already known to break.
 
-The route is the six items below, which is where each one's first action lives.
+The route is the nine items below, which is where each one's first action lives.
 What belongs here is the criterion they add up to.
 
 EXIT CRITERION: a clone of this repository, with nothing installed but an
@@ -293,9 +293,9 @@ as losses. THE THIRD FORM IS NOT THE FIRST, as in `0.3`: a number from a machine
 nobody else has is evidence about that machine, and the harness is what makes it
 evidence about the project.
 
-This milestone is deliberately last, and it is the one most likely to change the
-others: a measured loss on total wall clock does not invalidate `0.3`, but it
-would change what the README should claim.
+This milestone is deliberately placed before the two that follow, and it is the
+one most likely to change the others: a measured loss on total wall clock does
+not invalidate `0.3`, but it would change what the README should claim.
 
 ## 0.8 SCALE
 
