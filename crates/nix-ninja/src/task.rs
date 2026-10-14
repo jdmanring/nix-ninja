@@ -18080,11 +18080,7 @@ mod macro_arm_headers_tests {
         )
         .unwrap();
 
-        let got = macro_arm_headers(
-            &d,
-            std::slice::from_ref(&d),
-            &[d.join("clc_fabs.h")],
-        );
+        let got = macro_arm_headers(&d, std::slice::from_ref(&d), &[d.join("clc_fabs.h")]);
         let names: Vec<String> = got
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
