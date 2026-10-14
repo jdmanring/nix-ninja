@@ -15786,18 +15786,36 @@ mod self_rss_tests {
         let ballast = vec![1u8; 16 << 20];
         let mib = self_rss_mib();
         assert!(mib > 0, "self_rss_mib returned 0 for a live process");
-        // AGAINST AN INDEPENDENT READING, not a band. `/proc/self/statm`'s
-        // second field is resident PAGES; the subject reads VmRSS from
-        // status. A band under 8 GiB passed a unit error of 4x and a stub
-        // returning 1, so the two readings are required to agree within
-        // a factor that only allocation between the two calls can move.
-        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
-        let pages: u64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-        let independent = pages * page / (1024 * 1024);
+        // AGAINST AN INDEPENDENT READING, and INDEPENDENT MEANS A DIFFERENT
+        // SOURCE, which this arm did not have. `self_rss_mib` now reads
+        // `/proc/self/statm` field 1, and the arm below used to read THAT SAME
+        // FILE'S SAME FIELD - so the assertion compared one measurement taken
+        // twice, with `ballast` touching the heap in between, and it moved
+        // with the machine rather than with the subject. It passed 25/25 on an
+        // idle host and failed in CI's sandbox twice, once at `self_rss_mib
+        // 129 MiB disagrees with statm 83 MiB` - a 45 percent swing in the
+        // PROCESS's own RSS across two consecutive reads, which is the test
+        // measuring its own churn. The comment above claimed the subject read
+        // `VmRSS` from `status` and that stopped being true when the subject
+        // changed; the comment was not updated and the arm silently stopped
+        // being a control.
+        //
+        // `VmRSS` in `/proc/self/status` is a DIFFERENT FILE, parsed by a
+        // different kernel path, reported in kB, so agreement between the two
+        // is worth something again. The tolerance stays: allocation between
+        // the two reads is real, and a band wide enough to hide a unit error
+        // is the failure this pair exists to catch.
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let vmrss_kb: u64 = status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|kb| kb.parse().ok())
+            .expect("VmRSS is in /proc/self/status");
+        let independent = vmrss_kb / 1024;
         assert!(
             mib.abs_diff(independent) <= independent / 4 + 1,
-            "self_rss_mib {mib} MiB disagrees with statm {independent} MiB"
+            "self_rss_mib {mib} MiB disagrees with VmRSS {independent} MiB"
         );
         std::hint::black_box(ballast);
     }
