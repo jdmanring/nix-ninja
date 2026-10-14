@@ -1790,6 +1790,7 @@ impl Runner {
             let swig_i = swig_invocation(&args);
             let gir_filelists = gir_filelist_invocation(&args);
             let protoc = protoc_invocation(&args);
+            let valac = valac_invocation(&args);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -2320,6 +2321,18 @@ impl Runner {
             // the swig and msgfmt readers above.
             if let Some(filelists) = &gir_filelists {
                 for p in gir_filelist_referenced_paths(&self.config.build_dir, &cd_dir, filelists) {
+                    referenced.push(p);
+                }
+            }
+            // A VALAC RUN RESOLVES EACH `--pkg` TO A `.vapi`, and the file it
+            // finds is in the package's own source tree, reached by no path on
+            // the command line, so no edge declares it: umockdev asks for
+            // `--pkg libpcap` against `--vapidir=<its own src>`, the sandbox
+            // does not stage `src/libpcap.vapi`, and every task behind it in
+            // the desktop closure dies with it. Same family as the readers
+            // above; same placement.
+            if let Some((dirs, pkgs)) = &valac {
+                for p in valac_referenced_paths(&self.config.build_dir, &cd_dir, dirs, pkgs) {
                     referenced.push(p);
                 }
             }
@@ -8361,6 +8374,147 @@ fn protoc_referenced_paths(
     out
 }
 
+/// The `--vapidir` roots and `--pkg` names of a valac run, or None when the
+/// command is not valac.
+///
+/// A VALA RUN RESOLVES A `--pkg` TO A FILE NOBODY DECLARES, and it is the same
+/// family as the protoc `-I`, the swig `%include` and the g-ir-scanner
+/// `--filelist` readers around this one. umockdev 0.19.3's valac edge lists
+/// three vapis BY PATH (`src/selinux.vapi`, `src/ioctl.vapi`,
+/// `src/linux_fixes.vapi`, all carried) and reaches a fourth only through
+/// `--vapidir=/build/umockdev-0.19.3/src --pkg libpcap`, so `libpcap.vapi` never
+/// appears on a command line an edge can see. It is IN the package's own source
+/// tarball, the sandbox did not stage it, and the run dies `Package 'libpcap'
+/// not found in specified Vala API directories or GObject-Introspection GIR
+/// directories`. Measured 2026-10-13: 610 of 842 `Cannot build` blocks across
+/// ten iterations of one desktop round are that single derivation, with the
+/// closure behind it (pipewire, gobject-introspection, gtk+3, qtbase and the
+/// rest) failing as a consequence.
+///
+/// THE TRIGGER IS SEPARATE FROM THE READER so it is testable without a
+/// filesystem, as every reader here is.
+fn valac_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    if !args.iter().any(|a| a.rsplit('/').next() == Some("valac")) {
+        return None;
+    }
+    let mut dirs = Vec::new();
+    let mut pkgs = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--vapidir=") {
+            if !v.is_empty() {
+                dirs.push(v.to_string());
+            }
+        } else if a == "--vapidir" {
+            if let Some(v) = it.next() {
+                if !v.is_empty() {
+                    dirs.push(v.clone());
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--pkg=") {
+            if !v.is_empty() {
+                pkgs.push(v.to_string());
+            }
+        } else if a == "--pkg" {
+            if let Some(v) = it.next() {
+                if !v.is_empty() {
+                    pkgs.push(v.clone());
+                }
+            }
+        }
+    }
+    Some((dirs, pkgs))
+}
+
+/// The `<name>.vapi` files a valac run will look for, resolved the way valac
+/// resolves them, emitted as RELATIVE spellings the wiring keeps.
+///
+/// FOUR THINGS DECIDE WHETHER A CANDIDATE IS CARRIED, and each is a way this
+/// reader could be wrong without saying so:
+///
+/// (1) THE PACKAGE MAY BE SPELLED WITH A VERSION. valac takes `.vapi` AND
+///     `.deps`, and a package `foo-1.0` is found as `foo-1.0.vapi`. Both
+///     spellings are tried. The `--pkg` value itself is used verbatim first,
+///     because that is what the command asked for.
+/// (2) EACH `--vapidir` IS A ROOT, AND A RELATIVE ONE RESOLVES AGAINST THE
+///     PROCESS CWD, which is the post-`cd` directory. umockdev's is absolute,
+///     but a build-tree one is not, and reading it from the build root would
+///     miss the file the command finds. Every root is joined with the package
+///     name and probed.
+/// (3) THE EMITTED SPELLING MUST BE RELATIVE. A candidate that is absolute is
+///     dropped in silence by the `starts_with(store_dir)` filter - the trap
+///     `swig_referenced_paths` records - so an absolute `--vapidir` is emitted
+///     relative to the build dir when it can be, and skipped when it cannot.
+///     Skipping costs the old behaviour; emitting an absolute would cost a
+///     drop that reads as a fix that changed nothing.
+/// (4) ONLY A FILE THAT EXISTS IS CARRIED. An unresolvable package is dropped,
+///     so the worst case is an input nobody needed and never a path that fails
+///     a read.
+///
+/// The `.deps` companion is deliberately NOT carried: valac only reads one when
+/// the package is found, so a `.deps` without its `.vapi` is a file for a
+/// package that will fail anyway.
+fn valac_referenced_paths(
+    build_dir: &Path,
+    cd_dir: &Path,
+    dirs: &[String],
+    pkgs: &[String],
+) -> Vec<String> {
+    let cwd = build_dir.join(cd_dir);
+    let mut out = Vec::new();
+    for pkg in pkgs {
+        if pkg.is_empty() || pkg.contains('/') {
+            continue;
+        }
+        let mut names = vec![format!("{pkg}.vapi")];
+        // valac accepts `<name>` and `<name>-<version>`; a versioned package is
+        // spelled with its version in the FILE and without it in `--pkg`, so
+        // both a bare and a suffixed name are tried. The suffixed form cannot
+        // be guessed, so the bare one is the one that matters and the suffix
+        // loop exists for the reverse spelling.
+        if let Some((base, ver)) = pkg.rsplit_once('-') {
+            if ver.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                names.push(format!("{base}.vapi"));
+            }
+        }
+        for dir in dirs {
+            if dir.is_empty() {
+                continue;
+            }
+            let root = if Path::new(dir).is_absolute() {
+                PathBuf::from(dir)
+            } else {
+                cwd.join(dir)
+            };
+            for name in &names {
+                let abs = root.join(name);
+                if !abs.is_file() {
+                    continue;
+                }
+                // Spell it the way the command resolves it, relative to the
+                // build dir the wiring keeps: a `--vapidir` under the build
+                // tree comes back build-relative, one above it keeps the `..`
+                // climb the caller rebases, and a STORE path is skipped rather
+                // than emitted absolute, because an absolute candidate is
+                // dropped in silence by the `starts_with(store_dir)` filter.
+                let spelled = if Path::new(dir).is_absolute() {
+                    match relative_from(&abs, build_dir) {
+                        Some(p) if !p.is_absolute() => p,
+                        _ => continue,
+                    }
+                } else {
+                    Path::new(dir).join(name)
+                };
+                let s = spelled.to_string_lossy().into_owned();
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The `.i` files a swig invocation names, or None if the command is not a
 /// swig run. Kept separate from the reader so the trigger is testable without
 /// a filesystem.
@@ -8474,6 +8628,7 @@ mod its_and_swig_reader_tests {
     use super::{
         its_rule_targets, msgfmt_invocation, msgfmt_its_referenced_paths, proto_imports,
         protoc_invocation, protoc_referenced_paths, swig_invocation, swig_referenced_paths,
+        valac_invocation, valac_referenced_paths,
     };
 
     /// The locating rule is the ONLY place the `.its` name appears, so the
@@ -8730,6 +8885,88 @@ mod its_and_swig_reader_tests {
             got.len(),
             3,
             "each import appears once, deduped against re-roots: {got:?}"
+        );
+    }
+
+    /// A `valac` run that resolves `--pkg` against `--vapidir`, the way
+    /// umockdev does. The vapi is in the package's own source tree and reaches
+    /// no command line, so nothing else declares it.
+    #[test]
+    fn a_valac_package_is_resolved_against_its_vapidir() {
+        use super::Scratch;
+        let d = Scratch::new(format!("nn-valac-pkg-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(d.join("umockdev-0.19.3/src")).unwrap();
+        std::fs::create_dir_all(&bd).unwrap();
+        // The file the command asks for, in the tree it points --vapidir at.
+        std::fs::write(d.join("umockdev-0.19.3/src/libpcap.vapi"), "extern int x;\n").unwrap();
+        let args: Vec<String> = [
+            "valac",
+            "--vapidir=/x/umockdev-0.19.3/src",
+            "--pkg",
+            "libpcap",
+            "--pkg",
+            "gio-2.0",
+            "-o",
+            "out",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (dirs, pkgs) = valac_invocation(&args).expect("a valac run");
+        assert_eq!(pkgs, vec!["libpcap".to_string(), "gio-2.0".to_string()]);
+        assert_eq!(dirs, vec!["/x/umockdev-0.19.3/src".to_string()]);
+    }
+
+    /// The reader emits the RELATIVE spelling the wiring keeps, and drops a
+    /// package that resolves to nothing rather than inventing a path.
+    ///
+    /// THE NEGATIVE CONTROL IS THE SECOND HALF, and it carries the PAIR the
+    /// guard needs: the same argv with `--vapidir` and `--pkg` pointing at a
+    /// directory that holds no such vapi. Without it the first assertion could
+    /// be satisfied by a reader that carried any name it was handed.
+    #[test]
+    fn a_valac_package_that_resolves_is_carried_and_one_that_does_not_is_dropped() {
+        use super::Scratch;
+        use std::path::Path;
+        let d = Scratch::new(format!("nn-valac-read-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(d.join("umockdev-0.19.3/src")).unwrap();
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(d.join("umockdev-0.19.3/src/libpcap.vapi"), "extern int x;\n").unwrap();
+        std::fs::write(d.join("umockdev-0.19.3/src/absent.vapi"), "nope\n").unwrap();
+
+        // A RELATIVE --vapidir, which is the case the build tree actually
+        // produces, so the emit path under test is the one that runs.
+        let got = valac_referenced_paths(
+            &bd,
+            Path::new(""),
+            &["../umockdev-0.19.3/src".to_string()],
+            &["libpcap".to_string(), "nothere".to_string()],
+        );
+        assert_eq!(
+            got,
+            vec!["../umockdev-0.19.3/src/libpcap.vapi".to_string()],
+            "the resolved package is carried, spelled relative to the build dir, \
+             and the unresolvable one contributes nothing"
+        );
+        assert!(
+            !got.iter().any(|p| Path::new(p).is_absolute()),
+            "an absolute candidate is dropped silently by starts_with(store_dir)"
+        );
+
+        // The negative control: the SAME call with the vapidir pointing
+        // somewhere the file is not. A reader that carried the name anyway
+        // would pass the arm above and fail here.
+        let none = valac_referenced_paths(
+            &bd,
+            Path::new(""),
+            &["../elsewhere/src".to_string()],
+            &["libpcap".to_string()],
+        );
+        assert!(
+            none.is_empty(),
+            "a package that resolves to no file must carry nothing, got {none:?}"
         );
     }
 }
