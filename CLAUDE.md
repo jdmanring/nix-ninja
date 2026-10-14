@@ -176,8 +176,11 @@ THE SINGLE REKEY WAS TAKEN AT THE PIN `b00dfaf` (consumer `ac4b052`,
 2026-09-29; task binary `x92ay33p` -> `fwks8vlr`). The bumps through
 `4ef51fd` moved the DRIVER ONLY (`d4e82ca` `66ba407`, `5f0fe07` `2049344`,
 `c6040a0` `429ffd5`, `4ef51fd` `3122854`); THE TASK BINARY HAS MOVED SINCE,
-at `a9d5dd5` (`miniz_oxide` in `Cargo.lock`) and at `e1101af` (writable copy
-of an edit-in-place tree). Under the stable-builder knob the consumer runs,
+at `a9d5dd5` (`miniz_oxide` in `Cargo.lock`), at `e1101af` (writable copy
+of an edit-in-place tree), and at `239d6b1` (an output the command writes is
+copied writable rather than linked read-only - the mesa-libclc abort; task
+`3vnxcibcqqfin...` -> `86si75pg117f...`, the first MOVE OF THE 0.3.0 TASK BINARY
+this list records). Under the stable-builder knob the consumer runs,
 those moves leave banked compiles keyed as they were and move only the
 `/nn-task` MOUNT; that is why the mapping is read from the pin, below. The
 current pin is the consumer's lock, not this list. The rekey
