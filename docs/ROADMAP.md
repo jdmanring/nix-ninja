@@ -456,7 +456,7 @@ nothing is outstanding.
   measured. Until then the honest statement is that the granularity is per
   translation unit by construction, which is a fact about the design, and that
   no measurement here says what that is worth.
-- **Four open classes in `0.3`**, whose first actions item 2 below names, and
+- **Five open classes in `0.3`**, whose first actions item 2 below names, and
   **three inherited items** carried with no diagnosis, in item 6.
 - **The driver has never been run at distribution scale on hardware it owns.**
   The two slopes in item 6, `dyn` at 0.084 s per task and retention at 0.074 MiB
@@ -552,8 +552,16 @@ a reason stated in this file would be a second copy to keep in step.
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
 
-### 2. Close the four open classes
+### 2. Close the five open classes
 
+- **A macro arm whose define site the reader cannot see.** The macro-arm reader
+  scans a translation unit's INCLUDES and never its own text, so a macro defined
+  only in the unit's body reaches it at no point. First action: a fixture that
+  is one unit carrying its own define and no header that defines the same name,
+  then price the change, because scanning the unit adds an input to every
+  compile whose body carries such a macro. The two neighbouring rows that read
+  FIXED are the delimiter and the arm count and are real fixes; this is a third
+  axis.
 - **An alias output read at its store path.** What aborts is the include
   scanner's read, and the row says which task is still unknown. First action:
   keep the build directory of a failing drive and read `build.ninja` for the
