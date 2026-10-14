@@ -215,9 +215,8 @@ fn main() -> Result<()> {
     // through to `create_symlinks`.
     let declared: std::collections::HashSet<&std::path::Path> =
         outputs.iter().map(|o| o.build_path.as_path()).collect();
-    let (edit_in_place, inputs): (Vec<DerivedFile>, Vec<DerivedFile>) = inputs
-        .into_iter()
-        .partition(|i| declared.contains(i.build_path.as_path()));
+    let (edit_in_place, inputs): (Vec<DerivedFile>, Vec<DerivedFile>) =
+        partition_edit_in_place(inputs, &declared);
     create_symlinks(&build_dir, &cli.store_dir, inputs, false)?;
     for tree in &edit_in_place {
         let dst = build_dir.join(&tree.build_path);
@@ -885,6 +884,39 @@ mod producer_alias_tests {
         // a target with a separator: only `contains('/')` refuses it
         assert!(same_dir_aliases("orc/l.so=sub/l.so.1").is_empty());
     }
+}
+
+/// Split the inputs into the ones the command EDITS IN PLACE and the rest.
+///
+/// A PATH THIS TASK BOTH RECEIVES AND DECLARES AS AN OUTPUT IS ONE THE COMMAND
+/// WRITES. `create_symlinks` would place it as a link into the read-only
+/// store, and the write then fails. TWO SHAPES, and they were found one at a
+/// time:
+///
+/// - a DIRECTORY: ExternalProject's patch step runs `patch` inside
+///   `SOURCE_DIR`, which refuses a link into the store ("is not a regular
+///   file -- refusing to patch"). It is copied WHOLE so the command edits real
+///   files and the edited tree is what the output captures.
+/// - a FILE: mesa-libclc 22.1.8.3 declares the transformed depfile
+///   `CMakeFiles/d/<hash>.d` as both an input of the compile edge and one of
+///   its outputs, and the command's own second half,
+///   `cmake -E cmake_transform_depfile ... <that path>`, writes it. Through the
+///   0444 link cmake exits **2 with NO output at all**, which the task
+///   propagates, so the failure is a silent 4-line log that reads as a reader
+///   defect or a race.
+///
+/// THE TEST IS THE COLLISION, NOT THE KIND. The earlier version asked
+/// `declared && is_dir()`, so the FILE case fell through to the symlink path.
+/// The caller still branches on kind when it COPIES - `copy_tree` for a
+/// directory, a writable single-file copy otherwise - because that decision is
+/// about how to copy, not about whether to.
+fn partition_edit_in_place(
+    inputs: Vec<DerivedFile>,
+    declared: &std::collections::HashSet<&std::path::Path>,
+) -> (Vec<DerivedFile>, Vec<DerivedFile>) {
+    inputs
+        .into_iter()
+        .partition(|i| declared.contains(i.build_path.as_path()))
 }
 
 fn copy_outputs_to_placeholders(store_dir: &StoreDir, outputs: &[DerivedFile]) -> Result<()> {
@@ -1565,6 +1597,59 @@ mod dotdot_prefix_tests {
         assert!(dotdot_prefixes("gcc -DFOO=a/../b -c x.c", None).is_empty());
         // No `..` anywhere: nothing to do.
         assert!(dotdot_prefixes("gcc -I/build/source/lib -c x.c", None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod edit_in_place_tests {
+    use super::{partition_edit_in_place, DerivedFile};
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    /// Built through the SAME constructor the task uses, so the fixture cannot
+    /// drift from the real encoding.
+    fn df(build_path: &str) -> DerivedFile {
+        let store_dir: crate::StoreDir = "/nix/store".parse().unwrap();
+        DerivedFile::from_encoded(
+            &store_dir,
+            &format!("/nix/store/00000000000000000000000000000000-x:{build_path}"),
+        )
+        .unwrap()
+    }
+
+    /// A FILE THAT IS BOTH AN INPUT AND A DECLARED OUTPUT IS WRITTEN BY THE
+    /// COMMAND, so it must be diverted and copied writable. mesa-libclc's
+    /// `CMakeFiles/d/<hash>.d` is exactly this, and the old test
+    /// (`declared && is_dir()`) let it fall through to the read-only symlink,
+    /// where `cmake -E cmake_transform_depfile` exited 2 with no output.
+    ///
+    /// THE NEGATIVE CONTROL IS THE SECOND ARM: a plain input that no output
+    /// declares must NOT be diverted, or every input would be copied and the
+    /// symlink materialisation the whole design rests on would be gone.
+    #[test]
+    fn a_file_declared_as_an_output_is_diverted_and_a_plain_input_is_not() {
+        let depfile = "CMakeFiles/d/3bbd087b.d";
+        let source = "clc/lib/generic/relational/clc_isnan.cl";
+        let outputs = [Path::new(depfile)];
+        let declared: HashSet<&Path> = outputs.iter().copied().collect();
+
+        let (edited, linked) = partition_edit_in_place(vec![df(depfile), df(source)], &declared);
+
+        let names = |v: &[DerivedFile]| -> Vec<String> {
+            v.iter()
+                .map(|d| d.build_path.display().to_string())
+                .collect()
+        };
+        assert_eq!(
+            names(&edited),
+            vec![depfile.to_string()],
+            "the declared output that is also an input must be copied writable"
+        );
+        assert_eq!(
+            names(&linked),
+            vec![source.to_string()],
+            "a plain input must still be materialised as a symlink"
+        );
     }
 }
 
