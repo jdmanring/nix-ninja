@@ -14742,9 +14742,35 @@ pub fn discover_c_includes(
         let mut v = c_includes;
         let declaring: Vec<PathBuf> = v.iter().filter(|p| p.exists()).cloned().collect();
         if declaring.len() <= MACRO_ARM_SCAN_CAP {
-            let dirs: Vec<PathBuf> = include_dirs_named(cmdline, build_dir)
+            // THE ARM READER NEEDS THE DIRECTORIES THE COMMAND GIVES, NOT THE
+            // ONES THE TASK MUST CREATE. `include_dirs_named` answers the
+            // second question: it keeps an absolute `-I` only when it falls
+            // under the build dir and DROPS the rest, which is right for a
+            // directory a task has to make and wrong here. mesa-libclc's
+            // compile runs `cd /build/source/build` with
+            // `-I/build/source/clc/include`, which is ABOVE the build dir, so
+            // the reader was handed an EMPTY list, tried
+            // `build_dir.join("clc/shared/unary_decl.inc")`, found nothing,
+            // and dropped the arm in silence while the file it named sat on
+            // disk two directories up.
+            //
+            // KEPT AS A CLIMB, NOT AS AN ABSOLUTE PATH. An absolute spelling
+            // leaves this function and is then dropped by the wiring filters
+            // (`starts_with(store_dir)`, `same_project_tree`) without a word,
+            // which is the trap the readers' section of CLAUDE.md names. A
+            // `../clc/include` spelling resolves against the build dir (the
+            // process cwd here) exactly as the compiler resolves it, and the
+            // path the reader emits from it stays relative.
+            let dirs: Vec<PathBuf> = include_dirs_as_given(cmdline)
                 .into_iter()
-                .map(PathBuf::from)
+                .filter_map(|dir| {
+                    let p = PathBuf::from(&dir);
+                    if p.is_absolute() {
+                        relative_from(&p, build_dir)
+                    } else {
+                        Some(p)
+                    }
+                })
                 .collect();
             for extra in macro_arm_headers(build_dir, &dirs, &declaring) {
                 if !v.contains(&extra) {
@@ -18120,17 +18146,16 @@ mod macro_arm_headers_tests {
     /// exactly what `include_dirs_as_given`'s doc comment warns about, and it
     /// already exists and is already used by the forced-include reader.
     ///
-    /// THE FIX IS NOT LANDED and is not obvious: passing the absolute entries
-    /// resolves the arm but yields an ABSOLUTE spelling, which the wiring
-    /// filters then drop in silence (CLAUDE.md: "a reader must emit RELATIVE
-    /// spellings"). So the fix must keep the entry as a CLIMB
-    /// (`../clc/include`) rather than drop it or absolutise it, and it adds an
-    /// input to every compile whose headers name such an arm, which re-keys
-    /// compile tasks and needs a price. Shape and evidence:
-    /// `local/pending/next-rekey-batch.md` 2026-10-14.
+    /// THE FIX IS LANDED, and this test names the whole mechanism so a
+    /// regression points at the step that broke. The reader is handed the
+    /// command's OWN include directories, with an absolute entry kept as a
+    /// CLIMB (`../clc/include`) rather than either dropped (the defect) or
+    /// passed through absolute (which the wiring filters then drop in
+    /// silence - the trap this file records at length).
     #[test]
-    fn an_arm_above_the_build_dir_is_dropped_by_the_named_include_dirs() {
-        use super::include_dirs_named;
+    fn an_arm_above_the_build_dir_resolves_through_the_include_chain() {
+        use super::include_dirs_as_given;
+        use super::relative_from;
         let root = Scratch::new(format!("nn-arm-above-{}", std::process::id()));
         let build = root.join("build");
         fs::create_dir_all(root.join("clc/include/clc/integer")).unwrap();
@@ -18140,34 +18165,72 @@ mod macro_arm_headers_tests {
         let header = root.join("clc/include/clc/integer/clc_clz.h");
         fs::write(&header, "#define __CLC_BODY <clc/shared/unary_decl.inc>\n").unwrap();
 
-        // THE TWO CALLS THE CALLER MAKES, IN ORDER, because the DROP is the
-        // subject and a test that hands the reader its dirs directly bypasses
-        // it - the defect the row above records, one level down.
+        // THE COMMAND AS PRODUCTION SPELLS IT: absolute `-I`s above the
+        // build dir. Read from mesa-libclc's failing task
+        // `00s871wf4mwnsyf9m1q15ywiwpsl65px-ninja-build.drv`.
         let cmdline = format!(
             "clang -I{0}/clc/include -I{0}/clc/lib/generic/math -c a.cl -o a.bc",
             root.display()
         );
-        let dirs: Vec<PathBuf> = include_dirs_named(&cmdline, &build)
+
+        // THE PROCESS RUNS IN THE BUILD DIR, as `cli::run` makes it
+        // (`set_current_dir(build_dir)`), and the reader resolves a
+        // RELATIVE include dir against that cwd. A test that does not chdir
+        // resolves every relative entry against the repo root and reads a
+        // fix as broken - so chdir here is part of the fixture, not
+        // convenience.
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&build).unwrap();
+        let named: Vec<PathBuf> = super::include_dirs_named(&cmdline, &build)
             .into_iter()
             .map(PathBuf::from)
             .collect();
+        let dirs: Vec<PathBuf> = include_dirs_as_given(&cmdline)
+            .into_iter()
+            .filter_map(|dir| {
+                let p = PathBuf::from(&dir);
+                if p.is_absolute() {
+                    relative_from(&p, &build)
+                } else {
+                    Some(p)
+                }
+            })
+            .collect();
+        let from_named = macro_arm_headers(&build, &named, std::slice::from_ref(&header));
+        let got = macro_arm_headers(&build, &dirs, std::slice::from_ref(&header));
+        std::env::set_current_dir(prev).unwrap();
+
+        // THE NEGATIVE CONTROL, FIRST, because it is the defect: the
+        // task-creation reader drops both entries, and a reader handed THAT
+        // list finds nothing. Without this arm the test would pass on a
+        // build_dir.join() that happened to work, which is what made the
+        // class invisible for as long as it was.
         assert!(
-            dirs.is_empty(),
-            "DEFECT, pre-fix reading: an absolute -I above the build dir is \
-             dropped rather than kept as a climb; got {dirs:?}"
+            named.is_empty(),
+            "include_dirs_named drops an absolute -I above the build dir; got {named:?}"
+        );
+        assert!(
+            from_named.is_empty(),
+            "control: the task-creation list resolves nothing; got {from_named:?}"
         );
 
-        let got = macro_arm_headers(&build, &dirs, std::slice::from_ref(&header));
         let names: Vec<String> = got
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(
-            names.is_empty(),
-            "DEFECT, pre-fix reading: the arm the header names resolves above \
-             the build dir, exists on disk, and is dropped in silence; got \
-             {names:?}"
+            names.contains(&"unary_decl.inc".to_string()),
+            "the arm resolves above the build dir and must be carried; got {names:?}"
         );
+        // AND THE SPELLING SURVIVES THE WIRING FILTERS: relative, and inside
+        // the project tree. An absolute result here would be dropped
+        // downstream and read as a fix that changed nothing.
+        for p in &got {
+            assert!(
+                p.is_relative(),
+                "a reader must emit a relative spelling or the wiring drops it; got {p:?}"
+            );
+        }
     }
 }
 
