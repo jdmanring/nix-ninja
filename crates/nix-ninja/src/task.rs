@@ -7591,7 +7591,10 @@ fn macro_arm_headers(
     use std::collections::HashMap;
 
     // Every arm of every string-valued object-like macro, per define site.
-    let mut arms: HashMap<String, Vec<String>> = HashMap::new();
+    // EACH ARM REMEMBERS ITS DELIMITER, because the delimiter decides whether
+    // an un-declared arm needs carrying and the bare path cannot say which it
+    // was. See the gate below the loop.
+    let mut arms: HashMap<String, Vec<(String, bool)>> = HashMap::new();
     for header in defining_headers {
         let Ok(bytes) = std::fs::read(header) else {
             continue;
@@ -7644,19 +7647,40 @@ fn macro_arm_headers(
             }
             let path = &val[1..val.len() - 1];
             let entry = arms.entry(name.to_string()).or_default();
-            if !entry.iter().any(|e| e == path) {
-                entry.push(path.to_string());
+            if !entry.iter().any(|e| e.0 == path) {
+                entry.push((path.to_string(), angled));
             }
         }
     }
 
     let mut out = Vec::new();
     for (_name, paths) in arms {
-        // One arm is the ordinary case and the walk already resolved it.
-        if paths.len() < 2 {
+        // THE DISCRIMINATOR IS THE DELIMITER, NOT THE ARM COUNT, and both
+        // halves are pinned by a test with a failing control behind it.
+        //
+        // A SINGLE QUOTED ARM IS THE WALK'S OWN ANSWER - `"simd-sse2.h"` is an
+        // ordinary sibling include the normal scan resolves - so emitting it
+        // would put a class input on every TU in every package for no reason.
+        // `a_single_arm_macro_adds_nothing` holds that line.
+        //
+        // A SINGLE ANGLE ARM IS NOT. `clc_fabs.h:12` is
+        // `#define __CLC_BODY <clc/math/unary_decl.inc>`, its ONLY define site,
+        // and an angle include is resolved on a search path no edge declares,
+        // so the walk never resolved it and mesa-libclc died
+        // `'clc/math/unary_decl.inc' file not found`. The earlier version
+        // skipped on `paths.len() < 2` on the reasoning that one arm is always
+        // the walk's, which was true for the quoted case it was written
+        // against and false for this one - a control that could not carry the
+        // pair, which this file records as its own recurring class.
+        //
+        // THE `is_file` TEST BELOW IS WHAT KEEPS THIS FROM OVER-DECLARING: an
+        // arm is emitted only when it resolves to a regular file, the same
+        // guard that drops which 2.25's `"/"` root arm and a directory arm.
+        let single_angle = paths.len() == 1 && paths.iter().all(|(_, angled)| *angled);
+        if paths.len() < 2 && !single_angle {
             continue;
         }
-        for path in paths {
+        for (path, _) in paths {
             let p = PathBuf::from(&path);
             let resolved = if p.is_absolute() {
                 p
@@ -18025,6 +18049,49 @@ mod macro_arm_headers_tests {
         assert!(
             !got.iter().any(|p| p.is_dir()),
             "an angle arm naming a directory is never a header: {got:?}"
+        );
+    }
+
+    /// A macro with ONE define site still names a file, and that is the shape
+    /// production actually has.
+    ///
+    /// THE TWO TESTS ABOVE BOTH BUILD TWO ARMS, and the reader skips a macro
+    /// with fewer than two (`paths.len() < 2`) on the reasoning that one arm is
+    /// the ordinary case the walk already resolved. THAT REASONING IS FALSE
+    /// FOR AN ANGLE-BRACKET ARM NO EDGE DECLARES: `clc_fabs.h:12` is
+    /// `#define __CLC_BODY <clc/math/unary_decl.inc>` and it is the ONLY define
+    /// site, so the arm count is one, the reader skipped it, and mesa-libclc
+    /// died exactly as the quoted-arm case did before `8622e7a`:
+    ///
+    ///     gentype.inc:89:10: fatal error: 'clc/math/unary_decl.inc' file not found
+    ///
+    /// A fixture written with two arms cannot see this - it is the same class as
+    /// `a_negative_control_must_carry_the_pair`, one level up: the test was
+    /// written to the shape that passes rather than the shape that fails.
+    #[test]
+    fn a_macro_with_one_define_site_still_names_its_arm() {
+        let d = scratch("angle-single");
+        fs::create_dir_all(d.join("clc/math")).unwrap();
+        fs::write(d.join("clc/math/unary_decl.inc"), "\n").unwrap();
+        // ONE site, as production has, and the file it names exists.
+        fs::write(
+            d.join("clc_fabs.h"),
+            "#define __CLC_BODY <clc/math/unary_decl.inc>\n",
+        )
+        .unwrap();
+
+        let got = macro_arm_headers(
+            &d,
+            std::slice::from_ref(&d),
+            &[d.join("clc_fabs.h")],
+        );
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"unary_decl.inc".to_string()),
+            "a single define site still names a file the task must carry; got {names:?}"
         );
     }
 }
