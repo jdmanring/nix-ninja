@@ -8437,10 +8437,13 @@ fn valac_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
 ///     spellings are tried. The `--pkg` value itself is used verbatim first,
 ///     because that is what the command asked for.
 /// (2) EACH `--vapidir` IS A ROOT, AND A RELATIVE ONE RESOLVES AGAINST THE
-///     PROCESS CWD, which is the post-`cd` directory. umockdev's is absolute,
-///     but a build-tree one is not, and reading it from the build root would
-///     miss the file the command finds. Every root is joined with the package
-///     name and probed.
+///     PROCESS CWD, which is the post-`cd` directory. This is the branch that
+///     actually runs: `rewrite_ancestor_paths_ups` has already spelled
+///     `/build/<pkg>/...` as the `../` climb that reaches it, so by the time
+///     the reader sees it the value is RELATIVE. Reading it from the build
+///     root instead of the cwd would miss the file the command finds. An
+///     absolute value is still probed, because a `--vapidir` naming a store
+///     path arrives that way and never passes through the rewrite.
 /// (3) THE EMITTED SPELLING MUST BE RELATIVE. A candidate that is absolute is
 ///     dropped in silence by the `starts_with(store_dir)` filter - the trap
 ///     `swig_referenced_paths` records - so an absolute `--vapidir` is emitted
