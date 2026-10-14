@@ -8939,6 +8939,13 @@ mod its_and_swig_reader_tests {
     /// The reader emits the RELATIVE spelling the wiring keeps, and drops a
     /// package that resolves to nothing rather than inventing a path.
     ///
+    /// THE GEOMETRY IS THE PRODUCTION ONE, and getting it wrong is what this
+    /// test would otherwise do: umockdev builds in `/build/umockdev-0.19.3/build`
+    /// and its source sits at `/build/umockdev-0.19.3/src`, so the `--vapidir`
+    /// the command carries is `../src`, ONE level up, not a path that names the
+    /// package directory. A fixture that put the build dir outside the package
+    /// would pass while modelling a spelling no real edge emits.
+    ///
     /// THE NEGATIVE CONTROL IS THE SECOND HALF, and it carries the PAIR the
     /// guard needs: the same argv with `--vapidir` and `--pkg` pointing at a
     /// directory that holds no such vapi. Without it the first assertion could
@@ -8948,9 +8955,9 @@ mod its_and_swig_reader_tests {
         use super::Scratch;
         use std::path::Path;
         let d = Scratch::new(format!("nn-valac-read-{}", std::process::id()));
-        let bd = d.join("build");
-        std::fs::create_dir_all(d.join("umockdev-0.19.3/src")).unwrap();
+        let bd = d.join("umockdev-0.19.3/build");
         std::fs::create_dir_all(&bd).unwrap();
+        std::fs::create_dir_all(d.join("umockdev-0.19.3/src")).unwrap();
         std::fs::write(
             d.join("umockdev-0.19.3/src/libpcap.vapi"),
             "extern int x;\n",
@@ -8958,17 +8965,18 @@ mod its_and_swig_reader_tests {
         .unwrap();
         std::fs::write(d.join("umockdev-0.19.3/src/absent.vapi"), "nope\n").unwrap();
 
-        // A RELATIVE --vapidir, which is the case the build tree actually
-        // produces, so the emit path under test is the one that runs.
+        // `../src`, the spelling the real edge carries once the ancestor
+        // rewrite has turned `/build/umockdev-0.19.3/src` into the climb
+        // that reaches it from the build dir.
         let got = valac_referenced_paths(
             &bd,
             Path::new(""),
-            &["../umockdev-0.19.3/src".to_string()],
+            &["../src".to_string()],
             &["libpcap".to_string(), "nothere".to_string()],
         );
         assert_eq!(
             got,
-            vec!["../umockdev-0.19.3/src/libpcap.vapi".to_string()],
+            vec!["../src/libpcap.vapi".to_string()],
             "the resolved package is carried, spelled relative to the build dir, \
              and the unresolvable one contributes nothing"
         );
