@@ -157,6 +157,16 @@ and key on `NIX_NINJA_TASK_ABI`, as nix maps `/bin/sh` through
 - A change altering what a task WRITES moves the generation and pays once;
   a fix to a task that previously FAILED moves nothing, and most fixes here
   are that kind. Turning it on is one last global re-key.
+- THE KNOB PROTECTS ONLY WHAT WAS CREATED AFTER IT WAS IN PLACE. A frozen
+  derivation protects itself by carrying the ALIAS as its `builder` with no
+  task store path among its `srcs`; one made before the alias carries the
+  store path directly and re-keys on a task-binary move however the knob is
+  set. MEASURED 2026-10-14: three drvs of the consumer's current round read
+  `builder: /nn-task/bin/nix-ninja-task` and name no task path, while an older
+  campaign's drv names `fwks8vlr...-nix-ninja-task-0.1.0` and would re-key.
+  So a cheap move is a claim about the DERIVATIONS, not about the knob: read
+  the failing drv's `builder` and `srcs` before saying a task-binary move is
+  free.
 - The dynamic class is covered transitively, witnessed on
   `example-dynamic-deps`. WHICH ARM RUNS IS GATED ON
   `config.is_output_derivation`: local mode (A, B, the consumer's route)
