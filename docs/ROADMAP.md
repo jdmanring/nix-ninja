@@ -500,11 +500,13 @@ groups. The work is therefore almost entirely group 2, which is a copy and one
 runner assumption, and group 3, which is the real cost.
 
 **Publishing is a copy; RUNNING is the cost, and the two are not the same
-size.** Measured over the same corpus: 78 of the 91 scripts invoke nix at all
-(a `build`, an `eval` or a `develop`). Most of the remaining 13 read a file this
-tree does not carry: `CLAUDE.md` is gitignored, so a clone has none of it, and a
-gate that reads it FAILS SPURIOUSLY there rather than reporting an answer -
-measured by hiding the file and running one, which printed
+size.** Measured over the same corpus: 77 of the 91 scripts invoke nix at all
+(a `build`, an `eval` or a `develop`), counting an invocation in CODE rather
+than any mention of the word, because one probe prints the words "nix builds at
+once" in an explanatory line and needs no nix whatsoever. Of the 14 that do not,
+most read a file this tree does not carry: `CLAUDE.md` is gitignored, so a clone
+has none of it, and a gate that reads it FAILS SPURIOUSLY there rather than
+reporting an answer - measured by hiding the file and running one, which printed
 `grep: CLAUDE.md: No such file or directory` and then two FAIL lines.
 
 4 of the 91 EXECUTE in a clean clone, checked out with `git clone` and run
@@ -535,11 +537,12 @@ needed no such change. CI runs the THREE that print a verdict, matching each
 gate's verdict text rather than its exit code, because the duplicate-predicate
 sweep exits non-zero by design.
 
-What remains is 87 scripts: each needs a reason stated where it is. The 78 that
-invoke nix need the experimental features in the daemon, a working store and
-time, which is the same prerequisite `nix flake check` has and the README
-states, and the other 9 need either an argument, a parent gate, or a subject
-turned into a fixture.
+What remains is 87 scripts: each needs a reason stated where it is, and
+`REASONS.md` beside them states it for all 87, derived rather than catalogued.
+The 77 that invoke nix need the experimental features in the daemon, a working
+store and time, which is the same prerequisite `nix flake check` has and the
+README states, and the other 10 need either an argument, a parent gate, a
+gitignored file, or a subject turned into a fixture.
 
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
