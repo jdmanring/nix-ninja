@@ -8913,7 +8913,11 @@ mod its_and_swig_reader_tests {
         std::fs::create_dir_all(d.join("umockdev-0.19.3/src")).unwrap();
         std::fs::create_dir_all(&bd).unwrap();
         // The file the command asks for, in the tree it points --vapidir at.
-        std::fs::write(d.join("umockdev-0.19.3/src/libpcap.vapi"), "extern int x;\n").unwrap();
+        std::fs::write(
+            d.join("umockdev-0.19.3/src/libpcap.vapi"),
+            "extern int x;\n",
+        )
+        .unwrap();
         let args: Vec<String> = [
             "valac",
             "--vapidir=/x/umockdev-0.19.3/src",
@@ -8947,7 +8951,11 @@ mod its_and_swig_reader_tests {
         let bd = d.join("build");
         std::fs::create_dir_all(d.join("umockdev-0.19.3/src")).unwrap();
         std::fs::create_dir_all(&bd).unwrap();
-        std::fs::write(d.join("umockdev-0.19.3/src/libpcap.vapi"), "extern int x;\n").unwrap();
+        std::fs::write(
+            d.join("umockdev-0.19.3/src/libpcap.vapi"),
+            "extern int x;\n",
+        )
+        .unwrap();
         std::fs::write(d.join("umockdev-0.19.3/src/absent.vapi"), "nope\n").unwrap();
 
         // A RELATIVE --vapidir, which is the case the build tree actually
