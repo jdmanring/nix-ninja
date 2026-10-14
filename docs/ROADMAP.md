@@ -537,12 +537,15 @@ needed no such change. CI runs the THREE that print a verdict, matching each
 gate's verdict text rather than its exit code, because the duplicate-predicate
 sweep exits non-zero by design.
 
-What remains is 87 scripts: each needs a reason stated where it is, and
-`REASONS.md` beside them states it for all 87, derived rather than catalogued.
-The 77 that invoke nix need the experimental features in the daemon, a working
-store and time, which is the same prerequisite `nix flake check` has and the
-README states, and the other 10 need either an argument, a parent gate, a
-gitignored file, or a subject turned into a fixture.
+What remains is 87 scripts, and each carries its reason in the corpus rather
+than in this repository: a `REASONS.md` beside the gates states one for every
+script, derived from the script itself rather than catalogued. The 77 that
+invoke nix need the experimental features in the daemon, a working store and
+time, which is the same prerequisite `nix flake check` has and the README
+states, and the other 10 need either an argument, a parent gate, a gitignored
+file, or a subject turned into a fixture. Those reasons are stated there and
+not here for the reason the whole corpus is: publishing it is work item 1, and
+a reason stated in this file would be a second copy to keep in step.
 
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
