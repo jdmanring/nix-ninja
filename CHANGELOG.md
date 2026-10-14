@@ -4,6 +4,13 @@ Every milestone the tree has reached, newest first, each pinned to the commits
 that delivered it and to the gate that verified it. A row is added when a
 deliverable is VERIFIED, not when work starts.
 
+"Newest first" orders by VERSION, then by date within a version: the rows run
+`0.3.0` before `0.2.0` before `0.1.0`, and each block newest date first. So a
+`0.1.0` row can carry a later date than the `0.2.0` block above it, because the
+version is the milestone the work satisfies and the date is when that work
+landed. Reading the table as date-ordered is the one mistake this sentence
+exists to prevent.
+
 The date is the day the row's work was last delivered, which is the date of the
 latest commit the row cites. It is not the day the work began and not the day
 the row was written.
