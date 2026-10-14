@@ -14740,7 +14740,35 @@ pub fn discover_c_includes(
     // already-declared headers and nothing else.
     let c_includes = {
         let mut v = c_includes;
-        let declaring: Vec<PathBuf> = v.iter().filter(|p| p.exists()).cloned().collect();
+        // THE TRANSLATION UNIT'S OWN TEXT IS A DEFINE SITE TOO, and it was
+        // the one file the reader never read. `declaring` was drawn from
+        // `c_includes`, which is a unit's INCLUDES, so a macro defined ONLY
+        // in the unit's body reached the reader at no point: mesa-libclc's
+        // `clc_native_log.cl:14` carries
+        // `#define __CLC_BODY <clc/shared/unary_def.inc>` in its own body,
+        // its includes define nothing, and `gentype.inc:89` then expands
+        // `#include __CLC_BODY` into a file nobody declared. MEASURED: 27 of
+        // this package's `clc/lib/generic` units do exactly that, and
+        // `clc/shared/unary_def.inc` has ZERO define sites in any header.
+        //
+        // `files` ALREADY HOLDS THE UNIT: it is the declared-input seed set
+        // the scan runs over, and the caller filters it to files (a
+        // directory is not a translation unit). Only files that EXIST and
+        // are not already in the scan set are added, so a unit already in
+        // `v` is not read twice.
+        let mut declaring: Vec<PathBuf> = v
+            .iter()
+            .chain(files.iter())
+            .filter(|p| p.exists() && !p.is_dir())
+            .cloned()
+            .collect();
+        // A PROPER DEDUP, not `Vec::dedup`, which removes only ADJACENT
+        // repeats: the two lists overlap and a surviving duplicate would
+        // inflate the count the CAP below is compared against.
+        {
+            let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+            declaring.retain(|p| seen.insert(p.clone()));
+        }
         if declaring.len() <= MACRO_ARM_SCAN_CAP {
             // THE ARM READER NEEDS THE DIRECTORIES THE COMMAND GIVES, NOT THE
             // ONES THE TASK MUST CREATE. `include_dirs_named` answers the
@@ -18231,6 +18259,71 @@ mod macro_arm_headers_tests {
                 "a reader must emit a relative spelling or the wiring drops it; got {p:?}"
             );
         }
+    }
+
+    /// SHAPE B, THE DEFINE SITE IN THE TRANSLATION UNIT'S OWN BODY.
+    ///
+    /// THE FIXTURE IS PRODUCTION'S GEOMETRY, read from mesa-libclc's source:
+    /// `clc/lib/generic/math/clc_native_log.cl:14` carries
+    /// `#define __CLC_BODY <clc/shared/unary_def.inc>` in its OWN TEXT, its
+    /// includes (`clc/internal/clc.h`, `clc/math/gentype.inc`) define
+    /// nothing, and `clc/shared/unary_def.inc` is named by NO header anywhere
+    /// in the tree (99 define sites, all `.cl`, zero `.h`). 27 of that
+    /// package's `clc/lib/generic` units do exactly this, so fixing shape A
+    /// alone unmasks this one rather than closing the package.
+    ///
+    /// WHAT MAKES IT PASS: the unit is in the DECLARED INPUT SET, which is
+    /// what `files` holds at the call site, and the caller now adds those to
+    /// the set the reader scans for defines. Handing the reader ONLY the
+    /// includes reproduces the defect, and that is the negative control.
+    #[test]
+    fn a_define_in_the_translation_units_own_body_names_its_arm() {
+        use super::relative_from;
+        let root = Scratch::new(format!("nn-arm-body-{}", std::process::id()));
+        let build = root.join("build");
+        fs::create_dir_all(root.join("clc/include/clc/shared")).unwrap();
+        fs::create_dir_all(root.join("clc/math")).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::write(root.join("clc/include/clc/shared/unary_def.inc"), "\n").unwrap();
+        // The unit itself: the define lives HERE and nowhere else.
+        let unit = root.join("clc/math/clc_native_log.cl");
+        fs::write(
+            &unit,
+            "#include <clc/internal/clc.h>\n#define __CLC_BODY <clc/shared/unary_def.inc>\n#include <clc/math/gentype.inc>\n",
+        )
+        .unwrap();
+        // The only other file the scan reaches, and it defines nothing.
+        let inc = root.join("clc/math/gentype.inc");
+        fs::write(&inc, "#include __CLC_BODY\n").unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&build).unwrap();
+        let dirs: Vec<PathBuf> = vec![
+            relative_from(&root.join("clc/include"), &build).unwrap(),
+            relative_from(&root.join("clc/math"), &build).unwrap(),
+        ];
+        // NEGATIVE CONTROL: the includes alone, which is what `declaring` was
+        // drawn from. The unit's define is invisible and the arm is dropped.
+        let without_unit = macro_arm_headers(&build, &dirs, std::slice::from_ref(&inc));
+        // SUBJECT: includes PLUS the unit, which is what the caller passes.
+        let with_unit = macro_arm_headers(&build, &dirs, &[inc.clone(), unit.clone()]);
+        std::env::set_current_dir(prev).unwrap();
+
+        let name_of = |v: &[PathBuf]| -> Vec<String> {
+            v.iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert!(
+            name_of(&without_unit).is_empty(),
+            "control: the arm is invisible when only includes are scanned; got {:?}",
+            name_of(&without_unit)
+        );
+        assert!(
+            name_of(&with_unit).contains(&"unary_def.inc".to_string()),
+            "the unit's own define names an arm and must be carried; got {:?}",
+            name_of(&with_unit)
+        );
     }
 }
 
