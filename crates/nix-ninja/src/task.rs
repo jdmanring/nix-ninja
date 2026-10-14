@@ -96,6 +96,17 @@ pub struct Tools {
 /// nobody would ever report because the build succeeds. Both resolve to
 /// binutils, already in the closure of anything carrying a compiler.
 ///
+/// `ldd` IS THAT SAME DEFER TRIGGER FIRING, and it sits UPSTREAM of the whole
+/// introspection toolchain. `g-ir-scanner`'s `giscanner/shlibs.py`
+/// `_resolve_non_libtool` runs `subprocess.check_output(['ldd', ...])` to
+/// resolve a library's dependencies, so a task with no `ldd` on PATH dies
+/// `FileNotFoundError: [Errno 2] No such file or directory: 'ldd'`. Measured
+/// 2026-10-13 from the failing tasks' own leaf logs: colord's
+/// `lib-colord-colord.vapi` and libgweather's `libgweather/GWeather-4.0.gir`
+/// are the SAME failure, one line, and accountsservice's `AccountsService-1.0.gir`
+/// behind them. It resolves to glibc's `-bin` output, already in the closure of
+/// anything carrying a compiler.
+///
 /// HOW MANY OF THESE ACTUALLY RESOLVE IS A PROPERTY OF THE STDENV, NOT OF
 /// THIS LIST, so the length of the array is not a claim about the sandbox.
 /// Under this flake's own devShell, three resolve into the store (`sed` ->
@@ -109,7 +120,7 @@ pub struct Tools {
 /// measurement enumerates this population and only a build can report a
 /// member. A trigger phrased as "when someone notices the closure cost"
 /// would never fire.
-const SCRIPT_TOOLS: [&str; 7] = ["sed", "awk", "grep", "m4", "xxd", "nm", "readelf"];
+const SCRIPT_TOOLS: [&str; 8] = ["sed", "awk", "grep", "m4", "xxd", "nm", "readelf", "ldd"];
 
 impl Tools {
     pub fn new(store_dir: &StoreDir) -> Result<Self> {
