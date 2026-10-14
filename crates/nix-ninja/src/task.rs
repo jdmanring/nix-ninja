@@ -17839,6 +17839,7 @@ mod staged_output_name_tests {
 #[cfg(test)]
 mod macro_arm_headers_tests {
     use super::macro_arm_headers;
+    use super::Scratch;
     use std::fs;
     use std::path::PathBuf;
 
@@ -18088,6 +18089,84 @@ mod macro_arm_headers_tests {
         assert!(
             names.contains(&"unary_decl.inc".to_string()),
             "a single define site still names a file the task must carry; got {names:?}"
+        );
+    }
+
+    /// THE PRE-FIX READING, and the name says so: this test asserts the
+    /// DEFECT, so it goes RED when the fix lands and must be flipped in the
+    /// same commit that flips the behaviour. That is the corpus convention
+    /// (`run-all.sh`: "each was written to REPRODUCE a defect, so its
+    /// headline verdict is the PRE-FIX one").
+    ///
+    /// MEASURED 2026-10-14 on mesa-libclc 22.1.8.3's own failing task
+    /// (`00s871wf4mwnsyf9m1q15ywiwpsl65px-ninja-build.drv`, parent
+    /// `fzsash3cjn2vjb4addvnshlhjrhw2dcp-mesa-libclc-22.1.8.3.drv`), read from
+    /// the derivation's `args`, not from a round summary:
+    ///
+    ///     cd /build/source/build && clang ... -I/build/source/clc/include
+    ///       -I/build/source/clc/lib/generic/math ...
+    ///
+    /// The build dir is `/build/source/build` and BOTH `-I` directories sit
+    /// ABOVE it. `include_dirs_named` DROPS every absolute entry it cannot
+    /// `strip_prefix(build_dir)` (its own `Err(_) => continue`), so the arm
+    /// resolver is handed an EMPTY list, falls to `build_dir.join(<arm>)` =
+    /// `/build/source/build/clc/shared/unary_decl.inc`, finds no file, and
+    /// silently drops the arm. The task's own input set corroborates it: the
+    /// drv declares `../clc/include/clc/integer/clc_clz.h` and
+    /// `../clc/include/clc/integer/gentype.inc` (literal includes, which the
+    /// SCANNER resolves through its own flag reader) and NOT
+    /// `clc/shared/unary_decl.inc` (a macro operand, resolved by this reader
+    /// through the other one). TWO READERS OF ONE FLAG SET, diverging: this is
+    /// exactly what `include_dirs_as_given`'s doc comment warns about, and it
+    /// already exists and is already used by the forced-include reader.
+    ///
+    /// THE FIX IS NOT LANDED and is not obvious: passing the absolute entries
+    /// resolves the arm but yields an ABSOLUTE spelling, which the wiring
+    /// filters then drop in silence (CLAUDE.md: "a reader must emit RELATIVE
+    /// spellings"). So the fix must keep the entry as a CLIMB
+    /// (`../clc/include`) rather than drop it or absolutise it, and it adds an
+    /// input to every compile whose headers name such an arm, which re-keys
+    /// compile tasks and needs a price. Shape and evidence:
+    /// `local/pending/next-rekey-batch.md` 2026-10-14.
+    #[test]
+    fn an_arm_above_the_build_dir_is_dropped_by_the_named_include_dirs() {
+        use super::include_dirs_named;
+        let root = Scratch::new(format!("nn-arm-above-{}", std::process::id()));
+        let build = root.join("build");
+        fs::create_dir_all(root.join("clc/include/clc/integer")).unwrap();
+        fs::create_dir_all(root.join("clc/include/clc/shared")).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::write(root.join("clc/include/clc/shared/unary_decl.inc"), "\n").unwrap();
+        let header = root.join("clc/include/clc/integer/clc_clz.h");
+        fs::write(&header, "#define __CLC_BODY <clc/shared/unary_decl.inc>\n").unwrap();
+
+        // THE TWO CALLS THE CALLER MAKES, IN ORDER, because the DROP is the
+        // subject and a test that hands the reader its dirs directly bypasses
+        // it - the defect the row above records, one level down.
+        let cmdline = format!(
+            "clang -I{0}/clc/include -I{0}/clc/lib/generic/math -c a.cl -o a.bc",
+            root.display()
+        );
+        let dirs: Vec<PathBuf> = include_dirs_named(&cmdline, &build)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        assert!(
+            dirs.is_empty(),
+            "DEFECT, pre-fix reading: an absolute -I above the build dir is \
+             dropped rather than kept as a climb; got {dirs:?}"
+        );
+
+        let got = macro_arm_headers(&build, &dirs, std::slice::from_ref(&header));
+        let names: Vec<String> = got
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.is_empty(),
+            "DEFECT, pre-fix reading: the arm the header names resolves above \
+             the build dir, exists on disk, and is dropped in silence; got \
+             {names:?}"
         );
     }
 }
