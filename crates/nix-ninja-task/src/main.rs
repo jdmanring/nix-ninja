@@ -195,16 +195,69 @@ fn main() -> Result<()> {
     // measured on B). Partition those inputs out and COPY them, writable,
     // after the links, so the command edits real files and the edited tree
     // is what the output captures.
+    // A FILE THIS TASK BOTH RECEIVES AND DECLARES AS AN OUTPUT IS IN THE
+    // SAME POSITION AS THE DIRECTORY ABOVE, and the reason is the same: the
+    // command WRITES it. `create_symlinks` would place it as a link into the
+    // read-only store, and the write then fails. Measured on mesa-libclc
+    // 22.1.8.3, where CMake declares the transformed depfile
+    // `CMakeFiles/d/<hash>.d` as BOTH an input of the compile edge and one of
+    // its outputs: the command's second half,
+    // `cmake -E cmake_transform_depfile ... <raw .d> <CMakeFiles/d/<hash>.d>`,
+    // tried to write through the store link and exited **2 with NO output at
+    // all**, so the task reported `Failed with exit code 2` over an empty
+    // transcript and the failure looked like a reader or a race. It is
+    // neither: it is a 0444 file. Reproduced from the kept tree - the same
+    // command returns 2 against the link and 0 against a writable file.
+    //
+    // ONLY A DIRECTORY WAS DIVERTED BEFORE (`is_dir()`), because the case
+    // that motivated the partition was ExternalProject's patch step, which
+    // edits a TREE. A single FILE with the same in-and-out collision fell
+    // through to `create_symlinks`.
     let declared: std::collections::HashSet<&std::path::Path> =
         outputs.iter().map(|o| o.build_path.as_path()).collect();
-    let (edit_in_place, inputs): (Vec<DerivedFile>, Vec<DerivedFile>) =
-        inputs.into_iter().partition(|i| {
-            declared.contains(i.build_path.as_path()) && i.absolute_path(&cli.store_dir).is_dir()
-        });
+    let (edit_in_place, inputs): (Vec<DerivedFile>, Vec<DerivedFile>) = inputs
+        .into_iter()
+        .partition(|i| declared.contains(i.build_path.as_path()));
     create_symlinks(&build_dir, &cli.store_dir, inputs, false)?;
     for tree in &edit_in_place {
         let dst = build_dir.join(&tree.build_path);
-        copy_tree(&tree.absolute_path(&cli.store_dir), &dst)?;
+        let src = tree.absolute_path(&cli.store_dir);
+        // A DIRECTORY IS COPIED WHOLE; A FILE IS COPIED AS ITSELF. The tree
+        // case needs `copy_tree` because the command edits files INSIDE it;
+        // a single file needs only a writable copy of its own bytes.
+        if src.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else if let Some(parent) = dst.parent() {
+            // THE DESTINATION MAY ALREADY BE THE STORE LINK, because a
+            // previous pass or an earlier placement put it there; `fs::copy`
+            // then opens the LINK's target, which is read-only, and dies
+            // EACCES (measured: "copy(...): Permission denied"). The link has
+            // to go first.
+            fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("create_dir_all({}): {e}", parent.display()))?;
+            if fs::symlink_metadata(&dst).is_ok() {
+                fs::remove_file(&dst).map_err(|e| {
+                    anyhow::anyhow!(
+                        "remove_file({}) before copying its input: {e}",
+                        dst.display()
+                    )
+                })?;
+            }
+            fs::copy(&src, &dst).map_err(|e| {
+                anyhow::anyhow!("copy({} -> {}): {e}", src.display(), dst.display())
+            })?;
+            // THE STORE'S MODE IS 0444 AND `fs::copy` CARRIES IT, which would
+            // leave the file as unwritable as the link it replaces and move
+            // the failure one step rather than removing it. OWNER-WRITE ONLY,
+            // the same `mode() | 0o200` this tree uses in
+            // `local::write_restored`: `set_readonly(false)` would clear every
+            // write bit and make the file world-writable, which clippy
+            // refuses and which is not what a build tree needs.
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&dst)?.permissions();
+            perms.set_mode(perms.mode() | 0o200);
+            fs::set_permissions(&dst, perms)?;
+        }
     }
 
     // Configure-time alias symlinks the driver harvested from the build
