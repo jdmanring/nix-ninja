@@ -20,7 +20,7 @@ are met and `0.3` is in progress rather than finished, which is why its open
 classes are listed below. A reader should not take the number as a claim that
 the milestone it names is complete.
 
-The state of the tree TODAY, class by class, is a table of 94 rows. It is not in
+The state of the tree TODAY, class by class, is a table of 95 rows. It is not in
 this repository: it grew beside a private distribution and is development
 material rather than a public document, which is the same reason the gate corpus
 is not here (`0.5`). What this file carries is the part that is publishable now,
@@ -136,17 +136,19 @@ binary had to learn:
 
 Every one is closed against an instrument that fails on the revision before its
 fix. How many of those instruments are in THIS repository is a question the
-gate cell answers differently by how it is read: counting a row whose gate
-names a file under `tests/` or a `*_tests` symbol gives 8 of 89, allowing a
-unit test described in prose gives 11, and allowing "mutation-check" as well
-gives 15. Whichever predicate is used the answer is a small minority, so the
-honest statement is that most classes are verified by the gate corpus, which is
-not published yet, and a reader has this file's word rather than a test they can
-run; closing that is `0.5` and work item 1. This paragraph previously said
-"most of those instruments are covered by a test in this repository", which
-every reading of the count inverts. The trap that recurs: a reader emitting an
-absolute spelling is dropped in silence by the wiring filters, so it looks
-fixed and changes nothing.
+gate cell answers differently by how it is read: counting a row whose GATE cell
+names a file under `tests/` or a `*_tests` symbol gives 5 of 95, also allowing
+a test named in prose gives 20, and allowing "mutation-check" as well gives 24.
+These are read from the table, not from this paragraph, so they move when a row
+lands; re-derive them by parsing the gate cell rather than copying these
+numbers. Whichever predicate is used the answer is a minority, so the honest
+statement is that most classes are verified by the gate corpus, which is not
+published yet, and a reader has this file's word rather than a test they can
+run; closing that is `0.5` and work item 1. The earlier form of this paragraph
+said "most of those instruments are covered by a test in this repository",
+which every reading of the count inverts. The trap that recurs: a reader
+emitting an absolute spelling is dropped in silence by the wiring filters, so
+it looks fixed and changes nothing.
 
 EXIT CRITERION: the corpus passes on both configurations, and every class
 carries a gate arm, a named reason it cannot, or a witness on a real package.
