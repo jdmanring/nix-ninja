@@ -1,5 +1,9 @@
 use anyhow::Context;
 use anyhow::{anyhow, Result};
+// The dynamic section is read directly rather than through `patchelf`, so the
+// predicate needs none of the task PATH; see `origin_relative_executable`.
+use elf::endian::AnyEndian;
+use elf::ElfBytes;
 use harmonia_store_derivation::derived_path::SingleDerivedPath;
 use harmonia_store_derivation::placeholder::StorePathOrPlaceholder;
 use harmonia_store_path::StoreDir;
@@ -183,6 +187,94 @@ pub fn header_like(p: &Path) -> bool {
         p.extension().and_then(|e| e.to_str()),
         Some("h" | "H" | "hh" | "hp" | "hpp" | "hxx" | "h++" | "inc" | "ipp" | "inl" | "tcc")
     )
+}
+
+/// Whether an input is a BUILD-TREE EXECUTABLE whose loader search path is
+/// `$ORIGIN`-relative, and so must be placed as a COPY rather than a symlink
+/// into the store.
+///
+/// THE SAME SHAPE AS THE `.py` AND `node_modules` ARMS ABOVE, one level down:
+/// those exist because a script that realpaths itself lands in the store where
+/// its data siblings are not. An ELF with a `$ORIGIN` entry in its RUNPATH has
+/// the identical problem, because `$ORIGIN` is the directory of the RESOLVED
+/// executable. A symlink into the store therefore makes `$ORIGIN/../orc` mean
+/// the STORE's `orc/`, which does not exist, while the sibling library sits in
+/// the build tree's `orc/` the whole time.
+///
+/// MEASURED 2026-10-14 on orc 0.4.44, and proven by difference on the real
+/// binary in one directory: `tools/orc`'s `orcc` (RUNPATH
+/// `$ORIGIN/../orc`) RUNS as a real file beside `orc/liborc-0.4.so.0`, and
+/// dies `error while loading shared libraries: liborc-0.4.so.0` as a symlink
+/// into the store. Five task derivations failed this way in the round.
+///
+/// A REAL-NINJA DIVERGENCE, which is what makes it the driver's: in a real
+/// build dir the tool IS a real file, so `$ORIGIN` means the build tree and
+/// ninja succeeds. Only this placement breaks it.
+///
+/// NARROW BY CONSTRUCTION. It asks for a `$ORIGIN` entry specifically, so a
+/// tool with an absolute RUNPATH - every compiler wrapper - keeps its symlink
+/// and no task gains a copy it did not need. The alternative, copying every
+/// ELF input, would copy whole toolchains into every task.
+fn origin_relative_executable(source_path: &Path) -> bool {
+    // READ THE DYNAMIC SECTION DIRECTLY RATHER THAN SHELLING OUT TO patchelf.
+    // The first version called `patchelf --print-rpath`, which needs patchelf
+    // on PATH - true inside a task, so it would have worked in production, BUT
+    // the predicate answers `false` whenever the command is missing, so a task
+    // without it would silently place a tool as a symlink and the orc failure
+    // would return with no diagnostic. Its own test caught exactly that: the
+    // predicate returned false for `orcc` on a host without patchelf. The
+    // `elf` crate is already a dependency of this crate (patchelf.rs uses it),
+    // so this reads the same bytes without a subprocess.
+    let Ok(data) = fs::read(source_path) else {
+        return false;
+    };
+    let Ok(elf) = ElfBytes::<AnyEndian>::minimal_parse(&data) else {
+        return false;
+    };
+    // Only a dynamic object can carry RUNPATH. `ET_REL` objects cannot, and
+    // asking them is wasted work in every compile's own inputs.
+    if !matches!(elf.ehdr.e_type, elf::abi::ET_EXEC | elf::abi::ET_DYN) {
+        return false;
+    }
+    let Ok(Some(dyns)) = elf.dynamic() else {
+        return false;
+    };
+    // The dynamic table's strings live in `.dynstr`, reached through the
+    // section headers. A FILE WITH NO SECTION HEADERS STILL HAS RUNPATH (the
+    // loader reads PT_DYNAMIC), so this answers false there rather than
+    // guessing - the polarity the whole predicate uses: an unclassifiable
+    // file is placed the way it always was.
+    let Ok((shdrs, strtab)) = elf.section_headers_with_strtab() else {
+        return false;
+    };
+    let (Some(shdrs), Some(strtab)) = (shdrs, strtab) else {
+        return false;
+    };
+    let Some(dynstr) = shdrs.iter().find(|sh| {
+        strtab
+            .get(sh.sh_name as usize)
+            .is_ok_and(|n| n == ".dynstr")
+    }) else {
+        return false;
+    };
+    let Ok(dynstr_bytes) = elf.section_data(&dynstr) else {
+        return false;
+    };
+    let strs = elf::string_table::StringTable::new(dynstr_bytes.0);
+    // `DT_RUNPATH` is the modern entry and `DT_RPATH` the legacy one; glibc
+    // reads both, so both are asked.
+    let mut entries: Vec<String> = Vec::new();
+    for d in dyns.iter() {
+        if d.d_tag == elf::abi::DT_RUNPATH || d.d_tag == elf::abi::DT_RPATH {
+            if let Ok(s) = strs.get(d.d_val() as usize) {
+                entries.push(s.to_string());
+            }
+        }
+    }
+    entries.iter().any(|raw| {
+        raw.split(':')
+            .any(|e| e.starts_with("$ORIGIN") || e.starts_with("${ORIGIN}"))
+    })
 }
 
 /// What a placement should point AT: the store object's own link text when
@@ -461,7 +553,8 @@ pub fn create_symlinks(
                 || input
                     .build_path
                     .components()
-                    .any(|c| c.as_os_str() == "node_modules"));
+                    .any(|c| c.as_os_str() == "node_modules")
+                || origin_relative_executable(&source_path));
         if copy_not_link {
             // THE DUPLICATE CHECK ABOVE ASKS ONLY ABOUT LINKS, and a copied
             // header is not one. The driver keys its input set by the build
@@ -894,5 +987,57 @@ mod encoded_list_tests {
         let raw = format!("a:b:{sep}c:d:{sep}", sep = ENCODED_LIST_SEP);
         assert_eq!(split_encoded_list(&raw).count(), 2);
         assert_eq!(split_encoded_list("").count(), 0);
+    }
+
+    /// THE PREDICATE THAT DECIDES A PLACEMENT, against REAL store ELFs rather
+    /// than fixtures: this crate has no dev-dependencies on purpose (see the
+    /// note in `link_tree_tests`), and a hand-built ELF would be a fixture
+    /// whose bytes drift from what the loader actually reads.
+    ///
+    /// orc 0.4.44's `orcc` carries `$ORIGIN/../orc` in its RUNPATH, which is
+    /// the shape that must be COPIED. A compiler wrapper carries absolute
+    /// store paths and must stay a SYMLINK, and it is the negative control: a
+    /// predicate that simply answered true would copy whole toolchains into
+    /// every task.
+    #[test]
+    fn an_origin_relative_tool_is_recognised_and_an_absolute_one_is_not() {
+        use super::origin_relative_executable;
+        use std::path::Path;
+
+        // THE FIXTURES ARE ASSERTED PRESENT, NOT MERELY USED IF PRESENT. An
+        // `if path.exists()` arm passes on a machine where the store has been
+        // collected, which is the "green while proving nothing" shape this
+        // tree records: a test that cannot run must be LOUD, not silent. These
+        // are real store paths rather than fixtures because a hand-built ELF
+        // would be a second parser's idea of one.
+        let orcc = Path::new(
+            "/nix/store/4m052g3ncdx7iq0krjpk6rqq6lyswqbr-ninja-build-tools-orcc/tools/orcc",
+        );
+        assert!(
+            orcc.exists(),
+            "NO ANSWER: orcc is not in the store, so this arm cannot be exercised"
+        );
+        assert!(
+            origin_relative_executable(orcc),
+            "orcc carries $ORIGIN/../orc and must be placed as a copy"
+        );
+
+        // The negative control: a real compiler wrapper, absolute RUNPATH.
+        let cc =
+            Path::new("/nix/store/dw180d0daxdazdp4mnj7n7yhw3326hhq-gcc-wrapper-16.2.0/bin/g++");
+        assert!(
+            cc.exists(),
+            "NO ANSWER: the gcc wrapper is not in the store, so this control cannot be exercised"
+        );
+        assert!(
+            !origin_relative_executable(cc),
+            "a wrapper with an absolute RUNPATH must keep its symlink"
+        );
+
+        // A file that is not ELF, and one that does not exist, both answer
+        // false: the predicate decides a placement and an unclassifiable file
+        // is placed the way it always was.
+        assert!(!origin_relative_executable(Path::new("/etc/hostname")));
+        assert!(!origin_relative_executable(Path::new("/nonexistent/nope")));
     }
 }
