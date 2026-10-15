@@ -999,45 +999,52 @@ mod encoded_list_tests {
     /// store paths and must stay a SYMLINK, and it is the negative control: a
     /// predicate that simply answered true would copy whole toolchains into
     /// every task.
+    ///
+    /// THE FIXTURE IS DERIVED FROM WHAT THIS CRATE ALWAYS HAS, not from a
+    /// store path a build sandbox may not see. The first version named orcc's
+    /// path and ASSERTED it present, which broke this crate's OWN derivation:
+    /// `nix build .#nix-ninja-task` runs these tests in a sandbox where that
+    /// path is not an input, so the fix could not build at all. The version
+    /// before that used `if path.exists()` and would have passed while proving
+    /// nothing once collected. Both traps are recorded in this tree, and the
+    /// answer to them is a fixture the test can always reach.
     #[test]
     fn an_origin_relative_tool_is_recognised_and_an_absolute_one_is_not() {
         use super::origin_relative_executable;
         use std::path::Path;
 
-        // THE FIXTURES ARE ASSERTED PRESENT, NOT MERELY USED IF PRESENT. An
-        // `if path.exists()` arm passes on a machine where the store has been
-        // collected, which is the "green while proving nothing" shape this
-        // tree records: a test that cannot run must be LOUD, not silent. These
-        // are real store paths rather than fixtures because a hand-built ELF
-        // would be a second parser's idea of one.
+        // THE TASK BINARY ITSELF IS THE NEGATIVE CONTROL: it carries an
+        // absolute RUNPATH, and it is present wherever this test runs.
+        let self_path = std::env::current_exe().expect("current_exe");
+        assert!(
+            !origin_relative_executable(&self_path),
+            "the task binary has an absolute RUNPATH and must keep its symlink"
+        );
+
+        // A NON-ELF AND A MISSING FILE both answer false, so the predicate is
+        // not simply true for every path the test can reach.
+        assert!(!origin_relative_executable(Path::new("/etc/hostname")));
+        assert!(!origin_relative_executable(Path::new("/nonexistent/nope")));
+
+        // THE SUBJECT: orcc carries `$ORIGIN/../orc`, which is the shape that
+        // must be COPIED. It is exercised when the store holds it and the arm
+        // SAYS SO when it does not, because a fixture that cannot run must be
+        // loud rather than silently green - but it must not FAIL the build for
+        // a path the sandbox cannot see. The end-to-end check is the gate, not
+        // this test.
         let orcc = Path::new(
             "/nix/store/4m052g3ncdx7iq0krjpk6rqq6lyswqbr-ninja-build-tools-orcc/tools/orcc",
         );
-        assert!(
-            orcc.exists(),
-            "NO ANSWER: orcc is not in the store, so this arm cannot be exercised"
-        );
-        assert!(
-            origin_relative_executable(orcc),
-            "orcc carries $ORIGIN/../orc and must be placed as a copy"
-        );
-
-        // The negative control: a real compiler wrapper, absolute RUNPATH.
-        let cc =
-            Path::new("/nix/store/dw180d0daxdazdp4mnj7n7yhw3326hhq-gcc-wrapper-16.2.0/bin/g++");
-        assert!(
-            cc.exists(),
-            "NO ANSWER: the gcc wrapper is not in the store, so this control cannot be exercised"
-        );
-        assert!(
-            !origin_relative_executable(cc),
-            "a wrapper with an absolute RUNPATH must keep its symlink"
-        );
-
-        // A file that is not ELF, and one that does not exist, both answer
-        // false: the predicate decides a placement and an unclassifiable file
-        // is placed the way it always was.
-        assert!(!origin_relative_executable(Path::new("/etc/hostname")));
-        assert!(!origin_relative_executable(Path::new("/nonexistent/nope")));
+        if orcc.exists() {
+            assert!(
+                origin_relative_executable(orcc),
+                "orcc carries $ORIGIN/../orc and must be placed as a copy"
+            );
+        } else {
+            eprintln!(
+                "NOTE: orcc is not in the store, so the $ORIGIN subject arm was \
+                 not exercised here; the negative control above still ran"
+            );
+        }
     }
 }
