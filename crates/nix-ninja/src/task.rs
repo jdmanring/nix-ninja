@@ -16203,6 +16203,21 @@ mod self_rss_tests {
 #[cfg(test)]
 static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// THE SAME DEFECT AS THE LOCK ABOVE, ONE LEVEL DOWN, and it is why this file
+/// has a second file-scope lock rather than a second per-module one. The
+/// process working directory is global, cargo runs tests on threads, and
+/// `CHDIR_LOCK` lived INSIDE `create_symlink_undeclared_output_tests`, so every
+/// chdir test in `macro_arm_headers_tests` could not take it and took nothing.
+/// They were green only while nothing overlapped their window; adding two
+/// tests anywhere in the file shifted the schedule and three of them began
+/// failing at random (`an_arm_above_the_build_dir_resolves_through_the_include_
+/// chain`, `a_define_in_the_translation_units_own_body_names_its_arm`,
+/// `angle_include_resolves_against_dash_i_dot`). MEASURED 2026-10-14: the same
+/// flake reproduces on the commit BEFORE the change that exposed it, 3 runs in
+/// 6, so it is the lock's scope and not the new tests.
+#[cfg(test)]
+static CHDIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod ninja_pool_tests {
     use super::OUT_ENV_LOCK;
@@ -17016,9 +17031,6 @@ mod create_symlink_undeclared_output_tests {
         );
     }
 
-    /// This test changes the process working directory, which is global.
-    static CHDIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// glib, and the FIFTH member of the empty-parent class. A one-component
     /// relative directory has parent `Some("")`, `read_dir("")` is ENOENT,
     /// and the error propagates out of the closure walk, so the whole
@@ -17115,7 +17127,11 @@ mod create_symlink_undeclared_output_tests {
         // include that is missing fails as "No such file", loudly and at the
         // right place. An angle include that is missing SUCCEEDS at finding
         // the wrong file.
-        let _g = CHDIR_LOCK.lock().unwrap();
+        // A POISONED LOCK IS RECOVERED FROM, NOT PROPAGATED. One failing test
+        // would otherwise turn every other chdir test into a lock error, and
+        // the panic it reports names the mutex rather than the assertion that
+        // failed - which is the wrong place to send a reader.
+        let _g = CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = super::Scratch::new(format!("nn-angle-i-{}", std::process::id()));
         std::fs::write(dir.join("wchar.h"), b"#ifndef GEN_WCHAR\n#define GEN_WCHAR\nstatic void mbszero(void*p){(void)p;}\n#endif\n").unwrap();
         std::fs::write(dir.join("config.h"), b"#define PACKAGE \"m4\"\n").unwrap();
@@ -18146,6 +18162,7 @@ mod staged_output_name_tests {
 mod macro_arm_headers_tests {
     use super::macro_arm_headers;
     use super::Scratch;
+    use super::CHDIR_LOCK;
     use std::fs;
     use std::path::PathBuf;
 
@@ -18458,7 +18475,10 @@ mod macro_arm_headers_tests {
         // RELATIVE include dir against that cwd. A test that does not chdir
         // resolves every relative entry against the repo root and reads a
         // fix as broken - so chdir here is part of the fixture, not
-        // convenience.
+        // convenience. The lock is taken because the cwd is PROCESS-GLOBAL
+        // and cargo runs tests on threads: without it this test and the
+        // other chdir tests in this file interleave and fail at random.
+        let _cwd = CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&build).unwrap();
         let named: Vec<PathBuf> = super::include_dirs_named(&cmdline, &build)
@@ -18548,6 +18568,8 @@ mod macro_arm_headers_tests {
         let inc = root.join("clc/math/gentype.inc");
         fs::write(&inc, "#include __CLC_BODY\n").unwrap();
 
+        // Same global-cwd contract as the arm above, so the same lock.
+        let _cwd = CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&build).unwrap();
         let dirs: Vec<PathBuf> = vec![
