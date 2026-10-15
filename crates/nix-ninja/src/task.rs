@@ -19153,49 +19153,93 @@ mod cmake_autogen_reader_tests {
 #[cfg(test)]
 mod input_shipping_tests {
     use super::input_shipping;
-    use harmonia_store_path::StoreDir;
+    use harmonia_store_path::{StoreDir, StorePath};
+    use std::path::{Path, PathBuf};
+
+    // Nix's own hash alphabet: no `e`, `o`, `u` or `t`, so these decode as hashes.
+    const HASH_WRAPPER: &str = "0123456789abcdfghijklmnpqrsvwxyz";
+
+    /// A second hash, DERIVED from the alphabet rather than typed, so its length
+    /// cannot drift from the 32 the parser requires.
+    fn hash_bash() -> String {
+        HASH_WRAPPER.chars().rev().collect()
+    }
+
+    /// A store object the arm BUILDS, in a directory the arm owns, optionally
+    /// shipping one relative file.
+    ///
+    /// THE ARM BUILDS ITS SUBJECT, and that is the whole point of this helper.
+    /// Its first version named two LITERAL store paths that happened to be
+    /// resident on the machine the test was written on, so it passed there and
+    /// FAILED on any host where those exact objects were not in the store - the
+    /// reader was fine and the fixture was a property of one machine. It was
+    /// reported red from another session's host before this was written, and the
+    /// shape is already on record twice: `7296100` (green locally, red in CI
+    /// across commits differing only in unrelated files) and `emission-price.sh`,
+    /// whose pricer returned FREE on a host where the tool it priced was not
+    /// reachable. A gate input that does not survive is not an instrument.
+    fn object(dir: &Path, hash: &str, name: &str, ships: Option<&str>) -> StorePath {
+        assert_eq!(hash.len(), 32, "a store hash is 32 characters");
+        let sp = StorePath::from_base_path(&format!("{hash}-{name}")).unwrap();
+        if let Some(rel) = ships {
+            let f = sp.to_absolute_path(&StoreDir::new(dir).unwrap()).join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, b"#!/bin/sh\nexit 0\n").unwrap();
+        }
+        sp
+    }
+
+    /// A store-shaped directory for one arm, named so parallel arms do not share.
+    fn temp_store(tag: &str) -> (StoreDir, PathBuf) {
+        let root = std::env::temp_dir().join(format!("nn-ships-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        (StoreDir::new(root.clone()).unwrap(), root)
+    }
 
     /// THE ASK IS BY FILE, NOT BY NAME. `bin/ninja` is the case the helper was
     /// extracted from: a name test takes this driver's own `nix-ninja-0.1.0`
-    /// for the make program and misses a second resident ninja.
+    /// for the make program and misses a second resident ninja. The shipping
+    /// object is SECOND in the list here, so an ask that returns the first input
+    /// cannot pass.
     #[test]
     fn an_input_is_found_by_the_file_it_ships() {
-        let store_dir: StoreDir = "/nix/store".parse().unwrap();
-        // Real store objects, so the arm cannot be satisfied by a name.
-        let wrapper: harmonia_store_path::StorePath =
-            "j4nx9d7ipdqhncz8adnki7n90gmahhl3-pkg-config-wrapper-0.29.2"
-                .parse()
-                .unwrap();
-        let bash: harmonia_store_path::StorePath = "s9hw728xr5pdr1973yxqbc671gw0ziby-bash-5.3p15"
-            .parse()
-            .unwrap();
+        let (store_dir, root) = temp_store("find");
+        let wrapper = object(
+            &root,
+            HASH_WRAPPER,
+            "pkg-config-wrapper-0.29.2",
+            Some("bin/pkg-config"),
+        );
+        let bash = object(&root, &hash_bash(), "bash-5.3p15", Some("bin/bash"));
         let inputs = vec![bash.clone(), wrapper.clone()];
 
         assert_eq!(
             input_shipping(&store_dir, &inputs, "bin/pkg-config"),
             Some(wrapper),
-            "the wrapper ships bin/pkg-config and must be found"
+            "the wrapper ships bin/pkg-config and must be found behind bash"
         );
         assert_eq!(
             input_shipping(&store_dir, &inputs, "bin/bash"),
             Some(bash),
             "and the same ask finds a different file in a different input"
         );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// THE NEGATIVE CONTROL. An input that does not ship the file contributes
-    /// nothing, so the arm cannot be satisfied by returning the first input.
+    /// nothing, so the arm cannot be satisfied by returning the first input. The
+    /// object here is REAL and exists; it simply ships a different file.
     #[test]
     fn an_input_that_does_not_ship_the_file_is_not_returned() {
-        let store_dir: StoreDir = "/nix/store".parse().unwrap();
-        let bash: harmonia_store_path::StorePath = "s9hw728xr5pdr1973yxqbc671gw0ziby-bash-5.3p15"
-            .parse()
-            .unwrap();
+        let (store_dir, root) = temp_store("absent");
+        let bash = object(&root, &hash_bash(), "bash-5.3p15", Some("bin/bash"));
         assert_eq!(
             input_shipping(&store_dir, std::slice::from_ref(&bash), "bin/pkg-config"),
             None
         );
         assert_eq!(input_shipping(&store_dir, &[], "bin/pkg-config"), None);
         assert_eq!(input_shipping(&store_dir, &[bash], "bin/not-here"), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
