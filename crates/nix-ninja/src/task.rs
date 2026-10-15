@@ -1800,6 +1800,14 @@ impl Runner {
             let msgfmt_dirs = msgfmt_invocation(&args);
             let swig_i = swig_invocation(&args);
             let gir_filelists = gir_filelist_invocation(&args);
+            // A `g-ir-scanner` RUN NAMES ITS SOURCES POSITIONALLY when the edge
+            // carries no `--filelist`: meson emits them as bare names after the
+            // program (`g-ir-scanner app-indicator.c app-indicator.h
+            // --add-include-path=... --output ...`), and the edge declares none
+            // of them. The scanner resolves each against the process CWD, so a
+            // file that is absent there is fatal. Same undeclared-read family
+            // as the `--filelist` arm and the glib-mkenums reader.
+            let gir_positional = gir_positional_sources_invocation(&args);
             let protoc = protoc_invocation(&args);
             let valac = valac_invocation(&args);
             let mkenums = glib_mkenums_invocation(&args);
@@ -2363,6 +2371,17 @@ impl Runner {
             // the swig and msgfmt readers above.
             if let Some(filelists) = &gir_filelists {
                 for p in gir_filelist_referenced_paths(&self.config.build_dir, &cd_dir, filelists) {
+                    referenced.push(p);
+                }
+            }
+            // Same reader, the POSITIONAL spelling: the names the scanner opens
+            // are tokens, not a file's contents, so no file is read. They are
+            // resolved against the command's own directory, the way the
+            // glib-mkenums names are, because the edge below runs behind a
+            // `cd` prologue into the source tree while the build dir is its
+            // child.
+            if let Some(names) = &gir_positional {
+                for p in gir_positional_referenced_paths(&self.config.build_dir, &cmd_cwd, names) {
                     referenced.push(p);
                 }
             }
@@ -8806,6 +8825,77 @@ fn gir_filelist_referenced_paths(
     out
 }
 
+/// The source files a `g-ir-scanner` run names POSITIONALLY on its command
+/// line, with no `--filelist`. Meson's custom command passes them as bare
+/// names after the program token (`g-ir-scanner app-indicator.c
+/// app-indicator.h --add-include-path=... --output ...`), and the edge
+/// declares none of them. Only tokens that look like SOURCE files are
+/// carried: a bare name ending in a C-family suffix, which is what the
+/// scanner itself opens. `--output`'s value is NOT a source and is skipped
+/// explicitly, because the resolver carries only files that exist and a
+/// missing output would otherwise pass the filter in silence; `--include`
+/// names a GIR module, not a path, and every other flag starts with `-`.
+fn gir_positional_sources_invocation(args: &[String]) -> Option<Vec<String>> {
+    let program = args
+        .iter()
+        .position(|a| a.rsplit('/').next() == Some("g-ir-scanner"))?;
+    let mut out = Vec::new();
+    let mut it = args[program + 1..].iter().peekable();
+    while let Some(a) = it.next() {
+        if a == "--output" {
+            let _ = it.next();
+            continue;
+        }
+        if a.starts_with('-') {
+            continue;
+        }
+        // A bare name that is a C source or header. Anything else here is a
+        // value that lost its flag (a library name, a directory argument) and
+        // must not be declared as an input. The suffix set is the real
+        // population: three store `--filelist`s list `.c` and `.h` and nothing
+        // else, so a wider set would be speculation this arm cannot prove.
+        if matches!(a.rsplit('.').next(), Some("c") | Some("h")) {
+            out.push(a.clone());
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Resolve the positional sources against the directory the command runs in.
+/// Same shape as `glib_mkenums_referenced_paths`: the cwd the command
+/// establishes first, the build dir as a fallback, existence required, and the
+/// emitted spelling the climb back to the build dir rather than an absolute
+/// path the wiring would drop.
+fn gir_positional_referenced_paths(build_dir: &Path, cwd: &Path, files: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in files {
+        if name.is_empty() || name.starts_with('/') || name.starts_with('-') {
+            continue;
+        }
+        let abs = if cwd.join(name).is_file() {
+            cwd.join(name)
+        } else if build_dir.join(name).is_file() {
+            build_dir.join(name)
+        } else {
+            continue;
+        };
+        let Some(rel) = relative_from(&abs, build_dir) else {
+            continue;
+        };
+        if rel.is_absolute() {
+            continue;
+        }
+        let s = rel.to_string_lossy().into_owned();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 /// A GLIB GENERATOR RUN (`glib-mkenums`, `glib-genmarshal`) NAMES ITS INPUTS
 /// **BARE**, with no
 /// directory in the token at all. The generic relative-argument branch below
@@ -8920,12 +9010,101 @@ fn glib_mkenums_referenced_paths(build_dir: &Path, cwd: &Path, files: &[String])
 #[cfg(test)]
 mod its_and_swig_reader_tests {
     use super::{
+        gir_positional_referenced_paths, gir_positional_sources_invocation,
         glib_mkenums_invocation, glib_mkenums_referenced_paths, its_rule_targets,
         msgfmt_invocation, msgfmt_its_referenced_paths, proto_imports, protoc_invocation,
         protoc_referenced_paths, swig_invocation, swig_referenced_paths, valac_invocation,
         valac_referenced_paths,
     };
     use std::path::Path;
+
+    /// THE PRODUCTION-SHAPE ARM: the argv read VERBATIM from the failing
+    /// derivation `85mh8cgmszj3295m0q9vsh978ji03kbv-ninja-build.drv`, program
+    /// behind a `cd` prologue at index 3, sources positional right after it.
+    #[test]
+    fn a_gir_edge_names_its_sources_positionally() {
+        let real: Vec<String> = [
+            "cd",
+            "/build/source/src",
+            "&&",
+            "/nix/store/grr3rr630dr0ksl2d92dzcwc7p77vb4b-gobject-introspection-1.86.0-dev/bin/g-ir-scanner",
+            "app-indicator.c",
+            "app-indicator.h",
+            "--add-include-path=/build/source/build/src",
+            "--c-include=libayatana-appindicator/app-indicator.h",
+            "--symbol-prefix=app",
+            "--output",
+            "/build/source/build/src/AyatanaAppIndicator3-0.1.gir",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = gir_positional_sources_invocation(&real)
+            .expect("the program is named under a cd prologue");
+        assert_eq!(got, vec!["app-indicator.c", "app-indicator.h"]);
+        assert!(
+            !got.iter()
+                .any(|a| a == "&&" || a == "cd" || a.starts_with("--output")),
+            "the prologue and the output target are not inputs: {got:?}"
+        );
+    }
+
+    /// THE NEGATIVE CONTROL: a `--filelist` edge has NO positional sources,
+    /// so this trigger must stay silent and leave that arm to its own reader.
+    /// A trigger that fires on both spellings would double-declare and a test
+    /// that only drives one spelling cannot see it.
+    #[test]
+    fn a_gir_filelist_edge_has_no_positional_sources() {
+        let filelist: Vec<String> = [
+            "cd",
+            "/build/source/build",
+            "&&",
+            "/nix/store/grr3rr630dr0ksl2d92dzcwc7p77vb4b-gobject-introspection-1.86.0-dev/bin/g-ir-scanner",
+            "--filelist=/build/source/build/lib/colord/Colord_1_0_gir_filelist",
+            "--output",
+            "lib/colord/Colord-1.0.gir",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(gir_positional_sources_invocation(&filelist), None);
+        // And a command that is not g-ir-scanner is not an invocation.
+        let other: Vec<String> = ["gcc", "-c", "a.c", "-o", "a.o"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(gir_positional_sources_invocation(&other), None);
+    }
+
+    /// The positional names resolve against the command's own directory, not
+    /// the build dir: the edge runs `cd /build/source/src` while the build
+    /// dir is `/build/source/build`. Same geometry as the glib-mkenums reader.
+    #[test]
+    fn a_gir_positional_name_resolves_against_the_commands_own_directory() {
+        let root = std::env::temp_dir().join(format!("nn-girpos-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        let build = root.join("build");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(src.join("app-indicator.c"), b"int x;\n").unwrap();
+        std::fs::write(src.join("app-indicator.h"), b"int x;\n").unwrap();
+        let files = vec!["app-indicator.c".to_string(), "app-indicator.h".to_string()];
+        let got = gir_positional_referenced_paths(&build, &src, &files);
+        assert_eq!(
+            got,
+            vec!["../src/app-indicator.c", "../src/app-indicator.h"]
+        );
+        // The same names against the BUILD dir carry nothing: that is the
+        // geometry the old code read, and the control that proves the cwd
+        // is what resolves them.
+        let empty = gir_positional_referenced_paths(&build, &build, &files);
+        assert!(
+            empty.is_empty(),
+            "resolved against the build dir: {empty:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The locating rule is the ONLY place the `.its` name appears, so the
     /// reader has to take it from there rather than assume a name.
