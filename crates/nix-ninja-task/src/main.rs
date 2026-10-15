@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use harmonia_store_path::StoreDir;
 use nix_ninja_task::derived_file::{
-    copy_tree, create_symlinks, split_encoded_list, store_output, DerivedFile,
+    copy_tree, create_symlinks_with, split_encoded_list, store_output, DerivedFile,
 };
 use nix_ninja_task::patchelf;
 use std::env;
@@ -217,7 +217,21 @@ fn main() -> Result<()> {
         outputs.iter().map(|o| o.build_path.as_path()).collect();
     let (edit_in_place, inputs): (Vec<DerivedFile>, Vec<DerivedFile>) =
         partition_edit_in_place(inputs, &declared);
-    create_symlinks(&build_dir, &cli.store_dir, inputs, false)?;
+    // A FILE A `cmake -P` SCRIPT ASKS `file()` TO ARCHIVE. `file(ARCHIVE_CREATE
+    // FORMAT raw)` REFUSES ANYTHING THAT IS NOT A REGULAR FILE, and an input
+    // this task places is a symlink into the store: qtbase 6.11.2's rcc step
+    // died `CMake Error: archive_write_header: Raw format only supports filetype
+    // AE_IFREG` and took the Qt cluster behind it. Same family as the `$ORIGIN`
+    // executable and the script and header arms - a consumer that needs a
+    // RESOLVED or REGULAR file rather than a link - but the signal is on the
+    // COMMAND LINE rather than in the file's name, so it is computed here.
+    //
+    // NARROW BY CONSTRUCTION: the command must run `cmake -P <script>`, the
+    // script must name the file in an `ARCHIVE_CREATE ... PATHS` call, and the
+    // file must be one this task received. Measured on the failing task: of 466
+    // inputs exactly two are named on the command line and one is archived.
+    let archive_copy = archived_by_cmake_script(&cli.cmdline, &inputs, &build_dir);
+    create_symlinks_with(&build_dir, &cli.store_dir, inputs, false, &archive_copy)?;
     for tree in &edit_in_place {
         let dst = build_dir.join(&tree.build_path);
         let src = tree.absolute_path(&cli.store_dir);
@@ -1349,6 +1363,156 @@ fn lexical_normalize(p: &str) -> String {
     format!("/{}", out.join("/"))
 }
 
+/// The inputs a `cmake -P` SCRIPT will hand to `file(ARCHIVE_CREATE ... PATHS ...)`,
+/// which refuses anything that is not a regular file.
+///
+/// A SYMLINK INTO THE STORE IS NOT A REGULAR FILE to cmake's archiver, so the
+/// task must COPY these rather than link them. qtbase 6.11.2's rcc step is the
+/// witness: `file(ARCHIVE_CREATE FORMAT raw COMPRESSION GZip PATHS
+/// <mimetypes xml>)` died `archive_write_header: Raw format only supports
+/// filetype AE_IFREG`, and every Qt package and the KDE stack behind them
+/// aborted. Proven by difference on the real file: the same `cmake -P` call
+/// against a symlink reproduces the error and against a regular file writes the
+/// archive.
+///
+/// WHY THE TASK AND NOT THE DRIVER: the signal is composed at run time from
+/// values only the command line carries. `QtCompressMimeDatabase.cmake` does
+/// `set(qmimeprovider_db_data_file "${INPUT_FILE}")` then
+/// `file(ARCHIVE_CREATE OUTPUT "${qmimeprovider_db_data_file}" PATHS
+/// "${mimetypes_resource_file_minified}")`, and both variables arrive as `-D`
+/// values. The task has the cmdline and the script bytes, so it resolves them
+/// itself; pushing a list from the driver would re-key every derivation.
+///
+/// DELIBERATELY CONSERVATIVE: it returns the files it can PROVE are archived,
+/// and a script it cannot parse yields an empty set, which is the placement
+/// every task had before this arm existed.
+/// The script a `cmake -P <script>` invocation runs, as spelled on the line.
+fn cmake_p_script(cmdline: &str) -> Option<String> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let prog = toks
+        .iter()
+        .find(|t| t.rsplit('/').next() == Some("cmake"))?;
+    let _ = prog;
+    let i = toks.iter().position(|t| *t == "-P")?;
+    let script = toks.get(i + 1)?;
+    Some(script.to_string())
+}
+
+/// `-DNAME=VALUE` pairs from the command line, in order.
+fn cmake_d_definitions(cmdline: &str) -> Vec<(String, String)> {
+    cmdline
+        .split_whitespace()
+        .filter_map(|t| t.strip_prefix("-D"))
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// The `PATHS` arguments of every `file(ARCHIVE_CREATE ...)` call in a script,
+/// as written (the caller expands them). An `ARCHIVE_CREATE` without `PATHS`
+/// contributes nothing.
+fn cmake_archive_paths(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for body in cmake_call_bodies(text, "file") {
+        if !body.contains("ARCHIVE_CREATE") {
+            continue;
+        }
+        let toks: Vec<&str> = body.split_whitespace().collect();
+        let Some(i) = toks.iter().position(|t| *t == "PATHS") else {
+            continue;
+        };
+        for t in toks.iter().skip(i + 1) {
+            // The next keyword ends the list; `OUTPUT`, `FORMAT`,
+            // `COMPRESSION` and `COMPRESSION_LEVEL` all appear after it.
+            if matches!(
+                *t,
+                "OUTPUT" | "FORMAT" | "COMPRESSION" | "COMPRESSION_LEVEL" | "WORKING_DIRECTORY"
+            ) {
+                break;
+            }
+            let v = t.trim_matches('"');
+            if !v.is_empty() && !v.starts_with('-') {
+                out.push(v.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// `body` of each `name(...)` call, quote-stripped, in file order. Textual and
+/// shallow on purpose: a nested parenthesis ends the body early, which yields a
+/// SHORTER candidate list rather than a wrong one.
+fn cmake_call_bodies(text: &str, name: &str) -> Vec<String> {
+    let needle = format!("{name}(");
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(&needle) {
+        rest = &rest[i + needle.len()..];
+        let Some(j) = rest.find(')') else { break };
+        out.push(rest[..j].replace('"', ""));
+        rest = &rest[j..];
+    }
+    out
+}
+
+/// The value of a `${NAME}` reference against the `-D` definitions, once.
+/// Returns `None` when the name is not defined, which drops the candidate.
+fn expand_cmake_var(name: &str, defs: &[(String, String)]) -> Option<String> {
+    let n = name.trim();
+    let inner = n
+        .strip_prefix("${")
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(n);
+    defs.iter()
+        .find(|(k, _)| k == inner)
+        .map(|(_, v)| v.clone())
+}
+
+fn archived_by_cmake_script(
+    cmdline: &str,
+    inputs: &[DerivedFile],
+    build_dir: &Path,
+) -> std::collections::HashSet<PathBuf> {
+    let mut out = std::collections::HashSet::new();
+    // `cmake -P <script>` is the only shape that runs a script, so a task that
+    // does not run one is untouched whatever its inputs are named.
+    let Some(script) = cmake_p_script(cmdline) else {
+        return out;
+    };
+    let Ok(text) = std::fs::read_to_string(build_dir.join(&script)) else {
+        return out;
+    };
+    // The `-D` values the command supplies, expanded in the order cmake would.
+    let defs = cmake_d_definitions(cmdline);
+    for name in cmake_archive_paths(&text) {
+        let Some(value) = expand_cmake_var(&name, &defs) else {
+            continue;
+        };
+        // A `-D` value may be absolute (the build tree the task runs in) or
+        // relative; both are normalised against the build dir.
+        let abs = if value.starts_with('/') {
+            lexical_normalize(&value)
+        } else {
+            lexical_normalize(&format!("{}/{}", build_dir.display(), value))
+        };
+        // Only a file this task RECEIVED can be copied; a generated one is not
+        // here yet, and its absence is not this arm's business. The two
+        // spellings are compared the way the placement resolves them: the
+        // build-dir-relative one, and the same file through its store path.
+        for input in inputs {
+            let here = lexical_normalize(&format!(
+                "{}/{}",
+                build_dir.display(),
+                input.build_path.display()
+            ));
+            if here == abs {
+                out.insert(input.build_path.clone());
+            }
+        }
+    }
+    out
+}
+
 fn spawn_process(cmdline: &str) -> Result<i32> {
     ensure_cd_target(cmdline)?;
     // Under ninja's `-v` the driver declares one more output and names it
@@ -1688,5 +1852,87 @@ mod optional_pass_as_file_tests {
                 .as_deref(),
             Some("x")
         );
+    }
+}
+
+#[cfg(test)]
+mod cmake_archive_tests {
+    use super::{cmake_archive_paths, cmake_call_bodies, cmake_d_definitions, cmake_p_script};
+
+    /// THE REAL SCRIPT, reduced to the calls that matter, taken from
+    /// `QtCompressMimeDatabase.cmake` in qtbase 6.11.2. A fixture written from
+    /// the shape I expected rather than the shape on disk is the trap this
+    /// corpus records, so the `set()` then `file(ARCHIVE_CREATE)` pair is here
+    /// as the file spells it.
+    const QT_SCRIPT: &str = r#"
+        set(qmimeprovider_db_data_file "${INPUT_FILE}")
+        set(mimetypes_resource_file_minified "${INPUT_FILE}")
+        file(ARCHIVE_CREATE OUTPUT "${qmimeprovider_db_data_file}"
+            PATHS "${mimetypes_resource_file_minified}"
+            FORMAT raw
+            COMPRESSION ${cmake_compression_type}
+            ${additional_file_archive_create_parameters}
+        )
+"#;
+
+    /// The `PATHS` argument is found, and the keywords after it are not.
+    #[test]
+    fn the_paths_argument_of_an_archive_call_is_found() {
+        assert_eq!(
+            cmake_archive_paths(QT_SCRIPT),
+            vec!["${mimetypes_resource_file_minified}".to_string()],
+            "the PATHS value only, not FORMAT/COMPRESSION"
+        );
+    }
+
+    /// A `file()` call that is not an archive contributes nothing, so a script
+    /// full of file operations does not copy anything by accident.
+    #[test]
+    fn a_file_call_that_is_not_an_archive_contributes_nothing() {
+        assert!(cmake_archive_paths(r#"file(REMOVE "x")"#).is_empty());
+        assert!(cmake_archive_paths(r#"file(GLOB g "*.c")"#).is_empty());
+        // And an ARCHIVE_CREATE with no PATHS is not a path either.
+        assert!(cmake_archive_paths(r#"file(ARCHIVE_CREATE OUTPUT "o" FORMAT raw)"#).is_empty());
+    }
+
+    /// The command that runs a script, and the negative control: a cmake
+    /// invocation that runs no script yields None.
+    #[test]
+    fn the_script_is_taken_from_a_dash_capital_p() {
+        assert_eq!(
+            cmake_p_script("/nix/store/x-cmake/bin/cmake -DINPUT_FILE=/b/a.xml -P /b/s.cmake"),
+            Some("/b/s.cmake".to_string())
+        );
+        assert_eq!(
+            cmake_p_script("/nix/store/x-cmake/bin/cmake -E touch y"),
+            None
+        );
+        assert_eq!(cmake_p_script("gcc -c a.c"), None);
+    }
+
+    /// The `-D` pairs are read off the line, which is where qtbase supplies
+    /// both variables the script expands.
+    #[test]
+    fn the_definitions_come_from_the_command_line() {
+        let defs = cmake_d_definitions(
+            "/nix/store/x-cmake/bin/cmake -DINPUT_FILE=/b/tika.xml -DOUTPUT_FILE=/b/o.cpp -P /b/s.cmake",
+        );
+        assert_eq!(
+            defs,
+            vec![
+                ("INPUT_FILE".to_string(), "/b/tika.xml".to_string()),
+                ("OUTPUT_FILE".to_string(), "/b/o.cpp".to_string()),
+            ]
+        );
+        // A `-D` without a value is not a definition.
+        assert!(cmake_d_definitions("cmake -DFOO -P s.cmake").is_empty());
+    }
+
+    /// The shallow body scan yields each call, and a nested parenthesis
+    /// truncates rather than inventing text.
+    #[test]
+    fn a_call_body_ends_at_the_first_parenthesis() {
+        let bodies = cmake_call_bodies("file(A B)\nfile(C D)", "file");
+        assert_eq!(bodies, vec!["A B".to_string(), "C D".to_string()]);
     }
 }

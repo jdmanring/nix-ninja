@@ -8726,7 +8726,8 @@ fn gir_filelist_referenced_paths(
     out
 }
 
-/// A `glib-mkenums` RUN NAMES ITS TEMPLATE AND ITS HEADERS **BARE**, with no
+/// A GLIB GENERATOR RUN (`glib-mkenums`, `glib-genmarshal`) NAMES ITS INPUTS
+/// **BARE**, with no
 /// directory in the token at all. The generic relative-argument branch below
 /// requires a `/` before it will carry a relative name, so it never sees
 /// either, and the CMake rule that writes the edge declares no `DEPENDS` on
@@ -8756,9 +8757,21 @@ fn glib_mkenums_invocation(args: &[String]) -> Option<Vec<String>> {
     // the directory and `&&` - and the fixture that fed the reader a bare argv
     // could not see it. The arguments are read from the token AFTER the program,
     // which is the one place both shapes agree.
-    let program = args
-        .iter()
-        .position(|a| a.rsplit('/').next() == Some("glib-mkenums"))?;
+    // THE GLIB GENERATOR FAMILY, not one program. `glib-mkenums` names its
+    // template with `--template` and its inputs positionally; `glib-genmarshal`
+    // names the `.list` it reads positionally after `--header`. Both run behind
+    // the same `cd <dir> &&` prologue and both open a file that lives in the
+    // SOURCE tree while the build dir is its child, so one reader answers for
+    // the family. Measured 2026-10-14: `glib-genmarshal --prefix=X --header
+    // indicator-object-marshal.list --quiet --output=Y` died `can't open
+    // 'indicator-object-marshal.list'` on 10 task drvs, the round's largest
+    // single cause at that point.
+    let program = args.iter().position(|a| {
+        matches!(
+            a.rsplit('/').next(),
+            Some("glib-mkenums") | Some("glib-genmarshal")
+        )
+    })?;
     let mut out = Vec::new();
     let mut it = args[program + 1..].iter().peekable();
     while let Some(a) = it.next() {
@@ -9254,6 +9267,38 @@ mod its_and_swig_reader_tests {
             !got.iter()
                 .any(|a| a == "&&" || a == "cd" || a.starts_with("--output")),
             "the prologue and the output flag are not inputs: {got:?}"
+        );
+    }
+
+    /// THE SECOND PROGRAM IN THE FAMILY, from the round's own command line.
+    /// `glib-genmarshal` takes the `.list` it reads POSITIONALLY after
+    /// `--header`, not as a `--template` value, so a reader keyed on the flag
+    /// alone carries nothing here. Measured 2026-10-14: 10 task drvs, the
+    /// round's largest single cause at that point.
+    #[test]
+    fn a_glib_genmarshal_run_names_its_list_positionally() {
+        let real = vec![
+            "cd".to_string(),
+            "/build/source/src".to_string(),
+            "&&".to_string(),
+            "/nix/store/7y3yxnzk3yy1x8njrsa3m8804b1h1hz7-glib-2.88.3-dev/bin/glib-genmarshal"
+                .to_string(),
+            "--prefix=_indicator_object_marshal".to_string(),
+            "--header".to_string(),
+            "indicator-object-marshal.list".to_string(),
+            "--quiet".to_string(),
+            "--output=/build/source/build/src/indicator-object-marshal.h".to_string(),
+        ];
+        let got = glib_mkenums_invocation(&real).expect("the program is named under a cd prologue");
+        assert_eq!(
+            got,
+            vec!["indicator-object-marshal.list".to_string()],
+            "the positional .list, and neither the prefix value nor the output"
+        );
+        assert!(
+            !got.iter()
+                .any(|a| a == "cd" || a == "&&" || a.starts_with("--")),
+            "the prologue, the flags and their values are not inputs: {got:?}"
         );
     }
 

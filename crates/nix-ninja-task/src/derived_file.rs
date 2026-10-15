@@ -332,6 +332,20 @@ pub fn create_symlinks(
     inputs: Vec<DerivedFile>,
     overwrite: bool,
 ) -> Result<()> {
+    create_symlinks_with(prefix, store_dir, inputs, overwrite, &Default::default())
+}
+
+/// `create_symlinks` with the EXTRA copy list a task computes from its own
+/// command line. Split rather than given a default argument because Rust has
+/// none, and the local-mode caller (`local.rs`) drives a build dir with no
+/// command line, so it passes the empty set by using the name above.
+pub fn create_symlinks_with(
+    prefix: &std::path::Path,
+    store_dir: &StoreDir,
+    inputs: Vec<DerivedFile>,
+    overwrite: bool,
+    copy_required: &std::collections::HashSet<std::path::PathBuf>,
+) -> Result<()> {
     // DIRECTORY INPUTS LAST. A tree and an individually declared file can
     // name the same build path from the same rule - the tree output carries
     // a copy of every public forwarding header, and each is also its own
@@ -565,6 +579,7 @@ pub fn create_symlinks(
                     .build_path
                     .components()
                     .any(|c| c.as_os_str() == "node_modules")
+                || copy_required.contains(&input.build_path)
                 || origin_relative_executable(&source_path));
         if copy_not_link {
             // THE DUPLICATE CHECK ABOVE ASKS ONLY ABOUT LINKS, and a copied
