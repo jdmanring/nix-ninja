@@ -1802,6 +1802,7 @@ impl Runner {
             let gir_filelists = gir_filelist_invocation(&args);
             let protoc = protoc_invocation(&args);
             let valac = valac_invocation(&args);
+            let mkenums = glib_mkenums_invocation(&args);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -1826,6 +1827,25 @@ impl Runner {
                 )
             } else {
                 (0, PathBuf::new())
+            };
+            // THE DIRECTORY THE COMMAND ACTUALLY RUNS IN, absolute `cd`
+            // targets included. `cd_dir` above cannot express one: it is
+            // build-dir relative by construction, because the rewrite that
+            // feeds it compensates a relative prologue and drops an in-tree
+            // one. A reader that RESOLVES a file rather than compensating a
+            // spelling needs the real directory, and `glib-mkenums` edges are
+            // `cd /build/source/src` against a build dir of
+            // `/build/source/build` - a sibling outside the build dir, which
+            // the driver can see because it runs in the same sandbox.
+            let cmd_cwd = if args.len() >= 3 && args[0] == "cd" && args[2] == "&&" {
+                let target = Path::new(&args[1]);
+                if target.is_absolute() {
+                    target.to_path_buf()
+                } else {
+                    self.config.build_dir.join(target)
+                }
+            } else {
+                self.config.build_dir.clone()
             };
             if let Some((module, roots)) = python_module_invocation(&args) {
                 for rel in python_module_candidates(&module, &roots) {
@@ -2344,6 +2364,17 @@ impl Runner {
             // above; same placement.
             if let Some((dirs, pkgs)) = &valac {
                 for p in valac_referenced_paths(&self.config.build_dir, &cd_dir, dirs, pkgs) {
+                    referenced.push(p);
+                }
+            }
+            // A `glib-mkenums` RUN NAMES ITS TEMPLATE AND HEADERS BARE, so the
+            // generic relative-argument branch below - which requires a `/`
+            // in the token - never sees them, and the CMake rule declares no
+            // `DEPENDS` on either. It was the dominant leaf failure of the
+            // live desktop round of 2026-10-14. Same family as the readers
+            // around it; same placement.
+            if let Some(names) = &mkenums {
+                for p in glib_mkenums_referenced_paths(&self.config.build_dir, &cmd_cwd, names) {
                     referenced.push(p);
                 }
             }
@@ -8661,13 +8692,112 @@ fn gir_filelist_referenced_paths(
     out
 }
 
+/// A `glib-mkenums` RUN NAMES ITS TEMPLATE AND ITS HEADERS **BARE**, with no
+/// directory in the token at all. The generic relative-argument branch below
+/// requires a `/` before it will carry a relative name, so it never sees
+/// either, and the CMake rule that writes the edge declares no `DEPENDS` on
+/// them either: `add_custom_command(OUTPUT idotypebuiltins.h WORKING_DIRECTORY
+/// ${CMAKE_CURRENT_SOURCE_DIR} COMMAND glib-mkenums --template
+/// idotypebuiltins.h.template ${HEADERS} ...)`. Real ninja reads both off that
+/// working directory and succeeds; the sandbox materialises the working
+/// directory from declared inputs, so a file nothing declares is not there and
+/// the tool dies `FileNotFoundError: 'idotypebuiltins.h.template'`.
+///
+/// MEASURED 2026-10-14: it was the DOMINANT leaf failure of the live KDE round,
+/// 11 task drvs across ayatana-ido, llvm, onetbb and qtbase. The task's own
+/// derivation (`6p8jp3i7ikv9m4bdrzdv1pgpr041vlkc-ninja-build.drv`) declared
+/// fifteen inputs and not one was the template or a header, and `source/src/`
+/// in the kept tree was empty.
+///
+/// Same family as the swig `%include`, the g-ir-scanner `--filelist` and the
+/// valac `--vapidir` readers around it: files a command reads that no edge
+/// declares. The `--output` target is deliberately NOT collected - it is the
+/// thing the edge writes, and the resolver carries only files that exist, so
+/// collecting it would drop it anyway.
+fn glib_mkenums_invocation(args: &[String]) -> Option<Vec<String>> {
+    if !args
+        .iter()
+        .any(|a| a.rsplit('/').next() == Some("glib-mkenums"))
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    // The PROGRAM is argv[0] and is not a header, so the positional arm below
+    // skips index 0. Every real edge reaches the tool through a bare name or an
+    // absolute path, so the program test is `rsplit('/')` rather than equality.
+    let mut it = args.iter().enumerate().peekable();
+    while let Some((i, a)) = it.next() {
+        if let Some(v) = a.strip_prefix("--template=") {
+            if !v.is_empty() {
+                out.push(v.to_string());
+            }
+        } else if a == "--template" {
+            if let Some((_, v)) = it.next() {
+                if !v.is_empty() {
+                    out.push(v.clone());
+                }
+            }
+        } else if i > 0 && !a.starts_with('-') {
+            // The positional arguments are the headers. Over-collecting is
+            // safe here for the same reason it is safe for the readers above:
+            // the resolver carries a name only when it resolves to a file that
+            // EXISTS, so a format string or the `--output` target that happened
+            // to land here is dropped rather than declared.
+            out.push(a.clone());
+        }
+    }
+    Some(out)
+}
+
+/// Resolve the names a `glib-mkenums` run was given against the directory it
+/// actually runs in. That directory is NOT always the build dir: the edge this
+/// reader was written for is `cd /build/source/src && glib-mkenums ...` while
+/// the build dir is `/build/source/build`, so a name resolved against the
+/// build dir finds nothing and the read fails.
+///
+/// The spelling emitted is the climb the wiring keeps: an absolute candidate is
+/// dropped in silence by the `starts_with(store_dir)` filter, so what goes back
+/// is relative to the build dir, exactly as `include_dirs_as_given` returns
+/// `../clc/include` rather than an absolute path.
+fn glib_mkenums_referenced_paths(build_dir: &Path, cwd: &Path, files: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in files {
+        if name.is_empty() || name.starts_with('/') || name.starts_with('-') {
+            continue;
+        }
+        // The cwd the command establishes, then the build dir as a fallback for
+        // an edge that does not cd at all. Bare names only: an absolute one is
+        // the generic absolute branch's business, not this reader's.
+        let abs = if cwd.join(name).is_file() {
+            cwd.join(name)
+        } else if build_dir.join(name).is_file() {
+            build_dir.join(name)
+        } else {
+            continue;
+        };
+        let Some(rel) = relative_from(&abs, build_dir) else {
+            continue;
+        };
+        if rel.is_absolute() {
+            continue;
+        }
+        let s = rel.to_string_lossy().into_owned();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod its_and_swig_reader_tests {
     use super::{
-        its_rule_targets, msgfmt_invocation, msgfmt_its_referenced_paths, proto_imports,
-        protoc_invocation, protoc_referenced_paths, swig_invocation, swig_referenced_paths,
-        valac_invocation, valac_referenced_paths,
+        glib_mkenums_invocation, glib_mkenums_referenced_paths, its_rule_targets,
+        msgfmt_invocation, msgfmt_its_referenced_paths, proto_imports, protoc_invocation,
+        protoc_referenced_paths, swig_invocation, swig_referenced_paths, valac_invocation,
+        valac_referenced_paths,
     };
+    use std::path::Path;
 
     /// The locating rule is the ONLY place the `.its` name appears, so the
     /// reader has to take it from there rather than assume a name.
@@ -9022,6 +9152,128 @@ mod its_and_swig_reader_tests {
             none.is_empty(),
             "a package that resolves to no file must carry nothing, got {none:?}"
         );
+    }
+
+    /// BOTH SPELLINGS of `--template`, because CMake emits the separated one
+    /// and a hand-written edge emits the joined one. The positional arguments
+    /// are the headers and are carried as spelled.
+    #[test]
+    fn glib_mkenums_names_its_template_in_both_spellings() {
+        let sep = vec![
+            "glib-mkenums".to_string(),
+            "--template".to_string(),
+            "t.h.template".to_string(),
+            "a.h".to_string(),
+            "b.h".to_string(),
+        ];
+        assert_eq!(
+            glib_mkenums_invocation(&sep),
+            Some(vec![
+                "t.h.template".to_string(),
+                "a.h".to_string(),
+                "b.h".to_string()
+            ])
+        );
+        let joined = vec![
+            "glib-mkenums".to_string(),
+            "--template=t.h.template".to_string(),
+            "a.h".to_string(),
+        ];
+        assert_eq!(
+            glib_mkenums_invocation(&joined),
+            Some(vec!["t.h.template".to_string(), "a.h".to_string()])
+        );
+    }
+
+    /// THE TRIGGER IS THE PROGRAM, not a coincidental flag: a command that
+    /// merely mentions `--template` without running `glib-mkenums` is not one.
+    #[test]
+    fn a_command_that_is_not_glib_mkenums_is_not_an_invocation() {
+        assert_eq!(
+            glib_mkenums_invocation(&["gcc".to_string(), "--template=x".to_string()]),
+            None
+        );
+    }
+
+    /// THE EMITTED SPELLING IS THE CONTRACT, and this is the reader's real
+    /// geometry rather than a convenient one: ayatana-ido's edge runs
+    /// `cd /build/source/src && glib-mkenums --template idotypebuiltins.h.template
+    /// idorange.h ...` while the BUILD DIR is `/build/source/build`. The names
+    /// resolve against the CWD, one directory up from the build dir, so the
+    /// spelling that comes back is the `../src/...` climb. A reader that
+    /// resolved against the build dir instead would find nothing and carry
+    /// nothing, which is the state the round was in.
+    #[test]
+    fn a_glib_mkenums_name_resolves_against_the_commands_own_directory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "nn-mkenums-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let bd = tmp.join("source/build");
+        let cwd = tmp.join("source/src");
+        // BOTH directories exist and are known to be different, so a name can
+        // only resolve under the one that actually holds it. The build dir is
+        // created EMPTY: if it ever held these names the arms below could not
+        // tell which directory the reader used, which is the whole question.
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(cwd.join("idotypebuiltins.h.template"), "template").unwrap();
+        std::fs::write(cwd.join("idorange.h"), "header").unwrap();
+        assert!(
+            !bd.join("idotypebuiltins.h.template").exists() && !bd.join("idorange.h").exists(),
+            "the fixture is only meaningful while the files are NOT in the build dir"
+        );
+
+        let got = glib_mkenums_referenced_paths(
+            &bd,
+            &cwd,
+            &[
+                "idotypebuiltins.h.template".to_string(),
+                "idorange.h".to_string(),
+            ],
+        );
+        assert_eq!(
+            got,
+            vec![
+                "../src/idotypebuiltins.h.template".to_string(),
+                "../src/idorange.h".to_string()
+            ],
+            "resolved against the command's own directory, spelled as the climb \
+             back to the build dir"
+        );
+        assert!(
+            !got.iter().any(|p| Path::new(p).is_absolute()),
+            "an absolute candidate is dropped silently by starts_with(store_dir)"
+        );
+
+        // The negative control: the SAME names resolved against the BUILD DIR
+        // resolve to nothing, which is exactly the reading that made this the
+        // dominant failure of the round. A reader that ignored its `cwd`
+        // argument would pass the arm above and fail here.
+        let wrong = glib_mkenums_referenced_paths(
+            &bd,
+            &bd,
+            &[
+                "idotypebuiltins.h.template".to_string(),
+                "idorange.h".to_string(),
+            ],
+        );
+        assert!(
+            wrong.is_empty(),
+            "a name that is not in the directory the command runs in must carry \
+             nothing, got {wrong:?}"
+        );
+
+        // And a name that resolves to no file at all contributes nothing,
+        // rather than a guessed path.
+        let absent = glib_mkenums_referenced_paths(&bd, &cwd, &["nothere.h.template".to_string()]);
+        assert!(absent.is_empty(), "got {absent:?}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
