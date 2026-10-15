@@ -544,6 +544,17 @@ pub fn create_symlinks(
         // diverged when they were separate, at four spellings against
         // eleven, and `.inl`, `.inc`, `.ipp` and `.tcc` failed this class
         // while `.h` built.
+        //
+        // AN EXECUTABLE WITH AN `$ORIGIN` SEARCH PATH IS THE SAME CLASS ONE
+        // LEVEL DOWN, and it is asked LAST because it costs a read of the
+        // file rather than a test on its name. Those arms exist because a
+        // consumer that RESOLVES A PATH lands in the store where its siblings
+        // are not; `$ORIGIN` is the loader doing exactly that with the
+        // executable's own directory. orc 0.4.44's `orcc` carries
+        // `$ORIGIN/../orc` and died on `liborc-0.4.so.0` at exit 127 across
+        // five task derivations while the library and a correct alias chain
+        // sat in the build tree's `orc/`. See `origin_relative_executable`
+        // for the proof and for why the predicate is narrow.
         let copy_not_link = !source_path.is_symlink()
             && (input
                 .build_path
