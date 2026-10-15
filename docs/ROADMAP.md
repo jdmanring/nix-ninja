@@ -20,7 +20,7 @@ are met and `0.3` is in progress rather than finished, which is why its open
 classes are listed below. A reader should not take the number as a claim that
 the milestone it names is complete.
 
-The state of the tree TODAY, class by class, is a table of 99 rows. It is not in
+The state of the tree TODAY, class by class, is a table of 100 rows. It is not in
 this repository: it grew beside a private distribution and is development
 material rather than a public document, which is the same reason the gate corpus
 is not here (`0.5`). What this file carries is the part that is publishable now,
@@ -120,7 +120,12 @@ binary had to learn:
   sandbox stages nothing. The largest family, and the one still growing:
   `cmake -P` scripts and the modules they include, XInclude, TableGen, rst
   includes, msgfmt ITS, swig `%include`, the `g-ir-scanner` filelist, protoc
-  imports, python `-m`.
+  imports, valac `--pkg`, python `-m`, and `glib-mkenums` template-and-header
+  arguments. Every member is the same shape and is settled the same way: the
+  CMake rule naming the command declares a dependency on none of the files that
+  command reads, because the convention assumes a shared filesystem, so the
+  test is never whether a `DEPENDS` exists. It is whether real ninja succeeds
+  while the sandbox stages nothing, which puts the line in the driver.
 - **Output placement and aliases.** Getting a produced artifact to the path the
   build expects: co-outputs, symlinks stored as link text, `DT_NEEDED`, a
   byproduct nobody declared, one path claimed by two spellings.
