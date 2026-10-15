@@ -8715,29 +8715,30 @@ fn gir_filelist_referenced_paths(
 /// thing the edge writes, and the resolver carries only files that exist, so
 /// collecting it would drop it anyway.
 fn glib_mkenums_invocation(args: &[String]) -> Option<Vec<String>> {
-    if !args
+    // THE PROGRAM IS NOT ALWAYS argv[0]. Every CMake custom command arrives
+    // behind a `cd <dir> &&` prologue, so on the edge this reader exists for the
+    // program token sits at index 3 (`cd`, `/build/source/src`, `&&`, the tool).
+    // Skipping a FIXED index therefore carries the prologue as headers - `cd`,
+    // the directory and `&&` - and the fixture that fed the reader a bare argv
+    // could not see it. The arguments are read from the token AFTER the program,
+    // which is the one place both shapes agree.
+    let program = args
         .iter()
-        .any(|a| a.rsplit('/').next() == Some("glib-mkenums"))
-    {
-        return None;
-    }
+        .position(|a| a.rsplit('/').next() == Some("glib-mkenums"))?;
     let mut out = Vec::new();
-    // The PROGRAM is argv[0] and is not a header, so the positional arm below
-    // skips index 0. Every real edge reaches the tool through a bare name or an
-    // absolute path, so the program test is `rsplit('/')` rather than equality.
-    let mut it = args.iter().enumerate().peekable();
-    while let Some((i, a)) = it.next() {
+    let mut it = args[program + 1..].iter().peekable();
+    while let Some(a) = it.next() {
         if let Some(v) = a.strip_prefix("--template=") {
             if !v.is_empty() {
                 out.push(v.to_string());
             }
         } else if a == "--template" {
-            if let Some((_, v)) = it.next() {
+            if let Some(v) = it.next() {
                 if !v.is_empty() {
                     out.push(v.clone());
                 }
             }
-        } else if i > 0 && !a.starts_with('-') {
+        } else if !a.starts_with('-') {
             // The positional arguments are the headers. Over-collecting is
             // safe here for the same reason it is safe for the readers above:
             // the resolver carries a name only when it resolves to a file that
@@ -9182,6 +9183,43 @@ mod its_and_swig_reader_tests {
         assert_eq!(
             glib_mkenums_invocation(&joined),
             Some(vec!["t.h.template".to_string(), "a.h".to_string()])
+        );
+    }
+
+    /// THE ARGV SHAPE PRODUCTION ACTUALLY PASSES, which is NOT the bare one the
+    /// arms above build. Every CMake custom command arrives with a `cd` prologue
+    /// (`task.rs` reads `cd <dir> &&` to rebase the rest), so the program token
+    /// sits at index 3, not index 0, and a reader that skipped a fixed index
+    /// would carry `&&` as a header. Read verbatim from the failing derivation
+    /// `6p8jp3i7ikv9m4bdrzdv1pgpr041vlkc-ninja-build.drv`.
+    #[test]
+    fn the_argv_shape_production_passes_names_the_template() {
+        let real = vec![
+            "cd".to_string(),
+            "/build/source/src".to_string(),
+            "&&".to_string(),
+            "/nix/store/7y3yxnzk3yy1x8njrsa3m8804b1h1hz7-glib-2.88.3-dev/bin/glib-mkenums"
+                .to_string(),
+            "--template".to_string(),
+            "idotypebuiltins.h.template".to_string(),
+            "idorange.h".to_string(),
+            "libayatana-ido.h".to_string(),
+            "--output=/build/source/build/src/idotypebuiltins.h".to_string(),
+        ];
+        let got = glib_mkenums_invocation(&real).expect("the program is named under a cd prologue");
+        assert_eq!(
+            got,
+            vec![
+                "idotypebuiltins.h.template".to_string(),
+                "idorange.h".to_string(),
+                "libayatana-ido.h".to_string()
+            ],
+            "the template and the positional headers, and NOT the cd prologue"
+        );
+        assert!(
+            !got.iter()
+                .any(|a| a == "&&" || a == "cd" || a.starts_with("--output")),
+            "the prologue and the output flag are not inputs: {got:?}"
         );
     }
 
