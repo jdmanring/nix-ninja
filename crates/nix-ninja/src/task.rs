@@ -1828,25 +1828,35 @@ impl Runner {
             } else {
                 (0, PathBuf::new())
             };
-            // THE DIRECTORY THE COMMAND ACTUALLY RUNS IN, absolute `cd`
-            // targets included. `cd_dir` above cannot express one: it is
-            // build-dir relative by construction, because the rewrite that
-            // feeds it compensates a relative prologue and drops an in-tree
-            // one. A reader that RESOLVES a file rather than compensating a
-            // spelling needs the real directory, and `glib-mkenums` edges are
+            // THE DIRECTORY THE COMMAND ACTUALLY RUNS IN, READ FROM THE
+            // ORIGINAL COMMAND LINE. `args` above comes from
+            // `rewrite_cmdline`, WHICH DROPS A `cd` PROLOGUE WHOSE TARGET IS
+            // ABOVE THE BUILD DIR (see its "A CD TARGET ABOVE THE BUILD DIR"
+            // arm) - and every `glib-mkenums` edge is exactly that:
             // `cd /build/source/src` against a build dir of
-            // `/build/source/build` - a sibling outside the build dir, which
-            // the driver can see because it runs in the same sandbox.
-            let cmd_cwd = if args.len() >= 3 && args[0] == "cd" && args[2] == "&&" {
-                let target = Path::new(&args[1]);
-                if target.is_absolute() {
-                    target.to_path_buf()
-                } else {
-                    self.config.build_dir.join(target)
-                }
-            } else {
-                self.config.build_dir.clone()
-            };
+            // `/build/source/build`. Reading the cwd off the rewritten form
+            // therefore finds no prologue, falls back to the build dir, and
+            // resolves every bare name in the wrong directory. Measured
+            // 2026-10-14: the drive emitted fifteen inputs and NOT the
+            // template, while the file sat at `../src` from the build dir.
+            // The original cmdline is what the TASK executes, so it is what a
+            // reader that RESOLVES a file must ask. A relative target is
+            // joined onto the build dir, the same way `cd_dir` compensates.
+            let cmd_cwd = build
+                .cmdline
+                .as_deref()
+                .and_then(|c| shell_words::split(c).ok())
+                .and_then(|orig| {
+                    (orig.len() >= 3 && orig[0] == "cd" && orig[2] == "&&").then(|| {
+                        let target = Path::new(&orig[1]);
+                        if target.is_absolute() {
+                            target.to_path_buf()
+                        } else {
+                            self.config.build_dir.join(target)
+                        }
+                    })
+                })
+                .unwrap_or_else(|| self.config.build_dir.clone());
             if let Some((module, roots)) = python_module_invocation(&args) {
                 for rel in python_module_candidates(&module, &roots) {
                     let rel = rebase_post_cd(&cd_dir, &rel);
