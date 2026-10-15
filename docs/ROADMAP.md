@@ -112,7 +112,10 @@ binary had to learn:
   phony targets, the build-dir walk, and which pass owns a placed product.
 - **Include and header resolution.** What the compiler reads, found from the
   command: generated headers, PCH, sibling-directory prefixes, macro arms that
-  resolve to a file.
+  resolve to a file. The macro-arm reader has four axes and all four are closed:
+  the delimiter a body is spelled with, the count of arms a macro has, an arm
+  that sits above the build directory, and a define that lives in the
+  translation unit's own body rather than in a header it includes.
 - **Undeclared reads.** A file a COMMAND reads and no edge declares, so the
   sandbox stages nothing. The largest family, and the one still growing:
   `cmake -P` scripts and the modules they include, XInclude, TableGen, rst
@@ -456,7 +459,7 @@ nothing is outstanding.
   measured. Until then the honest statement is that the granularity is per
   translation unit by construction, which is a fact about the design, and that
   no measurement here says what that is worth.
-- **Five open classes in `0.3`**, whose first actions item 2 below names, and
+- **Four open classes in `0.3`**, whose first actions item 2 below names, and
   **three inherited items** carried with no diagnosis, in item 6.
 - **The driver has never been run at distribution scale on hardware it owns.**
   The two slopes in item 6, `dyn` at 0.084 s per task and retention at 0.074 MiB
@@ -552,16 +555,20 @@ a reason stated in this file would be a second copy to keep in step.
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
 
-### 2. Close the five open classes
+### 2. Close the four open classes
 
-- **A macro arm whose define site the reader cannot see.** The macro-arm reader
-  scans a translation unit's INCLUDES and never its own text, so a macro defined
-  only in the unit's body reaches it at no point. First action: a fixture that
-  is one unit carrying its own define and no header that defines the same name,
-  then price the change, because scanning the unit adds an input to every
-  compile whose body carries such a macro. The two neighbouring rows that read
-  FIXED are the delimiter and the arm count and are real fixes; this is a third
-  axis.
+- **A macro arm.** CLOSED, and it took four axes rather than the one this item
+  named. The reader now accepts the delimiter a body is spelled with
+  (angle-bracket as well as double-quoted), keeps a single-arm macro when that
+  arm is an angle include, resolves an arm against the directories the command
+  names even when they sit above the build directory, and reads a define that
+  lives in the translation unit's own text rather than only in its includes.
+  Each axis was unmasked by the previous one closing, so the first three were
+  landed before the package stopped failing: fixing one leaves the next fatal.
+  The fixture that hid the third axis is the lesson worth carrying - it built
+  two arms because its author reasoned "one arm is the ordinary case", which is
+  the shape that passes rather than the shape production has. A control written
+  to the passing shape asserts nothing.
 - **An alias output read at its store path.** What aborts is the include
   scanner's read, and the row says which task is still unknown. First action:
   keep the build directory of a failing drive and read `build.ninja` for the
