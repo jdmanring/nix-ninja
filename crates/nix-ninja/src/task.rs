@@ -2423,8 +2423,19 @@ impl Runner {
             // A `cmake -E cmake_autogen` PLAN NAMES ITS OWN SOURCES, and no edge
             // declares them: the task is handed the plan and cmake resolves
             // every header it will include from the lists inside it. The
-            // DIRECTORIES are pushed as arguments so the directory upload below
-            // carries them, the same way a directory argument is carried.
+            // DIRECTORIES it names are carried the way a directory ARGUMENT is
+            // (see the `--jinja2-path` arm above), because the entries are
+            // directories that cmake expands to the headers inside them.
+            //
+            // TWO GUARDS, AND THE FIRST VERSION OF THIS HAD NEITHER. It passed
+            // the plan's own ABSOLUTE paths straight to `upload_referenced_dir`,
+            // whose walk does `fs::read_dir(dir)?` - so the first entry that was
+            // not there on disk ABORTED the whole task, and the plan mixes
+            // source-tree paths with BUILD-tree ones that do not exist until
+            // something else has run. The directory-argument reader above is
+            // safe only because it checks `is_dir()` BEFORE calling; this is
+            // that check, and the rebase the `referenced` block does, so a path
+            // outside this project's tree is dropped rather than read.
             if let Some(info) = &autogen_info {
                 let info_path = if info.starts_with('/') {
                     PathBuf::from(info)
@@ -2433,11 +2444,18 @@ impl Runner {
                 };
                 if let Ok(text) = std::fs::read_to_string(&info_path) {
                     for d in cmake_autogen_referenced_dirs(&text) {
-                        for input in upload_referenced_dir(
-                            &self.rpc_client,
-                            &self.config.build_dir,
-                            Path::new(&d),
-                        )? {
+                        let p = Path::new(&d);
+                        if p.starts_with(&self.config.store_dir)
+                            || !same_project_tree(&self.config.build_dir, p)
+                        {
+                            continue;
+                        }
+                        if !p.is_dir() {
+                            continue;
+                        }
+                        for input in
+                            upload_referenced_dir(&self.rpc_client, &self.config.build_dir, p)?
+                        {
                             self.add_derived_file(files, input.clone());
                             input_set.insert(input.build_path.clone(), input);
                         }
