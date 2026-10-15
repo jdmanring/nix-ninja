@@ -4799,6 +4799,30 @@ fn build_task_derivation(
                 }
             }
         }
+        // A `g-ir-scanner` RUN EXECS `pkg-config` BY BARE NAME, and the wrapper
+        // that supplies it is ALREADY AN INPUT of these edges - it is only
+        // absent from the emitted `$PATH`. Measured 2026-10-15 on
+        // libayatana-appindicator 0.5.92, whose gir task carries
+        // `j4nx9d7i...-pkg-config-wrapper-0.29.2` (which ships `bin/pkg-config`)
+        // and died `pkg-config: error executing command
+        // ['pkg-config', '--cflags', 'harfbuzz-gobject', ...]:
+        // [Errno 2] No such file or directory`. The same `subprocess` call in
+        // giscanner resolves libraries through `ldd`, which SCRIPT_TOOLS already
+        // carries for this reason.
+        //
+        // ASKED OF THE INPUTS, NOT ADDED TO SCRIPT_TOOLS. Widening that list
+        // puts a tool on EVERY task's PATH and in EVERY task's inputs, and the
+        // pricer cannot tell a real widening from a no-op on a host where the
+        // tool resolves outside the store. This arm is scoped to the edges whose
+        // command runs the scanner, which is where the exec happens.
+        if cmdline.contains("g-ir-scanner") {
+            if let Some(pc) = input_shipping(&task.store_dir, &task.input_srcs, "bin/pkg-config") {
+                let dir = format!("{}/bin", task.store_dir.display(&pc));
+                if !path.contains(&dir) {
+                    path.push(dir);
+                }
+            }
+        }
         drv.env
             .insert(b"PATH"[..].into(), path.join(":").into_bytes().into());
     }
@@ -7186,9 +7210,21 @@ fn external_project_binary_dir(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> 
 /// single `stat` per candidate, and the answer is the same on every machine
 /// because it is a property of the package's own output.
 fn ninja_input(store_dir: &StoreDir, inputs: &[StorePath]) -> Option<StorePath> {
+    input_shipping(store_dir, inputs, "bin/ninja")
+}
+
+/// The input whose output SHIPS the given relative path, asked by `is_file`
+/// rather than by name.
+///
+/// THE ASK IS THE WHOLE POINT. `ninja_input` documents it for `bin/ninja`: a
+/// name test takes this driver's own `nix-ninja-0.1.0` as the make program and
+/// misses `python3.14-ninja-1.13.2`. The same shape recurs for every tool a
+/// generator execs by bare name, and each one is a file already in the task's
+/// closure that is simply not on its `$PATH`.
+fn input_shipping(store_dir: &StoreDir, inputs: &[StorePath], rel: &str) -> Option<StorePath> {
     inputs
         .iter()
-        .find(|sp| sp.to_absolute_path(store_dir).join("bin/ninja").is_file())
+        .find(|sp| sp.to_absolute_path(store_dir).join(rel).is_file())
         .cloned()
 }
 
@@ -19111,5 +19147,55 @@ mod cmake_autogen_reader_tests {
             cmake_autogen_info_arg(&["cmake".into(), "-E".into(), "touch".into(), "y".into()]),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod input_shipping_tests {
+    use super::input_shipping;
+    use harmonia_store_path::StoreDir;
+
+    /// THE ASK IS BY FILE, NOT BY NAME. `bin/ninja` is the case the helper was
+    /// extracted from: a name test takes this driver's own `nix-ninja-0.1.0`
+    /// for the make program and misses a second resident ninja.
+    #[test]
+    fn an_input_is_found_by_the_file_it_ships() {
+        let store_dir: StoreDir = "/nix/store".parse().unwrap();
+        // Real store objects, so the arm cannot be satisfied by a name.
+        let wrapper: harmonia_store_path::StorePath =
+            "j4nx9d7ipdqhncz8adnki7n90gmahhl3-pkg-config-wrapper-0.29.2"
+                .parse()
+                .unwrap();
+        let bash: harmonia_store_path::StorePath = "s9hw728xr5pdr1973yxqbc671gw0ziby-bash-5.3p15"
+            .parse()
+            .unwrap();
+        let inputs = vec![bash.clone(), wrapper.clone()];
+
+        assert_eq!(
+            input_shipping(&store_dir, &inputs, "bin/pkg-config"),
+            Some(wrapper),
+            "the wrapper ships bin/pkg-config and must be found"
+        );
+        assert_eq!(
+            input_shipping(&store_dir, &inputs, "bin/bash"),
+            Some(bash),
+            "and the same ask finds a different file in a different input"
+        );
+    }
+
+    /// THE NEGATIVE CONTROL. An input that does not ship the file contributes
+    /// nothing, so the arm cannot be satisfied by returning the first input.
+    #[test]
+    fn an_input_that_does_not_ship_the_file_is_not_returned() {
+        let store_dir: StoreDir = "/nix/store".parse().unwrap();
+        let bash: harmonia_store_path::StorePath = "s9hw728xr5pdr1973yxqbc671gw0ziby-bash-5.3p15"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            input_shipping(&store_dir, std::slice::from_ref(&bash), "bin/pkg-config"),
+            None
+        );
+        assert_eq!(input_shipping(&store_dir, &[], "bin/pkg-config"), None);
+        assert_eq!(input_shipping(&store_dir, &[bash], "bin/not-here"), None);
     }
 }
