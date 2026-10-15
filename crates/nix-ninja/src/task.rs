@@ -3363,6 +3363,7 @@ fn forwarded_to_tasks(key: &str) -> bool {
         || key == "XML_CATALOG_FILES"
         || key == "PYTHONPATH"
         || key == "XDG_DATA_DIRS"
+        || key == "PKG_CONFIG_PATH"
         || key == "NIX_GOBJECT_INTROSPECTION_DEFAULT_FALLBACK_LIBPATH"
 }
 
