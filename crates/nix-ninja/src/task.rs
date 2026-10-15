@@ -3775,32 +3775,47 @@ fn build_task_derivation(
         task.outputs.iter().filter_map(|p| p.to_str()),
     );
     if needs_cc {
-        // The refusal is LOUD only where the task would actually look `cc` up
-        // on PATH. A command naming its toolchain by absolute path exec's that
-        // path and needs no lookup, which is mesa-libclc: 514 tasks ran
-        // `$LIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR/clang` and the abort below
-        // killed the package for a `cc` it never invoked.
+        // THE INSERT CONDITION IS THE ORIGINAL ONE, `!names_only_absolute_toolchain`,
+        // and THAT IS WHAT KEEPS EMISSION IDENTICAL. Widening it to "the compiler
+        // resolved" would re-key every edge that names its toolchain by absolute
+        // path - mesa-libclc's 514 `clang` tasks among them - because the old code
+        // inserted nothing for those and they have banked outputs. The condition
+        // below is unchanged, so wherever `cc` resolves the same path is inserted
+        // under the same test.
         //
-        // The name test above stays deliberately broad, because it also
-        // decides the closure; it is the ABORT that must not fire here.
+        // WHAT MOVES IS ONLY THE ABSENT CASE, and there the old code called
+        // `require_cc` and ABORTED, so no derivation existed to invalidate. Two
+        // shapes reach it and they must part company:
+        //
+        //   a command that NAMES a toolchain without an absolute path - it comes
+        //     from PATH and the absence is a real defect, so the refusal still
+        //     fires, now naming the command in it.
+        //   a command that names NO toolchain - the edge is `deps = gcc` or its
+        //     output is object shaped. `cc_lookup_is_implied` decides which: a
+        //     generator writing an object execs the compiler and needs it, and
+        //     is refused; an absolute tablegen writing a `.inc` is not, and
+        //     proceeds without the wrapper. That second case is rustc 1.98.1's 41
+        //     `llvm-min-tblgen` edges, which aborted the package.
         if !names_only_absolute_toolchain(cmdline) {
-            // THE REFUSAL NAMES THE COMMAND IT REFUSED. Without this the abort
-            // carries the message and nothing else, and the task never emits a
-            // derivation, so the command cannot be recovered afterwards: `nix
-            // derivation show` needs a drv and `nix path-info` needs an output,
-            // and a refused edge produces neither. A reader is then left
-            // guessing which command tripped a predicate over a name list,
-            // which is what this cost on 2026-10-13 (a rustc/LLVM round, 32
-            // tasks, both sides reading a command from a DIFFERENT task that
-            // had succeeded). Truncated because a command can be megabytes and
-            // the part that matters is the head; `-v` reproduces it in full.
-            let shown: String = cmdline.chars().take(400).collect();
-            drv.inputs.insert(SingleDerivedPath::Opaque(
+            if let Some(cc) = tools.cc.as_ref() {
+                drv.inputs.insert(SingleDerivedPath::Opaque(cc.clone()));
+            } else if cc_lookup_is_implied(cmdline, task.outputs.iter().filter_map(|p| p.to_str()))
+            {
+                // THE REFUSAL NAMES THE COMMAND IT REFUSED. Without this the abort
+                // carries the message and nothing else, and the task never emits a
+                // derivation, so the command cannot be recovered afterwards: `nix
+                // derivation show` needs a drv and `nix path-info` needs an output,
+                // and a refused edge produces neither. A reader is then left
+                // guessing which command tripped a predicate over a name list,
+                // which is what this cost on 2026-10-13 (a rustc/LLVM round, 32
+                // tasks, both sides reading a command from a DIFFERENT task that
+                // had succeeded). Truncated because a command can be megabytes and
+                // the part that matters is the head; `-v` reproduces it in full.
+                let shown: String = cmdline.chars().take(400).collect();
                 tools
                     .require_cc()
-                    .with_context(|| format!("refused command: {shown}"))?
-                    .clone(),
-            ));
+                    .with_context(|| format!("refused command: {shown}"))?;
+            }
         }
     }
     drv.inputs
@@ -4490,13 +4505,22 @@ fn build_task_derivation(
     {
         // Prepare $PATH to have coreutils and bash.
         let mut path: Vec<String> = vec![format!("{}/bin", task.store_dir.display(&tools.bash))];
-        // Same guard as the input insert: an absolute toolchain path exec's
-        // itself and needs no PATH entry, so this must not abort for one.
+        // Same guard as the input insert, and for the same reason: an absolute
+        // toolchain path exec's itself and needs no PATH entry, so this must not
+        // abort for one.
+        //
+        // THIS PUSH IS ALSO WHAT MAKES A GENERATOR THAT EXECS THE COMPILER
+        // WORK - glib's `dtrace -G -s gobject_probes.d -o gobject_probes.o`
+        // names no toolchain and needs `cc` on PATH anyway (class 7, `3ec8201`).
+        // Its condition is therefore UNCHANGED, so every task whose `cc`
+        // resolves pushes the identical path it always did. The absent case is
+        // decided at the input insert above, which has already returned the
+        // refusal when a lookup was implied; here an absent `cc` simply
+        // contributes no entry, which is the llvm-min-tblgen shape.
         if needs_cc && !names_only_absolute_toolchain(cmdline) {
-            path.push(format!(
-                "{}/bin",
-                task.store_dir.display(tools.require_cc()?)
-            ));
+            if let Some(cc) = tools.cc.as_ref() {
+                path.push(format!("{}/bin", task.store_dir.display(cc)));
+            }
         }
         path.push(format!("{}/bin", task.store_dir.display(&tools.coreutils)));
         path.push(format!("{}/bin", task.store_dir.display(&tools.patchelf)));
@@ -12072,7 +12096,7 @@ fn task_needs_cc<'a>(
 
 #[cfg(test)]
 mod task_needs_cc_tests {
-    use super::{names_only_absolute_toolchain, task_needs_cc};
+    use super::{cc_lookup_is_implied, names_only_absolute_toolchain, task_needs_cc};
 
     /// glib's probe object: a tracing tool that execs the compiler from
     /// inside its own process, so no toolchain name is on the line.
@@ -12153,6 +12177,70 @@ mod task_needs_cc_tests {
             ["x"].into_iter()
         ));
         assert!(!task_needs_cc(None, "cmake -E touch x", ["x"].into_iter()));
+    }
+
+    /// THE COMBINATION THE REFUSAL GATE ACTUALLY COMPUTES, which is what no arm
+    /// covered and why a wrong repair could have shipped. The tests above assert
+    /// `task_needs_cc` and `names_only_absolute_toolchain` separately; the gate
+    /// is neither, and its two halves disagree about the case that costs a
+    /// package: a command naming NO toolchain.
+    ///
+    /// Three shapes, and the polarity that must hold for each:
+    ///
+    ///   llvm-min-tblgen  - absolute path, `.inc` output, no toolchain named.
+    ///     `needs_cc` is true because the EDGE is `deps = gcc`, and nothing asks
+    ///     PATH for a compiler, so it must NOT be refused. This is the rustc
+    ///     1.98.1 shape: 41 edges, the package aborted, the KDE stack behind it.
+    ///   dtrace           - no toolchain named, OBJECT output. A generator execs
+    ///     the compiler from inside its own process, so it DOES need `cc` on
+    ///     PATH and must be refused when the compiler is absent.
+    ///   bare `gcc`       - names a toolchain without a leading slash, so it
+    ///     comes from PATH and must be refused.
+    #[test]
+    fn the_refusal_gate_answers_by_why_the_compiler_is_needed() {
+        // VERBATIM from the live round's `refused command:` line, truncated at
+        // the 400-character cap the driver itself prints at. A paraphrase would
+        // let the fixture drift from the command that actually failed.
+        let tblgen = "cd /build/rustc-1.98.1-src/build/x86_64-unknown-linux-gnu/llvm/build/include/llvm/IR \
+             && /build/rustc-1.98.1-src/build/x86_64-unknown-linux-gnu/llvm/build/bin/llvm-min-tblgen \
+             -gen-intrinsic-impl \
+             -I/build/rustc-1.98.1-src/src/llvm-project/llvm/include/llvm/IR \
+             -I/build/rustc-1.98.1-src/build/x86_64-unknown-linux-gnu/llvm/build/include \
+             -I/build/rustc-1.98.1-src/src/llvm-project/llvm/include -no-warn-o";
+        assert!(
+            !cc_lookup_is_implied(tblgen, ["include/llvm/IR/IntrinsicImpl.inc"].into_iter()),
+            "an absolute generator writing a .inc asks PATH for no compiler"
+        );
+        assert!(
+            !cc_lookup_is_implied(tblgen, ["include/llvm/IR/IntrinsicImpl.h"].into_iter()),
+            "and neither does the header spelling"
+        );
+
+        // THE ARM A WRONG REPAIR BREAKS, and it is the whole reason this
+        // predicate exists: the same "names no toolchain" reading that must NOT
+        // refuse the tblgen edge MUST refuse this one.
+        assert!(
+            cc_lookup_is_implied(DTRACE, ["gobject_probes.o"].into_iter()),
+            "a generator writing an OBJECT execs the compiler and needs it on PATH"
+        );
+        // The negative control on the same command: the object SHAPE is what
+        // decides, exactly as it does in `task_needs_cc`.
+        assert!(
+            !cc_lookup_is_implied(DTRACE, ["probes.stamp"].into_iter()),
+            "a generator writing a stamp keeps the small closure"
+        );
+
+        assert!(
+            cc_lookup_is_implied("clang -c -o lib/x.bc lib/x.cl", ["lib/x.bc"].into_iter()),
+            "a bare toolchain name comes from PATH and must be refused"
+        );
+        assert!(
+            !cc_lookup_is_implied(
+                "/nix/store/x/bin/clang -c -o lib/x.bc lib/x.cl",
+                ["lib/x.bc"].into_iter()
+            ),
+            "an absolute toolchain path exec's itself and needs no lookup"
+        );
     }
 }
 
@@ -15477,6 +15565,64 @@ fn names_only_absolute_toolchain(cmdline: &str) -> bool {
         }
     }
     any_tool
+}
+
+/// WHETHER THIS TASK WILL LOOK `cc` UP ON PATH, and so must be refused when the
+/// compiler is absent.
+///
+/// THIS IS NOT `names_only_absolute_toolchain`, and the gap between them is a
+/// class of edges. That predicate reports whether a toolchain name is on the
+/// line and whether every one of them is absolute; a command naming NO toolchain
+/// makes it false, which reads as "needs a PATH-resolved cc". Two of the three
+/// reasons `needs_cc` is true do imply such a lookup and one does not:
+///
+///   1. the command names a toolchain WITHOUT an absolute path. A bare `gcc`
+///      comes from PATH, so it must be refused while the compiler is absent -
+///      the loud failure, rather than a task that dies later with `not found`.
+///      IMPLIES a lookup.
+///   2. the command names NO toolchain and its outputs are OBJECT SHAPED. The
+///      generator execs the compiler from inside its own process, which the
+///      command line cannot show: glib's `dtrace -G -s gobject_probes.d -o
+///      gobject_probes.o` (class 7, `3ec8201`). IMPLIES a lookup, and it is why
+///      this cannot be a test on the command line alone.
+///   3. the command names NO toolchain and the edge is `deps = gcc`. The rule
+///      says a compiler was involved; the command says it is not asking PATH for
+///      one. Does NOT imply a lookup.
+///
+/// MEASURED 2026-10-14, and the cost runs BOTH WAYS. rustc 1.98.1's vendored LLVM
+/// runs 41 `llvm-min-tblgen` edges - an absolute path, no toolchain named, a
+/// `.inc` output - and reason 3 was read as a lookup, so every one was refused
+/// and the package aborted with the KDE stack behind it. The obvious one-line
+/// repair, making `names_only_absolute_toolchain` true when nothing is named,
+/// breaks reason 2 instead: `dtrace` loses `cc` from `$PATH` and dies `No such
+/// file or directory: 'gcc'`. The discriminator has to be WHY the compiler is
+/// needed, never whether a name is on the line.
+fn cc_lookup_is_implied<'a>(cmdline: &str, outs: impl Iterator<Item = &'a str>) -> bool {
+    names_named_toolchain_needs_path(cmdline)
+        || (object_shaped_outputs(outs) && !command_names_toolchain(cmdline))
+}
+
+/// True when the command names a toolchain program WITHOUT an absolute path,
+/// which is the only spelling the NAME test can prove needs a PATH lookup.
+///
+/// Distinct from `names_only_absolute_toolchain`, which is also false when NO
+/// toolchain is named: that case is silent about a lookup and is decided by
+/// `cc_lookup_is_implied`'s output-shape arm instead.
+fn names_named_toolchain_needs_path(cmdline: &str) -> bool {
+    cmdline
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ';' | '|' | '&' | '(' | ')' | '<' | '>' | '"' | '\'' | '`' | '='
+                )
+        })
+        .filter(|t| !t.is_empty())
+        .filter(|t| {
+            let base = t.rsplit('/').next().unwrap_or(t);
+            TOOLCHAIN_TOOLS.contains(&base)
+        })
+        .any(|t| !t.starts_with('/'))
 }
 
 fn command_program(cmdline: &str) -> Option<&str> {
