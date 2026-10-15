@@ -653,10 +653,20 @@ Mechanisms in `task.rs`, cited by symbol because line numbers rot:
   rides its stamp as a co-output; a later step's registration of the tree
   SUPERSEDES the earlier one, the one place registration is not
   first-writer-wins.
-- **Header placement**: `create_symlinks` copies `.py`, `.mjs`, `.js`,
-  `.cjs`, `node_modules` and every `header_like` suffix (one predicate,
-  exported from `nix-ninja-task`), an alias excluded and asked BEFORE the
-  extension list. A hard link is EXDEV in a sandbox.
+- **Placement: a symlink into the store, or a COPY**. `create_symlinks`
+  symlinks an input by default and copies it when `copy_not_link` holds, which
+  is the ONE list `nix-ninja-task` owns: `.py`, `.mjs`, `.js`, `.cjs`,
+  `node_modules`, every `header_like` suffix (one predicate, exported), and a
+  build-tree EXECUTABLE whose loader search path is `$ORIGIN`-relative
+  (`origin_relative_executable`, `f8fb5e8`). An alias is excluded and asked
+  BEFORE the list, because a store object that is itself a symlink is dangling
+  by design and `fs::copy` on it is ENOENT. A hard link is EXDEV in a sandbox.
+  THE ARMS SHARE ONE REASON: a consumer that resolves its own location, or the
+  location of a file beside it, lands in the STORE where its siblings are not.
+  A script realpaths `__file__`, node realpaths a required module, a header is
+  reached as a quoted sibling of an already-relocated header, and an ELF
+  resolves `$ORIGIN`. Adding a member means finding the consumer that resolves
+  a path, never a file that merely looks similar.
 - **Build-dir deepening** (`main.rs`, the `escapes` closure) is the task's
   self-defense against a `..`-heavy input escaping the writable tree: it
   deepens its own build dir until every climb stays under `/build`, because
