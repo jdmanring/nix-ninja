@@ -230,7 +230,7 @@ fn main() -> Result<()> {
     // script must name the file in an `ARCHIVE_CREATE ... PATHS` call, and the
     // file must be one this task received. Measured on the failing task: of 466
     // inputs exactly two are named on the command line and one is archived.
-    let archive_copy = archived_by_cmake_script(&cli.cmdline, &inputs, &build_dir);
+    let archive_copy = archived_by_cmake_script(&cli.cmdline, &inputs, &build_dir, &cli.store_dir);
     create_symlinks_with(&build_dir, &cli.store_dir, inputs, false, &archive_copy)?;
     for tree in &edit_in_place {
         let dst = build_dir.join(&tree.build_path);
@@ -1408,35 +1408,16 @@ fn cmake_d_definitions(cmdline: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The `PATHS` arguments of every `file(ARCHIVE_CREATE ...)` call in a script,
-/// as written (the caller expands them). An `ARCHIVE_CREATE` without `PATHS`
-/// contributes nothing.
-fn cmake_archive_paths(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for body in cmake_call_bodies(text, "file") {
-        if !body.contains("ARCHIVE_CREATE") {
-            continue;
-        }
-        let toks: Vec<&str> = body.split_whitespace().collect();
-        let Some(i) = toks.iter().position(|t| *t == "PATHS") else {
-            continue;
-        };
-        for t in toks.iter().skip(i + 1) {
-            // The next keyword ends the list; `OUTPUT`, `FORMAT`,
-            // `COMPRESSION` and `COMPRESSION_LEVEL` all appear after it.
-            if matches!(
-                *t,
-                "OUTPUT" | "FORMAT" | "COMPRESSION" | "COMPRESSION_LEVEL" | "WORKING_DIRECTORY"
-            ) {
-                break;
-            }
-            let v = t.trim_matches('"');
-            if !v.is_empty() && !v.starts_with('-') {
-                out.push(v.to_string());
-            }
-        }
-    }
-    out
+/// Whether the script calls `file(ARCHIVE_CREATE ...)` at all, which is what
+/// makes a `-D`-named input archivable. The call's own `PATHS` value is NOT
+/// followed: it is composed from variables the script sets (qtbase's is
+/// `${mimetypes_resource_file_minified}`, set from `${INPUT_FILE}` through a
+/// macro), so a one-step expansion resolves nothing and drops the file in
+/// silence. The command line's own `-D` values are the reliable source.
+fn cmake_archives_something(text: &str) -> bool {
+    cmake_call_bodies(text, "file")
+        .iter()
+        .any(|b| b.contains("ARCHIVE_CREATE"))
 }
 
 /// `body` of each `name(...)` call, quote-stripped, in file order. Textual and
@@ -1455,23 +1436,60 @@ fn cmake_call_bodies(text: &str, name: &str) -> Vec<String> {
     out
 }
 
-/// The value of a `${NAME}` reference against the `-D` definitions, once.
-/// Returns `None` when the name is not defined, which drops the candidate.
-fn expand_cmake_var(name: &str, defs: &[(String, String)]) -> Option<String> {
-    let n = name.trim();
-    let inner = n
-        .strip_prefix("${")
-        .and_then(|s| s.strip_suffix('}'))
-        .unwrap_or(n);
-    defs.iter()
-        .find(|(k, _)| k == inner)
-        .map(|(_, v)| v.clone())
+/// The input a command-path spelling names, matched by TAIL rather than by root.
+///
+/// THE COMMAND SPELLS THE HOST PATH WHILE THE TASK RUNS UNDER ITS OWN ROOT, and
+/// that is why the first three versions of this arm carried nothing. Measured on
+/// qtbase 6.11.2: the task's `build_dir` is `/build/source/build`, the command's
+/// `-D` value spells `/build/qtbase-everywhere-src-6.11.2/src/corelib/...`, and
+/// the input's own `build_path` is `../src/corelib/...`. Resolving the input
+/// under the task's root gives `/build/source/src/corelib/...`; resolving the
+/// spelling under the same root gives `/build/qtbase-.../src/corelib/...`. THE
+/// TWO DIFFER ONLY IN THEIR ROOT, because the sandbox tree MIRRORS the source
+/// tree, so the trailing components are the identity.
+///
+/// A DIAGNOSTIC FOUND THIS, not reading: the arm printed an empty set while its
+/// own script-path lookup resolved correctly, and the printed `build_dir` named
+/// the wrong root. Instrument a predicate that matches on paper but does not
+/// fire, rather than reasoning about it a fourth time.
+///
+/// THE LONGEST MATCH WINS, and one trailing component is not enough: two trees
+/// can both hold a `config.h`.
+fn find_input_by_command_spelling<'a>(
+    inputs: &'a [DerivedFile],
+    build_dir: &Path,
+    spelling: &str,
+) -> Option<&'a DerivedFile> {
+    let want_norm = lexical_normalize(spelling);
+    let want: Vec<&str> = want_norm.split('/').filter(|c| !c.is_empty()).collect();
+    let mut best: Option<(&DerivedFile, usize)> = None;
+    for input in inputs {
+        let here = lexical_normalize(&format!(
+            "{}/{}",
+            build_dir.display(),
+            input.build_path.display()
+        ));
+        let comps: Vec<&str> = here.split('/').filter(|c| !c.is_empty()).collect();
+        let mut n = 0;
+        while n < comps.len().min(want.len())
+            && comps[comps.len() - 1 - n] == want[want.len() - 1 - n]
+        {
+            n += 1;
+        }
+        // TWO OR MORE, the smallest run that names a file in a directory rather
+        // than a bare basename.
+        if n >= 2 && best.is_none_or(|(_, bn)| n > bn) {
+            best = Some((input, n));
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 fn archived_by_cmake_script(
     cmdline: &str,
     inputs: &[DerivedFile],
     build_dir: &Path,
+    store_dir: &StoreDir,
 ) -> std::collections::HashSet<PathBuf> {
     let mut out = std::collections::HashSet::new();
     // `cmake -P <script>` is the only shape that runs a script, so a task that
@@ -1479,35 +1497,57 @@ fn archived_by_cmake_script(
     let Some(script) = cmake_p_script(cmdline) else {
         return out;
     };
-    let Ok(text) = std::fs::read_to_string(build_dir.join(&script)) else {
+    // READ THE SCRIPT FROM ITS STORE PATH, NOT ITS BUILD PATH. At this point
+    // nothing is placed on disk yet - `create_symlinks_with` runs immediately
+    // after - so `build_dir.join(script)` is a path to a file that does not
+    // exist, the read fails, and the arm returns an empty set IN SILENCE. That
+    // is what the first two versions of this did, and the diagnostic that found
+    // it printed `archive_copy={}` with the script path resolving correctly.
+    // The script is one of the inputs, so its store path is what to open; its
+    // build path is only how the COMMAND spells it.
+    // THE SAME TAIL MATCH THE CANDIDATES USE, because the script's spelling
+    // differs from its input the same way: the command names it under the HOST
+    // root while the input's build path is relative to the task's.
+    let Some(src) = find_input_by_command_spelling(inputs, build_dir, &script) else {
         return out;
     };
-    // The `-D` values the command supplies, expanded in the order cmake would.
+    let Ok(text) = std::fs::read_to_string(src.absolute_path(store_dir)) else {
+        return out;
+    };
+    // A script that archives nothing needs no copy, whatever its `-D` values
+    // name. This is what keeps the arm from copying a file a script merely
+    // READS.
+    if !cmake_archives_something(&text) {
+        return out;
+    }
+    // WHAT TO COPY, AND WHY THE `PATHS` VALUE CANNOT BE FOLLOWED TO IT.
+    // The archive call names its input through a variable the script composes -
+    // qtbase's is `PATHS ${mimetypes_resource_file_minified}`, set from
+    // `${INPUT_FILE}` by a macro through `PARENT_SCOPE` - so expanding the
+    // `PATHS` text against the `-D` values in one step resolves NOTHING and the
+    // candidate is dropped in silence. That is exactly what the first version of
+    // this reader did, and the real task still failed with it: measured on
+    // qtbase 6.11.2, `tika-mimetypes.xml` stayed a symlink and CMake aborted.
+    //
+    // SO THE RULE IS THE COMMAND LINE'S OWN VALUES, which is a WEAKER CLAIM AND
+    // A SAFER ONE: a `-D` value that resolves to a file this task RECEIVED is a
+    // file the command hands to cmake, and a script that calls
+    // `ARCHIVE_CREATE` may archive any of them. Measured on the failing task:
+    // of four `-D` values exactly ONE resolves to a received input, and it is
+    // the file that gets archived. The `ARCHIVE_CREATE` requirement is what
+    // keeps a `-P` script that merely READS a file from copying it.
     let defs = cmake_d_definitions(cmdline);
-    for name in cmake_archive_paths(&text) {
-        let Some(value) = expand_cmake_var(&name, &defs) else {
+    for (_, value) in &defs {
+        if value.is_empty() {
             continue;
-        };
-        // A `-D` value may be absolute (the build tree the task runs in) or
-        // relative; both are normalised against the build dir.
-        let abs = if value.starts_with('/') {
-            lexical_normalize(&value)
-        } else {
-            lexical_normalize(&format!("{}/{}", build_dir.display(), value))
-        };
-        // Only a file this task RECEIVED can be copied; a generated one is not
-        // here yet, and its absence is not this arm's business. The two
-        // spellings are compared the way the placement resolves them: the
-        // build-dir-relative one, and the same file through its store path.
-        for input in inputs {
-            let here = lexical_normalize(&format!(
-                "{}/{}",
-                build_dir.display(),
-                input.build_path.display()
-            ));
-            if here == abs {
-                out.insert(input.build_path.clone());
-            }
+        }
+        // THE COMMAND SPELLS THE HOST PATH WHILE THE TASK RUNS UNDER ITS OWN
+        // ROOT, so the two are matched by TAIL: see
+        // `find_input_by_command_spelling` for the measurement. Only a file
+        // this task RECEIVED can be copied; a generated one is not here yet,
+        // and its absence is not this arm's business.
+        if let Some(input) = find_input_by_command_spelling(inputs, build_dir, value) {
+            out.insert(input.build_path.clone());
         }
     }
     out
@@ -1857,46 +1897,32 @@ mod optional_pass_as_file_tests {
 
 #[cfg(test)]
 mod cmake_archive_tests {
-    use super::{cmake_archive_paths, cmake_call_bodies, cmake_d_definitions, cmake_p_script};
+    use super::{cmake_archives_something, cmake_call_bodies, cmake_d_definitions, cmake_p_script};
 
-    /// THE REAL SCRIPT, reduced to the calls that matter, taken from
-    /// `QtCompressMimeDatabase.cmake` in qtbase 6.11.2. A fixture written from
-    /// the shape I expected rather than the shape on disk is the trap this
-    /// corpus records, so the `set()` then `file(ARCHIVE_CREATE)` pair is here
-    /// as the file spells it.
+    /// THE REAL SCRIPT, verbatim from `QtCompressMimeDatabase.cmake` in qtbase
+    /// 6.11.2: the archive call names its input through a variable the script
+    /// composes, which is why following `PATHS` resolves nothing.
     const QT_SCRIPT: &str = r#"
         set(qmimeprovider_db_data_file "${INPUT_FILE}")
-        set(mimetypes_resource_file_minified "${INPUT_FILE}")
         file(ARCHIVE_CREATE OUTPUT "${qmimeprovider_db_data_file}"
             PATHS "${mimetypes_resource_file_minified}"
             FORMAT raw
             COMPRESSION ${cmake_compression_type}
-            ${additional_file_archive_create_parameters}
         )
 "#;
 
-    /// The `PATHS` argument is found, and the keywords after it are not.
+    /// An archive call is detected, and a script that only reads is not. This is
+    /// the gate that keeps the arm from copying a file a script merely opens.
     #[test]
-    fn the_paths_argument_of_an_archive_call_is_found() {
-        assert_eq!(
-            cmake_archive_paths(QT_SCRIPT),
-            vec!["${mimetypes_resource_file_minified}".to_string()],
-            "the PATHS value only, not FORMAT/COMPRESSION"
-        );
+    fn a_script_that_archives_is_told_from_one_that_only_reads() {
+        assert!(cmake_archives_something(QT_SCRIPT));
+        assert!(!cmake_archives_something(r#"file(READ "${INPUT_FILE}" x)"#));
+        assert!(!cmake_archives_something(r#"file(GLOB g "*.c")"#));
+        assert!(!cmake_archives_something(""));
     }
 
-    /// A `file()` call that is not an archive contributes nothing, so a script
-    /// full of file operations does not copy anything by accident.
-    #[test]
-    fn a_file_call_that_is_not_an_archive_contributes_nothing() {
-        assert!(cmake_archive_paths(r#"file(REMOVE "x")"#).is_empty());
-        assert!(cmake_archive_paths(r#"file(GLOB g "*.c")"#).is_empty());
-        // And an ARCHIVE_CREATE with no PATHS is not a path either.
-        assert!(cmake_archive_paths(r#"file(ARCHIVE_CREATE OUTPUT "o" FORMAT raw)"#).is_empty());
-    }
-
-    /// The command that runs a script, and the negative control: a cmake
-    /// invocation that runs no script yields None.
+    /// The command that runs a script, with the negative controls: a cmake
+    /// invocation that runs no script, and a program that is not cmake.
     #[test]
     fn the_script_is_taken_from_a_dash_capital_p() {
         assert_eq!(
@@ -1910,8 +1936,9 @@ mod cmake_archive_tests {
         assert_eq!(cmake_p_script("gcc -c a.c"), None);
     }
 
-    /// The `-D` pairs are read off the line, which is where qtbase supplies
-    /// both variables the script expands.
+    /// THE CANDIDATES COME FROM `-D`, because the `PATHS` value cannot be
+    /// followed. On the real task four `-D` values are present and exactly one
+    /// resolves to a received input, which is the file archived.
     #[test]
     fn the_definitions_come_from_the_command_line() {
         let defs = cmake_d_definitions(
@@ -1924,7 +1951,6 @@ mod cmake_archive_tests {
                 ("OUTPUT_FILE".to_string(), "/b/o.cpp".to_string()),
             ]
         );
-        // A `-D` without a value is not a definition.
         assert!(cmake_d_definitions("cmake -DFOO -P s.cmake").is_empty());
     }
 
