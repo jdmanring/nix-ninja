@@ -1803,6 +1803,7 @@ impl Runner {
             let protoc = protoc_invocation(&args);
             let valac = valac_invocation(&args);
             let mkenums = glib_mkenums_invocation(&args);
+            let autogen_info = cmake_autogen_info_arg(&args).map(str::to_string);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
             // is relative to the subdir, not to the build root the rewrite
@@ -2417,6 +2418,30 @@ impl Runner {
                     referenced.push(script.clone());
                     referenced.extend(cmake_script_referenced_paths(&text, &cmake_p_defs));
                     referenced.extend(cmake_script_included_modules(&script_path, &text));
+                }
+            }
+            // A `cmake -E cmake_autogen` PLAN NAMES ITS OWN SOURCES, and no edge
+            // declares them: the task is handed the plan and cmake resolves
+            // every header it will include from the lists inside it. The
+            // DIRECTORIES are pushed as arguments so the directory upload below
+            // carries them, the same way a directory argument is carried.
+            if let Some(info) = &autogen_info {
+                let info_path = if info.starts_with('/') {
+                    PathBuf::from(info)
+                } else {
+                    self.config.build_dir.join(rebase_post_cd(&cd_dir, info))
+                };
+                if let Ok(text) = std::fs::read_to_string(&info_path) {
+                    for d in cmake_autogen_referenced_dirs(&text) {
+                        for input in upload_referenced_dir(
+                            &self.rpc_client,
+                            &self.config.build_dir,
+                            Path::new(&d),
+                        )? {
+                            self.add_derived_file(files, input.clone());
+                            input_set.insert(input.build_path.clone(), input);
+                        }
+                    }
                 }
             }
             {
@@ -9836,6 +9861,55 @@ fn tablegen_include_names(text: &str) -> Vec<String> {
             Some(inner[..end].to_string())
         })
         .collect()
+}
+
+/// The `AutogenInfo.json` a `cmake -E cmake_autogen` invocation is handed, as
+/// spelled on the command line.
+///
+/// THE PLAN IS ON THE COMMAND LINE and its CONTENTS are the inputs: cmake's
+/// autogen driver resolves every header it will include from the lists inside
+/// this file, and no ninja edge declares them, because at configure time they
+/// were reachable on a shared filesystem. Same family as the `-P` script, the
+/// `g-ir-scanner --filelist` and the protoc imports: a file a command reads
+/// whose own references nothing declares.
+fn cmake_autogen_info_arg(args: &[String]) -> Option<&str> {
+    let i = args.iter().position(|a| a == "cmake_autogen")?;
+    args.get(i + 1).map(String::as_str)
+}
+
+/// The source directories an `AutogenInfo.json` names, which is where its
+/// headers live.
+///
+/// MEASURED 2026-10-14 on qtbase 6.11.2, and it blocks every Qt package and the
+/// KDE stack behind them: the autogen task for `Core` carried 470 inputs and
+/// NONE of them was under `src/3rdparty/`, so `cmake_autogen` died
+/// `The header file "SRC:/src/3rdparty/forkfd/forkfd.h" does not exist` and all
+/// 475 downstream `Core.dir` translation units failed with it. Of the 116
+/// `MOC_INCLUDES` entries, FOUR were absent from the task's tree: `forkfd`,
+/// `tinycbor/src`, `kernel` and `mkspecs/linux-g++`.
+///
+/// THE LISTS ARE DIRECTORIES rather than files, so the caller uploads them the
+/// way it uploads a directory argument - `MOC_INCLUDES` names a directory and
+/// cmake expands it to the headers inside. `CMAKE_LIST_FILES` is read too
+/// because a `CMakeLists.txt` can be regenerated between the two passes.
+pub fn cmake_autogen_referenced_dirs(text: &str) -> Vec<String> {
+    const KEYS: [&str; 2] = ["MOC_INCLUDES", "CMAKE_LIST_FILES"];
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in KEYS {
+        let Some(arr) = v.get(key).and_then(|a| a.as_array()) else {
+            continue;
+        };
+        for e in arr {
+            let Some(p) = e.as_str() else { continue };
+            if p.starts_with('/') && !out.contains(&p.to_string()) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn cmake_script_arg(args: &[String]) -> Option<&str> {
@@ -18958,6 +19032,66 @@ mod collision_emitter_agrees_with_grouper_tests {
             emitted,
             Some(PathBuf::from("src/include/pg_config_os.h")),
             "the key the grouper returned emits an unnormalized build_path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cmake_autogen_reader_tests {
+    use super::{cmake_autogen_info_arg, cmake_autogen_referenced_dirs};
+
+    /// THE REAL PLAN, reduced to the lists that matter, from qtbase 6.11.2's
+    /// `Core_autogen.dir/AutogenInfo.json`. The directories are what cmake
+    /// expands to find its headers, and `forkfd` is the one it died on.
+    #[test]
+    fn an_autogen_plan_names_the_directories_its_headers_live_in() {
+        let plan = r#"{
+  "MOC_INCLUDES": ["/b/build/include", "/b/src/3rdparty/forkfd", "/b/src/corelib"],
+  "CMAKE_LIST_FILES": ["/b/src/corelib/CMakeLists.txt"],
+  "CMAKE_SOURCE_DIR": "/b",
+  "CMAKE_BINARY_DIR": "/b/build"
+}"#;
+        let got = cmake_autogen_referenced_dirs(plan);
+        assert_eq!(
+            got,
+            vec![
+                "/b/build/include".to_string(),
+                "/b/src/3rdparty/forkfd".to_string(),
+                "/b/src/corelib".to_string(),
+                "/b/src/corelib/CMakeLists.txt".to_string(),
+            ],
+            "every absolute entry of both lists, in order, deduped"
+        );
+    }
+
+    /// THE NEGATIVE CONTROLS. A plan that is not JSON, one with no lists, and
+    /// one whose entries are RELATIVE all contribute nothing: the caller
+    /// resolves these against a build dir it owns, and a relative path here
+    /// would be a guess.
+    #[test]
+    fn an_autogen_plan_that_names_nothing_absolute_contributes_nothing() {
+        assert!(cmake_autogen_referenced_dirs("not json").is_empty());
+        assert!(cmake_autogen_referenced_dirs("{}").is_empty());
+        assert!(cmake_autogen_referenced_dirs(r#"{"MOC_INCLUDES": ["rel/path", 7]}"#).is_empty());
+        assert!(cmake_autogen_referenced_dirs(r#"{"MOC_INCLUDES": null}"#).is_empty());
+    }
+
+    /// The trigger is the SUBTOOL, not the word: a cmake invocation that does
+    /// not run `cmake_autogen` has no plan.
+    #[test]
+    fn the_plan_is_taken_from_the_autogen_subtool() {
+        assert_eq!(
+            cmake_autogen_info_arg(&[
+                "cmake".into(),
+                "-E".into(),
+                "cmake_autogen".into(),
+                "/b/pi.json".into()
+            ]),
+            Some("/b/pi.json")
+        );
+        assert_eq!(
+            cmake_autogen_info_arg(&["cmake".into(), "-E".into(), "touch".into(), "y".into()]),
+            None
         );
     }
 }
