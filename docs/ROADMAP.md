@@ -118,10 +118,11 @@ binary had to learn:
   translation unit's own body rather than in a header it includes.
 - **Undeclared reads.** A file a COMMAND reads and no edge declares, so the
   sandbox stages nothing. The largest family, and the one still growing:
-  `cmake -P` scripts and the modules they include, XInclude, TableGen, rst
-  includes, msgfmt ITS, swig `%include`, the `g-ir-scanner` filelist, protoc
-  imports, valac `--pkg`, python `-m`, and `glib-mkenums` template-and-header
-  arguments. Every member is the same shape and is settled the same way: the
+  `cmake -P` scripts and the modules they include, `cmake -E cmake_autogen`
+  plans, XInclude, TableGen, rst includes, msgfmt ITS, swig `%include`, the
+  `g-ir-scanner` filelist, protoc imports, valac `--pkg`, python `-m`, the
+  `glib-mkenums` template-and-header arguments, and `glib-genmarshal`'s
+  positional list. Every member is the same shape and is settled the same way: the
   CMake rule naming the command declares a dependency on none of the files that
   command reads, because the convention assumes a shared filesystem, so the
   test is never whether a `DEPENDS` exists. It is whether real ninja succeeds
