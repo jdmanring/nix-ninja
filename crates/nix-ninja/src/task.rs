@@ -1810,6 +1810,7 @@ impl Runner {
             // as the `--filelist` arm and the glib-mkenums reader.
             let gir_positional = gir_positional_sources_invocation(&args);
             let protoc = protoc_invocation(&args);
+            let nasm = nasm_invocation(&args);
             let valac = valac_invocation(&args);
             let mkenums = glib_mkenums_invocation(&args);
             let autogen_info = cmake_autogen_info_arg(&args).map(str::to_string);
@@ -2361,6 +2362,13 @@ impl Runner {
             // `-I` roots, so nothing on the command line declares them (upb
             // 33.6.0 / 36.2.0, `File not found` on every protoc task of two
             // desktop rounds). Same family and reader placement as swig.
+            // AN ASSEMBLER RESOLVES `%include` THROUGH ITS `-I` ROOTS, the
+            // protoc shape one tool over (gst-plugins-good's `x86inc.asm`).
+            if let Some((incs, srcs)) = &nasm {
+                for p in nasm_referenced_paths(&self.config.build_dir, &cd_dir, incs, srcs) {
+                    referenced.push(p);
+                }
+            }
             if let Some((incs, protos)) = &protoc {
                 let got = protoc_referenced_paths(&self.config.build_dir, &cd_dir, incs, protos);
                 for p in got {
@@ -8567,6 +8575,109 @@ fn proto_imports(text: &str) -> Vec<String> {
 /// that EXIST so an unresolvable reference drops rather than failing a read.
 /// Emitted RELATIVE: the wiring's absolute filters drop a store or foreign
 /// path in silence (see `swig_referenced_paths`).
+/// An assembler run (`nasm`/`yasm`): its `-I` roots and its source files.
+/// The assembler resolves `%include "name"` through those roots at runtime
+/// and no edge declares the target: gst-plugins-good 1.28.7's `yadif.asm`
+/// includes `x86inc.asm` through `-I../gst/deinterlace/x86/` and the task
+/// died `unable to open include file`.
+pub fn nasm_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    let at = args.iter().position(|a| {
+        let b = Path::new(a)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        b == "nasm" || b == "yasm"
+    })?;
+    let (mut incs, mut srcs) = (Vec::new(), Vec::new());
+    let mut it = args[at + 1..].iter();
+    while let Some(a) = it.next() {
+        if a == "&&" || a == ";" || a == "|" {
+            break;
+        }
+        if a == "-I" || a == "-i" || a == "-o" {
+            let v = it.next();
+            if a != "-o" {
+                incs.extend(v.cloned());
+            }
+        } else if let Some(d) = a.strip_prefix("-I").or_else(|| a.strip_prefix("-i")) {
+            incs.push(d.to_string());
+        } else if !a.starts_with('-')
+            && [".asm", ".nasm", ".s", ".S"].iter().any(|s| a.ends_with(s))
+        {
+            srcs.push(a.clone());
+        }
+    }
+    (!srcs.is_empty()).then_some((incs, srcs))
+}
+
+/// The targets of `%include "x"` / `%include 'x'` lines, case-insensitive
+/// in the directive as nasm is.
+pub fn nasm_includes(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim_start();
+            let rest = l.get(..8).filter(|d| d.eq_ignore_ascii_case("%include"))?;
+            let tail = l[rest.len()..].trim_start();
+            let q = tail.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let body = &tail[1..];
+            body.find(q).map(|e| body[..e].to_string())
+        })
+        .collect()
+}
+
+/// The `%include` closure of an assembler run, as absolute paths:
+/// the cwd first, then each `-I` root, the order nasm searches.
+pub fn nasm_referenced_paths(
+    build_dir: &Path,
+    cd_dir: &Path,
+    incs: &[String],
+    srcs: &[String],
+) -> Vec<String> {
+    let root = build_dir.join(cd_dir);
+    let abs = |p: &str| {
+        if Path::new(p).is_absolute() {
+            PathBuf::from(p)
+        } else {
+            lexical_join(&root, Path::new(p))
+        }
+    };
+    let roots: Vec<PathBuf> = std::iter::once(root.clone())
+        .chain(incs.iter().map(|d| abs(d)))
+        .collect();
+    let mut queue: Vec<PathBuf> = srcs
+        .iter()
+        .map(|s| abs(s))
+        .filter(|p| p.is_file())
+        .collect();
+    let mut seen: rustc_hash::FxHashSet<PathBuf> = queue.iter().cloned().collect();
+    let mut out = Vec::new();
+    while let Some(doc) = queue.pop() {
+        let Ok(text) = std::fs::read_to_string(&doc) else {
+            continue;
+        };
+        for inc in nasm_includes(&text) {
+            let Some(hit) = roots.iter().find_map(|r| {
+                let c = r.join(&inc);
+                c.is_file().then_some(c)
+            }) else {
+                continue;
+            };
+            if !seen.insert(hit.clone()) {
+                continue;
+            }
+            queue.push(hit.clone());
+            // Absolute: the consumer keeps an in-tree absolute path and
+            // spells it from the build dir, so a `cd` prologue cannot rebase
+            // it twice.
+            let s = hit.to_string_lossy().into_owned();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
 fn protoc_referenced_paths(
     build_dir: &Path,
     cd_dir: &Path,
@@ -19692,6 +19803,58 @@ mod gir_header_closure_tests {
         // THE CONTROL: without the include path the header is not reached,
         // so the arm above cannot pass on a walk that returns every file.
         let bare = gir_header_closure("g-ir-scanner --filelist=x", &build, &[bg]);
+        assert!(bare.is_empty(), "{bare:?}");
+        let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod nasm_reader_tests {
+    use super::*;
+
+    #[test]
+    fn the_failing_argv_names_its_roots_and_source() {
+        let argv: Vec<String> = "/nix/store/x-nasm-3.02/bin/nasm -I../gst/deinterlace \
+            -I../gst/deinterlace/x86/ -DARCH_X86_64=1 -DPIC -UPREFIX -f elf64 \
+            -o gst/deinterlace/libgstdeinterlace.so.p/yadif.asm.o \
+            ../gst/deinterlace/x86/yadif.asm"
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        let (incs, srcs) = nasm_invocation(&argv).unwrap();
+        assert_eq!(incs, vec!["../gst/deinterlace", "../gst/deinterlace/x86/"]);
+        assert_eq!(srcs, vec!["../gst/deinterlace/x86/yadif.asm"]);
+        let cc: Vec<String> = "gcc -c a.s -o a.o".split(' ').map(String::from).collect();
+        assert_eq!(nasm_invocation(&cc), None);
+    }
+
+    #[test]
+    fn an_include_is_resolved_through_the_roots_and_an_absent_one_is_not() {
+        let d = std::env::temp_dir().join(format!("nn-nasm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let x86 = d.join("src/gst/x86");
+        let build = d.join("src/build");
+        fs::create_dir_all(&x86).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::write(
+            x86.join("yadif.asm"),
+            "%include \"x86inc.asm\"\n%INCLUDE 'gone.asm'\n",
+        )
+        .unwrap();
+        fs::write(x86.join("x86inc.asm"), "; nothing\n").unwrap();
+        let got = nasm_referenced_paths(
+            &build,
+            Path::new(""),
+            &["../gst/x86/".into()],
+            &["../gst/x86/yadif.asm".into()],
+        );
+        assert_eq!(
+            got,
+            vec![x86.join("x86inc.asm").to_string_lossy().into_owned()]
+        );
+        // THE CONTROL: without the root the include is not reached.
+        let bare =
+            nasm_referenced_paths(&build, Path::new(""), &[], &["../gst/x86/yadif.asm".into()]);
         assert!(bare.is_empty(), "{bare:?}");
         let _ = fs::remove_dir_all(&d);
     }
