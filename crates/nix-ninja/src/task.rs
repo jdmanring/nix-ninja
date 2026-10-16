@@ -1842,6 +1842,7 @@ impl Runner {
             let gir_positional = gir_positional_sources_invocation(&args);
             let protoc = protoc_invocation(&args);
             let nasm = nasm_invocation(&args);
+            let vapigen = vapigen_invocation(&args);
             let valac = valac_invocation(&args);
             let mkenums = glib_mkenums_invocation(&args);
             let autogen_info = cmake_autogen_info_arg(&args).map(str::to_string);
@@ -2395,6 +2396,15 @@ impl Runner {
             // desktop rounds). Same family and reader placement as swig.
             // AN ASSEMBLER RESOLVES `%include` THROUGH ITS `-I` ROOTS, the
             // protoc shape one tool over (gst-plugins-good's `x86inc.asm`).
+            // VAPIGEN OPENS `<metadatadir>/<Namespace>.metadata` BY NAME, so
+            // no argument names the file: packagekit's renames
+            // (`ErrorEnum`, `DistroUpgradeEnum`) never arrived, and vapigen
+            // rejected the clashing classes' constructors.
+            if let Some((dirs, girs)) = &vapigen {
+                for p in vapigen_referenced_paths(&self.config.build_dir, &cd_dir, dirs, girs) {
+                    referenced.push(p);
+                }
+            }
             if let Some((incs, srcs)) = &nasm {
                 for p in nasm_referenced_paths(&self.config.build_dir, &cd_dir, incs, srcs) {
                     referenced.push(p);
@@ -8618,6 +8628,57 @@ fn proto_imports(text: &str) -> Vec<String> {
 /// that EXIST so an unresolvable reference drops rather than failing a read.
 /// Emitted RELATIVE: the wiring's absolute filters drop a store or foreign
 /// path in silence (see `swig_referenced_paths`).
+/// A `vapigen` run: its `--metadatadir` values and its `.gir` arguments.
+pub fn vapigen_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    let at = args
+        .iter()
+        .position(|a| Path::new(a).file_name().and_then(|n| n.to_str()) == Some("vapigen"))?;
+    let (mut dirs, mut girs) = (Vec::new(), Vec::new());
+    let mut it = args[at + 1..].iter();
+    while let Some(a) = it.next() {
+        if a == "&&" || a == ";" || a == "|" {
+            break;
+        }
+        if a == "--metadatadir" {
+            dirs.extend(it.next().cloned());
+        } else if let Some(d) = a.strip_prefix("--metadatadir=") {
+            dirs.push(d.to_string());
+        } else if !a.starts_with('-') && a.ends_with(".gir") {
+            girs.push(a.clone());
+        }
+    }
+    (!dirs.is_empty() && !girs.is_empty()).then_some((dirs, girs))
+}
+
+/// `<dir>/<Namespace>.metadata` for each metadata dir and `.gir` argument,
+/// where the file exists, as absolute paths.
+pub fn vapigen_referenced_paths(
+    build_dir: &Path,
+    cd_dir: &Path,
+    dirs: &[String],
+    girs: &[String],
+) -> Vec<String> {
+    let root = build_dir.join(cd_dir);
+    let mut out = Vec::new();
+    for gir in girs {
+        let Some(stem) = Path::new(gir).file_stem() else {
+            continue;
+        };
+        for d in dirs {
+            // By string: `with_extension` would take the `.0` of
+            // `PackageKitGlib-1.0` for the extension and replace it.
+            let mut name = stem.to_os_string();
+            name.push(".metadata");
+            let c = lexical_join(&root, Path::new(d)).join(name);
+            let s = c.to_string_lossy().into_owned();
+            if c.is_file() && !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
 /// An assembler run (`nasm`/`yasm`): its `-I` roots and its source files.
 /// The assembler resolves `%include "name"` through those roots at runtime
 /// and no edge declares the target: gst-plugins-good 1.28.7's `yadif.asm`
@@ -19928,5 +19989,51 @@ mod soname_link_edge_tests {
             &["gnu/libfoo.so"],
         ));
         assert!(!soname_link_edge(CMD, &["a.o"], &["gnu/libtbbmalloc.so.2"]));
+    }
+}
+
+#[cfg(test)]
+mod vapigen_reader_tests {
+    use super::*;
+
+    #[test]
+    fn the_failing_argv_names_its_metadata_dir_and_gir() {
+        let argv: Vec<String> = "/nix/store/x-vala-0.56.19/bin/vapigen --quiet \
+            --library=packagekit-glib2 --directory=/build/source/build/lib --pkg=glib-2.0 \
+            --metadatadir=/build/source/lib /build/source/build/lib/PackageKitGlib-1.0.gir"
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        let (dirs, girs) = vapigen_invocation(&argv).unwrap();
+        assert_eq!(dirs, vec!["/build/source/lib"]);
+        assert_eq!(girs, vec!["/build/source/build/lib/PackageKitGlib-1.0.gir"]);
+        let valac: Vec<String> = "valac --pkg=x a.vala"
+            .split(' ')
+            .map(String::from)
+            .collect();
+        assert_eq!(vapigen_invocation(&valac), None);
+    }
+
+    #[test]
+    fn the_namespace_metadata_is_carried_and_an_absent_one_is_not() {
+        let d = std::env::temp_dir().join(format!("nn-vapigen-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let lib = d.join("src/lib");
+        let build = d.join("src/build");
+        fs::create_dir_all(&lib).unwrap();
+        fs::create_dir_all(build.join("lib")).unwrap();
+        let md = lib.join("PackageKitGlib-1.0.metadata");
+        fs::write(&md, "ErrorEnum name=\"ErrorEnum\"\n").unwrap();
+        let got = vapigen_referenced_paths(
+            &build,
+            Path::new(""),
+            &["../lib".into()],
+            &[
+                "lib/PackageKitGlib-1.0.gir".into(),
+                "lib/Other-1.0.gir".into(),
+            ],
+        );
+        assert_eq!(got, vec![md.to_string_lossy().into_owned()]);
+        let _ = fs::remove_dir_all(&d);
     }
 }
