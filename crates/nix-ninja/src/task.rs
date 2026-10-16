@@ -1522,6 +1522,23 @@ impl Runner {
         );
         let mut worklist: Vec<(FileId, bool)> =
             build.ordering_ins().iter().map(|f| (*f, false)).collect();
+        // The names a compile's own translation units `#include`, so the
+        // phony filter below can tell a generated SOURCE the TU reads from
+        // one it merely sits beside. Qt's `#include "moc_qobject.cpp"` and
+        // `"qmimeprovider_database.cpp"` are generated `.cpp` files reached
+        // only through `cmake_object_order_depends_*` (qtbase 6.11.2, the
+        // moc edge's `.json` co-output survived the filter and the `.cpp`
+        // beside it did not). Explicit inputs only, read where they exist.
+        let tu_includes: rustc_hash::FxHashSet<std::ffi::OsString> = if is_gcc_task {
+            tu_include_names(
+                build
+                    .explicit_ins()
+                    .iter()
+                    .map(|f| self.config.build_dir.join(files.by_id[*f].name.as_str())),
+            )
+        } else {
+            Default::default()
+        };
 
         // A SONAME ALIAS IS CARRIED AS LINK TEXT AND THE FILE IT NAMES IS
         // NOT CARRIED WITH IT, so the symlink the task recreates dangles and
@@ -1671,7 +1688,8 @@ impl Runner {
                 // predicate wait() uses to recognise the tree.
                 let tree_like = is_tree_path(Path::new(name.as_str()));
                 let p = Path::new(name.as_str());
-                if !header_like(p) && !tree_like && compile_artifact_shaped(p) {
+                let named_by_tu = p.file_name().is_some_and(|n| tu_includes.contains(n));
+                if !header_like(p) && !tree_like && !named_by_tu && compile_artifact_shaped(p) {
                     continue;
                 }
             }
@@ -7772,6 +7790,60 @@ fn compile_artifact_shaped(p: &Path) -> bool {
             | "s" | "S" | "asm"
         )
     )
+}
+
+/// The file names a set of translation units `#include`, by directive text
+/// alone (no resolution). A phony-reached generated file carrying one of
+/// these names is READ by the compile, whatever its suffix says, so the
+/// `compile_artifact_shaped` filter must let it through. Files that do not
+/// exist contribute nothing: a generated TU is not a reader of anything yet.
+fn tu_include_names<I: IntoIterator<Item = PathBuf>>(
+    sources: I,
+) -> rustc_hash::FxHashSet<std::ffi::OsString> {
+    let mut names = rustc_hash::FxHashSet::default();
+    for src in sources {
+        if !src.is_file() {
+            continue;
+        }
+        let Ok(scan) = c_include_parser::scan_directives(&src) else {
+            continue;
+        };
+        names.extend(
+            scan.directives
+                .iter()
+                .filter_map(|d| d.name.file_name().map(|n| n.to_owned())),
+        );
+    }
+    names
+}
+
+#[cfg(test)]
+mod tu_include_names_tests {
+    use super::{compile_artifact_shaped, tu_include_names};
+    use std::path::Path;
+
+    /// qtbase's shape: a generated `.cpp` the TU includes must be named, and
+    /// a generated `.cpp` it does not include must not be, or the filter's
+    /// control arm (perfetto's `.gen.cc` world) collapses.
+    #[test]
+    fn a_generated_source_the_tu_includes_is_named_and_a_sibling_is_not() {
+        let dir = std::env::temp_dir().join(format!("nn-tu-includes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tu = dir.join("qobject.cpp");
+        std::fs::write(
+            &tu,
+            "#include <QtCore/qobject.h>\n#include \"moc_qobject.cpp\"\n",
+        )
+        .unwrap();
+        let names = tu_include_names([tu, dir.join("absent.cpp")]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(names.contains(Path::new("moc_qobject.cpp").as_os_str()));
+        assert!(names.contains(Path::new("qobject.h").as_os_str()));
+        assert!(!names.contains(Path::new("moc_qdirlisting.cpp").as_os_str()));
+        // Both are artifact shaped; only the named one may survive the filter.
+        assert!(compile_artifact_shaped(Path::new("moc_qobject.cpp")));
+        assert!(compile_artifact_shaped(Path::new("moc_qdirlisting.cpp")));
+    }
 }
 
 #[cfg(test)]
