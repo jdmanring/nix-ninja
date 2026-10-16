@@ -1755,8 +1755,9 @@ impl Runner {
         // after the loop (the loop holds cmdline borrowed).
         let mut extra_rspfile: Option<(PathBuf, String)> = None;
         let mut arg_rewrites: Vec<(String, String)> = Vec::new();
-        // Indices into the split argv that the `@` branch respelled, so the
-        // same respelling can be applied to the ORIGINAL argv below.
+        // Positions FROM THE END of the split argv that the `@` branch
+        // respelled, so the same respelling can be applied to the ORIGINAL
+        // argv below (`respell_rsp_args`).
         let mut rewritten_idx: Vec<usize> = Vec::new();
         // A TASK'S OWN DECLARED OUTPUTS ARE NEVER ITS INPUTS.
         //
@@ -1885,6 +1886,7 @@ impl Runner {
             // extension: any schema arg to compiler.py implies its schema
             // directory.
             let schema_tool = cmdline.contains("json_schema_compiler/compiler.py");
+            let argc = args.len();
             for (arg_i, arg) in args.into_iter().enumerate() {
                 // The schema-dir rule must sit ABOVE the node dispatch: the
                 // schema file is a DECLARED input on these edges, so
@@ -2072,7 +2074,7 @@ impl Runner {
                                 extra_rspfile =
                                     Some((PathBuf::from(format!("{rsp_rel}.nn-rsp")), content));
                                 arg_rewrites.push((arg.clone(), format!("{arg}.nn-rsp")));
-                                rewritten_idx.push(arg_i);
+                                rewritten_idx.push(argc - arg_i);
                             }
                         }
                         continue;
@@ -2880,14 +2882,7 @@ impl Runner {
                 (Some(orig), Some(_)) => {
                     // Textual, like the rewrite above: re-joining split
                     // argv would quote `&&` and break the cd prologue.
-                    let orig_args = shell_words::split(orig)?;
-                    let mut c = orig.clone();
-                    for i in &rewritten_idx {
-                        if let Some(a) = orig_args.get(*i) {
-                            c = c.replace(a.as_str(), &format!("{a}.nn-rsp"));
-                        }
-                    }
-                    Some(c)
+                    Some(respell_rsp_args(orig, &rewritten_idx)?)
                 }
                 _ => cmdline,
             }
@@ -6703,6 +6698,28 @@ fn rewrite_ancestor_paths(cmdline: &str, build_dir: &Path) -> String {
 /// re-launch each). Rewrite the cd target root-relative and the rest
 /// with the subdir's depth compensated; commands with no cd prologue
 /// keep the plain rewrite.
+/// Appends `.nn-rsp` to the `@rsp` tokens of the ORIGINAL command line,
+/// given their positions counted from the END of the argv discovery split.
+/// From the end, because `rewrite_cmdline` drops a `cd` prologue whose target
+/// is above the build dir, so the discovery argv can be shorter than the
+/// original by its head; an index from the start then lands on the `cd`
+/// target (qtbase's moc `cd <src>/corelib && moc @<params>` ran with
+/// `cd <src>/corelib.nn-rsp` and an unsuffixed `@` argument).
+pub fn respell_rsp_args(orig: &str, from_end: &[usize]) -> Result<String> {
+    let orig_args = shell_words::split(orig)?;
+    let mut c = orig.to_string();
+    for n in from_end {
+        if let Some(a) = orig_args
+            .len()
+            .checked_sub(*n)
+            .and_then(|i| orig_args.get(i))
+        {
+            c = c.replace(a.as_str(), &format!("{a}.nn-rsp"));
+        }
+    }
+    Ok(c)
+}
+
 fn rewrite_cmdline(cmdline: &str, build_dir: &Path) -> String {
     if let Some(after_cd) = cmdline.strip_prefix("cd ") {
         if let Some((dir, tail)) = after_cd.split_once(" && ") {
@@ -19514,5 +19531,37 @@ mod input_shipping_tests {
         assert_eq!(input_shipping(&store_dir, &[], "bin/pkg-config"), None);
         assert_eq!(input_shipping(&store_dir, &[bash], "bin/not-here"), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod respell_rsp_args_tests {
+    use super::*;
+
+    // qtbase 6.11.2's moc edge, verbatim shape: the cd target sits above the
+    // build dir, so `rewrite_cmdline` drops the prologue and the discovery
+    // argv is `[moc, @params]` while the original is five tokens long.
+    const ORIG: &str = "cd /build/q/src/corelib && /build/q/build/libexec/moc \
+                        @/build/q/build/src/corelib/kernel/moc_qobject.cpp_parameters_Release";
+
+    #[test]
+    fn a_dropped_cd_prologue_still_suffixes_the_rsp_argument() {
+        let rewritten = rewrite_cmdline(ORIG, Path::new("/build/q/build"));
+        let args = shell_words::split(&rewritten).unwrap();
+        assert!(
+            args[0] != "cd",
+            "fixture must drop the prologue: {rewritten}"
+        );
+        let at = args.iter().position(|a| a.starts_with('@')).unwrap();
+        let out = respell_rsp_args(ORIG, &[args.len() - at]).unwrap();
+        assert!(out.ends_with("cpp_parameters_Release.nn-rsp"), "{out}");
+        assert!(out.starts_with("cd /build/q/src/corelib && "), "{out}");
+    }
+
+    #[test]
+    fn a_kept_prologue_suffixes_the_same_token() {
+        let orig = "cd sub && moc @params";
+        let out = respell_rsp_args(orig, &[1]).unwrap();
+        assert_eq!(out, "cd sub && moc @params.nn-rsp");
     }
 }
