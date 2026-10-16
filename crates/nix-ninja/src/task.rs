@@ -629,7 +629,10 @@ pub struct Runner {
     rpc_client: Arc<BuilderRpcClient>,
     config: RunnerConfig,
     wrapper_vars: HashMap<String, String>,
-    wrapper_store_paths: Vec<StorePath>,
+    /// The store paths each forwarded variable's value names, per KEY, so a
+    /// command-scoped variable's inputs travel only with the tasks that
+    /// receive it (`command_scoped`).
+    wrapper_store_paths: HashMap<String, Vec<StorePath>>,
     store_regex: Regex,
     permits: JobPermits,
     /// One semaphore per declared ninja pool, by name. Absent name or depth 0
@@ -704,11 +707,11 @@ impl Runner {
             *value = rewrite_str(value, &rewrite);
         }
 
-        // Extract store paths from wrapper variables once
-        let mut wrapper_store_paths = Vec::new();
-        for value in wrapper_vars.values() {
+        // Extract store paths from wrapper variables once, per key
+        let mut wrapper_store_paths = HashMap::new();
+        for (key, value) in &wrapper_vars {
             let found_store_paths = extract_store_paths(&config.store_dir, &store_regex, value)?;
-            wrapper_store_paths.extend(found_store_paths);
+            wrapper_store_paths.insert(key.clone(), found_store_paths);
         }
 
         let (tx, rx) = mpsc::channel();
@@ -2999,7 +3002,28 @@ impl Runner {
         } else {
             self.empty_dirs.clone()
         };
-        let mut input_srcs = self.wrapper_store_paths.clone();
+        // A command-scoped variable (and the store paths its value names)
+        // reaches only a task whose command runs its consumer; every other
+        // task's emission is byte for byte what it was without the entry.
+        let forwarded = |key: &str| {
+            command_scoped(key).is_none_or(|programs| {
+                cmdline
+                    .as_deref()
+                    .is_some_and(|c| programs.iter().any(|p| c.contains(p)))
+            })
+        };
+        let wrapper_vars: HashMap<String, String> = self
+            .wrapper_vars
+            .iter()
+            .filter(|(k, _)| forwarded(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut input_srcs: Vec<StorePath> = self
+            .wrapper_store_paths
+            .iter()
+            .filter(|(k, _)| forwarded(k))
+            .flat_map(|(_, v)| v.iter().cloned())
+            .collect();
         if let Some(cmdline) = &cmdline {
             let found_store_paths =
                 extract_store_paths(&self.config.store_dir, &self.store_regex, cmdline)?;
@@ -3008,7 +3032,7 @@ impl Runner {
 
         Ok(Task {
             system: self.config.system.clone(),
-            wrapper_vars: self.wrapper_vars.clone(),
+            wrapper_vars,
             input_srcs,
             build_dir: self.config.build_dir.clone(),
             build_deps: build.dependencies.clone(),
@@ -3475,6 +3499,14 @@ pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> 
 /// value IS the outer output, which the placeholder rewrite below is what
 /// makes safe to forward.
 ///
+/// GETTEXTDATADIRS is where msgfmt looks for ITS rules (`<dir>/its/*.loc`)
+/// when no `--datadirs` names them. gettext's env hook appends
+/// `$dep/share/gettext` per build input, so polkit's `polkit.its` reaches
+/// the outer shell through it and a task that inherits nothing dies `cannot
+/// locate ITS rules for <name>.policy.in` with the rules present in polkit's
+/// output (colord 1.4.8 and malcontent, 2026-10-16). The value is store
+/// paths, so the extraction below declares them as inputs.
+///
 /// GI_TYPELIB_PATH is NOT here, and the elimination is a claim about
 /// giscanner alone: it is set by the same hook, and no file in the scanner
 /// reads it. An edge that RUNS a typelib consumer is a different question and
@@ -3490,6 +3522,24 @@ pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> 
 /// entirely store paths, which is the case the name form cannot express and
 /// the only one worth the risk.
 fn forwarded_to_tasks(key: &str) -> bool {
+    command_scoped(key).is_some() || forwarded_to_every_task(key)
+}
+
+/// A forwarded variable only ONE tool reads, with the program names whose
+/// presence on a command line admits it. Forwarding it to every task would
+/// add its store paths to every task in every build that sets it (gettext
+/// is in most meson closures), a re-key of banked compiles for a variable
+/// the compiler never reads; scoped to the consumer, only the tasks that
+/// failed without it move. Matched as a substring of the command, which
+/// takes `--msgfmt=<path>` and `msgfmthelper` alike.
+fn command_scoped(key: &str) -> Option<&'static [&'static str]> {
+    match key {
+        "GETTEXTDATADIRS" => Some(&["msgfmt"]),
+        _ => None,
+    }
+}
+
+fn forwarded_to_every_task(key: &str) -> bool {
     key.starts_with("NIX_CFLAGS_COMPILE")
         || key.starts_with("NIX_LDFLAGS")
         || key.starts_with("NIX_CC_WRAPPER")
@@ -3576,6 +3626,15 @@ mod forwarded_to_tasks_tests {
     #[test]
     fn the_xdg_data_dirs_are_forwarded() {
         assert!(forwarded_to_tasks("XDG_DATA_DIRS"));
+    }
+
+    /// msgfmt's ITS search path, exact name: the hook also writes a
+    /// `GETTEXTDATADIRS_FOR_BUILD` role, which names the build platform's
+    /// tools and is not what a host-platform msgfmt reads.
+    #[test]
+    fn the_gettext_data_dirs_are_forwarded() {
+        assert!(forwarded_to_tasks("GETTEXTDATADIRS"));
+        assert!(!forwarded_to_tasks("GETTEXTDATADIRS_FOR_BUILD"));
     }
 
     /// The silent half, and the reason it is not a NIX_ PREFIX like the
