@@ -583,6 +583,11 @@ pub struct Runner {
     /// names the soname needs the link placed, and the edge that makes it
     /// is a sibling of the library, never one of the link's own inputs.
     soname_links: HashMap<FileId, Vec<FileId>>,
+    /// Each `.gir` a `g-ir-scanner` edge writes, mapped to the in-tree girs
+    /// its `--include-uninstalled=` arguments name. `g-ir-compiler` on the
+    /// gir re-reads those includes through `--includedir` and no edge
+    /// declares them to it (`gir_included_girs`).
+    gir_includes: HashMap<FileId, Vec<FileId>>,
     /// Edge outputs -> that edge's lib-shaped dependency fids: relative
     /// `.so*` files and meson's SHSYM `.symbols` indirection. A task that
     /// EXECUTES a build-produced binary (meson custom commands running a
@@ -727,6 +732,7 @@ impl Runner {
             stamp_input_files: HashMap::new(),
             co_outputs: HashMap::new(),
             soname_links: HashMap::new(),
+            gir_includes: HashMap::new(),
             runtime_lib_deps: HashMap::new(),
             permits,
             pool_permits,
@@ -979,6 +985,26 @@ impl Runner {
             if soname_link_edge(build.cmdline.as_deref().unwrap_or(""), &ins, &outs) {
                 self.soname_links
                     .insert(build.explicit_ins()[0], build.outs().to_vec());
+            }
+        }
+
+        // Record a scanner's uninstalled gir includes BEFORE building the
+        // task, same ordering. The typelib edge downstream declares the gir
+        // alone; the compiler then opens every `<include>` in it.
+        if let Some(cmd) = build.cmdline.as_deref() {
+            let incs: Vec<FileId> = gir_included_girs(cmd)
+                .iter()
+                .filter_map(|p| {
+                    let rel = p.strip_prefix(&self.config.build_dir).ok()?;
+                    files.lookup(&rel.to_string_lossy())
+                })
+                .collect();
+            if !incs.is_empty() {
+                for fid in build.outs() {
+                    if files.by_id[*fid].name.ends_with(".gir") {
+                        self.gir_includes.insert(*fid, incs.clone());
+                    }
+                }
             }
         }
 
@@ -1645,6 +1671,17 @@ impl Runner {
             // is not yet a file drops silently rather than erroring.
             if let Some(sibs) = self.co_outputs.get(&fid) {
                 worklist.extend(sibs.iter().filter(|s| **s != fid).map(|s| (*s, true)));
+            }
+            // A gir this task reads carries the in-tree girs it includes:
+            // `g-ir-compiler GnomeBG-4.0.gir --includedir=<build>/x` opens
+            // `GnomeDesktop-4.0.gir` from a sibling scanner edge and the
+            // typelib edge declares only its own gir (gnome-desktop 44.5).
+            // Compile tasks never read a gir, and are kept lean by the same
+            // gate as the phony filter.
+            if !is_gcc_task {
+                if let Some(incs) = self.gir_includes.get(&fid) {
+                    worklist.extend(incs.iter().map(|f| (*f, true)));
+                }
             }
             // A build-produced binary this task may EXECUTE needs its
             // runtime libraries materialized; enqueueing the producing
@@ -7817,6 +7854,55 @@ fn autogen_cache_dir(outputs: &[PathBuf]) -> Option<PathBuf> {
 /// must let through: a syncqt module tree (`include/<Module>`) or a CMake
 /// autogen dir (`.../<T>_autogen`). One predicate, so the
 /// three sites that need it cannot drift.
+/// The in-tree girs a `g-ir-scanner` command includes by path, from its
+/// `--include-uninstalled=<path>` arguments (meson's spelling for a gir of
+/// the same project; an installed one is `--include=<Name-V>` and resolves
+/// through the store `--includedir`, already an input). Absolute, as meson
+/// writes them; the caller maps each onto the graph.
+fn gir_included_girs(cmdline: &str) -> Vec<PathBuf> {
+    if !cmdline.contains("g-ir-scanner") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut words = shell_words::split(cmdline).unwrap_or_default().into_iter();
+    while let Some(w) = words.next() {
+        if let Some(v) = w.strip_prefix("--include-uninstalled=") {
+            if !v.is_empty() {
+                out.push(PathBuf::from(v));
+            }
+        } else if w == "--include-uninstalled" {
+            if let Some(v) = words.next() {
+                out.push(PathBuf::from(v));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod gir_included_girs_tests {
+    use super::gir_included_girs;
+    use std::path::Path;
+
+    /// gnome-desktop's scanner edge for GnomeBG, as meson spells it, plus a
+    /// `g-ir-compiler` line that must contribute nothing (the compiler
+    /// consumes the map, it does not feed it).
+    #[test]
+    fn a_scanners_uninstalled_includes_are_read_and_a_compiler_line_is_not() {
+        let scan = "/nix/store/x-gobject-introspection-1.86.0-dev/bin/g-ir-scanner --quiet --no-libtool --namespace=GnomeBG --nsversion=4.0 --include=GdkPixbuf-2.0 --include-uninstalled=/build/gnome-desktop-44.5/build/libgnome-desktop/GnomeDesktop-4.0.gir --output libgnome-desktop/gnome-bg/GnomeBG-4.0.gir";
+        assert_eq!(
+            gir_included_girs(scan),
+            vec![Path::new(
+                "/build/gnome-desktop-44.5/build/libgnome-desktop/GnomeDesktop-4.0.gir"
+            )
+            .to_path_buf()]
+        );
+        let compile = "g-ir-compiler libgnome-desktop/gnome-bg/GnomeBG-4.0.gir --output x.typelib --includedir=/build/gnome-desktop-44.5/build/libgnome-desktop";
+        assert!(gir_included_girs(compile).is_empty());
+        assert!(gir_included_girs("g-ir-scanner --include-uninstalled=").is_empty());
+    }
+}
+
 /// A COMPILED ARTIFACT, as opposed to something a command might READ.
 ///
 /// The phony filter below exists to stop GN's inputdeps phonies dragging
