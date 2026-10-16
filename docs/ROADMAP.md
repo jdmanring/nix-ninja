@@ -20,7 +20,7 @@ are met and `0.3` is in progress rather than finished, which is why its open
 classes are listed below. A reader should not take the number as a claim that
 the milestone it names is complete.
 
-The state of the tree TODAY, class by class, is a table of 105 rows. It is not in
+The state of the tree TODAY, class by class, is a table of 106 rows. It is not in
 this repository: it grew beside a private distribution and is development
 material rather than a public document, which is the same reason the gate corpus
 is not here (`0.5`). What this file carries is the part that is publishable now,
@@ -53,7 +53,7 @@ And the supporting sections:
 ## Where this file comes from
 
 The project began when `pdtpartners/nix-ninja` stopped. Work continued here:
-the tree is more than 650 commits past the last upstream commit of May 2026,
+the tree is more than 700 commits past the last upstream commit of May 2026,
 and the milestone numbering above two is new. `docs/todo.md` records the state
 of the issues that came with the project; this file is what comes after them.
 
