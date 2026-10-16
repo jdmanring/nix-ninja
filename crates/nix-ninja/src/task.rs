@@ -12605,6 +12605,60 @@ mod task_needs_cc_tests {
             "an absolute toolchain path exec's itself and needs no lookup"
         );
     }
+
+    /// THE THIRD SHAPE OF "EXECS THE COMPILER UNNAMED": a generator writing
+    /// something that is NOT object shaped, which the `dtrace` arm cannot see.
+    ///
+    /// `g-ir-scanner` reaches `distutils`' `UnixCCompiler` through
+    /// `giscanner/ccompiler.py` and shells bare `gcc` to preprocess, then
+    /// writes a `.gir`. Measured 2026-10-16 on libayatana-appindicator
+    /// 0.5.92, task `cnayivpcpxk9j6dgd7abvjndj7cvh5gf`: the scanner resolved
+    /// its sources and ran, then died `FileNotFoundError: [Errno 2] 'gcc'`
+    /// through `spawn.py` and `subprocess._execute_child`, with ten PATH
+    /// entries and no `cc` among them.
+    ///
+    /// THE COMMAND IS VERBATIM from that task's own derivation, so the
+    /// fixture cannot drift from what failed. Note the two properties that
+    /// made every earlier arm silent: the program is named by ABSOLUTE store
+    /// path, and the output is a `.gir`.
+    #[test]
+    fn a_scanner_writing_a_gir_execs_the_compiler_and_needs_it() {
+        let gir = "cd /build/source/src && /nix/store/grr3rr630dr0ksl2d92dzcwc7p77vb4b-gobject-introspection-1.86.0-dev/bin/g-ir-scanner \
+             app-indicator.c app-indicator.h \
+             --add-include-path=/build/source/build/src \
+             --c-include=libayatana-appindicator/app-indicator.h \
+             --symbol-prefix=app --identifier-prefix=App \
+             --namespace=AyatanaAppIndicator3 --nsversion=0.1 --quiet --warn-all \
+             --include=GObject-2.0 --include=Gtk-3.0 \
+             --library-path=/build/source/build/src --library=ayatana-appindicator3 \
+             --output /build/source/build/src/AyatanaAppIndicator3-0.1.gir";
+        assert!(
+            cc_lookup_is_implied(gir, ["src/AyatanaAppIndicator3-0.1.gir"].into_iter()),
+            "a scanner writing a .gir shells bare gcc and needs it on PATH"
+        );
+
+        // THE NEGATIVE CONTROL, and it is the arm that keeps this from being
+        // "any command mentioning the scanner": a scanner that is NOT the
+        // program - here a shell wrapper that merely names it as an argument -
+        // must not carry the compiler closure.
+        assert!(
+            !cc_lookup_is_implied(
+                "/nix/store/x/bin/bash -c 'echo g-ir-scanner > /build/x.gir'",
+                ["x.gir"].into_iter()
+            ),
+            "naming the scanner as an argument is not running it"
+        );
+
+        // And the tblgen shape above must STILL not be refused, so this arm
+        // cannot be satisfied by making the predicate broadly true.
+        assert!(
+            !cc_lookup_is_implied(
+                "/build/bin/llvm-min-tblgen -gen-intrinsic-impl -o x.inc",
+                ["x.inc"].into_iter()
+            ),
+            "an absolute generator writing a .inc still asks PATH for nothing"
+        );
+    }
 }
 
 fn is_compile_task<'a>(deps: Option<&str>, outs: impl Iterator<Item = &'a str>) -> bool {
@@ -15963,6 +16017,42 @@ fn names_only_absolute_toolchain(cmdline: &str) -> bool {
 fn cc_lookup_is_implied<'a>(cmdline: &str, outs: impl Iterator<Item = &'a str>) -> bool {
     names_named_toolchain_needs_path(cmdline)
         || (object_shaped_outputs(outs) && !command_names_toolchain(cmdline))
+        || generator_execs_cc_unnamed(cmdline)
+}
+
+/// A GENERATOR THAT SHELLS OUT TO THE COMPILER BY BARE NAME, writing
+/// something that is not object shaped.
+///
+/// The output-shape arm above cannot see these: it exists for `dtrace -G`,
+/// which writes a `.o`, and the two shapes are otherwise identical - a
+/// command naming no toolchain that execs one anyway. `g-ir-scanner` is the
+/// member that proved the split. It reaches `distutils`' `UnixCCompiler`
+/// through `giscanner/ccompiler.py`, which shells bare `gcc` to preprocess,
+/// and it writes a `.gir`. Measured 2026-10-16 on libayatana-appindicator
+/// 0.5.92, task `cnayivpcpxk9j6dgd7abvjndj7cvh5gf`: the scanner resolved its
+/// sources and ran, then died `FileNotFoundError: [Errno 2] 'gcc'` through
+/// `spawn.py` and `subprocess._execute_child`, with ten PATH entries and no
+/// `cc` among them. The command names the scanner by ABSOLUTE store path, so
+/// the name test is silent by construction, and the output is a `.gir`, so
+/// the object arm is silent too.
+///
+/// KEYED ON THE PROGRAM, NOT ON A WIDER TOOLCHAIN LIST. Adding `gcc` to the
+/// name test would fire on every command that merely MENTIONS the word -
+/// `--c-include=...gcc...`, a `-D` value, a filename - and would carry the
+/// 27-path compiler closure on tasks that never exec it. The discriminator
+/// is which program runs, the same one the `ninja_input` and `pkg-config`
+/// arms use.
+///
+/// THE POPULATION IS ONE PROGRAM TODAY. `g-ir-scanner` is the only member
+/// measured; a second would be added here with its own failing task, not
+/// guessed from a family resemblance.
+fn generator_execs_cc_unnamed(cmdline: &str) -> bool {
+    const GENERATORS: [&str; 1] = ["g-ir-scanner"];
+    let Some(program) = command_program(cmdline) else {
+        return false;
+    };
+    let base = program.rsplit('/').next().unwrap_or(program);
+    GENERATORS.contains(&base)
 }
 
 /// True when the command names a toolchain program WITHOUT an absolute path,
