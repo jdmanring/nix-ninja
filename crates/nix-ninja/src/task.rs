@@ -3006,6 +3006,29 @@ fn include_dirs_as_given(cmdline: &str) -> Vec<String> {
     out
 }
 
+/// The include directories the macro-arm reader resolves through, relative to
+/// the build dir. An absolute directory OUTSIDE the project tree is dropped,
+/// not climbed to: fontforge's `-isystem /nix/store/...-freetype-dev/...`
+/// became `../../../nix/store/...`, freetype's `FT_*_H` arms resolved through
+/// it as build-relative store headers that dodge the store filter, and the
+/// task's deepening guard read the climb past `/build` as a cwd error and
+/// lost the source tree (`freetype.c: No such file`).
+pub fn macro_arm_include_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    include_dirs_as_given(cmdline)
+        .into_iter()
+        .filter_map(|dir| {
+            let p = PathBuf::from(&dir);
+            if !p.is_absolute() {
+                Some(p)
+            } else if same_project_tree(build_dir, &p) {
+                relative_from(&p, build_dir)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn include_dirs_named(cmdline: &str, build_dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     for dir in include_dirs_as_given(cmdline) {
@@ -15604,17 +15627,7 @@ pub fn discover_c_includes(
             // `../clc/include` spelling resolves against the build dir (the
             // process cwd here) exactly as the compiler resolves it, and the
             // path the reader emits from it stays relative.
-            let dirs: Vec<PathBuf> = include_dirs_as_given(cmdline)
-                .into_iter()
-                .filter_map(|dir| {
-                    let p = PathBuf::from(&dir);
-                    if p.is_absolute() {
-                        relative_from(&p, build_dir)
-                    } else {
-                        Some(p)
-                    }
-                })
-                .collect();
+            let dirs = macro_arm_include_dirs(cmdline, build_dir);
             for extra in macro_arm_headers(build_dir, &dirs, &declaring) {
                 if !v.contains(&extra) {
                     v.push(extra);
@@ -19563,5 +19576,25 @@ mod respell_rsp_args_tests {
         let orig = "cd sub && moc @params";
         let out = respell_rsp_args(orig, &[1]).unwrap();
         assert_eq!(out, "cd sub && moc @params.nn-rsp");
+    }
+}
+
+#[cfg(test)]
+mod macro_arm_include_dirs_tests {
+    use super::*;
+
+    // fontforge's compile, the include flags as spelled: a source-tree `-I`
+    // above the build dir must stay a climb, a store `-isystem` must go.
+    #[test]
+    fn a_store_include_dir_is_dropped_and_a_source_dir_is_climbed_to() {
+        let cmd = "gcc -I/build/source/fontforge -I/build/source/build/inc \
+                   -isystem /nix/store/dmfq3354-freetype-2.14.3-dev/include/freetype2 \
+                   -c /build/source/fontforge/freetype.c";
+        let dirs = macro_arm_include_dirs(cmd, Path::new("/build/source/build"));
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("../fontforge"), PathBuf::from("inc")],
+            "{dirs:?}"
+        );
     }
 }
