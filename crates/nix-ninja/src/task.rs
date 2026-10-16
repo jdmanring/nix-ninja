@@ -12454,7 +12454,10 @@ fn task_needs_cc<'a>(
     cmdline: &str,
     outs: impl Iterator<Item = &'a str>,
 ) -> bool {
-    deps == Some("gcc") || command_names_toolchain(cmdline) || object_shaped_outputs(outs)
+    deps == Some("gcc")
+        || command_names_toolchain(cmdline)
+        || object_shaped_outputs(outs)
+        || generator_execs_cc_unnamed(cmdline)
 }
 
 #[cfg(test)]
