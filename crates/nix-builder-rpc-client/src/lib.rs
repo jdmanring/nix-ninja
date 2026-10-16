@@ -22,7 +22,7 @@ use harmonia_store_derivation::derived_path::{
     DerivedPath, OutputName, OutputSpec, SingleDerivedPath,
 };
 use harmonia_store_path::{StorePath, StorePathSet};
-use harmonia_store_remote::{ConnectionPool, PoolConfig};
+use harmonia_store_remote::{ConnectionPool, PoolConfig, PooledConnectionGuard};
 use tokio::io::BufReader;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
@@ -247,6 +247,75 @@ fn upload_allowance() -> std::time::Duration {
     std::time::Duration::from_secs(stall_allowance_s(0))
 }
 
+/// A connection pool whose every acquisition carries a deadline.
+///
+/// `ConnectionPool::acquire` waits for a free slot INDEFINITELY, and it sits
+/// BEFORE any watchdog the caller arms - so a bare acquire is an unbounded
+/// wait the logging cannot see. Production code reaches the pool ONLY
+/// through this wrapper, which makes a bare acquire a type error rather
+/// than a property a test has to count occurrences of. (That test was
+/// written first, and it failed four times on its own needles: the fix's
+/// name contains the counted substring, one call spans a line break, and
+/// the assertion message matched itself.)
+///
+/// THE ACQUIRE WAS THE ONE UNBOUNDED WAIT. A pool connection is held for
+/// the whole of a build, so a request that finds every connection busy
+/// waits on the pool rather than on the daemon, and the timeout around
+/// `guard.execute` has not started yet when it parks. Measured 2026-10-15:
+/// a peer's round burned one stall of 43 minutes with the driver's CPU
+/// frozen at 00:02:32 and NO watchdog line at all - only the periodic
+/// peak-in-flight - while the main thread sat in `futex_do_wait` and two
+/// tokio workers sat on futexes beside it. The daemon's own log named the
+/// cause at the matching cadence: `entering sandbox user namespace: Bad
+/// file descriptor`, a child that dies holding its connection, so every
+/// later request queues behind a guard that will never be released.
+///
+/// A TIMEOUT HERE IS NOT THE SAME EVENT AS A TIMEOUT ON THE EXCHANGE, and
+/// the message says which: nothing was sent, so there is no wedged
+/// connection to drop and no daemon child to kill. What the caller gets is
+/// the same `DaemonStalled`, because the caller's recovery is the same -
+/// retry on a fresh connection, which the build loop already does and which
+/// re-reads the pool.
+struct BoundedPool(ConnectionPool);
+
+impl BoundedPool {
+    fn new(path: &Path, config: PoolConfig) -> Self {
+        Self(ConnectionPool::new(path, config))
+    }
+
+    /// Hold a slot WITHOUT a deadline, for the test that proves a full
+    /// pool reports instead of parking. Production has no path to this:
+    /// it exists so the arm can construct the state the defect produces -
+    /// every connection held - against the same pool the bound call uses.
+    #[cfg(test)]
+    async fn hold_raw(&self) -> std::result::Result<PooledConnectionGuard, DaemonError> {
+        self.0.acquire().await
+    }
+
+    async fn acquire(
+        &self,
+        what: &str,
+        allowance: std::time::Duration,
+    ) -> Result<PooledConnectionGuard> {
+        match tokio::time::timeout(allowance, self.0.acquire()).await {
+            Ok(out) => out.map_err(Error::from),
+            Err(_elapsed) => {
+                eprintln!(
+                    "nix-ninja: [{}] WATCHDOG timeout on {what}: no pooled connection in {}s \
+                     (every connection is held by a build that has not returned); nothing sent",
+                    now_s(),
+                    allowance.as_secs(),
+                );
+                Err(Error::DaemonStalled {
+                    attempts: 1,
+                    connect_failures: 0,
+                    last_allowance_s: allowance.as_secs(),
+                })
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod bounded_exchange_tests {
     use super::{bounded, Error};
@@ -283,6 +352,130 @@ mod bounded_exchange_tests {
             bounded_calls + 1,
             "execute sites {executes}, bounded {bounded_calls}"
         );
+    }
+
+    /// THE ACQUIRE IS THE WAIT THE WATCHDOG CANNOT SEE, and it is now a
+    /// TYPE rather than a count. `BuilderRpcClient::pool` is a
+    /// `BoundedPool`, whose only acquisition takes a deadline, so a bare
+    /// `pool.acquire()` does not compile and no test has to look for one.
+    ///
+    /// THE COUNTING VERSION WAS TRIED FIRST AND FAILED FOUR TIMES, each on
+    /// its own needle: the fix's name contains the counted substring
+    /// (`acquire_bounded(` contains `bounded(`), one production call spans
+    /// a line break, the assertion message matched itself, and the test
+    /// modules are INTERLEAVED with production code so cutting at the
+    /// first `#[cfg(test)]` deleted every call site and read a confident
+    /// zero. A property the compiler enforces needs none of that.
+    ///
+    /// This arm states the guarantee in the one place a reader looks for
+    /// it, and fails if the field's type is widened back.
+    #[test]
+    fn the_client_holds_a_bounded_pool() {
+        let src = include_str!("lib.rs");
+        let field = ["    pool: ", "BoundedPool,\n"].concat();
+        assert!(
+            src.contains(&field),
+            "BuilderRpcClient::pool must stay a BoundedPool: a bare \
+             ConnectionPool::acquire waits forever"
+        );
+    }
+
+    /// THE BOUND FIRES ON THE REAL POOL, not on a stub: a one-slot pool
+    /// whose only connection is held by another guard leaves `acquire`
+    /// with no free slot and nothing to connect, so it parks exactly as
+    /// it does when every connection is held by a build that has not
+    /// returned - the state the defect produces - and the timeout is the
+    /// only thing that ends it.
+    ///
+    /// A POOL OF ZERO IS NOT THE SAME THING: the constructor asserts
+    /// positive capacity, so zero is unreachable and testing it proves
+    /// nothing. A test that mocked the pool would prove the timeout wraps
+    /// a future, which was never in doubt.
+    ///
+    /// NEEDS THE MACHINE'S DAEMON for the held guard to exist: with no
+    /// socket the first acquire fails at connect and nothing is held, so
+    /// where none is listening the arm is skipped rather than failed.
+    #[test]
+    fn a_pool_with_no_free_slot_ends_as_daemon_stalled() {
+        use super::{BoundedPool, Error};
+        use harmonia_store_remote::PoolConfig;
+
+        let socket = std::path::Path::new("/nix/var/nix/daemon-socket/socket");
+        if !socket.exists() {
+            eprintln!("SKIP: no daemon socket, nothing to hold the slot with");
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = BoundedPool::new(
+                socket,
+                PoolConfig {
+                    max_size: 1,
+                    ..PoolConfig::default()
+                },
+            );
+            // Held against the SAME pool the bound call uses: with the
+            // only slot taken, `acquire` has nothing to grant and nothing
+            // to connect, which is the state the defect produces.
+            let held = match pool.hold_raw().await {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("SKIP: daemon not answering ({e:?}), nothing to hold");
+                    return;
+                }
+            };
+            let got = pool
+                .acquire("probe", std::time::Duration::from_millis(20))
+                .await;
+            drop(held);
+            // Matched rather than formatted: the Ok arm holds a guard that
+            // is not Debug, and the subject is the error.
+            match got {
+                Err(Error::DaemonStalled { attempts: 1, .. }) => {}
+                Err(other) => panic!("expected DaemonStalled, got {other:?}"),
+                Ok(_) => panic!("acquire returned while the only slot was held"),
+            }
+        });
+    }
+
+    /// The control for the arm above: the same call with an allowance that
+    /// has not elapsed must NOT report, or the arm is satisfied by a
+    /// helper that always fails. Driven with a pool that HAS a slot, so
+    /// the only difference from the subject is the state.
+    #[test]
+    fn a_pool_with_a_free_slot_does_not_report_a_stall() {
+        use super::BoundedPool;
+        use harmonia_store_remote::PoolConfig;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // A real daemon is needed for this arm to have a slot to hand
+            // out; where none is listening the pool cannot connect and the
+            // arm has nothing to say, so it is skipped rather than failed.
+            if !std::path::Path::new("/nix/var/nix/daemon-socket/socket").exists() {
+                return;
+            }
+            let pool = BoundedPool::new(
+                std::path::Path::new("/nix/var/nix/daemon-socket/socket"),
+                PoolConfig {
+                    max_size: 1,
+                    ..PoolConfig::default()
+                },
+            );
+            let got = pool
+                .acquire("probe", std::time::Duration::from_secs(30))
+                .await;
+            assert!(
+                got.is_ok(),
+                "a free slot must be granted, not reported as a stall"
+            );
+        });
     }
 }
 
@@ -348,7 +541,7 @@ mod watchdog_policy_tests {
 pub struct BuilderRpcClient {
     /// Multi-thread so the pool's RAII drop tasks can complete asynchronously.
     runtime: Runtime,
-    pool: ConnectionPool,
+    pool: BoundedPool,
     /// Whether or not nix-ninja is running within a derivation
     /// Needed since scanning is not available outside derivations
     in_drv: bool,
@@ -702,7 +895,7 @@ impl BuilderRpcClient {
             .worker_threads(rpc_worker_threads(pool_max))
             .enable_all()
             .build()?;
-        let pool = ConnectionPool::new(
+        let pool = BoundedPool::new(
             path,
             PoolConfig {
                 max_size: pool_max.max(1),
@@ -749,7 +942,10 @@ impl BuilderRpcClient {
         let refs: StorePathSet = drv.inputs.iter().map(|p| p.root_path().clone()).collect();
         let name = format!("{}.drv", drv.name);
         let info = self.runtime.block_on(async {
-            let mut guard = self.pool.acquire().await?;
+            let mut guard = self
+                .pool
+                .acquire(&format!("add_drv_to_store {name}"), upload_allowance())
+                .await?;
             let source = BufReader::new(Cursor::new(bytes.clone()));
             bounded(
                 &format!("add_drv_to_store {name}"),
@@ -800,9 +996,9 @@ impl BuilderRpcClient {
         let info = self
             .runtime
             .block_on(async {
-                let mut guard = self.pool.acquire().await?;
-                let source = BufReader::new(Cursor::new(bytes));
                 let what = format!("add_to_store_text {name}");
+                let mut guard = self.pool.acquire(&what, upload_allowance()).await?;
+                let source = BufReader::new(Cursor::new(bytes));
                 if self.in_drv {
                     bounded(
                         &what,
@@ -966,9 +1162,9 @@ impl BuilderRpcClient {
                     bridge.shutdown()?;
                     Ok(())
                 });
-                let mut guard = self.pool.acquire().await?;
-                let source = BufReader::new(reader);
                 let what = format!("add_to_store_nar {name}");
+                let mut guard = self.pool.acquire(&what, upload_allowance()).await?;
+                let source = BufReader::new(reader);
                 let out = if self.in_drv {
                     bounded(
                         &what,
@@ -1387,8 +1583,32 @@ impl BuilderRpcClient {
                 // children and fresh accepts time out (measured round 80:
                 // one "timeout: connecting to daemon" ended the round a
                 // minute after the recovery worked).
-                let mut guard = match self.pool.acquire().await {
+                let allowance = std::time::Duration::from_secs(allowance_s);
+                let mut guard = match self.pool.acquire(&waited_on, allowance).await {
                     Ok(g) => g,
+                    Err(Error::DaemonStalled { .. }) => {
+                        // The pool never granted a connection: every one is
+                        // held by a build that has not returned. That is a
+                        // STALL, not a failed connect, so it spends the
+                        // stall budget with its escalating allowance, not
+                        // the connect one. There is no guard to drop -
+                        // nothing was sent - and the retry re-reads the pool.
+                        stall_attempts += 1;
+                        if stall_attempts > patience_limit(patience) {
+                            break Err(Error::DaemonStalled {
+                                attempts: stall_attempts,
+                                connect_failures,
+                                last_allowance_s: allowance_s,
+                            });
+                        }
+                        eprintln!(
+                            "nix-ninja: [{}] WATCHDOG pool-wait on {waited_on}: no \
+                             pooled connection in {allowance_s}s; retrying \
+                             (stalls this call {stall_attempts})",
+                            now_s(),
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         connect_failures += 1;
                         if connect_failures > CONNECT_RETRIES {
@@ -1399,7 +1619,7 @@ impl BuilderRpcClient {
                                 now_s(),
                                 CONNECT_BACKOFF_S.iter().sum::<u64>(),
                             );
-                            break Err(Error::from(e));
+                            break Err(e);
                         }
                         // Backoff rather than a flat 10s: the failure this
                         // covers is the daemon being DOWN, not busy, and a
@@ -1658,9 +1878,10 @@ impl BuilderRpcClient {
     /// `outputPathName(callingDrv.name, name)`.
     pub fn submit_output(&self, path: &SingleDerivedPath, name: &OutputName) -> Result<()> {
         self.runtime.block_on(async {
-            let mut guard = self.pool.acquire().await?;
+            let what = format!("submit_output {name}");
+            let mut guard = self.pool.acquire(&what, upload_allowance()).await?;
             bounded(
-                &format!("submit_output {name}"),
+                &what,
                 upload_allowance(),
                 guard.execute(|client| client.submit_output(path, name)),
             )
