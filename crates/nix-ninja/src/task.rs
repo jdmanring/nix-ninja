@@ -2387,6 +2387,25 @@ impl Runner {
                     referenced.push(p);
                 }
             }
+            // THE SCANNER PREPROCESSES WHAT IT IS HANDED, so the headers those
+            // sources include are read too (gnome-desktop's GnomeBG gir).
+            if gir_filelists.is_some() || gir_positional.is_some() {
+                let seeds: Vec<PathBuf> = referenced
+                    .iter()
+                    .map(|s| {
+                        if s.starts_with('/') {
+                            PathBuf::from(s)
+                        } else {
+                            lexical_join(&self.config.build_dir, &rebase_post_cd(&cd_dir, s))
+                        }
+                    })
+                    .collect();
+                if let Some(orig) = &build.cmdline {
+                    for p in gir_header_closure(orig, &self.config.build_dir, &seeds) {
+                        referenced.push(p);
+                    }
+                }
+            }
             // A VALAC RUN RESOLVES EACH `--pkg` TO A `.vapi`, and the file it
             // finds is in the package's own source tree, reached by no path on
             // the command line, so no edge declares it: umockdev asks for
@@ -8875,6 +8894,45 @@ fn gir_filelist_referenced_paths(
 /// explicitly, because the resolver carries only files that exist and a
 /// missing output would otherwise pass the filter in silence; `--include`
 /// names a GIR module, not a path, and every other flag starts with `-`.
+/// The include closure of the sources a `g-ir-scanner` run is handed, as
+/// absolute paths. The scanner runs the C preprocessor over every listed
+/// header, so a header those sources include is read as surely as the
+/// sources are, and no edge declares it: gnome-desktop 44.5's `gnome-bg.h`
+/// includes `<libgnome-desktop/gnome-desktop-thumbnail.h>` through the
+/// command's `-I.../libgnome-desktop/..` and the gir task died on it.
+/// `cmdline` is the ORIGINAL command, whose `-I` values are absolute, so the
+/// walk does not depend on the process cwd. Paths outside the project tree
+/// and in the store are left to the consumer's filters.
+pub fn gir_header_closure(cmdline: &str, build_dir: &Path, seeds: &[PathBuf]) -> Vec<String> {
+    let seeds: Vec<PathBuf> = seeds.iter().filter(|p| p.is_file()).cloned().collect();
+    if seeds.is_empty() {
+        return Vec::new();
+    }
+    let scan = match deps_infer::c_include_parser::retrieve_c_includes_checked(
+        cmdline,
+        seeds.clone(),
+        None,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("nix-ninja: g-ir-scanner header closure not read: {e:#}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for inc in scan.includes {
+        let abs = lexical_join(build_dir, &inc);
+        if seeds.contains(&abs) {
+            continue;
+        }
+        let s = abs.to_string_lossy().into_owned();
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 fn gir_positional_sources_invocation(args: &[String]) -> Option<Vec<String>> {
     let program = args
         .iter()
@@ -19596,5 +19654,45 @@ mod macro_arm_include_dirs_tests {
             vec![PathBuf::from("../fontforge"), PathBuf::from("inc")],
             "{dirs:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod gir_header_closure_tests {
+    use super::*;
+
+    // gnome-desktop 44.5's GnomeBG gir edge: the scanner is handed
+    // `gnome-bg/gnome-bg.h`, which includes a sibling-directory header
+    // through `-I<src>/libgnome-desktop/..`, and the build dir is a child of
+    // the source tree.
+    #[test]
+    fn a_header_the_scanned_source_includes_is_carried() {
+        let d = std::env::temp_dir().join(format!("nn-gir-closure-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let src = d.join("gd");
+        let build = src.join("build");
+        fs::create_dir_all(src.join("libgnome-desktop/gnome-bg")).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        let bg = src.join("libgnome-desktop/gnome-bg/gnome-bg.h");
+        fs::write(
+            &bg,
+            "#include <glib.h>\n#include <libgnome-desktop/gnome-desktop-thumbnail.h>\n",
+        )
+        .unwrap();
+        let thumb = src.join("libgnome-desktop/gnome-desktop-thumbnail.h");
+        fs::write(&thumb, "#define T 1\n").unwrap();
+        let cmd = format!(
+            "g-ir-scanner -I{s}/libgnome-desktop/.. --filelist=x --cflags-begin \
+             -I{s}/libgnome-desktop/.. --cflags-end",
+            s = src.display()
+        );
+        let got = gir_header_closure(&cmd, &build, std::slice::from_ref(&bg));
+        assert_eq!(got, vec![thumb.to_string_lossy().into_owned()], "{got:?}");
+
+        // THE CONTROL: without the include path the header is not reached,
+        // so the arm above cannot pass on a walk that returns every file.
+        let bare = gir_header_closure("g-ir-scanner --filelist=x", &build, &[bg]);
+        assert!(bare.is_empty(), "{bare:?}");
+        let _ = fs::remove_dir_all(&d);
     }
 }
