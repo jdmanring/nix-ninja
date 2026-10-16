@@ -588,6 +588,11 @@ pub struct Runner {
     /// gir re-reads those includes through `--includedir` and no edge
     /// declares them to it (`gir_included_girs`).
     gir_includes: HashMap<FileId, Vec<FileId>>,
+    /// In-tree DIRECTORIES a compile edge bakes into its object through a
+    /// path-shaped `-D<NAME>=<dir>`, carried forward through every edge that
+    /// consumes the object (archive, link), so an edge that RUNS the linked
+    /// binary can carry what the binary will open (`path_defined_dirs`).
+    path_defines: HashMap<FileId, Vec<PathBuf>>,
     /// Edge outputs -> that edge's lib-shaped dependency fids: relative
     /// `.so*` files and meson's SHSYM `.symbols` indirection. A task that
     /// EXECUTES a build-produced binary (meson custom commands running a
@@ -733,6 +738,7 @@ impl Runner {
             co_outputs: HashMap::new(),
             soname_links: HashMap::new(),
             gir_includes: HashMap::new(),
+            path_defines: HashMap::new(),
             runtime_lib_deps: HashMap::new(),
             permits,
             pool_permits,
@@ -1004,6 +1010,41 @@ impl Runner {
                     if files.by_id[*fid].name.ends_with(".gir") {
                         self.gir_includes.insert(*fid, incs.clone());
                     }
+                }
+            }
+        }
+
+        // Record path-shaped defines BEFORE building the task, same ordering.
+        // libjxl's test_utils.cc compiles `-DTEST_DATA_PATH=<src>/testdata`
+        // into `libjxl_testlib-internal.a`; gtest discovery then RUNS each
+        // test binary from its link edge and the binary opens that
+        // directory, which no edge declares. The set an edge's outputs carry
+        // is its own defines plus those of every explicit input, so the
+        // directory follows the object through the archive to the link.
+        {
+            let mut dirs: Vec<PathBuf> = build
+                .explicit_ins()
+                .iter()
+                .filter_map(|f| self.path_defines.get(f))
+                .flatten()
+                .cloned()
+                .collect();
+            if let Some(cmd) = build.cmdline.as_deref() {
+                // A quoted value reads `=\"/...`, so the cheap test is the
+                // flag, not the `=/` pair.
+                if cmd.contains("-D") {
+                    dirs.extend(path_defined_dirs(
+                        cmd,
+                        &self.config.store_dir,
+                        &self.config.build_dir,
+                    ));
+                }
+            }
+            if !dirs.is_empty() {
+                dirs.sort();
+                dirs.dedup();
+                for fid in build.outs() {
+                    self.path_defines.insert(*fid, dirs.clone());
                 }
             }
         }
@@ -2583,6 +2624,32 @@ impl Runner {
             // safe only because it checks `is_dir()` BEFORE calling; this is
             // that check, and the rebase the `referenced` block does, so a path
             // outside this project's tree is dropped rather than read.
+            // AN EDGE THAT RUNS THE BINARY IT LINKS carries the in-tree
+            // directories compiled into that binary's objects (gtest
+            // discovery's POST_BUILD; libjxl's gain_map_test died
+            // `Check(file.good()) failed` on `testdata/.../scRGB-v2.icc`,
+            // the directory named only by a define on test_utils.cc's
+            // compile edge). Same guards and upload as the autogen plan.
+            if cmdline.contains("GoogleTestAddTests.cmake") {
+                let dirs: Vec<PathBuf> = build
+                    .outs()
+                    .iter()
+                    .filter_map(|f| self.path_defines.get(f))
+                    .flatten()
+                    .cloned()
+                    .collect();
+                for p in dirs {
+                    if !p.is_dir() {
+                        continue;
+                    }
+                    for input in
+                        upload_referenced_dir(&self.rpc_client, &self.config.build_dir, &p)?
+                    {
+                        self.add_derived_file(files, input.clone());
+                        input_set.insert(input.build_path.clone(), input);
+                    }
+                }
+            }
             if let Some(info) = &autogen_info {
                 let info_path = if info.starts_with('/') {
                     PathBuf::from(info)
@@ -7854,6 +7921,65 @@ fn autogen_cache_dir(outputs: &[PathBuf]) -> Option<PathBuf> {
 /// must let through: a syncqt module tree (`include/<Module>`) or a CMake
 /// autogen dir (`.../<T>_autogen`). One predicate, so the
 /// three sites that need it cannot drift.
+/// The in-tree directories a command bakes into its output through a
+/// path-shaped define, `-D<NAME>=<absolute dir>` in either spelling. Only a
+/// directory that exists inside this project's tree and outside the store
+/// qualifies: a file-valued define is a header the macro-arm reader already
+/// handles, and a store path reaches the sandbox on its own.
+fn path_defined_dirs(cmdline: &str, store_dir: &StoreDir, build_dir: &Path) -> Vec<PathBuf> {
+    let store = store_dir.to_string();
+    let mut out = Vec::new();
+    let mut words = shell_words::split(cmdline).unwrap_or_default().into_iter();
+    while let Some(w) = words.next() {
+        let def = if w == "-D" {
+            words.next()
+        } else {
+            w.strip_prefix("-D").map(str::to_string)
+        };
+        let Some(def) = def else { continue };
+        let Some((_, value)) = def.split_once('=') else {
+            continue;
+        };
+        let value = value.trim_matches('"');
+        let p = Path::new(value);
+        if !p.is_absolute() || p.starts_with(&store) || !same_project_tree(build_dir, p) {
+            continue;
+        }
+        if p.is_dir() {
+            out.push(p.to_path_buf());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod path_defined_dirs_tests {
+    use super::path_defined_dirs;
+    use std::path::Path;
+
+    /// libjxl's define on test_utils.cc, against a tree where the directory
+    /// exists; a file-valued define and an absent directory contribute
+    /// nothing, and a store path is left to the sandbox.
+    #[test]
+    fn a_define_naming_an_in_tree_directory_is_read_and_others_are_not() {
+        let root = std::env::temp_dir().join(format!("nn-pathdef-{}", std::process::id()));
+        let src = root.join("source");
+        let build = src.join("build");
+        std::fs::create_dir_all(src.join("testdata")).unwrap();
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(src.join("config.h"), "").unwrap();
+        let store = super::StoreDir::new(Path::new("/nix/store")).unwrap();
+        let cmd = format!(
+            "g++ -DTEST_DATA_PATH=\"{s}/testdata\" -D FOO={s}/config.h -DBAR={s}/absent -DBAZ=/nix/store/x-y/share -c a.cc",
+            s = src.display()
+        );
+        let got = path_defined_dirs(&cmd, &store, &build);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got, vec![src.join("testdata")]);
+        assert!(path_defined_dirs("g++ -O2 -c a.cc", &store, Path::new("/b")).is_empty());
+    }
+}
+
 /// The in-tree girs a `g-ir-scanner` command includes by path, from its
 /// `--include-uninstalled=<path>` arguments (meson's spelling for a gir of
 /// the same project; an installed one is `--include=<Name-V>` and resolves
