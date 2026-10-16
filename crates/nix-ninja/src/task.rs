@@ -578,6 +578,11 @@ pub struct Runner {
     /// a consumer depending on ONE of them gets the co-outputs too, since
     /// tools follow a declared output to files written beside it.
     co_outputs: HashMap<FileId, Vec<FileId>>,
+    /// A shared library -> the soname links an edge of THIS build makes for
+    /// it (`soname_link_edge`). A link against a library whose `DT_NEEDED`
+    /// names the soname needs the link placed, and the edge that makes it
+    /// is a sibling of the library, never one of the link's own inputs.
+    soname_links: HashMap<FileId, Vec<FileId>>,
     /// Edge outputs -> that edge's lib-shaped dependency fids: relative
     /// `.so*` files and meson's SHSYM `.symbols` indirection. A task that
     /// EXECUTES a build-produced binary (meson custom commands running a
@@ -718,6 +723,7 @@ impl Runner {
             stamp_inputs: HashMap::new(),
             stamp_input_files: HashMap::new(),
             co_outputs: HashMap::new(),
+            soname_links: HashMap::new(),
             runtime_lib_deps: HashMap::new(),
             permits,
             pool_permits,
@@ -959,6 +965,17 @@ impl Runner {
             let outs: Vec<FileId> = build.outs().to_vec();
             for fid in build.outs() {
                 self.co_outputs.insert(*fid, outs.clone());
+            }
+        }
+
+        // Record soname links BEFORE building the task, same ordering.
+        {
+            let name = |f: &FileId| files.by_id[*f].name.as_str();
+            let ins: Vec<&str> = build.explicit_ins().iter().map(name).collect();
+            let outs: Vec<&str> = build.outs().iter().map(name).collect();
+            if soname_link_edge(build.cmdline.as_deref().unwrap_or(""), &ins, &outs) {
+                self.soname_links
+                    .insert(build.explicit_ins()[0], build.outs().to_vec());
             }
         }
 
@@ -1618,6 +1635,20 @@ impl Runner {
             if !is_gcc_task {
                 if let Some(libs) = self.runtime_lib_deps.get(&fid) {
                     worklist.extend(libs.iter().map(|f| (*f, true)));
+                    // A library reached THROUGH another library pulls in
+                    // the soname links this build makes for it: the outer
+                    // library names the soname in DT_NEEDED, so ld and the
+                    // loader look for that name, and only the
+                    // CMAKE_SYMLINK_LIBRARY edge declares it (onetbb's test
+                    // link carried `libtbbmalloc.so.2.17`, not `.so.2`).
+                    // Transitive only: a task handed the library directly
+                    // names it by path and never asks for the soname, and
+                    // those tasks are banked.
+                    for lib in libs {
+                        if let Some(links) = self.soname_links.get(lib) {
+                            worklist.extend(links.iter().map(|f| (*f, true)));
+                        }
+                    }
                 }
             }
             // For a compile (deps=gcc), a phony-EXPANDED order-only dep is
@@ -2981,6 +3012,18 @@ impl Runner {
 /// uses: a plain `.so`, or a versioned `libfoo.so.1.2.3`. Written once and
 /// called from both sides of the soname-alias gate, since a predicate
 /// written twice diverges.
+/// CMake's `CMAKE_SYMLINK_LIBRARY` edge: one shared library in, its soname
+/// and namelink out, made by `cmake -E cmake_symlink_library`. Keyed on the
+/// COMMAND, since the rule name is the generator's and the shape alone (one
+/// `.so` in, `.so` out) also fits a real link of one object-less library.
+pub fn soname_link_edge(cmdline: &str, ins: &[&str], outs: &[&str]) -> bool {
+    cmdline.contains("cmake_symlink_library")
+        && ins.len() == 1
+        && shared_library_spelling(ins[0])
+        && !outs.is_empty()
+        && outs.iter().all(|o| shared_library_spelling(o))
+}
+
 fn shared_library_spelling(name: &str) -> bool {
     let base = match name.rsplit_once('/') {
         Some((_, b)) => b,
@@ -19857,5 +19900,33 @@ mod nasm_reader_tests {
             nasm_referenced_paths(&build, Path::new(""), &[], &["../gst/x86/yadif.asm".into()]);
         assert!(bare.is_empty(), "{bare:?}");
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod soname_link_edge_tests {
+    use super::soname_link_edge;
+
+    // onetbb 2022.3.0's own edge, from its build.ninja.
+    const CMD: &str = "cd /build/source/build/gnu_16.2_cxx11_64_release && \
+        cmake -E cmake_symlink_library libtbbmalloc.so.2.17 libtbbmalloc.so.2 libtbbmalloc.so";
+
+    #[test]
+    fn the_symlink_edge_is_recognised() {
+        assert!(soname_link_edge(
+            CMD,
+            &["gnu/libtbbmalloc.so.2.17"],
+            &["gnu/libtbbmalloc.so.2", "gnu/libtbbmalloc.so"],
+        ));
+    }
+
+    #[test]
+    fn a_link_with_the_same_shape_is_not() {
+        assert!(!soname_link_edge(
+            "g++ -shared -o gnu/libfoo.so gnu/libbar.so",
+            &["gnu/libbar.so"],
+            &["gnu/libfoo.so"],
+        ));
+        assert!(!soname_link_edge(CMD, &["a.o"], &["gnu/libtbbmalloc.so.2"]));
     }
 }
