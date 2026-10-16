@@ -31,7 +31,11 @@ Default branch `main`, tracking `origin/main` (never `upstream/main`). Commits c
 (`rev-parse --show-toplevel` inside a gate script answers about it); its
 `origin` is the private `jdmanring/nix-ninja-local` (Actions off): push
 freely with `--no-verify` (James's decision 2026-10-11).
-`CLAUDE.md` is gitignored.
+`CLAUDE.md` is TRACKED on `main` and published with it; the `/CLAUDE.md`
+line in `.git/info/exclude` governs untracked files only and has no effect
+on it. It is also mirrored to `local/instructions/CLAUDE.md`, which
+`claude-md-citations.sh` compares byte for byte: refresh the mirror in the
+same change as any edit here.
 
 ## THE ONE THING TO UNDERSTAND: what an edit costs
 
