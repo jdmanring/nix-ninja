@@ -214,12 +214,6 @@ struct Task {
     // (Runner::empty_dirs), and a compile gets every include directory its
     // command names that exists in the tree.
     make_dirs: Vec<String>,
-    /// UNRESOLVED-HEADER DEFERRAL, set by the discovery worker on a miss
-    /// the producer index answers. None for every task whose discovery
-    /// declares no indexed miss, which is the byte-identity case: the
-    /// deferral reaches the graph only through `DeferMiss::new_ids`, and
-    /// a miss the task already carries answers nothing.
-    defer: Option<DeferMiss>,
     /// The producer index this task's discovery consults for misses. `Arc`
     /// so the shared read-only table is handed to the worker threads;
     /// `None` is the byte-identity case, which pays one `None` check.
@@ -327,6 +321,25 @@ pub struct DeferMiss {
     pub fids: Vec<FileId>,
     pub header: String,
 }
+
+/// `build_task_derivation`'s answer when discovery finds a header an
+/// unordered producer owns: an error, so no derivation is emitted, which
+/// the spawn site downcasts back into the deferral.
+struct Deferred(DeferMiss);
+
+impl std::fmt::Debug for Deferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "deferred on {}", self.0.header)
+    }
+}
+
+impl std::fmt::Display for Deferred {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "deferred on {}", self.0.header)
+    }
+}
+
+impl std::error::Error for Deferred {}
 
 impl DeferMiss {
     /// The FileIds in the deferral that are not already among the edge's
@@ -1401,25 +1414,19 @@ impl Runner {
 
         let config = self.config.clone();
         let rpc_client = self.rpc_client.clone();
-        // A DISCOVERED DEFERRAL CARRIES OUT OF THE THREAD AS THE RESULT'S
-        // OWN FIELD. The miss-detection set `task.defer` in
-        // `build_task_derivation` (the static arm), so the graph edit
-        // lands on the next pass: no derived path, no derived files, the
-        // scheduler makes the implicit-input edit and re-queues the edge.
-        // The byte-identity case is `defer_out = None`, which is what every
-        // task gets until a miss the producer index answers shows up.
-        let defer_out = task.defer.clone();
         std::thread::spawn(move || {
             let _permit = permit;
             let _pool_permit = pool_permit;
-            let (derived_path, err) = if task.defer.is_some() {
-                // The miss was answered by the producer index before any
-                // store write: the task's own derivation stays unwritten,
-                // and the graph edit the scheduler makes on the re-run
-                // resolves it like any declared input. Nothing below
-                // touches the daemon on this path.
-                (None, None)
-            } else {
+            // A DISCOVERED DEFERRAL CARRIES OUT OF THE THREAD AS THE RESULT'S
+            // OWN FIELD. `build_task_derivation` takes the task BY VALUE, so a
+            // deferral recorded on it never reached this frame, and the first
+            // version, which read `task.defer` here, emitted every deferred
+            // task unchanged: the qtbase gtk3, libsecret and flatpak drives
+            // failed exactly as before. It now returns `Deferred` before
+            // writing anything; no derived path, no derived files, and the
+            // scheduler makes the implicit-input edit and re-queues the edge.
+            let mut defer_out: Option<DeferMiss> = None;
+            let (derived_path, err) = {
                 match build_task_derivation(tools.clone(), &rpc_client, task.clone()) {
                     Ok(drv) => match handle_derivation_result(
                         tools.clone(),
@@ -1440,10 +1447,18 @@ impl Runner {
                             ))))
                         }
                     },
-                    Err(err) => (
-                        None,
-                        Some(err.context("Failed to build task derivation for task".to_string())),
-                    ),
+                    Err(err) => match err.downcast::<Deferred>() {
+                        Ok(Deferred(d)) => {
+                            defer_out = Some(d);
+                            (None, None)
+                        }
+                        Err(err) => (
+                            None,
+                            Some(
+                                err.context("Failed to build task derivation for task".to_string()),
+                            ),
+                        ),
+                    },
                 }
             };
 
@@ -3501,10 +3516,6 @@ impl Runner {
             outer_stage_outputs,
             alias_symlinks: self.alias_symlinks.clone(),
             make_dirs,
-            // Set by the discovery worker when a miss the producer index
-            // answers; None is the byte-identity case, and the guard at the
-            // top of build_task_derivation reads it.
-            defer: None,
             is_gcc_task,
         })
     }
@@ -4274,35 +4285,8 @@ const VERBOSE_LOG_SUFFIX: &str = ".nn-verbose-log";
 fn build_task_derivation(
     tools: Tools,
     rpc_client: &Arc<BuilderRpcClient>,
-    mut task: Task,
+    task: Task,
 ) -> Result<Derivation> {
-    // A DISCOVERED DEFERRAL SKIPS THE EMISSION. The miss-detection in
-    // `discover_c_includes` set `task.defer` the moment it found a
-    // spelling the producer index answers; the graph edit lands on the
-    // next pass, where `new_task` resolves the added input like any
-    // declared one, so the task's own derivation is never written and
-    // no store write happens on this path. The spawn site checks
-    // `task.defer` before calling `handle_derivation_result` and drops
-    // the result, so this early return is the empty derivation and the
-    // only thing it needs is a well-formed name.
-    if task.defer.is_some() {
-        let name = task
-            .outs()
-            .first()
-            .and_then(|fid| task.files.get(fid))
-            .map(|f| f.name.clone())
-            .unwrap_or_else(|| "ninja-build".to_string());
-        let drv_name: harmonia_store_path::StorePathName = name
-            .parse()
-            .with_context(|| format!("parsing task name {name}"))?;
-        return Ok(Derivation::new(
-            drv_name,
-            task.system.clone().into_bytes().into(),
-            task_builder_path(&keyed_store_path(&task.store_dir, &tools.nix_ninja_task))?
-                .into_bytes()
-                .into(),
-        ));
-    }
     let cmdline = match &task.cmdline {
         Some(c) => c,
         None => {
@@ -4672,11 +4656,12 @@ fn build_task_derivation(
                     .then(|| task.producer_index.as_ref().map(|v| v.as_ref()))
                     .flatten(),
             )?;
-            // The deferral is recorded on the task for the worker to
-            // carry in the BuildResult. `build_task_derivation` skips
-            // the emission on a miss (see the guard at its top); the
-            // graph edit is made by the Scheduler from `defer.new_ids`.
-            task.defer = defer;
+            // A miss the producer index answers ends the emission here,
+            // before the derivation is written; the spawn site turns it
+            // back into the deferral and the Scheduler makes the edit.
+            if let Some(d) = defer {
+                return Err(anyhow::Error::new(Deferred(d)));
+            }
 
             declare_dotdot_dirs(&mut drv, &task.build_dir, &dotdot_dirs);
 

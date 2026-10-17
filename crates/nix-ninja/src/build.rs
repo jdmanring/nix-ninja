@@ -622,10 +622,16 @@ impl<'a> Scheduler<'a> {
         new: &[n2::graph::FileId],
     ) -> Result<()> {
         if new.is_empty() {
-            // Nothing new to add: the task already carries every producer
-            // the miss answers, so the ordinary emission was correct and
-            // this deferral is a no-op.
-            return Ok(());
+            // NOTHING NEW TO ADD IS A FAILURE, NOT A NO-OP. The task did not
+            // emit, so returning here left the edge Running forever: the run
+            // loop then found nothing ready and nothing running and stopped
+            // with the target unbuilt. It happens when the re-run misses
+            // again although the producer's output is already an input, so
+            // that output does not supply the header after all.
+            anyhow::bail!(
+                "header {} is still unresolved with its producer's output already an input",
+                defer.header
+            );
         }
         // The cycle guard answers the question before any graph edit: a
         // producer that transitively reaches the consumer means the
@@ -652,6 +658,23 @@ impl<'a> Scheduler<'a> {
         for fid in new {
             dyndep::add_implicit_input(self.graph, consumer, *fid);
         }
+        // WANT THE PRODUCER. A target-only run (`nix-ninja <one object>`)
+        // never wanted an edge outside that object's closure, and an
+        // Unneeded producer is never scheduled: the consumer would wait in
+        // Want forever and the run would stop with it unbuilt.
+        for fid in new {
+            let mut stack = Vec::new();
+            self.build_states.want_file(self.graph, &mut stack, *fid)?;
+        }
+        let label = self.graph.builds[consumer]
+            .outs()
+            .first()
+            .map(|fid| self.graph.files.by_id[*fid].name.clone())
+            .unwrap_or_default();
+        eprintln!(
+            "nix-ninja: deferred {label} until the producer of {} has built",
+            defer.header
+        );
         // Move the edge back to Want. It is Running now, and the implicit
         // input lands inside that run, so the edge's ordering inputs are no
         // longer all Done. `set` updates `total_pending` only on the
