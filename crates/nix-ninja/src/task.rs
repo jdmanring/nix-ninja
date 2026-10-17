@@ -1640,8 +1640,16 @@ impl Runner {
                 // graph DOES know, which is what the caller does below.
                 let paths: Vec<PathBuf> =
                     drv_outputs.iter().map(|d| d.build_path.clone()).collect();
-                for dir in undeclared_outputs(&paths, task.cmdline.as_deref(), &config.build_dir) {
-                    if !paths.contains(&dir) {
+                for dir in undeclared_outputs(&paths, task.cmdline.as_deref(), &config.build_dir)
+                    .into_iter()
+                    .chain(copy_writes_not_inputs(
+                        &paths,
+                        task.cmdline.as_deref(),
+                        &config.build_dir,
+                        &task.inputs,
+                    ))
+                {
+                    if !paths.contains(&dir) && !drv_outputs.iter().any(|d| d.build_path == dir) {
                         drv_outputs.push(new_built_file(final_derived_path.clone(), dir));
                     }
                 }
@@ -1664,7 +1672,12 @@ impl Runner {
                         .into_iter()
                         .chain(vapigen_vapi(c, &config.build_dir))
                         .chain(cmake_p_stamp_edge_writes(&paths, c, &config.build_dir))
-                        .chain(cmake_e_copy_stamp_edge_writes(&paths, c, &config.build_dir))
+                        .chain(copy_writes_not_inputs(
+                            &paths,
+                            Some(c),
+                            &config.build_dir,
+                            &task.inputs,
+                        ))
                         .chain(gdbus_docbook_interface_outputs(
                             c,
                             &config.build_dir,
@@ -5222,7 +5235,15 @@ fn build_task_derivation(
     // does not exist - a dangling reference rather than a missing header.
     // For a task that is not syncqt the rule declares a directory holding
     // exactly its own declared outputs, which is redundant and correct.
-    for dir in undeclared_outputs(&task_outputs, task.cmdline.as_deref(), &task.build_dir) {
+    for dir in undeclared_outputs(&task_outputs, task.cmdline.as_deref(), &task.build_dir)
+        .into_iter()
+        .chain(copy_writes_not_inputs(
+            &dedup_paths(&task.outputs),
+            task.cmdline.as_deref(),
+            &task.build_dir,
+            &task.inputs,
+        ))
+    {
         if !task_outputs.contains(&dir) {
             task_outputs.push(dir);
         }
@@ -8399,6 +8420,26 @@ fn cmake_e_copy_stamp_edge_writes(
     out
 }
 
+/// `cmake_e_copy_stamp_edge_writes` minus what the task already receives: a
+/// destination that is one of the edge's inputs is a file configure wrote
+/// (freerdp's `winpr/wlog.7`, which its `ct-*` target lists as a dependency),
+/// so the install reads it already and declaring it would only re-key the
+/// edge. Asked of the task's input list, which the worker and the derivation
+/// both hold, so they agree.
+fn copy_writes_not_inputs(
+    declared: &[PathBuf],
+    cmdline: Option<&str>,
+    build_dir: &Path,
+    inputs: &[DerivedFile],
+) -> Vec<PathBuf> {
+    cmdline
+        .map(|c| cmake_e_copy_stamp_edge_writes(declared, c, build_dir))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|w| !inputs.iter().any(|i| &i.build_path == w))
+        .collect()
+}
+
 /// A CMake custom-target stamp whose name carries a dot: freerdp's
 /// `add_custom_target(${manpage}.target ALL COMMAND ...)` declares
 /// `client/X11/man/CMakeFiles/xfreerdp.1.target`, which nothing writes, and
@@ -8634,11 +8675,6 @@ fn undeclared_outputs(
             }
         }
         for w in gdbus_docbook_interface_outputs(c, build_dir, declared) {
-            if !v.contains(&w) {
-                v.push(w);
-            }
-        }
-        for w in cmake_e_copy_stamp_edge_writes(declared, c, build_dir) {
             if !v.contains(&w) {
                 v.push(w);
             }
@@ -13671,10 +13707,32 @@ endforeach()
             super::cmake_e_copy_stamp_edge_writes(&stamp("CMakeFiles/x"), outside, build)
                 .is_empty()
         );
-        assert!(
-            super::undeclared_outputs(&stamp("CMakeFiles/genlapacke"), Some(openblas), build)
-                .contains(&PathBuf::from("lapacke_mangling.h"))
+        // Through the helper both production sites call: openblas declares
+        // its copy; freerdp's destination is an input of its own edge (a file
+        // configure wrote), so nothing is declared and the edge emits as it did.
+        let input = |p: &str| super::DerivedFile {
+            derived_path: super::SingleDerivedPath::Opaque(
+                "00000000000000000000000000000000-x".parse().unwrap(),
+            ),
+            build_path: PathBuf::from(p),
+            rel_path: None,
+        };
+        assert_eq!(
+            super::copy_writes_not_inputs(
+                &stamp("CMakeFiles/genlapacke"),
+                Some(openblas),
+                build,
+                &[]
+            ),
+            vec![PathBuf::from("lapacke_mangling.h")]
         );
+        assert!(super::copy_writes_not_inputs(
+            &stamp("winpr/CMakeFiles/ct-c6620a4a"),
+            Some(freerdp),
+            build,
+            &[input("winpr/cfg/wlog.7_Release"), input("winpr/wlog.7")]
+        )
+        .is_empty());
     }
 }
 
