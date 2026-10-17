@@ -4080,12 +4080,19 @@ fn build_task_derivation(
     };
     // A vapigen edge's declared name that vapigen never writes is stamped,
     // so the task's written-output check sees what real ninja never checks
-    // (`vapigen_vapi`). Empty, and the command unchanged, for every other
-    // edge.
-    let unwritten = task
+    // (`vapigen_vapi`); a `gdbus-codegen --generate-docbook` edge carries
+    // the same defect in its docbook outputs (`gdbus_unwritten_outputs`):
+    // meson declares one docbook name per input xml and the tool writes
+    // one file per interface instead. Empty, and the command unchanged,
+    // for every other edge.
+    let unwritten: Vec<PathBuf> = task
         .cmdline
         .as_deref()
-        .map(|c| vapigen_unwritten_outputs(c, &task.build_dir, &task.outputs))
+        .map(|c| {
+            let mut v = vapigen_unwritten_outputs(c, &task.build_dir, &task.outputs);
+            v.extend(gdbus_unwritten_outputs(c, &task.build_dir, &task.outputs));
+            v
+        })
         .unwrap_or_default();
     let cmdline = &if unwritten.is_empty() {
         cmdline.clone()
@@ -7776,6 +7783,85 @@ pub fn vapigen_unwritten_outputs(
                 p.extension().and_then(|e| e.to_str()),
                 Some("vapi" | "deps")
             )
+        })
+        .cloned()
+        .collect()
+}
+
+/// Declared docbook outputs of a `gdbus-codegen --generate-docbook` edge
+/// that the tool does not write, so the command can stamp them the way
+/// real ninja's shared tree simply never misses them. Empty for every
+/// other edge.
+///
+/// meson's `gnome.gdbus_codegen(docbook: 'dbus')` declares one docbook
+/// output per input xml, each named `<output-directory>/dbus-<input-stem>.
+/// xml`. `gdbus-codegen --generate-docbook dbus` writes one file per
+/// interface in the xml (`dbus-<input-stem>-<Interface>.xml`), and for an
+/// input with several interfaces it never writes the bare stem name.
+/// flatpak 1.18.4's task `cv596rws` died in the task's written-output
+/// check on `doc/reference/dbus-org.freedesktop.Flatpak.xml`, which
+/// `gdbus-codegen` does not write (it writes
+/// `dbus-org.freedesktop.Flatpak.{SessionHelper,Development,
+/// SystemHelper}.xml` instead). Stamping the bare stem is harmless for a
+/// single-interface input the tool did write: `touch` on an existing file
+/// is a no-op.
+///
+/// GATED on `gdbus-codegen` and `--generate-docbook`: an ordinary run and
+/// every other command yield nothing, and no other edge's emission moves.
+pub fn gdbus_unwritten_outputs(
+    cmdline: &str,
+    _build_dir: &Path,
+    declared: &[PathBuf],
+) -> Vec<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let is_gdbus = toks.iter().any(|t| {
+        Path::new(t)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("gdbus-codegen"))
+    });
+    if !is_gdbus {
+        return Vec::new();
+    }
+    let has_docbook_flag = toks
+        .iter()
+        .any(|t| *t == "--generate-docbook" || t.starts_with("--generate-docbook="));
+    if !has_docbook_flag {
+        return Vec::new();
+    }
+    let mut out_dir = None;
+    let mut inputs: Vec<&str> = Vec::new();
+    let mut it = toks.iter();
+    while let Some(t) = it.next() {
+        match *t {
+            "&&" | ";" | "|" => break,
+            "--output-directory" => {
+                out_dir = it.next().copied();
+            }
+            _ => {
+                if let Some(v) = t.strip_prefix("--output-directory=") {
+                    out_dir = Some(v);
+                } else if t.ends_with(".xml") && t.starts_with('/') {
+                    inputs.push(t);
+                }
+            }
+        }
+    }
+    let od = out_dir.map(|s| s.trim_matches('"')).unwrap_or(".");
+    // Each absolute input xml names one declared docbook output:
+    // `<od>/dbus-<input-stem>.xml`, the spelling meson declares.
+    let candidates: Vec<String> = inputs
+        .iter()
+        .map(|input| {
+            let stem = input.rsplit('/').next().unwrap_or("");
+            format!("{od}/dbus-{stem}")
+        })
+        .collect();
+    declared
+        .iter()
+        .filter(|p| {
+            let s = p.to_string_lossy();
+            candidates.iter().any(|c| s == c.as_str())
         })
         .cloned()
         .collect()
@@ -11951,7 +12037,8 @@ endforeach()
         // and finds nothing; what it recovers must not pretend to exist.
         // xfreerdp-global-links.1.in is not among the X11-owned set.
         assert!(
-            got.iter().all(|g| g != "/build/source/client/X11/man/xfreerdp-global-links.1.in"),
+            got.iter()
+                .all(|g| g != "/build/source/client/X11/man/xfreerdp-global-links.1.in"),
             "an unshipped section was recovered: {got:?}"
         );
     }
@@ -12135,10 +12222,8 @@ endforeach()
     /// `include` expands.
     #[test]
     fn a_composed_include_reaches_a_module_set_by_a_build_dir_helper() {
-        let root = std::env::temp_dir().join(format!(
-            "nn-cmake-build-helper-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("nn-cmake-build-helper-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (src, build) = (root.join("source"), root.join("source/build"));
         std::fs::create_dir_all(src.join("cmake/vars")).unwrap();
@@ -12185,7 +12270,8 @@ endforeach()
         // The sub-module the module pulls in through `CMAKE_CURRENT_LIST_DIR`
         // is reached too.
         assert!(
-            got.iter().any(|g| g.ends_with("/cmake/vars/EnableModeVars.cmake")),
+            got.iter()
+                .any(|g| g.ends_with("/cmake/vars/EnableModeVars.cmake")),
             "the module's own include was not recovered; got {got:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -12197,12 +12283,9 @@ endforeach()
     /// is not recovered. A walk that invented a value here would recover
     /// the module and let the test pass; it must not.
     #[test]
-    fn a_composed_include_without_a_setting_helper_recovers_nothing_beyond_the_helper()
-    {
-        let root = std::env::temp_dir().join(format!(
-            "nn-cmake-build-helper-none-{}",
-            std::process::id()
-        ));
+    fn a_composed_include_without_a_setting_helper_recovers_nothing_beyond_the_helper() {
+        let root =
+            std::env::temp_dir().join(format!("nn-cmake-build-helper-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (src, build) = (root.join("source"), root.join("source/build"));
         std::fs::create_dir_all(src.join("cmake")).unwrap();
@@ -12225,13 +12308,15 @@ endforeach()
         let _ = std::fs::remove_dir_all(&root);
         // The helper itself is still reached: it is named by a definition.
         assert!(
-            got.iter().any(|g| g == &helper.to_string_lossy().into_owned()),
+            got.iter()
+                .any(|g| g == &helper.to_string_lossy().into_owned()),
             "the helper must ride the recovery; got {got:?}"
         );
         // The module is NOT reached: the variable that composes it is set by
         // nothing the walk reads.
         assert!(
-            got.iter().all(|g| g != &module.to_string_lossy().into_owned()),
+            got.iter()
+                .all(|g| g != &module.to_string_lossy().into_owned()),
             "the uncomposable module was recovered; got {got:?}"
         );
     }
@@ -21806,7 +21891,7 @@ mod script_bare_programs_tests {
 
 #[cfg(test)]
 mod vapigen_outputs_tests {
-    use super::{vapigen_unwritten_outputs, vapigen_vapi};
+    use super::{gdbus_unwritten_outputs, vapigen_unwritten_outputs, vapigen_vapi};
     use std::path::{Path, PathBuf};
 
     /// libayatana-appindicator 0.5.92's edge, argv as its task drv carried
@@ -21837,5 +21922,57 @@ mod vapigen_outputs_tests {
         let not_vapigen = "cd /build/source/build && valac --library=x a.vala";
         assert!(vapigen_vapi(not_vapigen, bd).is_none());
         assert!(vapigen_unwritten_outputs(not_vapigen, bd, &declared).is_empty());
+    }
+
+    /// flatpak 1.18.4's `dbus` docbook edge from task `cv596rws`
+    /// (2026-10-17): meson's `gnome.gdbus_codegen(docbook: 'dbus')`
+    /// declares one docbook output per input xml, each named
+    /// `<output-directory>/dbus-<input-stem>.xml`. The command's argv is
+    /// verbatim from the failing task drv.
+    #[test]
+    fn a_gdbus_docbook_edge_stamps_the_declared_names_it_may_not_write() {
+        let bd = Path::new("/build/flatpak-1.18.4");
+        let cmd = "/nix/store/7y3yxnzk3yy1x8njrsa3m8804b1h1hz7-glib-2.88.3-dev/bin/gdbus-codegen \
+                   --c-generate-autocleanup all --c-namespace doc \
+                   --output-directory doc/reference --generate-docbook dbus \
+                   /build/flatpak-1.18.4/data/org.freedesktop.Flatpak.Authenticator.xml \
+                   /build/flatpak-1.18.4/data/org.freedesktop.Flatpak.xml \
+                   /build/flatpak-1.18.4/data/org.freedesktop.impl.portal.PermissionStore.xml \
+                   /build/flatpak-1.18.4/data/org.freedesktop.portal.Documents.xml \
+                   /build/flatpak-1.18.4/data/org.freedesktop.portal.Flatpak.xml";
+        // The five docbook outputs meson declared, one per input xml.
+        let declared = [
+            PathBuf::from("doc/reference/dbus-org.freedesktop.Flatpak.Authenticator.xml"),
+            PathBuf::from("doc/reference/dbus-org.freedesktop.Flatpak.xml"),
+            PathBuf::from("doc/reference/dbus-org.freedesktop.impl.portal.PermissionStore.xml"),
+            PathBuf::from("doc/reference/dbus-org.freedesktop.portal.Documents.xml"),
+            PathBuf::from("doc/reference/dbus-org.freedesktop.portal.Flatpak.xml"),
+        ];
+        // Every declared docbook spelling is a candidate: the tool writes
+        // it for a single-interface input and not for a multi-interface
+        // one, so a bare-stem declared name may or may not exist when the
+        // check runs. The command must stamp all of them; `touch` on a
+        // file the tool already wrote is a no-op.
+        let unwritten = gdbus_unwritten_outputs(cmd, bd, &declared);
+        assert_eq!(
+            unwritten,
+            declared.to_vec(),
+            "every declared docbook spelling must be stamped; got {unwritten:?}"
+        );
+        // A command without `--generate-docbook` stamps nothing: the
+        // ordinary `gdbus-codegen` run has no docbook half.
+        let plain = "/nix/store/x/bin/gdbus-codegen --c-namespace doc \
+                     --output-directory doc/reference \
+                     /build/flatpak-1.18.4/data/org.freedesktop.Flatpak.xml";
+        assert!(
+            gdbus_unwritten_outputs(plain, bd, &declared).is_empty(),
+            "an ordinary run must stamp nothing"
+        );
+        // A declared set with no docbook spelling matches nothing.
+        let no_docbook_declared = [PathBuf::from("doc/reference/other.xml")];
+        assert!(
+            gdbus_unwritten_outputs(cmd, bd, &no_docbook_declared).is_empty(),
+            "a non-docbook declared name must not be stamped"
+        );
     }
 }
