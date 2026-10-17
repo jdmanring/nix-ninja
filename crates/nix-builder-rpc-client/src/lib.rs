@@ -542,6 +542,9 @@ pub struct BuilderRpcClient {
     /// Multi-thread so the pool's RAII drop tasks can complete asynchronously.
     runtime: Runtime,
     pool: BoundedPool,
+    /// The pool's connection count, so a caller fanning out requests never
+    /// queues more of them than there are connections to carry them.
+    pool_max: usize,
     /// Whether or not nix-ninja is running within a derivation
     /// Needed since scanning is not available outside derivations
     in_drv: bool,
@@ -657,6 +660,44 @@ fn reorder_misses(miss_slots: &[usize], len: usize) -> Vec<usize> {
 /// order; every opaque path is its own group. The groups partition
 /// `0..paths.len()` and each group's indices are ascending, which is what
 /// lets the caller write results back by index without a second pass.
+/// `f(0..n)` on at most `width` threads, results in index order, the first
+/// error by index returned. Extracted from `build_paths` so the fan-out is
+/// tested without a daemon.
+pub fn for_each_bounded<T: Send>(
+    n: usize,
+    width: usize,
+    f: impl Fn(usize) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<Result<T>>>> = Mutex::new((0..n).map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..width.clamp(1, n.max(1)) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let r = f(i);
+                let failed = r.is_err();
+                slots.lock().unwrap()[i] = Some(r);
+                if failed {
+                    // Stop handing out work; requests in flight finish.
+                    next.store(n, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    let mut out = Vec::with_capacity(n);
+    for r in slots.into_inner().unwrap() {
+        match r {
+            Some(Ok(v)) => out.push(v),
+            Some(Err(e)) => return Err(e),
+            None => {}
+        }
+    }
+    Ok(out)
+}
+
 fn split_by_derivation(store_dir: &StoreDir, paths: &[SingleDerivedPath]) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -905,6 +946,7 @@ impl BuilderRpcClient {
         Ok(Self {
             runtime,
             pool,
+            pool_max: pool_max.max(1),
             in_drv,
             uploaded_drvs: Default::default(),
             realised: Default::default(),
@@ -1362,11 +1404,21 @@ impl BuilderRpcClient {
         let built = if groups.len() <= 1 {
             self.build_paths_uncached(store_dir, &misses, patience)?
         } else {
-            let mut by_slot: Vec<Option<StorePath>> = vec![None; misses.len()];
-            for group in groups {
+            // THE GROUPS RUN CONCURRENTLY, ONE REQUEST EACH. Serial, the
+            // end-of-run placement of a restarted round asked the daemon for
+            // every banked output one derivation at a time on one connection
+            // while the rest of the pool sat idle: three drivers at 0 CPU for
+            // over 30 minutes with no task in flight (KDE round, 2026-10-17).
+            // Each request still names one derivation, so the crash above
+            // cannot be reached; width is the pool's, so no request waits on
+            // an acquire deadline for a connection that cannot come.
+            let results = for_each_bounded(groups.len(), self.pool_max, |g| {
                 let subset: Vec<SingleDerivedPath> =
-                    group.iter().map(|&i| misses[i].clone()).collect();
-                let got = self.build_paths_uncached(store_dir, &subset, patience)?;
+                    groups[g].iter().map(|&i| misses[i].clone()).collect();
+                self.build_paths_uncached(store_dir, &subset, patience)
+            })?;
+            let mut by_slot: Vec<Option<StorePath>> = vec![None; misses.len()];
+            for (group, got) in groups.iter().zip(results) {
                 for (&i, sp) in group.iter().zip(got) {
                     by_slot[i] = Some(sp);
                 }
@@ -2552,5 +2604,38 @@ mod nar_stamp_hit_tests {
             Some((12, 34))
         )
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod fan_out_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn fan_out_runs_wide_keeps_order_and_bounds_width() {
+        let live = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let got = for_each_bounded(24, 6, |i| {
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            live.fetch_sub(1, Ordering::SeqCst);
+            Ok(i * 10)
+        })
+        .unwrap();
+        assert_eq!(got, (0..24).map(|i| i * 10).collect::<Vec<_>>());
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak > 1, "the groups ran serially (peak {peak})");
+        assert!(
+            peak <= 6,
+            "more requests in flight than connections (peak {peak})"
+        );
+    }
+
+    #[test]
+    fn fan_out_returns_an_error() {
+        let r = for_each_bounded(8, 3, |i| if i == 5 { Err(Error::NoDaemon) } else { Ok(i) });
+        assert!(r.is_err());
     }
 }
