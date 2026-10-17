@@ -1943,6 +1943,7 @@ impl Runner {
             let rst_docs = rst_invocation(&args);
             let gresource = gresource_invocation(&args);
             let gi_docgen = gi_docgen_invocation(&args);
+            let doxyfile = doxygen_invocation(&args);
             let msgfmt_dirs = msgfmt_invocation(&args);
             let swig_i = swig_invocation(&args);
             let gir_filelists = gir_filelist_invocation(&args);
@@ -2500,6 +2501,31 @@ impl Runner {
                 let root = self.config.build_dir.join(&cd_dir);
                 for p in gi_docgen_referenced_files(&root, config, dirs) {
                     referenced.push(p.to_string_lossy().into_owned());
+                }
+            }
+            // A DOXYFILE NAMES ITS INPUTS, HEADER, FOOTER, STYLESHEET AND
+            // IMAGE DIRS INSIDE THE FILE, every one relative to the directory
+            // doxygen RUNS IN (proven both ways on rapidjson, consumer ledger
+            // 2026-09-26). CMake's doxygen edge declares the Doxyfile alone.
+            // Files ride `referenced`; directories take the guarded directory
+            // upload the autogen plan uses.
+            if let Some(doxyfile) = &doxyfile {
+                for p in doxygen_referenced_paths(&cmd_cwd, doxyfile) {
+                    if p.is_dir() {
+                        if p.starts_with(&self.config.store_dir)
+                            || !same_project_tree(&self.config.build_dir, &p)
+                        {
+                            continue;
+                        }
+                        for input in
+                            upload_referenced_dir(&self.rpc_client, &self.config.build_dir, &p)?
+                        {
+                            self.add_derived_file(files, input.clone());
+                            input_set.insert(input.build_path.clone(), input);
+                        }
+                    } else {
+                        referenced.push(p.to_string_lossy().into_owned());
+                    }
                 }
             }
             // A SWIG RUN RESOLVES ITS OWN `%include` TARGETS. Same family and
@@ -10759,6 +10785,144 @@ fn gi_docgen_extra_names(text: &str) -> Vec<String> {
             if KEYS.contains(&k.trim()) {
                 quoted(v, &mut out);
                 array_open = v.contains('[') && !v.contains(']');
+            }
+        }
+    }
+    out
+}
+
+/// The Doxyfile a `doxygen` run reads: its first positional argument, or
+/// `Doxyfile` in the cwd when none is given. A run carrying a flag (`-g`,
+/// `-u`, `-w`, `-x`, `-s`) writes or inspects a config rather than
+/// generating from one and names no input.
+fn doxygen_invocation(args: &[String]) -> Option<PathBuf> {
+    let tool = args
+        .iter()
+        .position(|a| a.rsplit('/').next() == Some("doxygen"))?;
+    let rest = &args[tool + 1..];
+    let rest = rest
+        .iter()
+        .position(|a| matches!(a.as_str(), "&&" | "||" | ";" | "|"))
+        .map_or(rest, |k| &rest[..k]);
+    if rest.iter().any(|a| a.starts_with('-')) {
+        return None;
+    }
+    Some(PathBuf::from(
+        rest.first().map_or("Doxyfile", String::as_str),
+    ))
+}
+
+/// The config tags whose values name files or directories doxygen opens.
+/// `TAGFILES` entries are `file=url` pairs; the file is the part before `=`.
+const DOXYFILE_PATH_TAGS: [&str; 15] = [
+    "INPUT",
+    "HTML_HEADER",
+    "HTML_FOOTER",
+    "HTML_STYLESHEET",
+    "HTML_EXTRA_STYLESHEET",
+    "HTML_EXTRA_FILES",
+    "IMAGE_PATH",
+    "EXAMPLE_PATH",
+    "LAYOUT_FILE",
+    "PROJECT_LOGO",
+    "CITE_BIB_FILES",
+    "USE_MDFILE_AS_MAINPAGE",
+    "INCLUDE_PATH",
+    "TAGFILES",
+    "@INCLUDE",
+];
+
+/// Every path a Doxyfile names under `DOXYFILE_PATH_TAGS`, resolved against
+/// `cwd`, the directory the doxygen command runs in. MEASURED on rapidjson
+/// (consumer ledger 2026-09-26, task `1yyv38wq`): `HTML_HEADER =
+/// ./doc/misc/header.html` with `cd /build/source && doxygen
+/// <build>/doc/Doxyfile` resolved against the cwd and failed `header file
+/// './doc/misc/header.html' does not exist` with 29 inputs and none under
+/// `doc/misc`. The caller sorts files from directories and applies the
+/// store and project-tree guards; a name that resolves to nothing is dropped
+/// by the existence checks there.
+///
+/// ponytail: `=` and `+=` lines with `\` continuations and double-quoted
+/// values; `$(ENV)` expansion and `@INCLUDE` transitivity are not followed
+/// (the included file itself is carried). A Doxyfile that needs either
+/// names the next arm.
+fn doxygen_referenced_paths(cwd: &Path, doxyfile: &Path) -> Vec<PathBuf> {
+    let path = if doxyfile.is_absolute() {
+        doxyfile.to_path_buf()
+    } else {
+        cwd.join(doxyfile)
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for value in doxyfile_tag_values(&text) {
+        let name = value.split_once('=').map_or(value.as_str(), |(f, _)| f);
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let p = Path::new(name);
+        out.push(if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
+        });
+    }
+    out
+}
+
+/// The whitespace-separated values of every `DOXYFILE_PATH_TAGS` line, with
+/// `\` continuations joined and double quotes stripped, in file order.
+fn doxyfile_tag_values(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut carry: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        let (body, continued) = match line.strip_suffix('\\') {
+            Some(b) => (b.trim_end(), true),
+            None => (line, false),
+        };
+        let values = if let Some(acc) = carry.as_mut() {
+            acc.push(' ');
+            acc.push_str(body);
+            if continued {
+                continue;
+            }
+            carry.take()
+        } else {
+            if body.starts_with('#') {
+                continue;
+            }
+            let Some((tag, value)) = body.split_once('=') else {
+                continue;
+            };
+            let tag = tag.trim_end_matches('+').trim();
+            if !DOXYFILE_PATH_TAGS.contains(&tag) {
+                continue;
+            }
+            if continued {
+                carry = Some(value.to_string());
+                continue;
+            }
+            Some(value.to_string())
+        };
+        if let Some(v) = values {
+            let mut in_quote = false;
+            let mut cur = String::new();
+            for ch in v.chars() {
+                match ch {
+                    '"' => in_quote = !in_quote,
+                    c if c.is_whitespace() && !in_quote => {
+                        if !cur.is_empty() {
+                            out.push(std::mem::take(&mut cur));
+                        }
+                    }
+                    c => cur.push(c),
+                }
+            }
+            if !cur.is_empty() {
+                out.push(cur);
             }
         }
     }
@@ -19603,6 +19767,118 @@ pattern = "DEPRECATED"
         );
         let none = gi_docgen_referenced_files(&root, &PathBuf::from("doc/x.toml"), &[]);
         assert_eq!(none, vec![root.join("logo.svg")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod doxygen_tests {
+    use super::{doxyfile_tag_values, doxygen_invocation, doxygen_referenced_paths};
+    use std::path::{Path, PathBuf};
+
+    /// rapidjson's `doc/Doxyfile.in` (store source `8wyp2jw7`), the
+    /// tags that name files, with its backslash continuations.
+    const RAPIDJSON: &str = r#"PROJECT_LOGO           =
+LAYOUT_FILE            =
+INPUT                  = readme.md \
+                         include/rapidjson/rapidjson.h \
+                         include/ \
+                         doc/faq.md
+FILE_PATTERNS          = *.c \
+                         *.md
+RECURSIVE              = YES
+EXCLUDE                = ./include/rapidjson/msinttypes/
+IMAGE_PATH             = ./doc
+USE_MDFILE_AS_MAINPAGE = readme.md
+HTML_HEADER            = ./doc/misc/header.html
+HTML_FOOTER            = ./doc/misc/footer.html
+HTML_EXTRA_STYLESHEET  = ./doc/misc/doxygenextra.css
+HTML_EXTRA_FILES       =
+TAGFILES               = "../qt.tag=https://doc.qt.io" other.tag
+# INPUT = commented.md
+"#;
+
+    #[test]
+    fn the_path_tags_are_read_with_continuations_and_nothing_else_is() {
+        assert_eq!(
+            doxyfile_tag_values(RAPIDJSON),
+            [
+                "readme.md",
+                "include/rapidjson/rapidjson.h",
+                "include/",
+                "doc/faq.md",
+                "./doc",
+                "readme.md",
+                "./doc/misc/header.html",
+                "./doc/misc/footer.html",
+                "./doc/misc/doxygenextra.css",
+                "../qt.tag=https://doc.qt.io",
+                "other.tag",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+        );
+    }
+
+    /// The two real edges: rapidjson (consumer ledger, `cd <src> && doxygen
+    /// <abs Doxyfile>`) and libjxl (kept tree `nix-7430-161407557`, a
+    /// `make_directory` step before the tool). `-g` writes a config and
+    /// names nothing; a bare run reads `Doxyfile`.
+    #[test]
+    fn the_doxyfile_is_the_positional_argument() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(
+            doxygen_invocation(&v(&[
+                "cd",
+                "/build/source",
+                "&&",
+                "/nix/store/x-doxygen-1.17.0/bin/doxygen",
+                "/build/source/build/doc/Doxyfile",
+            ])),
+            Some(PathBuf::from("/build/source/build/doc/Doxyfile"))
+        );
+        assert_eq!(
+            doxygen_invocation(&v(&[
+                "cd",
+                "/build/source/build/doc",
+                "&&",
+                "/nix/store/x-cmake-4.4.3/bin/cmake",
+                "-E",
+                "make_directory",
+                "/build/source/build/doc",
+                "&&",
+                "/nix/store/x-doxygen-1.17.0/bin/doxygen",
+                "/build/source/build/doc/Doxyfile.doc",
+            ])),
+            Some(PathBuf::from("/build/source/build/doc/Doxyfile.doc"))
+        );
+        assert_eq!(
+            doxygen_invocation(&v(&["doxygen"])),
+            Some(PathBuf::from("Doxyfile"))
+        );
+        assert!(doxygen_invocation(&v(&["doxygen", "-g", "Doxyfile"])).is_none());
+        assert!(doxygen_invocation(&v(&["cp", "Doxyfile", "x"])).is_none());
+    }
+
+    /// Resolution is against the CWD the command runs in, never the
+    /// Doxyfile's own directory: the Doxyfile sits in `build/doc`, the
+    /// header is found from the source root.
+    #[test]
+    fn names_resolve_against_the_commands_cwd() {
+        let root = std::env::temp_dir().join(format!("nn-doxy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("build/doc")).expect("mkdir");
+        std::fs::write(root.join("build/doc/Doxyfile"), RAPIDJSON).expect("write");
+        let got = doxygen_referenced_paths(&root, &root.join("build/doc/Doxyfile"));
+        assert_eq!(got[0], root.join("readme.md"));
+        assert!(got.contains(&root.join("./doc/misc/header.html")));
+        assert!(got.contains(&root.join("include/")));
+        assert!(got.contains(&root.join("../qt.tag")), "{got:?}");
+        assert!(!got.iter().any(|p| p.ends_with("commented.md")));
+        assert!(
+            doxygen_referenced_paths(Path::new("/nonexistent"), Path::new("Doxyfile")).is_empty()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
