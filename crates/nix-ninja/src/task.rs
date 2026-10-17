@@ -2591,6 +2591,7 @@ impl Runner {
                     referenced.push(p);
                 }
             }
+            let mut gtest_discovery = runs_gtest_discovery(cmdline, None);
             if let Some(script) = &cmake_p_script {
                 // THE `-P` PATH IS SPELLED RELATIVE TO THE cd TARGET, NOT TO
                 // THE BUILD ROOT THIS PROCESS RUNS IN. llvm's VCSRevision.h
@@ -2608,6 +2609,7 @@ impl Runner {
                     self.config.build_dir.join(rebase_post_cd(&cd_dir, script))
                 };
                 if let Ok(text) = std::fs::read_to_string(&script_path) {
+                    gtest_discovery |= runs_gtest_discovery(cmdline, Some(&text));
                     // THE SCRIPT ITSELF IS AN INPUT, and nothing else declares
                     // it when configure wrote it: CMake's ExternalProject
                     // emits `<name>-prefix/tmp/<name>-mkdirs.cmake` at
@@ -2644,7 +2646,12 @@ impl Runner {
             // `Check(file.good()) failed` on `testdata/.../scRGB-v2.icc`,
             // the directory named only by a define on test_utils.cc's
             // compile edge). Same guards and upload as the autogen plan.
-            if cmdline.contains("GoogleTestAddTests.cmake") {
+            // THE MODULE IS NOT ON THE COMMAND LINE: CMake writes
+            // `<test>_<hash>_discovery.cmake` and runs THAT with `-P`; its
+            // first line includes GoogleTestAddTests.cmake. The first
+            // version matched the module's name on the command line, which
+            // production never spells, and libjxl failed with it mounted.
+            if gtest_discovery {
                 let dirs: Vec<PathBuf> = build
                     .outs()
                     .iter()
@@ -7940,6 +7947,36 @@ fn autogen_cache_dir(outputs: &[PathBuf]) -> Option<PathBuf> {
 /// directory that exists inside this project's tree and outside the store
 /// qualifies: a file-valued define is a header the macro-arm reader already
 /// handles, and a store path reaches the sandbox on its own.
+/// Whether an edge runs gtest discovery over the binary it links: the
+/// `GoogleTestAddTests.cmake` module named on the command line (older
+/// CMake), or a `-P` script whose text includes it (CMake 4's
+/// `<test>_<hash>_discovery.cmake`, libjxl `az5f2s1p`). The script text is
+/// the caller's, read once for every `-P` reader.
+pub fn runs_gtest_discovery(cmdline: &str, script_text: Option<&str>) -> bool {
+    cmdline.contains("GoogleTestAddTests.cmake")
+        || script_text.is_some_and(|t| t.contains("GoogleTestAddTests.cmake"))
+}
+
+#[cfg(test)]
+mod runs_gtest_discovery_tests {
+    use super::runs_gtest_discovery;
+
+    /// libjxl's real link edge names only the generated discovery script;
+    /// the module is the script's first line.
+    #[test]
+    fn the_module_is_found_in_the_script_not_the_command() {
+        let cmd = ": && g++ a.o -o lib/tests/gain_map_test && cd /build/source/build/lib && /nix/store/x-cmake-4.4.3/bin/cmake -P /build/source/build/lib/gain_map_test_9cf322f2_discovery.cmake --";
+        let script = "include(\"/nix/store/x-cmake-4.4.3/share/cmake-4.4/Modules/GoogleTestAddTests.cmake\")\ngtest_discover_tests_impl(\n  TEST_TARGET [==[gain_map_test]==]\n";
+        assert!(!runs_gtest_discovery(cmd, None));
+        assert!(runs_gtest_discovery(cmd, Some(script)));
+        assert!(runs_gtest_discovery(
+            "cmake -D TEST_TARGET=t -P /x/GoogleTestAddTests.cmake",
+            None
+        ));
+        assert!(!runs_gtest_discovery(cmd, Some("set(X 1)\n")));
+    }
+}
+
 fn path_defined_dirs(cmdline: &str, store_dir: &StoreDir, build_dir: &Path) -> Vec<PathBuf> {
     let store = store_dir.to_string();
     let mut out = Vec::new();
