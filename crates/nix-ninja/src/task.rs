@@ -1268,9 +1268,13 @@ impl Runner {
                 // the same class - the source half landed first and the
                 // binary half was never built.
                 // AND opencv's generated kernel header, which every TU of the
-                // module includes and which no edge declares.
+                // module includes and which no edge declares, and the `.vapi`
+                // a vapigen edge writes beside the name its rule declares.
                 if let Some(c) = task.cmdline.as_deref() {
-                    undeclared_files = cl2cpp_header(c, &config.build_dir).into_iter().collect();
+                    undeclared_files = cl2cpp_header(c, &config.build_dir)
+                        .into_iter()
+                        .chain(vapigen_vapi(c, &config.build_dir))
+                        .collect();
                     undeclared_dirs = external_project_extract_dirs(c, &config.build_dir)
                         .into_iter()
                         .chain(external_project_binary_dir(c, &config.build_dir))
@@ -2669,6 +2673,11 @@ impl Runner {
                     referenced.push(script.clone());
                     referenced.extend(cmake_script_referenced_paths(&text, &cmake_p_defs));
                     referenced.extend(cmake_script_included_modules(&script_path, &text));
+                    referenced.extend(cmake_script_included_paths(
+                        &script_path,
+                        &text,
+                        &cmake_p_defs,
+                    ));
                 }
             }
             // A `cmake -E cmake_autogen` PLAN NAMES ITS OWN SOURCES, and no edge
@@ -4069,6 +4078,27 @@ fn build_task_derivation(
     } else {
         format!("{cmdline} {}", outer_mirror.join(" "))
     };
+    // A vapigen edge's declared name that vapigen never writes is stamped,
+    // so the task's written-output check sees what real ninja never checks
+    // (`vapigen_vapi`). Empty, and the command unchanged, for every other
+    // edge.
+    let unwritten = task
+        .cmdline
+        .as_deref()
+        .map(|c| vapigen_unwritten_outputs(c, &task.build_dir, &task.outputs))
+        .unwrap_or_default();
+    let cmdline = &if unwritten.is_empty() {
+        cmdline.clone()
+    } else {
+        let stamps: Vec<String> = unwritten
+            .iter()
+            .map(|p| {
+                let p = task.build_dir.join(p).display().to_string();
+                format!("'{}'", p.replace('\'', "'\\''"))
+            })
+            .collect();
+        format!("{cmdline} && touch {}", stamps.join(" "))
+    };
     drv.args.push(cmdline.to_string().into_bytes().into());
 
     if let Some(desc) = &task.desc {
@@ -5042,6 +5072,24 @@ fn build_task_derivation(
             }
             // Unresolved: leave the command as written and let the link
             // fail with the compiler's own message, which names the linker.
+        }
+        // A SHELL SCRIPT THE COMMAND RUNS EXECS ITS TOOLS BY BARE NAME, and
+        // this PATH carries none of them. packagekit's ref.xml edge is `/bin/sh
+        // <src>/docs/api/dbus/spec-to-docbook.sh ...`, whose second line pipes
+        // `xsltproc` into `tail`: the task logged `xsltproc: not found`, the
+        // pipeline's status was `tail`'s, and the edge "succeeded" with a
+        // header-only XML that gtk-doc rejected at install. Same remedy as
+        // `-fuse-ld`: resolve each name the script runs on the caller's PATH
+        // and carry what lands in the store. A word that resolves to nothing
+        // contributes nothing.
+        for name in script_bare_programs(cmdline) {
+            if let Ok(Some(sp)) = which_store_path_opt(&task.store_dir, &name) {
+                let entry = format!("{}/bin", task.store_dir.display(&sp));
+                if !path.contains(&entry) {
+                    path.push(entry);
+                    drv.inputs.insert(SingleDerivedPath::Opaque(sp));
+                }
+            }
         }
         // THE SECOND MEMBER OF THE `-fuse-ld` CLASS, and the only other one.
         // `lto-wrapper` runs the LTRANS phase by writing a makefile and
@@ -7661,6 +7709,78 @@ fn cl2cpp_header(cmdline: &str, build_dir: &Path) -> Option<PathBuf> {
     (rel.is_relative() && !rel.starts_with("..")).then_some(rel)
 }
 
+/// The `.vapi` a `vapigen --library=<name>` run writes, relative to the
+/// build dir: `<directory>/<name>.vapi`, where `--directory`/`-d` defaults
+/// to the directory the command runs in (a leading `cd`).
+///
+/// libayatana-appindicator 0.5.92's rule declares `OUTPUT
+/// AyatanaAppIndicator3-0.1.vala`, a file vapigen never writes, and its
+/// install reads `ayatana-appindicator3-0.1.vapi`, which nothing declares.
+/// Real ninja checks neither. The task refused the unwritten name, and had
+/// it not, the `.vapi` would have stayed in the sandbox.
+pub fn vapigen_vapi(cmdline: &str, build_dir: &Path) -> Option<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let at = toks
+        .iter()
+        .position(|t| Path::new(t).file_name().and_then(|n| n.to_str()) == Some("vapigen"))?;
+    let (mut lib, mut dir) = (None, ".");
+    let mut it = toks[at + 1..].iter();
+    while let Some(t) = it.next() {
+        match *t {
+            "&&" | ";" | "|" => break,
+            "--library" => lib = it.next().copied(),
+            "--directory" | "-d" => dir = it.next().copied().unwrap_or("."),
+            _ => {
+                if let Some(v) = t.strip_prefix("--library=") {
+                    lib = Some(v);
+                } else if let Some(v) = t.strip_prefix("--directory=") {
+                    dir = v;
+                }
+            }
+        }
+    }
+    let vapi = Path::new(dir.trim_matches('"')).join(format!("{}.vapi", lib?.trim_matches('"')));
+    let rel = if vapi.is_absolute() {
+        relative_from(&vapi, build_dir)?
+    } else {
+        match toks.as_slice() {
+            ["cd", d, "&&", ..] if d.starts_with('/') => {
+                relative_from(&Path::new(d).join(&vapi), build_dir)?
+            }
+            ["cd", d, "&&", ..] => rebase_post_cd(Path::new(d), &vapi.to_string_lossy()),
+            _ => vapi,
+        }
+    };
+    let rel: PathBuf = rel
+        .components()
+        .filter(|c| *c != std::path::Component::CurDir)
+        .collect();
+    (rel.is_relative() && !rel.starts_with("..")).then_some(rel)
+}
+
+/// Declared outputs of a vapigen edge that vapigen does not write (anything
+/// but `.vapi` and `.deps`), so the command can stamp them the way real
+/// ninja's shared tree simply never misses them. Empty for every other edge.
+pub fn vapigen_unwritten_outputs(
+    cmdline: &str,
+    build_dir: &Path,
+    declared: &[PathBuf],
+) -> Vec<PathBuf> {
+    if vapigen_vapi(cmdline, build_dir).is_none() {
+        return Vec::new();
+    }
+    declared
+        .iter()
+        .filter(|p| {
+            !matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("vapi" | "deps")
+            )
+        })
+        .cloned()
+        .collect()
+}
+
 fn undeclared_outputs(
     declared: &[PathBuf],
     cmdline: Option<&str>,
@@ -7696,6 +7816,11 @@ fn undeclared_outputs(
         if let Some(hpp) = cl2cpp_header(c, build_dir) {
             if !v.contains(&hpp) {
                 v.push(hpp);
+            }
+        }
+        if let Some(vapi) = vapigen_vapi(c, build_dir) {
+            if !v.contains(&vapi) {
+                v.push(vapi);
             }
         }
         // AN EXTERNALPROJECT DOWNLOAD EXTRACTS INTO `SOURCE_DIR` AND
@@ -11348,6 +11473,80 @@ fn cmake_script_included_modules(script: &Path, text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Files a `cmake -P` script pulls in with an `include()` whose path is
+/// COMPOSED from variables, each read in turn so the next include can use
+/// what the last one set.
+///
+/// opencv's `opencv4.pc` edge runs `cmake -DCMAKE_HELPER_SCRIPT=<build>/
+/// OpenCVGenPkgConfig.info.cmake -P <src>/cmake/OpenCVGenPkgconfig.cmake`;
+/// the script does `include("${CMAKE_HELPER_SCRIPT}")`, which sets
+/// `OpenCV_SOURCE_DIR`, then `include("${OpenCV_SOURCE_DIR}/cmake/
+/// OpenCVUtils.cmake")`. The edge declares only the helper, so the task
+/// carried neither the module nor the `vars/EnableModeVars.cmake` the
+/// module includes through `CMAKE_CURRENT_LIST_DIR`, and cmake stopped
+/// with `include could not find requested file`. A path with a reference
+/// no definition or earlier `set` explains is skipped, as is a bare name
+/// (`cmake_script_included_modules` reads those). Only an ABSOLUTE
+/// expansion is opened and descended into; the caller keeps what exists.
+fn cmake_script_included_paths(
+    script: &Path,
+    text: &str,
+    definitions: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut vars = definitions.clone();
+    let mut out = Vec::new();
+    included_paths_walk(script, text, &mut vars, &mut out, 0);
+    out
+}
+
+fn included_paths_walk(
+    file: &Path,
+    text: &str,
+    vars: &mut HashMap<String, String>,
+    out: &mut Vec<String>,
+    depth: usize,
+) {
+    let dir = file.parent().map(|d| d.to_string_lossy().into_owned());
+    let saved = vars.get("CMAKE_CURRENT_LIST_DIR").cloned();
+    if let Some(d) = &dir {
+        vars.insert("CMAKE_CURRENT_LIST_DIR".into(), d.clone());
+    }
+    // ponytail: a file's sets are folded before its includes, not
+    // interleaved; exact order needs a real cmake evaluator
+    for (name, raw) in cmake_set_calls(text) {
+        if let Some(value) = expand_cmake_vars(&raw, vars) {
+            vars.insert(name, value);
+        }
+    }
+    for body in cmake_call_bodies(text, "include") {
+        let Some(raw) = body.split_whitespace().next() else {
+            continue;
+        };
+        let raw = raw.trim_matches('"');
+        if !raw.contains("${") && !raw.contains('/') {
+            continue;
+        }
+        let Some(path) = expand_cmake_vars(raw, vars) else {
+            continue;
+        };
+        if out.contains(&path) {
+            continue;
+        }
+        out.push(path.clone());
+        // A regular file only: a composed path can name a device or fifo,
+        // and reading one would hang the driver.
+        if depth < 4 && path.starts_with('/') && Path::new(&path).is_file() {
+            if let Ok(child) = std::fs::read_to_string(&path) {
+                included_paths_walk(Path::new(&path), &child, vars, out, depth + 1);
+            }
+        }
+    }
+    match saved {
+        Some(v) => vars.insert("CMAKE_CURRENT_LIST_DIR".into(), v),
+        None => vars.remove("CMAKE_CURRENT_LIST_DIR"),
+    };
+}
+
 /// The argument text of every `name(...)` call in file order, where the
 /// name begins a CALL rather than sitting inside a longer identifier
 /// (`unset(`, `file(SET`, a comment mentioning it).
@@ -11520,7 +11719,7 @@ fn sibling_dirs_of(dir: &Path) -> Result<Vec<PathBuf>> {
 mod cmake_script_reference_tests {
     use super::{
         cmake_definitions, cmake_script_arg, cmake_script_included_modules,
-        cmake_script_referenced_paths, expand_cmake_vars,
+        cmake_script_included_paths, cmake_script_referenced_paths, expand_cmake_vars,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -11640,6 +11839,55 @@ mod cmake_script_reference_tests {
         assert_eq!(
             got,
             vec!["/build/source/llvm/cmake/modules/VersionFromVCS.cmake".to_string()]
+        );
+    }
+
+    /// opencv's `opencv4.pc` edge, lines as the 4.13.0 sources spell them:
+    /// the helper the definition names sets `OpenCV_SOURCE_DIR`, the next
+    /// include composes from it, and that module includes through
+    /// `CMAKE_CURRENT_LIST_DIR`. A reference nothing sets is not offered.
+    #[test]
+    fn a_composed_include_follows_what_earlier_includes_set() {
+        let root = std::env::temp_dir().join(format!("nn-cmake-incl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, build) = (root.join("source"), root.join("source/build"));
+        std::fs::create_dir_all(src.join("cmake/vars")).unwrap();
+        std::fs::create_dir_all(&build).unwrap();
+        let helper = build.join("OpenCVGenPkgConfig.info.cmake");
+        std::fs::write(
+            &helper,
+            format!(
+                "\nset(BUILD_SHARED_LIBS \"ON\")\nset(OpenCV_SOURCE_DIR \"{}\")\n",
+                src.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("cmake/OpenCVUtils.cmake"),
+            "include(CMakeParseArguments)\n      include(\"${__hook}\")\n\
+             include(\"${CMAKE_CURRENT_LIST_DIR}/vars/EnableModeVars.cmake\")\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("cmake/vars/EnableModeVars.cmake"), "").unwrap();
+        let script = src.join("cmake/OpenCVGenPkgconfig.cmake");
+        let text = "cmake_policy(SET CMP0012 NEW)\ninclude(\"${CMAKE_HELPER_SCRIPT}\")\n\
+                    include(\"${OpenCV_SOURCE_DIR}/cmake/OpenCVUtils.cmake\")\n";
+        let defs = cmake_definitions(&args(&format!(
+            "cmake -DCMAKE_HELPER_SCRIPT={} -P {}",
+            helper.display(),
+            script.display()
+        )));
+        let got = cmake_script_included_paths(&script, text, &defs);
+        let _ = std::fs::remove_dir_all(&root);
+        let want: Vec<String> = [helper.clone(), src.join("cmake/OpenCVUtils.cmake")]
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[..2], want[..], "{got:?}");
+        assert!(
+            got[2].ends_with("/cmake/vars/EnableModeVars.cmake"),
+            "{got:?}"
         );
     }
 
@@ -17107,6 +17355,59 @@ fn cc_lookup_is_implied<'a>(cmdline: &str, outs: impl Iterator<Item = &'a str>) 
         || generator_execs_cc_unnamed(cmdline)
 }
 
+/// Programs a shell script run by `cmdline` names in command position: the
+/// first word of each line or of each segment after `|`, `;`, `&&`, `||`,
+/// `$(` or a backtick, past `NAME=value` assignments, shell keywords and
+/// builtins. The script is the first `.sh` token that is the program or
+/// follows `sh`/`bash`, read where it is spelled (absolute, or relative to
+/// the directory the driver runs in).
+// ponytail: a lexical scan, not a shell parser; quoted separators yield junk
+// words, which resolve to no store binary and are dropped by the caller
+pub fn script_bare_programs(cmdline: &str) -> Vec<String> {
+    const SKIP: &[&str] = &[
+        "if", "then", "else", "elif", "fi", "for", "do", "done", "while", "until", "case", "esac",
+        "in", "function", "echo", "test", "[", "[[", "cd", "export", "set", "unset", "exit",
+        "return", "local", "read", "shift", "eval", "exec", "true", "false", ":", ".", "source",
+        "trap", "wait", "printf", "sh", "bash", "!", "{", "}",
+    ];
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let script = toks.iter().enumerate().find_map(|(i, t)| {
+        let shell_before = i > 0
+            && matches!(
+                Path::new(toks[i - 1]).file_name().and_then(|n| n.to_str()),
+                Some("sh" | "bash")
+            );
+        (t.ends_with(".sh") && (i == 0 || shell_before || toks[i - 1] == "&&")).then_some(*t)
+    });
+    let Some(text) = script.and_then(|p| fs::read_to_string(p.trim_matches('"')).ok()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut seg = line.to_string();
+        for sep in ["&&", "||", "$(", "|", ";", "`"] {
+            seg = seg.replace(sep, "\n");
+        }
+        for part in seg.split('\n') {
+            let word = part
+                .split_whitespace()
+                .find(|w| !(w.contains('=') && !w.starts_with('=')));
+            let Some(w) = word else { continue };
+            let ok = w
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b));
+            if ok && !SKIP.contains(&w) && !out.iter().any(|o| o == w) {
+                out.push(w.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// A GENERATOR THAT SHELLS OUT TO THE COMPILER BY BARE NAME, writing
 /// something that is not object shaped.
 ///
@@ -21128,5 +21429,75 @@ mod vapigen_reader_tests {
         );
         assert_eq!(got, vec![md.to_string_lossy().into_owned()]);
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod script_bare_programs_tests {
+    use super::script_bare_programs;
+
+    /// packagekit 1.4.0's `docs/api/dbus/spec-to-docbook.sh`, verbatim, run
+    /// the way its meson edge runs it. `xsltproc` is what the task lacked;
+    /// assignments and the `echo` builtin are not programs.
+    #[test]
+    fn a_script_edge_names_the_tools_its_script_runs() {
+        let dir = std::env::temp_dir().join(format!("nn-s2d-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("spec-to-docbook.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nspec_to_docbook_xsl=\"$1\"\ninput_file=\"$2\"\noutput_file=\"$3\"\n\n\
+             echo \"<?xml version=\\\"1.0\\\"?>\"\"<!DOCTYPE refentry>\" > ${output_file}\n\
+             xsltproc ${spec_to_docbook_xsl} ${input_file} | tail -n +2 >> ${output_file}\n",
+        )
+        .unwrap();
+        let cmd = format!(
+            "/bin/sh {} ../docs/api/dbus/spec-to-docbook.xsl /build/source/src/x.xml out.ref.xml",
+            script.display()
+        );
+        let got = script_bare_programs(&cmd);
+        let unrun = script_bare_programs(&format!("cat {}", script.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, vec!["xsltproc".to_string(), "tail".to_string()]);
+        assert!(
+            unrun.is_empty(),
+            "a script that is only an argument runs nothing: {unrun:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vapigen_outputs_tests {
+    use super::{vapigen_unwritten_outputs, vapigen_vapi};
+    use std::path::{Path, PathBuf};
+
+    /// libayatana-appindicator 0.5.92's edge, argv as its task drv carried
+    /// it: the `.vapi` lands in the `cd` target, and the declared `.vala` is
+    /// the name vapigen never writes.
+    #[test]
+    fn a_vapigen_edge_writes_its_library_vapi_not_its_declared_name() {
+        let bd = Path::new("/build/source/build");
+        let cmd = "cd /build/source/build/bindings/vala && /nix/store/x-vala-0.56.19/bin/vapigen \
+                   --library=ayatana-appindicator3-0.1 --pkg gtk+-3.0 --girdir=\"/build/source/src\" \
+                   --metadatadir /build/source/src /build/source/build/src/AyatanaAppIndicator3-0.1.gir \
+                   /build/source/bindings/vala/ayatana-appindicator-0.1-custom.vala";
+        assert_eq!(
+            vapigen_vapi(cmd, bd),
+            Some(PathBuf::from(
+                "bindings/vala/ayatana-appindicator3-0.1.vapi"
+            ))
+        );
+        let declared = [PathBuf::from("bindings/vala/AyatanaAppIndicator3-0.1.vala")];
+        assert_eq!(
+            vapigen_unwritten_outputs(cmd, bd, &declared),
+            declared.to_vec()
+        );
+        let honest = [PathBuf::from(
+            "bindings/vala/ayatana-appindicator3-0.1.vapi",
+        )];
+        assert!(vapigen_unwritten_outputs(cmd, bd, &honest).is_empty());
+        let not_vapigen = "cd /build/source/build && valac --library=x a.vala";
+        assert!(vapigen_vapi(not_vapigen, bd).is_none());
+        assert!(vapigen_unwritten_outputs(not_vapigen, bd, &declared).is_empty());
     }
 }
