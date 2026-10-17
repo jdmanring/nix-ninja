@@ -1028,11 +1028,16 @@ impl Runner {
         // into `libjxl_testlib-internal.a`; gtest discovery then RUNS each
         // test binary from its link edge and the binary opens that
         // directory, which no edge declares. The set an edge's outputs carry
-        // is its own defines plus those of every explicit input, so the
-        // directory follows the object through the archive to the link.
+        // is its own defines plus those of every explicit AND implicit
+        // input, so the directory follows the object through the archive to
+        // the link: CMake lists a link's libraries after `|`
+        // (`gain_map_test ... | lib/libjxl_testlib-internal.a`) and names
+        // them through `LINK_LIBRARIES`, so an explicit-only walk stopped at
+        // the archive and the round of 2026-10-16 failed with the first
+        // version mounted. Order-only inputs stay out.
         {
             let mut dirs: Vec<PathBuf> = build
-                .explicit_ins()
+                .dirtying_ins()
                 .iter()
                 .filter_map(|f| self.path_defines.get(f))
                 .flatten()
