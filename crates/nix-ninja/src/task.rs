@@ -353,7 +353,10 @@ pub fn producer_index_of(graph: &graph::Graph) -> ProducerIndex {
         let Some(bid) = file.input else {
             continue;
         };
-        if !graph.builds[bid].outs().contains(&fid) {
+        // A PHONY EDGE PRODUCES NOTHING: CMake writes one over every file the
+        // configure step read, and opencv's own `opencv2/core/version.hpp`
+        // read as produced, deferring 210 compiles on a source header.
+        if !graph.builds[bid].outs().contains(&fid) || graph.builds[bid].cmdline.is_none() {
             continue;
         }
         let name = file.name.clone();
@@ -397,48 +400,68 @@ fn carried_module_trees(inputs: &[DerivedFile]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The realised store roots of the module trees among `inputs`, or None if
-/// realising them fails. Only local mode may realise; a tree's store path
-/// mirrors its build-relative layout, so its root is the realised path with
-/// the build path taken off the end.
-fn carried_tree_roots(
+/// The task's input view for the confirming preprocessor: a directory beside
+/// the build dir holding, at each build-relative input path, a symlink to the
+/// input's store path (a tree is one link to its directory), or None. The
+/// driver's own disk is not that view: it lacks the carried trees (Qt's
+/// `#if QT_CONFIG(x)` then fails to parse), generated sources (libsecret's
+/// valac output, qtbase's `mocs_compilation.cpp`) and generated headers.
+/// Beside the build dir, so the command's `../src` climbs still reach the
+/// source tree. Only local mode may realise; the caller removes it.
+fn task_view(
     rpc_client: &BuilderRpcClient,
     store_dir: &StoreDir,
+    build_dir: &Path,
     inputs: &[DerivedFile],
-) -> Option<Vec<PathBuf>> {
-    let trees: Vec<DerivedFile> = inputs
+) -> Option<PathBuf> {
+    let in_tree = |bp: &Path| {
+        bp.is_relative()
+            && bp
+                .components()
+                .next()
+                .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
+    };
+    let built: Vec<DerivedFile> = inputs
         .iter()
         .filter(|i| {
-            let bp = i.build_path.to_string_lossy();
-            let bp = bp.strip_suffix("/.nn-tree").unwrap_or(&bp);
-            is_tree_path(Path::new(bp))
-                && bp.starts_with("include/")
-                && matches!(i.derived_path, SingleDerivedPath::Built { .. })
+            in_tree(&i.build_path) && matches!(i.derived_path, SingleDerivedPath::Built { .. })
         })
         .cloned()
         .collect();
-    if trees.is_empty() {
-        return Some(Vec::new());
-    }
-    let built = local::build_derived_files(rpc_client, store_dir, &trees).ok()?;
-    let mut roots: Vec<PathBuf> = built
-        .into_iter()
-        .map(|(bp, host)| {
-            let bp = PathBuf::from(bp.to_string_lossy().trim_end_matches("/.nn-tree"));
-            let n = bp.components().count();
-            if host.ends_with(&bp) {
-                host.ancestors()
-                    .nth(n)
-                    .map(Path::to_path_buf)
-                    .unwrap_or(host)
-            } else {
-                host
+    let realised = if built.is_empty() {
+        HashMap::new()
+    } else {
+        local::build_derived_files(rpc_client, store_dir, &built).ok()?
+    };
+    let view = build_dir.parent()?.join(
+        format!(
+            ".nn-defer-view-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )
+        .replace(['(', ')', ' '], ""),
+    );
+    let _ = std::fs::remove_dir_all(&view);
+    std::fs::create_dir_all(&view).ok()?;
+    for i in inputs.iter().filter(|i| in_tree(&i.build_path)) {
+        let host = match &i.derived_path {
+            SingleDerivedPath::Opaque(sp) => {
+                let p = sp.to_absolute_path(store_dir);
+                i.rel_path.as_ref().map_or(p.clone(), |r| p.join(r))
             }
-        })
-        .collect();
-    roots.sort();
-    roots.dedup();
-    Some(roots)
+            SingleDerivedPath::Built { .. } => match realised.get(&i.build_path) {
+                Some(h) => h.clone(),
+                None => continue,
+            },
+        };
+        let bp = i.build_path.to_string_lossy();
+        let link = view.join(bp.strip_suffix("/.nn-tree").unwrap_or(&bp));
+        if let Some(parent) = link.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::os::unix::fs::symlink(&host, &link);
+    }
+    Some(view)
 }
 
 /// One task's answer to its unresolved include: the sorted, deduplicated
@@ -4769,7 +4792,9 @@ fn build_task_derivation(
                 &carried_module_trees(&task.inputs),
                 &|| {
                     task.local_mode
-                        .then(|| carried_tree_roots(rpc_client, &task.store_dir, &task.inputs))
+                        .then(|| {
+                            task_view(rpc_client, &task.store_dir, &task.build_dir, &task.inputs)
+                        })
                         .flatten()
                 },
             )?;
@@ -6089,7 +6114,14 @@ fn handle_derivation_result(
                     .then_some(task.producer_index.as_deref())
                     .flatten(),
                 &carried_module_trees(&task.inputs),
-                &|| carried_tree_roots(rpc_client, &config.store_dir, &task.inputs),
+                &|| {
+                    task_view(
+                        rpc_client,
+                        &config.store_dir,
+                        &config.build_dir,
+                        &task.inputs,
+                    )
+                },
             )?;
             // THE COMPLETE VIEW DECIDES. Only here are the built inputs
             // realised and their trees expanded, so only here is an
@@ -18291,15 +18323,17 @@ pub struct Discovered {
 fn preprocessor_confirmed(
     cmdline: &str,
     build_dir: &Path,
-    tree_roots: &[PathBuf],
+    view: Option<&Path>,
     candidates: Vec<DeferMiss>,
 ) -> Vec<DeferMiss> {
-    let Ok(deps) = preprocessor_deps(cmdline, build_dir, tree_roots) else {
+    let Ok(deps) = preprocessor_deps(cmdline, build_dir, view) else {
         return Vec::new();
     };
+    let root = view.unwrap_or(build_dir);
     let rel = |p: &Path| {
         let p = lexical_join(Path::new(""), p);
-        p.strip_prefix(build_dir)
+        p.strip_prefix(root)
+            .or_else(|_| p.strip_prefix(build_dir))
             .map(Path::to_path_buf)
             .unwrap_or(p)
     };
@@ -18324,10 +18358,16 @@ fn preprocessor_confirmed(
 fn preprocessor_deps(
     cmdline: &str,
     build_dir: &Path,
-    tree_roots: &[PathBuf],
+    view: Option<&Path>,
 ) -> std::result::Result<Vec<PathBuf>, String> {
     let words = shell_words::split(cmdline).map_err(|e| e.to_string())?;
     let (program, rest) = words.split_first().ok_or("empty command")?;
+    // In the task's view, every build-dir spelling names the view instead.
+    let bd = build_dir.to_string_lossy().into_owned();
+    let to_view = |w: &str| match view {
+        Some(v) => w.replace(&bd, &v.to_string_lossy()),
+        None => w.to_string(),
+    };
     let mut args: Vec<String> = Vec::new();
     let mut it = rest.iter();
     while let Some(w) = it.next() {
@@ -18337,28 +18377,19 @@ fn preprocessor_deps(
             }
             "-c" | "-MD" | "-MMD" | "-MP" => {}
             _ => {
-                // THE TASK'S VIEW OF A CARRIED TREE. A realised module tree
-                // mirrors its build-relative layout (`<root>/include/QtCore`),
-                // so each include dir inside the build dir gets the same path
-                // under every carried tree's root, ahead of it. Without them
-                // Qt's `#if QT_CONFIG(x)` cannot parse: the macro lives in a
-                // header only the carried tree holds.
-                if let Some(d) = w.strip_prefix("-I").filter(|d| !d.is_empty()) {
+                // An include dir the view lacks would fail
+                // `-Werror=missing-include-dirs`; it exists in the task.
+                if let (Some(v), Some(d)) = (view, w.strip_prefix("-I")) {
                     let p = lexical_join(Path::new(""), Path::new(d));
                     let rel = p
                         .strip_prefix(build_dir)
                         .map(Path::to_path_buf)
                         .unwrap_or(p);
                     if rel.is_relative() && !rel.starts_with("..") {
-                        for root in tree_roots {
-                            let mirrored = root.join(&rel);
-                            if mirrored.is_dir() {
-                                args.push(format!("-I{}", mirrored.display()));
-                            }
-                        }
+                        let _ = std::fs::create_dir_all(v.join(rel));
                     }
                 }
-                args.push(w.clone());
+                args.push(to_view(w));
             }
         }
     }
@@ -18376,7 +18407,11 @@ fn preprocessor_deps(
     // nothing.
     let build_top =
         std::env::var_os("NIX_BUILD_TOP").unwrap_or_else(|| std::env::temp_dir().into());
-    let out = std::process::Command::new(program)
+    let mut cmd = std::process::Command::new(program);
+    if let Some(v) = view {
+        cmd.current_dir(v);
+    }
+    let out = cmd
         .args(&args)
         .env("NIX_BUILD_TOP", build_top)
         .arg("-M")
@@ -18522,7 +18557,7 @@ pub fn discover_c_includes(
     depfile: Option<&Path>,
     producer: Option<&ProducerIndex>,
     carried_trees: &[PathBuf],
-    tree_roots: &dyn Fn() -> Option<Vec<PathBuf>>,
+    task_view: &dyn Fn() -> Option<PathBuf>,
 ) -> Result<(Discovered, Option<DeferMiss>)> {
     // The virtual set is consumed by the scan below; the UPLOAD filter
     // further down needs it too, so keep a copy. See generated_not_yet_written.
@@ -18847,12 +18882,12 @@ pub fn discover_c_includes(
         // preprocessor confirmed; off, nothing is printed.
         let debug = std::env::var_os("NIX_NINJA_DEBUG_DEFER").is_some();
         let names: Vec<String> = candidates.iter().map(|c| c.header.clone()).collect();
-        // No realised view (DRV mode, or the realise failed): nothing is
+        // No input view (DRV mode, or the realise failed): nothing is
         // confirmed, the emission of before.
-        let roots = tree_roots()?;
-        let live = preprocessor_confirmed(cmdline, build_dir, &roots, candidates);
+        let view = task_view()?;
+        let live = preprocessor_confirmed(cmdline, build_dir, Some(&view), candidates);
         if debug {
-            let why = match preprocessor_deps(cmdline, build_dir, &roots) {
+            let why = match preprocessor_deps(cmdline, build_dir, Some(&view)) {
                 Ok(d) => format!(
                     "-M ok, {} deps, matching {:?}",
                     d.len(),
@@ -18874,6 +18909,7 @@ pub fn discover_c_includes(
                 cmdline.split_whitespace().last().unwrap_or("")
             );
         }
+        let _ = std::fs::remove_dir_all(&view);
         let (header, at) = live.first().map(|m| (m.header.clone(), m.at.clone()))?;
         let mut fids: Vec<FileId> = live.into_iter().flat_map(|m| m.fids).collect();
         fids.sort_by_key(n2::densemap::Index::index);
@@ -24215,14 +24251,14 @@ mod unresolved_include_defer_tests {
                 cand("live/live.h", "inc/live/live.h"),
             ]
         };
-        let absent = super::preprocessor_confirmed(cmd, &here, &[], cands());
+        let absent = super::preprocessor_confirmed(cmd, &here, None, cands());
         std::fs::create_dir_all(d.join("inc/live")).unwrap();
         std::fs::write(d.join("inc/live/live.h"), "").unwrap();
-        let present = super::preprocessor_confirmed(cmd, &here, &[], cands());
+        let present = super::preprocessor_confirmed(cmd, &here, None, cands());
         let elsewhere = super::preprocessor_confirmed(
             cmd,
             &here,
-            &[],
+            None,
             vec![cand("live/live.h", "gen/live/live.h")],
         );
         std::env::set_current_dir(prev).unwrap();
@@ -24246,7 +24282,7 @@ mod unresolved_include_defer_tests {
             at: PathBuf::from("include/QtWidgets/QWidget"),
         }];
         let got =
-            super::preprocessor_confirmed("/nonexistent/cc -c x.c -o x.o", Path::new("/"), &[], c);
+            super::preprocessor_confirmed("/nonexistent/cc -c x.c -o x.o", Path::new("/"), None, c);
         assert!(got.is_empty());
     }
 
@@ -24274,5 +24310,47 @@ mod unresolved_include_defer_tests {
                 PathBuf::from("include/QtCore")
             ]
         );
+    }
+
+    /// THE TASK'S VIEW, NOT THE DISK: qtbase's `mocs_compilation.cpp` and
+    /// libsecret's valac output are generated translation units the build
+    /// dir does not hold, and the confirming run died on them. Here the
+    /// build dir is empty on disk and the view (a sibling, as `task_view`
+    /// makes it) holds the generated unit and a carried header; with the
+    /// view the live miss is confirmed, without it nothing is.
+    #[test]
+    fn the_preprocessor_runs_in_the_task_view() {
+        if std::process::Command::new("gcc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: no gcc on PATH; this test needs the real preprocessor");
+            return;
+        }
+        let d = super::Scratch::new(format!("nn-defer-view-{}", std::process::id()));
+        let build = d.join("build");
+        let view = d.join(".view");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::create_dir_all(view.join("gen")).unwrap();
+        std::fs::create_dir_all(view.join("inc/carried")).unwrap();
+        std::fs::write(view.join("inc/carried/config.h"), "#define FEATURE 1\n").unwrap();
+        std::fs::write(
+            view.join("gen/tu.c"),
+            "#include <carried/config.h>\n#if FEATURE\n#include <live/live.h>\n#endif\n",
+        )
+        .unwrap();
+        let cmd = format!("gcc -I{b}/inc -c {b}/gen/tu.c -o tu.o", b = build.display());
+        let cand = || {
+            vec![DeferMiss {
+                fids: vec![],
+                header: "live/live.h".into(),
+                at: PathBuf::from("inc/live/live.h"),
+            }]
+        };
+        let with_view = super::preprocessor_confirmed(&cmd, &build, Some(&view), cand());
+        let without = super::preprocessor_confirmed(&cmd, &build, None, cand());
+        assert_eq!(with_view.len(), 1, "the view holds the unit and the config");
+        assert!(without.is_empty(), "the bare disk has no translation unit");
     }
 }
