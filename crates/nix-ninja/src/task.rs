@@ -2402,6 +2402,9 @@ impl Runner {
             .chain(build.depfile.as_ref().map(PathBuf::from))
             .filter_map(|p| normalize_build_path(&self.config.build_dir, p).ok())
             .collect();
+        // The `cmake -E cmake_autogen` plan, the one configure-time file
+        // inside the autogen trees this edge writes; see the choke point.
+        let mut autogen_plan: Option<PathBuf> = None;
 
         // Directories holding a module named by `python -m a.b.c`, resolved
         // through the command's own PYTHONPATH; merged into the sibling
@@ -3206,6 +3209,7 @@ impl Runner {
                 } else {
                     self.config.build_dir.join(rebase_post_cd(&cd_dir, info))
                 };
+                autogen_plan = normalize_build_path(&self.config.build_dir, info_path.clone()).ok();
                 if let Ok(text) = std::fs::read_to_string(&info_path) {
                     // Generated entries live in the build dir and arrive as
                     // derived inputs; only source files ride `referenced`.
@@ -3380,6 +3384,27 @@ impl Runner {
                     own.display()
                 );
             }
+        }
+        // THE SAME RULE FOR THE AUTOGEN TREES, which ninja does not declare:
+        // `<T>_autogen` and `CMakeFiles/<T>_autogen.dir` are written by this
+        // edge (`undeclared_trees`), and at configure time they hold only the
+        // plan the command names. A later driver pass over a tree an earlier
+        // one placed (the shim's install branch after its plain one) found
+        // the earlier moc output through the plan's include dirs, keyed a new
+        // task on it, and materialized it read-only where moc writes:
+        // qtbase's Core_autogen, 144 "Permission denied", 2026-10-17.
+        let declared: Vec<PathBuf> = self_outputs.iter().cloned().collect();
+        let beneath = autogen_own_products(&declared, autogen_plan.as_deref(), input_set.keys());
+        for p in &beneath {
+            input_set.remove(p);
+        }
+        if let Some(first) = beneath.first() {
+            eprintln!(
+                "nix-ninja: {} input(s) beneath this edge's autogen trees dropped, \
+                 first {} (its own output from an earlier pass)",
+                beneath.len(),
+                first.display()
+            );
         }
 
         lap(&NT_CMDLINE_MS);
@@ -9171,6 +9196,25 @@ fn autogen_cache_dir(outputs: &[PathBuf]) -> Option<PathBuf> {
     let root = autogen_include_root(outputs)?;
     let t = root.file_name()?.to_string_lossy().into_owned();
     Some(root.parent()?.join("CMakeFiles").join(format!("{t}.dir")))
+}
+
+/// The inputs that lie beneath the autogen trees an edge with these
+/// declared outputs writes, other than its plan: the edge's own products
+/// from an earlier pass. Empty for any edge that is not CMake's autogen.
+pub fn autogen_own_products<'a>(
+    declared: &[PathBuf],
+    plan: Option<&Path>,
+    inputs: impl Iterator<Item = &'a PathBuf>,
+) -> Vec<PathBuf> {
+    let trees: Vec<PathBuf> = autogen_include_root(declared)
+        .into_iter()
+        .chain(autogen_cache_dir(declared))
+        .collect();
+    inputs
+        .filter(|p| trees.iter().any(|t| p.starts_with(t) && *p != t))
+        .filter(|p| plan != Some(p.as_path()))
+        .cloned()
+        .collect()
 }
 
 /// The shape wait() attaches as a co-output and the gcc header filter
@@ -23358,6 +23402,56 @@ mod collision_emitter_agrees_with_grouper_tests {
             Some(PathBuf::from("src/include/pg_config_os.h")),
             "the key the grouper returned emits an unnormalized build_path"
         );
+    }
+}
+
+#[cfg(test)]
+mod autogen_own_products_tests {
+    use super::autogen_own_products;
+    use std::path::{Path, PathBuf};
+
+    /// qtbase 6.11.2's Core_autogen edge as the install pass emitted it
+    /// (`kw0ja5vj...-ninja-build.drv`): its two declared outputs, its plan,
+    /// and inputs of every kind that drv carried.
+    #[test]
+    fn an_autogen_edge_drops_its_earlier_output_and_keeps_its_plan() {
+        let declared: Vec<PathBuf> = [
+            "src/corelib/Core_autogen/timestamp",
+            "src/corelib/Core_autogen/mocs_compilation.cpp",
+        ]
+        .map(PathBuf::from)
+        .to_vec();
+        let plan = Path::new("src/corelib/CMakeFiles/Core_autogen.dir/AutogenInfo.json");
+        let inputs: Vec<PathBuf> = [
+            "src/corelib/CMakeFiles/Core_autogen.dir/AutogenInfo.json",
+            "src/corelib/CMakeFiles/Core_autogen.dir/ParseCache.txt",
+            "src/corelib/Core_autogen/include/moc_qfile.cpp",
+            "src/corelib/Core_autogen/HR73DCNJIQ/moc_qdirlisting.cpp.json",
+            "src/corelib/Core_autogen/deps",
+            // The compile of mocs_compilation.cpp: an `_autogen` component,
+            // not beneath either tree.
+            "src/corelib/CMakeFiles/Core.dir/Core_autogen/mocs_compilation.cpp.o",
+            // Configure-time headers syncqt's tree holds, not this edge's.
+            "include/QtCore/qtcoreexports.h",
+        ]
+        .map(PathBuf::from)
+        .to_vec();
+        let mut got = autogen_own_products(&declared, Some(plan), inputs.iter());
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "src/corelib/CMakeFiles/Core_autogen.dir/ParseCache.txt",
+                "src/corelib/Core_autogen/HR73DCNJIQ/moc_qdirlisting.cpp.json",
+                "src/corelib/Core_autogen/deps",
+                "src/corelib/Core_autogen/include/moc_qfile.cpp",
+            ]
+            .map(PathBuf::from)
+            .to_vec()
+        );
+        // Not an autogen edge: its outputs name no `<T>_autogen` root.
+        let other = [PathBuf::from("src/corelib/Core_autogen/include/x.o")];
+        assert!(autogen_own_products(&other, None, inputs.iter()).is_empty());
     }
 }
 
