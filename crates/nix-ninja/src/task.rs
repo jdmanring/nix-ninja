@@ -11414,6 +11414,75 @@ fn cmake_script_referenced_paths(
         }
         vars.insert(name, value);
     }
+    for p in cmake_script_foreach_paths(script_text, &vars) {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Paths a `foreach(<var> IN LISTS <list>)` body composes, one per element.
+///
+/// freerdp 3.32.1's `GenerateManpages.cmake` gets its sections as one
+/// `-Ddependencies="a b c"` value, splits it with `string(REPLACE " " ";")`
+/// and, per element, tries `${CURRENT_SOURCE_DIR}/${DEP}.in` and three more
+/// spellings. The elements climb out of the edge's own directory
+/// (`../../../common/man/freerdp-global-envvar.1`), no argument names the
+/// `.in` that exists, and the manpage edge died `Missing manpage section`
+/// (KDE round 2026-10-17, task `gpy1sk9l`). Only that split and that loop
+/// form are read; each composed path is resolved lexically, since the
+/// caller keeps only what exists.
+fn cmake_script_foreach_paths(text: &str, vars: &HashMap<String, String>) -> Vec<String> {
+    let mut vars = vars.clone();
+    for body in cmake_call_bodies(text, "string") {
+        let Some(args) = body.trim().strip_prefix("REPLACE \" \" \";\"") else {
+            continue;
+        };
+        let toks: Vec<&str> = args.split_whitespace().collect();
+        if let [out, input] = toks[..] {
+            if let Some(v) = expand_cmake_vars(input.trim_matches('"'), &vars) {
+                vars.insert(out.to_string(), v.replace(' ', ";"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = find_cmake_call(rest, "foreach") {
+        rest = &rest[pos..];
+        let Some(end) = find_cmake_call(rest, "endforeach") else {
+            break;
+        };
+        let (block, tail) = rest.split_at(end);
+        rest = tail;
+        let Some(head) = cmake_call_bodies(block, "foreach").into_iter().next() else {
+            continue;
+        };
+        let toks: Vec<&str> = head.split_whitespace().collect();
+        let [var, "IN", "LISTS", list] = toks[..] else {
+            continue;
+        };
+        let Some(items) = vars.get(list) else {
+            continue;
+        };
+        let body = &block[block.find(')').map_or(block.len(), |i| i + 1)..];
+        for item in items.split(';').filter(|i| !i.is_empty()) {
+            let mut v = vars.clone();
+            v.insert(var.to_string(), item.to_string());
+            for (_, raw) in cmake_set_calls(body) {
+                let Some(value) = expand_cmake_vars(&raw, &v) else {
+                    continue;
+                };
+                if value.starts_with('/') {
+                    let n = lexical_join(Path::new(""), Path::new(&value));
+                    let n = n.to_string_lossy().into_owned();
+                    if !out.contains(&n) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+    }
     out
 }
 
@@ -11726,6 +11795,74 @@ mod cmake_script_reference_tests {
 
     fn args(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    /// FREERDP'S OWN SHAPE: the manpage edge's argv from task `gpy1sk9l`
+    /// (KDE round 2026-10-17) and freerdp 3.32.1's `GenerateManpages.cmake`
+    /// verbatim. The section `.in` files sit in a sibling tree the elements
+    /// climb into, named by no argument.
+    #[test]
+    fn a_foreach_over_a_split_definition_recovers_each_section() {
+        let cmdline = r#"cd /build/source/build/client/SDL/SDL3/man && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -Dtemplate="sdl3-freerdp.1" -DMANPAGE_NAME="sdl-freerdp" -Dmanpage="sdl-freerdp.1" -DMAN_TODAY="1980-01-01" -DCURRENT_SOURCE_DIR="/build/source/client/SDL/SDL3/man" -DCURRENT_BINARY_DIR="/build/source/build/client/SDL/SDL3/man" -Dtarget="sdl3-freerdp" -Dsection="1" -Ddependencies="../../../common/man/freerdp-global-options.1 ../../../common/man/freerdp-global-envvar.1 sdl3-freerdp-envvar.1 ../../common/man/sdl-freerdp-config.1 ../../../common/man/freerdp-global-config.1 ../../common/man/sdl-global-config.1 ../../common/man/sdl-freerdp-examples.1 ../../../common/man/freerdp-global-links.1" -DVENDOR=FreeRDP -DPRODUCT=FreeRDP -DVENDOR_PRODUCT=freerdp -DSYSCONF_DIR=/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-freerdp-3.32.1/etc/FreeRDP -DSDL_WIKI_BASE_URL=https://wiki.libsdl.org/SDL3 -P "/build/source/cmake/GenerateManpages.cmake""#;
+        let a = shell_words::split(cmdline).unwrap();
+        let script = r#"get_filename_component(GENERATE_MANPAGES_SCRIPT_DIR "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
+list(APPEND CMAKE_MODULE_PATH ${GENERATE_MANPAGES_SCRIPT_DIR})
+
+set(SRC "${CURRENT_SOURCE_DIR}/${target}.${section}.in")
+configure_file(${SRC} ${manpage}.tmp @ONLY IMMEDIATE)
+
+# write header (aka name of the manpage), truncate existing
+file(READ ${CURRENT_BINARY_DIR}/${manpage}.tmp CONTENTS)
+file(WRITE ${CURRENT_BINARY_DIR}/${manpage} "${CONTENTS}")
+
+string(REPLACE " " ";" DEPS ${dependencies})
+foreach(DEP IN LISTS DEPS)
+  get_filename_component(DNAME "${DEP}" NAME)
+  set(SRC_IN ${CURRENT_SOURCE_DIR}/${DEP}.in)
+  set(DST_IN ${CURRENT_BINARY_DIR}/${DEP}.in)
+  set(SRC ${CURRENT_SOURCE_DIR}/${DEP})
+  set(BIN ${CURRENT_BINARY_DIR}/${DEP})
+  set(DST ${CURRENT_BINARY_DIR}/${DNAME})
+
+  if(EXISTS ${SRC_IN})
+    message("using generated ${DST} from ${SRC_IN}")
+    configure_file(${SRC_IN} ${DST} @ONLY IMMEDIATE)
+  elseif(EXISTS ${DST_IN})
+    message("using generated ${DST} from ${DST_IN}")
+    configure_file(${DST_IN} ${DST} @ONLY IMMEDIATE)
+  elseif(EXISTS ${SRC})
+    set(DST ${SRC})
+    message("using ${DST}")
+  elseif(EXISTS ${BIN})
+    set(DST ${BIN})
+    message("using ${DST}")
+  elseif(EXISTS ${DST})
+    message("using ${DST}")
+  else()
+    message(WARNING "Missing manpage section, considered:")
+    message(WARNING "   ${SRC_IN}")
+    message(WARNING "   ${DST_IN}")
+    message(WARNING "   ${SRC}")
+    message(WARNING "   ${BIN}")
+    message(WARNING "   ${DST}")
+    message(FATAL_ERROR "Can not continue, terminating")
+  endif()
+
+  file(READ ${DST} CONTENTS)
+  file(APPEND ${CURRENT_BINARY_DIR}/${manpage} "${CONTENTS}")
+endforeach()
+"#;
+        let got = cmake_script_referenced_paths(script, &cmake_definitions(&a));
+        for want in [
+            "/build/source/client/common/man/freerdp-global-envvar.1.in",
+            "/build/source/client/SDL/common/man/sdl-freerdp-config.1.in",
+            "/build/source/client/SDL/SDL3/man/sdl3-freerdp-envvar.1",
+        ] {
+            assert!(
+                got.iter().any(|g| g == want),
+                "{want} not recovered; got {got:?}"
+            );
+        }
     }
 
     /// ONETBB'S OWN SHAPE, taken from the failing edge and the script it
