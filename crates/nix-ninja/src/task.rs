@@ -3179,7 +3179,17 @@ impl Runner {
                 .map(|c| named_dirs_to_create(c, &self.config.build_dir))
                 .unwrap_or_default()
         } else {
-            self.empty_dirs.clone()
+            let mut dirs = self.empty_dirs.clone();
+            for d in cmdline
+                .as_deref()
+                .map(|c| gtkdoc_make_dirs(&self.config.build_dir, c))
+                .unwrap_or_default()
+            {
+                if !dirs.contains(&d) {
+                    dirs.push(d);
+                }
+            }
+            dirs
         };
         // A command-scoped variable (and the store paths its value names)
         // reaches only a task whose command runs its consumer; every other
@@ -11677,15 +11687,19 @@ fn gtkdoc_dirs_to_carry(
     };
     let mut dirs = Vec::new();
     if let (Some(src), Some(sub)) = (value("--sourcedir"), value("--subdir")) {
-        dirs.push(abs(&src).join(sub));
+        dirs.push(lexical_join(&abs(&src), Path::new(&sub)));
     }
     if let Some(h) = value("--headerdirs") {
         dirs.extend(h.split("@@").filter(|d| !d.is_empty()).map(abs));
     }
+    dirs.extend(gtkdoc_cflags_include_dirs(build_dir, cd_dir, args));
     let mut out = Vec::new();
     for d in dirs {
+        // An ancestor of the build dir (`-I<sourcedir>/.`) exists in every
+        // task already, and carrying it would carry the whole source tree.
         if d.starts_with(store_dir)
             || d.starts_with(build_dir)
+            || build_dir.starts_with(&d)
             || !same_project_tree(build_dir, &d)
             || !d.is_dir()
             || out.contains(&d)
@@ -11693,6 +11707,55 @@ fn gtkdoc_dirs_to_carry(
             continue;
         }
         out.push(d);
+    }
+    out
+}
+
+/// The `-I` directories of a `meson --internal gtkdoc` run's `--cflags`, which
+/// meson passes as ONE quoted argument, so `include_dirs_as_given` never sees
+/// them. gtkdoc-scangobj compiles its scanner with them and
+/// `-Werror=missing-include-dirs`, so each one must exist: flatpak's died on
+/// `subprojects/libglnx/.`. Absolute and normalized.
+fn gtkdoc_cflags_include_dirs(build_dir: &Path, cd_dir: &Path, args: &[String]) -> Vec<PathBuf> {
+    if !args
+        .windows(2)
+        .any(|w| w[0] == "--internal" && w[1] == "gtkdoc")
+    {
+        return Vec::new();
+    }
+    let Some(cflags) = args.iter().find_map(|a| a.strip_prefix("--cflags=")) else {
+        return Vec::new();
+    };
+    cflags
+        .split_whitespace()
+        .filter_map(|t| t.strip_prefix("-I"))
+        .map(|v| {
+            if v.starts_with('/') {
+                lexical_join(Path::new(""), Path::new(v))
+            } else {
+                lexical_join(build_dir, &rebase_post_cd(cd_dir, v))
+            }
+        })
+        .collect()
+}
+
+/// The build-tree directories a gtkdoc run's `--cflags` names that exist,
+/// relative to the build dir, for the task to create
+/// (`NIX_NINJA_MAKE_DIRS`): their contents arrive through the graph, and an
+/// absent one fails the scanner's compile.
+fn gtkdoc_make_dirs(build_dir: &Path, cmdline: &str) -> Vec<String> {
+    let Ok(args) = shell_words::split(cmdline) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for d in gtkdoc_cflags_include_dirs(build_dir, &rewritten_cd_dir(&args), &args) {
+        let Ok(rel) = d.strip_prefix(build_dir) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().into_owned();
+        if !rel.is_empty() && d.is_dir() && !out.contains(&rel) {
+            out.push(rel);
+        }
     }
     out
 }
@@ -12216,8 +12279,8 @@ mod cmake_script_reference_tests {
         cmake_definitions, cmake_dotted_stamp_outputs, cmake_p_references,
         cmake_p_stamp_edge_writes, cmake_script_arg, cmake_script_included_modules,
         cmake_script_included_paths, cmake_script_referenced_paths, expand_cmake_vars,
-        gtkdoc_dirs_to_carry, lexical_join, referenced_file_rel, rewrite_cmdline, rewritten_cd_dir,
-        undeclared_outputs, StoreDir,
+        gtkdoc_dirs_to_carry, gtkdoc_make_dirs, lexical_join, referenced_file_rel, rewrite_cmdline,
+        rewritten_cd_dir, undeclared_outputs, StoreDir,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
@@ -12879,12 +12942,18 @@ endforeach()
         touch(&src.join("doc/reference/libflatpak-docs.xml"), "");
         touch(&src.join("common/flatpak.h"), "");
         touch(&build.join("common/flatpak-enum-types.h"), "");
+        touch(&src.join("subprojects/libglnx/libglnx.h"), "");
+        std::fs::create_dir_all(build.join("subprojects/libglnx")).unwrap();
         let s = src.display();
+        // `--cflags` is ONE quoted argument, as meson writes it.
         let cmdline = format!(
             "/nix/store/wks9ln3yjvpymilzgw8yjj18p1n69qyb-meson-1.12.1/bin/meson --internal gtkdoc \
              --sourcedir={s} --builddir={s}/build --subdir=doc/reference \
              --headerdirs={s}/build/common@@{s}/common@@{s}/absent \
-             --mainfile=libflatpak-docs.xml --modulename=flatpak --moduleversion= --mode=auto"
+             --mainfile=libflatpak-docs.xml --modulename=flatpak --moduleversion= --mode=auto \
+             --cc=gcc --ld=gcc '--cflags=-I/nix/store/7y3yxnzk3yy1x8njrsa3m8804b1h1hz7-glib-2.88.3-dev/include/glib-2.0 \
+             -I{s}/. -I{s}/build/. -I{s}/build/common -I{s}/build/subprojects/libglnx/. \
+             -I{s}/common -I{s}/subprojects/libglnx/.' '--ldflags=-L{s}/build/common'"
         );
         let store = StoreDir::new(Path::new("/nix/store")).unwrap();
         let a = shell_words::split(&rewrite_cmdline(&cmdline, &build)).unwrap();
@@ -12895,9 +12964,30 @@ endforeach()
         ))
         .unwrap();
         let none = gtkdoc_dirs_to_carry(&build, &store, &rewritten_cd_dir(&other), &other);
+        let made = gtkdoc_make_dirs(&build, &cmdline);
+        let made_other = gtkdoc_make_dirs(
+            &build,
+            &format!("/nix/store/x-meson/bin/meson --internal exe '--cflags=-I{s}/build/common'"),
+        );
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(got, vec![src.join("doc/reference"), src.join("common")]);
+        // The source root (an ancestor of the build dir) and the build-tree
+        // dirs are not carried; the libglnx source dir the scanner's
+        // `-Werror=missing-include-dirs` died on is.
+        assert_eq!(
+            got,
+            vec![
+                src.join("doc/reference"),
+                src.join("common"),
+                src.join("subprojects/libglnx")
+            ]
+        );
         assert!(none.is_empty(), "{none:?}");
+        // The build-tree `-I` dirs are created in the task instead.
+        assert_eq!(
+            made,
+            vec!["common".to_string(), "subprojects/libglnx".to_string()]
+        );
+        assert!(made_other.is_empty(), "{made_other:?}");
     }
 }
 
