@@ -29,7 +29,8 @@ pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
 
     // Stage 2: Discover dynamic dependencies
     let discovered =
-        discover_dynamic_dependencies(&rpc_client, store_dir, &build_dir, &drv, built_paths)?;
+        discover_dynamic_dependencies(&rpc_client, store_dir, &build_dir, &drv, built_paths, None)?
+            .0;
 
     // A `..` spelling discovered HERE has to reach the final derivation:
     // this subtool emits the derivation, it does not run the command, so
@@ -260,7 +261,8 @@ pub fn discover_dynamic_dependencies(
     build_dir: &Path,
     drv: &Derivation,
     built_paths: HashMap<PathBuf, PathBuf>,
-) -> Result<crate::task::Discovered> {
+    producer: Option<&crate::task::ProducerIndex>,
+) -> Result<(crate::task::Discovered, Option<crate::task::DeferMiss>)> {
     let cmdline_bytes = drv
         .args
         .first()
@@ -269,7 +271,7 @@ pub fn discover_dynamic_dependencies(
 
     let (files, built_paths) = scan_inputs(built_paths);
 
-    let (discovered, _defer) = discover_c_includes(
+    discover_c_includes(
         rpc_client,
         store_dir,
         build_dir,
@@ -281,9 +283,8 @@ pub fn discover_dynamic_dependencies(
         // the only source. Upstream #17's read-back applies to the outer,
         // persistent build dir path only.
         None,
-        None,
-    )?;
-    Ok(discovered)
+        producer,
+    )
 }
 
 /// Stage 3: Update derivation with discovered dependencies and store paths

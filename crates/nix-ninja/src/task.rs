@@ -1436,6 +1436,12 @@ impl Runner {
                         &config,
                     ) {
                         Ok(final_derived_path) => (Some(final_derived_path), None),
+                        Err(err) if err.is::<Deferred>() => {
+                            if let Ok(Deferred(d)) = err.downcast::<Deferred>() {
+                                defer_out = Some(d);
+                            }
+                            (None, None)
+                        }
                         Err(err) => {
                             // Cause FIRST and no multi-megabyte JSON dump:
                             // at Chromium scale the dump swallowed the cause
@@ -4652,9 +4658,17 @@ fn build_task_derivation(
                 files,
                 Some(virtual_paths),
                 task.depfile.as_deref().map(Path::new),
-                task.is_gcc_task
-                    .then(|| task.producer_index.as_ref().map(|v| v.as_ref()))
-                    .flatten(),
+                // Only where this view is complete: a task with a built
+                // input is decided in `handle_derivation_result`, after the
+                // realise, because its trees and generated sources are not
+                // readable here.
+                (task.is_gcc_task
+                    && !task
+                        .inputs
+                        .iter()
+                        .any(|i| matches!(i.derived_path, SingleDerivedPath::Built { .. })))
+                .then_some(task.producer_index.as_deref())
+                .flatten(),
             )?;
             // A miss the producer index answers ends the emission here,
             // before the derivation is written; the spawn site turns it
@@ -5955,17 +5969,32 @@ fn handle_derivation_result(
             );
 
             let t_discover = std::time::Instant::now();
-            let Discovered {
-                deps: discovered_deps,
-                store_paths: discovered_store_paths,
-                dotdot_dirs,
-            } = dynamic_task::discover_dynamic_dependencies(
+            let (
+                Discovered {
+                    deps: discovered_deps,
+                    store_paths: discovered_store_paths,
+                    dotdot_dirs,
+                },
+                defer,
+            ) = dynamic_task::discover_dynamic_dependencies(
                 rpc_client,
                 &config.store_dir,
                 &config.build_dir,
                 &drv,
                 built_paths,
+                task.is_gcc_task
+                    .then_some(task.producer_index.as_deref())
+                    .flatten(),
             )?;
+            // THE COMPLETE VIEW DECIDES. Only here are the built inputs
+            // realised and their trees expanded, so only here is an
+            // unresolved spelling really unresolved (the static arm read
+            // qtbase's Bootstrap compiles as missing QtCore headers they
+            // build with, and never opened libsecret's valac-generated
+            // translation unit). Nothing is written before this point.
+            if let Some(d) = defer {
+                return Err(anyhow::Error::new(Deferred(d)));
+            }
             declare_dotdot_dirs(&mut drv, &config.build_dir, &dotdot_dirs);
             DYN_DISCOVER_MS.fetch_add(
                 t_discover.elapsed().as_millis() as u64,
