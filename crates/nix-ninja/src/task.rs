@@ -433,6 +433,24 @@ fn task_view(
     } else {
         local::build_derived_files(rpc_client, store_dir, &built).ok()?
     };
+    build_view(store_dir, build_dir, inputs, &realised)
+}
+
+/// `task_view`'s filesystem half, given the realised paths of the built
+/// inputs: no daemon, so a test drives it over fixture trees.
+fn build_view(
+    store_dir: &StoreDir,
+    build_dir: &Path,
+    inputs: &[DerivedFile],
+    realised: &HashMap<PathBuf, PathBuf>,
+) -> Option<PathBuf> {
+    let in_tree = |bp: &Path| {
+        bp.is_relative()
+            && bp
+                .components()
+                .next()
+                .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
+    };
     let view = build_dir.parent()?.join(
         format!(
             ".nn-defer-view-{}-{:?}",
@@ -459,7 +477,30 @@ fn task_view(
         if let Some(parent) = link.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::os::unix::fs::symlink(&host, &link);
+        // A TREE IS REAL DIRECTORIES WITH A LINK PER FILE, as the task's own
+        // `link_tree` materialises it. One link to the store directory made
+        // the kernel resolve `..` physically from inside the store, so
+        // qtbase's `moc_*.cpp` climbing out of its autogen tree to the gtk3
+        // headers reached nothing and the miss behind them went unconfirmed.
+        if host.is_dir() {
+            for e in walkdir::WalkDir::new(&host)
+                .follow_links(true)
+                .into_iter()
+                .flatten()
+            {
+                let Ok(rel) = e.path().strip_prefix(&host) else {
+                    continue;
+                };
+                let dst = link.join(rel);
+                if e.file_type().is_dir() {
+                    let _ = std::fs::create_dir_all(&dst);
+                } else {
+                    let _ = std::os::unix::fs::symlink(e.path(), &dst);
+                }
+            }
+        } else {
+            let _ = std::os::unix::fs::symlink(&host, &link);
+        }
     }
     Some(view)
 }
@@ -24556,5 +24597,44 @@ mod unresolved_include_defer_tests {
             .files
             .keys()
             .any(|k| k.ends_with("opencv2/core/version.hpp")));
+    }
+
+    /// A tree in the view is real directories with a link per file, as the
+    /// task's `link_tree` makes it: qtbase's `moc_*.cpp` climbs out of its
+    /// autogen tree with `../..`, and through one link to the store directory
+    /// the kernel resolved `..` inside the store and reached nothing.
+    #[test]
+    fn a_climb_out_of_a_tree_in_the_view_lands_in_the_view() {
+        let d = super::Scratch::new(format!("nn-defer-viewtree-{}", std::process::id()));
+        let store = d.join("store");
+        let tree = store.join("0000000000000000000000000000000a-tree");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("sub/moc_x.cpp"), "").unwrap();
+        let sib = store.join("0000000000000000000000000000000b-sibling.h");
+        std::fs::write(&sib, "").unwrap();
+        let build = d.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let sd = super::StoreDir::new(&store).unwrap();
+        let input = |name: &str, bp: &str| super::DerivedFile {
+            derived_path: super::SingleDerivedPath::Opaque(name.parse().unwrap()),
+            build_path: PathBuf::from(bp),
+            rel_path: None,
+        };
+        let view = super::build_view(
+            &sd,
+            &build,
+            &[
+                input("0000000000000000000000000000000a-tree", "t"),
+                input("0000000000000000000000000000000b-sibling.h", "sibling.h"),
+            ],
+            &HashMap::new(),
+        )
+        .expect("a view");
+        let climbed = view.join("t/sub/../../sibling.h").exists();
+        let _ = std::fs::remove_dir_all(&view);
+        assert!(
+            climbed,
+            "a `..` out of a tree must land beside it in the view"
+        );
     }
 }
