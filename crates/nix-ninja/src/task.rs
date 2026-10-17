@@ -998,10 +998,19 @@ impl Runner {
         // task, same ordering. The typelib edge downstream declares the gir
         // alone; the compiler then opens every `<include>` in it.
         if let Some(cmd) = build.cmdline.as_deref() {
+            // meson spells the include RELATIVE to the build dir
+            // (`--include-uninstalled=libgnome-desktop/GnomeDesktop-4.0.gir`,
+            // gnome-desktop 44.5 and colord 1.4.8 in the round of
+            // 2026-10-16); the first version took only an absolute spelling
+            // and dropped the real one in silence.
             let incs: Vec<FileId> = gir_included_girs(cmd)
                 .iter()
                 .filter_map(|p| {
-                    let rel = p.strip_prefix(&self.config.build_dir).ok()?;
+                    let rel = if p.is_absolute() {
+                        p.strip_prefix(&self.config.build_dir).ok()?
+                    } else {
+                        p.as_path()
+                    };
                     files.lookup(&rel.to_string_lossy())
                 })
                 .collect();
@@ -7983,8 +7992,9 @@ mod path_defined_dirs_tests {
 /// The in-tree girs a `g-ir-scanner` command includes by path, from its
 /// `--include-uninstalled=<path>` arguments (meson's spelling for a gir of
 /// the same project; an installed one is `--include=<Name-V>` and resolves
-/// through the store `--includedir`, already an input). Absolute, as meson
-/// writes them; the caller maps each onto the graph.
+/// through the store `--includedir`, already an input). As spelled, which
+/// meson makes RELATIVE to the build dir; the caller maps each onto the
+/// graph, stripping the build dir from an absolute one.
 fn gir_included_girs(cmdline: &str) -> Vec<PathBuf> {
     if !cmdline.contains("g-ir-scanner") {
         return Vec::new();
@@ -8026,6 +8036,13 @@ mod gir_included_girs_tests {
         let compile = "g-ir-compiler libgnome-desktop/gnome-bg/GnomeBG-4.0.gir --output x.typelib --includedir=/build/gnome-desktop-44.5/build/libgnome-desktop";
         assert!(gir_included_girs(compile).is_empty());
         assert!(gir_included_girs("g-ir-scanner --include-uninstalled=").is_empty());
+        // The spelling meson actually emits (gnome-desktop's real scanner
+        // drv `j6lplawg`): relative to the build dir, returned as given.
+        let real = "g-ir-scanner --include-uninstalled=libgnome-desktop/GnomeDesktop-4.0.gir --output libgnome-desktop/gnome-bg/GnomeBG-4.0.gir";
+        assert_eq!(
+            gir_included_girs(real),
+            vec![Path::new("libgnome-desktop/GnomeDesktop-4.0.gir").to_path_buf()]
+        );
     }
 }
 
