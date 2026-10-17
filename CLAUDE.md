@@ -305,7 +305,9 @@ Mechanisms, cited by symbol because line numbers rot:
   `make` for an LTO link (argv AND the cc's `cc-cflags-before`),
   `gcc-ar`/`gcc-nm`/`gcc-ranlib` from the wrapper's `orig-cc` when named,
   `SCRIPT_TOOLS` (`nm`, `readelf`, `ldd`, text filters; its `DEFER` trigger
-  is a round failure naming a missing tool); `as` needs none (`-B`). The
+  is a round failure naming a missing tool); `as` needs none (`-B`). A `.sh` script an edge
+  runs gets the store tools it names in command position
+  (`script_bare_programs`), that edge only. The
   compiler wrapper (27 closure paths vs 14) is added only where
   `task_needs_cc`: a toolchain named by basename, `deps = gcc`, all outputs
   object shaped, or a known generator execing cc unnamed
