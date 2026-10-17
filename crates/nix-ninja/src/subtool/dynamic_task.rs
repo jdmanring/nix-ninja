@@ -36,6 +36,7 @@ pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
         built_paths,
         None,
         &[],
+        &|| None,
     )?
     .0;
 
@@ -262,6 +263,7 @@ pub fn scan_inputs(
 }
 
 /// Stage 2: Discover dynamic dependencies by analyzing built files for includes
+#[allow(clippy::too_many_arguments)]
 pub fn discover_dynamic_dependencies(
     rpc_client: &Arc<BuilderRpcClient>,
     store_dir: &StoreDir,
@@ -270,6 +272,7 @@ pub fn discover_dynamic_dependencies(
     built_paths: HashMap<PathBuf, PathBuf>,
     producer: Option<&crate::task::ProducerIndex>,
     carried_trees: &[PathBuf],
+    tree_roots: &dyn Fn() -> Option<Vec<PathBuf>>,
 ) -> Result<(crate::task::Discovered, Option<crate::task::DeferMiss>)> {
     let cmdline_bytes = drv
         .args
@@ -295,6 +298,7 @@ pub fn discover_dynamic_dependencies(
         // A header absent from a tree the task carries is not a miss the
         // tree's producer could answer: it already ran.
         carried_trees,
+        tree_roots,
     )
 }
 

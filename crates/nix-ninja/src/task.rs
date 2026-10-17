@@ -224,6 +224,9 @@ struct Task {
     /// header. A non-compile edge misses nothing this way and pays no
     /// index lookups.
     is_gcc_task: bool,
+    /// Local mode (configurations A and B), where discovery may realise a
+    /// carried tree to show the confirming preprocessor what the task sees.
+    local_mode: bool,
 }
 
 impl Deref for Task {
@@ -394,6 +397,50 @@ fn carried_module_trees(inputs: &[DerivedFile]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The realised store roots of the module trees among `inputs`, or None if
+/// realising them fails. Only local mode may realise; a tree's store path
+/// mirrors its build-relative layout, so its root is the realised path with
+/// the build path taken off the end.
+fn carried_tree_roots(
+    rpc_client: &BuilderRpcClient,
+    store_dir: &StoreDir,
+    inputs: &[DerivedFile],
+) -> Option<Vec<PathBuf>> {
+    let trees: Vec<DerivedFile> = inputs
+        .iter()
+        .filter(|i| {
+            let bp = i.build_path.to_string_lossy();
+            let bp = bp.strip_suffix("/.nn-tree").unwrap_or(&bp);
+            is_tree_path(Path::new(bp))
+                && bp.starts_with("include/")
+                && matches!(i.derived_path, SingleDerivedPath::Built { .. })
+        })
+        .cloned()
+        .collect();
+    if trees.is_empty() {
+        return Some(Vec::new());
+    }
+    let built = local::build_derived_files(rpc_client, store_dir, &trees).ok()?;
+    let mut roots: Vec<PathBuf> = built
+        .into_iter()
+        .map(|(bp, host)| {
+            let bp = PathBuf::from(bp.to_string_lossy().trim_end_matches("/.nn-tree"));
+            let n = bp.components().count();
+            if host.ends_with(&bp) {
+                host.ancestors()
+                    .nth(n)
+                    .map(Path::to_path_buf)
+                    .unwrap_or(host)
+            } else {
+                host
+            }
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    Some(roots)
+}
+
 /// One task's answer to its unresolved include: the sorted, deduplicated
 /// FileIds to add as implicit inputs - the producer's file node and the
 /// tree's representative - and the header's own spelling so the refusal
@@ -402,6 +449,10 @@ fn carried_module_trees(inputs: &[DerivedFile]) -> Vec<PathBuf> {
 pub struct DeferMiss {
     pub fids: Vec<FileId>,
     pub header: String,
+    /// The build-relative location the index answered, where the producer
+    /// writes the header; the preprocessor confirms this file or the bare
+    /// spelling, never a same-named file elsewhere.
+    pub at: PathBuf,
 }
 
 /// `build_task_derivation`'s answer when discovery finds a header an
@@ -3576,6 +3627,7 @@ impl Runner {
             alias_symlinks: self.alias_symlinks.clone(),
             make_dirs,
             is_gcc_task,
+            local_mode: !self.config.is_output_derivation,
         })
     }
 }
@@ -4715,6 +4767,11 @@ fn build_task_derivation(
                     .then_some(task.producer_index.as_deref())
                     .flatten(),
                 &carried_module_trees(&task.inputs),
+                &|| {
+                    task.local_mode
+                        .then(|| carried_tree_roots(rpc_client, &task.store_dir, &task.inputs))
+                        .flatten()
+                },
             )?;
             // A miss the producer index answers ends the emission here,
             // before the derivation is written; the spawn site turns it
@@ -6032,6 +6089,7 @@ fn handle_derivation_result(
                     .then_some(task.producer_index.as_deref())
                     .flatten(),
                 &carried_module_trees(&task.inputs),
+                &|| carried_tree_roots(rpc_client, &config.store_dir, &task.inputs),
             )?;
             // THE COMPLETE VIEW DECIDES. Only here are the built inputs
             // realised and their trees expanded, so only here is an
@@ -18230,18 +18288,28 @@ pub struct Discovered {
 /// resolved path or, missing, under its spelling, and never one in a branch
 /// the build does not take. A failed run is unknown and leaves the
 /// candidates as the scanner found them.
-fn preprocessor_confirmed(cmdline: &str, candidates: Vec<DeferMiss>) -> Vec<DeferMiss> {
-    match preprocessor_deps(cmdline) {
-        // A run that fails is UNKNOWN, not refuted: the driver's disk lacks
-        // the trees a task carries, so a Qt header's `#if QT_CONFIG(x)`
-        // fails to parse there. The scanner's candidates, already filtered
-        // by the carried module trees, stand.
-        Err(_) => candidates,
-        Ok(deps) => candidates
-            .into_iter()
-            .filter(|c| deps.iter().any(|p| p.ends_with(&c.header)))
-            .collect(),
-    }
+fn preprocessor_confirmed(
+    cmdline: &str,
+    build_dir: &Path,
+    tree_roots: &[PathBuf],
+    candidates: Vec<DeferMiss>,
+) -> Vec<DeferMiss> {
+    let Ok(deps) = preprocessor_deps(cmdline, build_dir, tree_roots) else {
+        return Vec::new();
+    };
+    let rel = |p: &Path| {
+        let p = lexical_join(Path::new(""), p);
+        p.strip_prefix(build_dir)
+            .map(Path::to_path_buf)
+            .unwrap_or(p)
+    };
+    candidates
+        .into_iter()
+        .filter(|c| {
+            deps.iter()
+                .any(|d| d == Path::new(&c.header) || rel(d) == c.at)
+        })
+        .collect()
 }
 
 /// The compile command's own preprocessor dependencies, `-M -MG`, or its
@@ -18253,10 +18321,14 @@ fn preprocessor_confirmed(cmdline: &str, candidates: Vec<DeferMiss>) -> Vec<Defe
 /// ANGLE header as a system header, exits 0 and lists nothing, so
 /// `<QtWidgets/QWidget>` read as a dead branch; and deps-infer is in the task
 /// binary's fileset, so changing it would re-key every banked compile.
-fn preprocessor_deps(cmdline: &str) -> std::result::Result<Vec<PathBuf>, String> {
+fn preprocessor_deps(
+    cmdline: &str,
+    build_dir: &Path,
+    tree_roots: &[PathBuf],
+) -> std::result::Result<Vec<PathBuf>, String> {
     let words = shell_words::split(cmdline).map_err(|e| e.to_string())?;
     let (program, rest) = words.split_first().ok_or("empty command")?;
-    let mut args: Vec<&str> = Vec::new();
+    let mut args: Vec<String> = Vec::new();
     let mut it = rest.iter();
     while let Some(w) = it.next() {
         match w.as_str() {
@@ -18264,7 +18336,30 @@ fn preprocessor_deps(cmdline: &str) -> std::result::Result<Vec<PathBuf>, String>
                 it.next();
             }
             "-c" | "-MD" | "-MMD" | "-MP" => {}
-            _ => args.push(w),
+            _ => {
+                // THE TASK'S VIEW OF A CARRIED TREE. A realised module tree
+                // mirrors its build-relative layout (`<root>/include/QtCore`),
+                // so each include dir inside the build dir gets the same path
+                // under every carried tree's root, ahead of it. Without them
+                // Qt's `#if QT_CONFIG(x)` cannot parse: the macro lives in a
+                // header only the carried tree holds.
+                if let Some(d) = w.strip_prefix("-I").filter(|d| !d.is_empty()) {
+                    let p = lexical_join(Path::new(""), Path::new(d));
+                    let rel = p
+                        .strip_prefix(build_dir)
+                        .map(Path::to_path_buf)
+                        .unwrap_or(p);
+                    if rel.is_relative() && !rel.starts_with("..") {
+                        for root in tree_roots {
+                            let mirrored = root.join(&rel);
+                            if mirrored.is_dir() {
+                                args.push(format!("-I{}", mirrored.display()));
+                            }
+                        }
+                    }
+                }
+                args.push(w.clone());
+            }
         }
     }
     let dep = std::env::temp_dir().join(
@@ -18403,6 +18498,7 @@ fn find_unresolved_miss(
                     out.push(DeferMiss {
                         fids: vec![fid],
                         header: name.display().to_string(),
+                        at: rel_of(&cand),
                     });
                     break;
                 }
@@ -18426,6 +18522,7 @@ pub fn discover_c_includes(
     depfile: Option<&Path>,
     producer: Option<&ProducerIndex>,
     carried_trees: &[PathBuf],
+    tree_roots: &dyn Fn() -> Option<Vec<PathBuf>>,
 ) -> Result<(Discovered, Option<DeferMiss>)> {
     // The virtual set is consumed by the scan below; the UPLOAD filter
     // further down needs it too, so keep a copy. See generated_not_yet_written.
@@ -18750,9 +18847,12 @@ pub fn discover_c_includes(
         // preprocessor confirmed; off, nothing is printed.
         let debug = std::env::var_os("NIX_NINJA_DEBUG_DEFER").is_some();
         let names: Vec<String> = candidates.iter().map(|c| c.header.clone()).collect();
-        let live = preprocessor_confirmed(cmdline, candidates);
+        // No realised view (DRV mode, or the realise failed): nothing is
+        // confirmed, the emission of before.
+        let roots = tree_roots()?;
+        let live = preprocessor_confirmed(cmdline, build_dir, &roots, candidates);
         if debug {
-            let why = match preprocessor_deps(cmdline) {
+            let why = match preprocessor_deps(cmdline, build_dir, &roots) {
                 Ok(d) => format!(
                     "-M ok, {} deps, matching {:?}",
                     d.len(),
@@ -18774,11 +18874,11 @@ pub fn discover_c_includes(
                 cmdline.split_whitespace().last().unwrap_or("")
             );
         }
-        let header = live.first()?.header.clone();
+        let (header, at) = live.first().map(|m| (m.header.clone(), m.at.clone()))?;
         let mut fids: Vec<FileId> = live.into_iter().flat_map(|m| m.fids).collect();
         fids.sort_by_key(n2::densemap::Index::index);
         fids.dedup();
-        Some(DeferMiss { fids, header })
+        Some(DeferMiss { fids, header, at })
     });
     let c_include_count = c_includes.len();
     let mut discovered_deps = Vec::new();
@@ -23809,6 +23909,7 @@ mod unresolved_include_defer_tests {
         let defer = DeferMiss {
             fids: vec![gen],
             header: "gen.h".to_string(),
+            at: PathBuf::new(),
         };
         // `a.o` already carries `gen.h` as an order-only input.
         assert!(defer.new_ids(&g.builds[consumer]).is_empty());
@@ -23836,6 +23937,7 @@ mod unresolved_include_defer_tests {
             // order discovery found the misses.
             fids: vec![other, gen, other],
             header: "gen.h".to_string(),
+            at: PathBuf::new(),
         };
         let mut want = vec![gen, other];
         want.sort_by_key(n2::densemap::Index::index);
@@ -24071,11 +24173,12 @@ mod unresolved_include_defer_tests {
     }
 
     /// The preprocessor separates a live miss from an `#if` branch the build
-    /// never takes, which the scanner cannot: qtbase's QtGui private header
-    /// that deferred 279 compiles is the dead shape. Two runs of the real
-    /// compiler, live.h absent and then present: it is confirmed both times,
-    /// the dead spelling never, and an unrelated missing header ahead of it
-    /// does not stop the run.
+    /// never takes, which the scanner cannot: qtbase's QtSql compiles deferred
+    /// on QtGui headers in dead branches. Two runs of the real compiler with
+    /// live.h absent and then present: it is confirmed both times, the dead
+    /// spelling never, an unrelated missing header ahead of it does not stop
+    /// the run, and a same-named header at another place (opencv's source
+    /// `version.hpp` against the produced one) confirms nothing.
     #[test]
     fn the_preprocessor_confirms_the_live_miss_and_not_the_dead_branch() {
         if std::process::Command::new("gcc")
@@ -24090,50 +24193,61 @@ mod unresolved_include_defer_tests {
         let prev = std::env::current_dir().unwrap();
         let d = super::Scratch::new(format!("nn-defer-cpp-{}", std::process::id()));
         std::fs::create_dir_all(d.join("inc")).unwrap();
+        // An unrelated header the disk lacks comes FIRST, as qtbase gtk3's
+        // `qpa/qplatformthemeplugin.h` does: the run must not stop there.
         std::fs::write(
             d.join("tu.c"),
-            // An unrelated header the disk lacks comes FIRST, as qtbase gtk3's
-            // `qpa/qplatformthemeplugin.h` does: the run must not stop there.
             "#include <carried/elsewhere.h>\n#if 0\n#include <dead/dead.h>\n#endif\n\
              #include <live/live.h>\nint x;\n",
         )
         .unwrap();
-        std::env::set_current_dir(d.join(".")).unwrap();
+        let here = d.join(".");
+        std::env::set_current_dir(&here).unwrap();
         let cmd = "gcc -Iinc -c tu.c -o tu.o";
+        let cand = |h: &str, at: &str| DeferMiss {
+            fids: vec![],
+            header: h.into(),
+            at: PathBuf::from(at),
+        };
         let cands = || {
             vec![
-                DeferMiss {
-                    fids: vec![],
-                    header: "dead/dead.h".into(),
-                },
-                DeferMiss {
-                    fids: vec![],
-                    header: "live/live.h".into(),
-                },
+                cand("dead/dead.h", "inc/dead/dead.h"),
+                cand("live/live.h", "inc/live/live.h"),
             ]
         };
-        let absent = super::preprocessor_confirmed(cmd, cands());
+        let absent = super::preprocessor_confirmed(cmd, &here, &[], cands());
         std::fs::create_dir_all(d.join("inc/live")).unwrap();
         std::fs::write(d.join("inc/live/live.h"), "").unwrap();
-        let present = super::preprocessor_confirmed(cmd, cands());
+        let present = super::preprocessor_confirmed(cmd, &here, &[], cands());
+        let elsewhere = super::preprocessor_confirmed(
+            cmd,
+            &here,
+            &[],
+            vec![cand("live/live.h", "gen/live/live.h")],
+        );
         std::env::set_current_dir(prev).unwrap();
         let names = |v: Vec<DeferMiss>| v.into_iter().map(|m| m.header).collect::<Vec<_>>();
         assert_eq!(names(absent), vec!["live/live.h".to_string()]);
         assert_eq!(names(present), vec!["live/live.h".to_string()]);
+        assert!(
+            elsewhere.is_empty(),
+            "a same-named file elsewhere is not the produced one"
+        );
     }
 
-    /// A preprocessor run that fails is unknown, not a refutation: qtbase
-    /// gtk3's died on `#if QT_CONFIG(...)` because the driver's disk lacks
-    /// the trees the task carries, and confirming nothing dropped the real
-    /// miss. The candidates stand.
+    /// A preprocessor run that fails confirms nothing, the emission of
+    /// before: with the carried trees shown to it, a failure is no longer
+    /// the driver's view being incomplete.
     #[test]
-    fn a_failed_preprocessor_run_keeps_the_candidates() {
+    fn a_failed_preprocessor_run_confirms_nothing() {
         let c = vec![DeferMiss {
             fids: vec![],
             header: "QtWidgets/QWidget".into(),
+            at: PathBuf::from("include/QtWidgets/QWidget"),
         }];
-        let got = super::preprocessor_confirmed("/nonexistent/cc -c x.c -o x.o", c);
-        assert_eq!(got.len(), 1);
+        let got =
+            super::preprocessor_confirmed("/nonexistent/cc -c x.c -o x.o", Path::new("/"), &[], c);
+        assert!(got.is_empty());
     }
 
     /// Only module trees hold a spelling; an autogen tree, qtbase gtk3's
