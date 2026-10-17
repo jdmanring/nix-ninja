@@ -1169,10 +1169,38 @@ where
     // patchelf.rs, and the same remedy - refusing here, at the single
     // resolution point, lets the search fall through to the next include
     // dir exactly as the compiler does.
-    let result = match std::fs::metadata(path.as_ref()) {
+    let mut result = match std::fs::metadata(path.as_ref()) {
         Ok(md) if !md.is_dir() => Some(canonicalize(&path)?),
         _ => None,
     };
+
+    // A `..` CLIMB THROUGH A DIRECTORY THAT IS NOT ON THIS DISK. The kernel
+    // resolves `..` physically, so every component before it must exist
+    // here; the compiler in the task sandbox walks real directories that the
+    // task materialized, where the climb lands at its LEXICAL target. qtbase
+    // 6.11.2, XcbQpaPrivate's mocs_compilation.cpp: AUTOMOC writes
+    // `#include "../../../../../../../src/.../qxcbglintegrationplugin.h"`
+    // into `XcbQpaPrivate_autogen/MVTLVZ3TR3/moc_*.cpp`, a directory that
+    // exists only inside the realised autogen output, so the physical probe
+    // missed, the header went undeclared, and the sandbox compile died on
+    // it. Asked only after the physical probe misses, so a symlinked
+    // component that the physical walk resolves keeps its answer.
+    if result.is_none() {
+        let key: &Path = path.as_ref();
+        if key
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            let lexical = lexical_normalize(key);
+            if lexical != key {
+                if let Ok(md) = std::fs::metadata(&lexical) {
+                    if !md.is_dir() {
+                        result = Some(canonicalize(&lexical)?);
+                    }
+                }
+            }
+        }
+    }
 
     let mut cache = PATH_CACHE.write().unwrap();
     cache.insert(path.as_ref().to_path_buf(), result.clone());

@@ -202,6 +202,57 @@ fn seed_readable(store_path: &Path) -> bool {
     !store_path.is_dir() && store_path.try_exists().unwrap_or(false)
 }
 
+/// A FILE INSIDE A REALISED DIRECTORY OUTPUT IS REACHABLE ONLY THROUGH ITS
+/// OWN KEY. The map holds one entry per declared output, so a directory
+/// output answers for its own path and nothing under it, and an include
+/// naming a file inside it falls through to the disk, where the directory
+/// has not been placed. qtbase 6.11.2: `mocs_compilation.cpp` includes
+/// `MVTLVZ3TR3/moc_qxcbglintegrationplugin.cpp` from the
+/// `XcbQpaPrivate_autogen` tree, the moc file was never read, and the
+/// source header it includes went undeclared.
+///
+/// Adds one entry per regular file (or link) under each directory value,
+/// keyed by its build path. Seeds are taken BEFORE this runs, so the walk
+/// still reads only what an include reaches. An existing key is kept: an
+/// individually declared output is authoritative over the tree's copy,
+/// the order `create_symlinks_with` places them in.
+pub fn expand_directory_outputs(built_paths: &mut HashMap<PathBuf, PathBuf>) {
+    fn walk(build: &Path, store: &Path, out: &mut Vec<(PathBuf, PathBuf)>) {
+        let Ok(entries) = fs::read_dir(store) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let (b, s) = (build.join(e.file_name()), e.path());
+            if s.is_dir() {
+                walk(&b, &s, out);
+            } else {
+                out.push((b, s));
+            }
+        }
+    }
+    let mut extra = Vec::new();
+    for (build, store) in built_paths.iter() {
+        if store.is_dir() {
+            walk(build, store, &mut extra);
+        }
+    }
+    for (b, s) in extra {
+        built_paths.entry(b).or_insert(s);
+    }
+}
+
+/// The seeds and the resolution map one discovery reads, in that order:
+/// seeds from the declared outputs alone, then the map widened to the
+/// files inside directory outputs. A function so the order is tested.
+pub fn scan_inputs(
+    built_paths: HashMap<PathBuf, PathBuf>,
+) -> (Vec<PathBuf>, HashMap<PathBuf, PathBuf>) {
+    let files = scan_seeds(&built_paths);
+    let mut built_paths = built_paths;
+    expand_directory_outputs(&mut built_paths);
+    (files, built_paths)
+}
+
 /// Stage 2: Discover dynamic dependencies by analyzing built files for includes
 pub fn discover_dynamic_dependencies(
     rpc_client: &Arc<BuilderRpcClient>,
@@ -216,7 +267,7 @@ pub fn discover_dynamic_dependencies(
         .ok_or_else(|| anyhow!("No command line found in derivation"))?;
     let cmdline = std::str::from_utf8(cmdline_bytes)?;
 
-    let files = scan_seeds(&built_paths);
+    let (files, built_paths) = scan_inputs(built_paths);
 
     discover_c_includes(
         rpc_client,
@@ -642,6 +693,80 @@ mod tests {
             drv.builder.as_ref(),
             &builder[..],
             "the embedded plain derivation keeps the builder it was emitted with"
+        );
+    }
+
+    fn automoc_scratch() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("nn-automoc-{}-{nanos}", std::process::id()));
+        fs::create_dir(&p).unwrap();
+        p.canonicalize().unwrap()
+    }
+
+    /// A MOC FILE INSIDE A REALISED DIRECTORY OUTPUT CLIMBS BACK TO ITS SOURCE.
+    ///
+    /// qtbase 6.11.2, `XcbQpaPrivate_autogen/mocs_compilation.cpp`, the KDE round
+    /// of 2026-10-17: AUTOMOC writes the moc files into hash-named directories of
+    /// the autogen tree, and each includes its source header by a climb out of
+    /// the build tree:
+    ///
+    /// ```text
+    /// mocs_compilation.cpp:        #include "MVTLVZ3TR3/moc_qxcbglintegrationplugin.cpp"
+    /// moc_qxcbglintegrationplugin: #include "../../../../../../../src/plugins/platforms/xcb/gl_integrations/qxcbglintegrationplugin.h"
+    /// ```
+    ///
+    /// Discovery missed both steps. The tree is ONE map entry, so the moc file
+    /// under it fell through to a disk the tree was never placed on
+    /// (`expand_directory_outputs`), and the climb was resolved physically
+    /// through a directory that exists only in the realised output, where the
+    /// sandbox has it real (the lexical probe in `canonicalize_cached`). The
+    /// header went undeclared and the compile died on it.
+    ///
+    /// The fixture builds its own "store" tree; the autogen build path is absent
+    /// from the build directory, which is the state discovery runs in.
+    #[test]
+    fn a_moc_climb_out_of_a_realised_tree_declares_its_source_header() {
+        let t = automoc_scratch();
+        let src = t.join("q/src/gl");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("plugin.h"), "").unwrap();
+        let build = t.join("q/build");
+        fs::create_dir_all(&build).unwrap();
+
+        // The realised outputs, each in its own object as the store holds them.
+        let store_tree = t.join("store/ag");
+        fs::create_dir_all(store_tree.join("MVTLVZ3TR3")).unwrap();
+        // MVTLVZ3TR3 -> ag -> a -> build -> q
+        fs::write(
+            store_tree.join("MVTLVZ3TR3/moc_plugin.cpp"),
+            "#include \"../../../../src/gl/plugin.h\"\n",
+        )
+        .unwrap();
+        let store_mc = t.join("store/mc/mocs_compilation.cpp");
+        fs::create_dir_all(store_mc.parent().unwrap()).unwrap();
+        fs::write(&store_mc, "#include \"MVTLVZ3TR3/moc_plugin.cpp\"\n").unwrap();
+
+        let ag = build.join("a/ag");
+        let mc = ag.join("mocs_compilation.cpp");
+        let mut built = HashMap::new();
+        built.insert(mc.clone(), store_mc);
+        built.insert(ag.clone(), store_tree);
+        let (seeds, map) = scan_inputs(built);
+        assert_eq!(seeds, vec![mc.clone()], "a directory output became a seed");
+
+        let cmd = format!("g++ -I{} -c {}", src.display(), mc.display());
+        let scan =
+            deps_infer::c_include_parser::retrieve_c_includes_checked(&cmd, seeds, Some(map))
+                .unwrap();
+        let _ = fs::remove_dir_all(&t);
+
+        assert!(
+            scan.includes.contains(&src.join("plugin.h")),
+            "the moc file's source header was not declared; includes: {:?}",
+            scan.includes
         );
     }
 }
