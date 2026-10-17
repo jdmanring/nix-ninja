@@ -4700,7 +4700,14 @@ fn build_task_derivation(
                     .filter_map(|i| {
                         let bp = i.build_path.to_string_lossy();
                         let bp = bp.strip_suffix("/.nn-tree").unwrap_or(&bp);
-                        is_tree_path(Path::new(bp)).then(|| PathBuf::from(bp))
+                        // A MODULE tree only (`include/<Module>`): it is the
+                        // shape a spelling names (`<QtCore/...>`). An autogen
+                        // tree holds moc output, and counting it vouched for
+                        // every spelling through `-I<T>_autogen/include`,
+                        // qtbase gtk3's FIRST include dir, so
+                        // `QtWidgets/QWidget` never became a candidate.
+                        (is_tree_path(Path::new(bp)) && bp.starts_with("include/"))
+                            .then(|| PathBuf::from(bp))
                     })
                     .collect::<Vec<_>>(),
             )?;
@@ -18204,8 +18211,15 @@ fn preprocessor_deps(cmdline: &str) -> std::result::Result<Vec<PathBuf>, String>
         )
         .replace(['(', ')', ' '], ""),
     );
+    // The nixpkgs compiler wrapper runs under `set -u` and reads
+    // NIX_BUILD_TOP, which only a derivation sets; outside one (configuration
+    // A) every run died `NIX_BUILD_TOP: unbound variable` and confirmed
+    // nothing.
+    let build_top =
+        std::env::var_os("NIX_BUILD_TOP").unwrap_or_else(|| std::env::temp_dir().into());
     let out = std::process::Command::new(program)
         .args(&args)
+        .env("NIX_BUILD_TOP", build_top)
         .arg("-M")
         .arg("-MF")
         .arg(&dep)
