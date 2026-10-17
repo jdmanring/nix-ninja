@@ -239,6 +239,9 @@ pub struct BuildResult {
     /// cannot know them: `deps/src/<name>` is identified by the command that
     /// writes it, not by its name.
     pub undeclared_dirs: Vec<PathBuf>,
+    /// Undeclared FILES among `derived_files` that a consumer must reach,
+    /// attached to the rule's co-outputs the same way (`cl2cpp_header`).
+    pub undeclared_files: Vec<PathBuf>,
     pub err: Option<Error>,
 }
 
@@ -940,6 +943,7 @@ impl Runner {
                 derived_path: None,
                 derived_files: Vec::new(),
                 undeclared_dirs: Vec::new(),
+                undeclared_files: Vec::new(),
                 err: None,
             })
             .context("completing phony build")?;
@@ -1220,6 +1224,7 @@ impl Runner {
             let mut derived_path = derived_path;
             let mut err = err;
             let mut undeclared_dirs: Vec<PathBuf> = Vec::new();
+            let mut undeclared_files: Vec<PathBuf> = Vec::new();
             let derived_files = if let Some(ref final_derived_path) = derived_path.clone() {
                 let names: Vec<String> = task
                     .outs()
@@ -1262,7 +1267,10 @@ impl Runner {
                 // declares the tree it WRITES, and this is the second half of
                 // the same class - the source half landed first and the
                 // binary half was never built.
+                // AND opencv's generated kernel header, which every TU of the
+                // module includes and which no edge declares.
                 if let Some(c) = task.cmdline.as_deref() {
+                    undeclared_files = cl2cpp_header(c, &config.build_dir).into_iter().collect();
                     undeclared_dirs = external_project_extract_dirs(c, &config.build_dir)
                         .into_iter()
                         .chain(external_project_binary_dir(c, &config.build_dir))
@@ -1316,6 +1324,7 @@ impl Runner {
                 derived_path,
                 derived_files,
                 undeclared_dirs,
+                undeclared_files,
                 err,
             };
             let _ = tx.send(result);
@@ -1369,6 +1378,7 @@ impl Runner {
         for derived_file in result.derived_files {
             let edited_tree = result.undeclared_dirs.contains(&derived_file.build_path);
             let is_tree = is_tree_path(&derived_file.build_path) || edited_tree;
+            let rides = is_tree || result.undeclared_files.contains(&derived_file.build_path);
             let fid = self.add_derived_file(files, derived_file.clone());
             // A TREE A LATER STEP EDITS IN PLACE SUPERSEDES THE EARLIER COPY.
             // Registration is first-writer-wins, which is right for a file
@@ -1381,7 +1391,7 @@ impl Runner {
             if edited_tree {
                 self.derived_files.insert(fid, derived_file.clone());
             }
-            if is_tree {
+            if rides {
                 tree_fids.push(fid);
             } else {
                 fids.push(fid);
@@ -7607,6 +7617,43 @@ fn input_shipping(store_dir: &StoreDir, inputs: &[StorePath], rel: &str) -> Opti
         .cloned()
 }
 
+/// THE HEADER OPENCV'S `cl2cpp.cmake` WRITES BESIDE THE ONE FILE ITS EDGE
+/// DECLARES. `OpenCVModule.cmake` declares `OUTPUT opencl_kernels_<m>.cpp`
+/// ("don't add .hpp file here to optimize build process") and the script
+/// writes `<OUTPUT minus .cpp>.hpp` too; every TU of the module includes the
+/// header and reaches the generator only through the target's order-only
+/// phony. Real ninja finds it on the shared filesystem; a task's output kept
+/// declared files only, so opencv 4.13.0's core compiles died
+/// `opencl_kernels_core.hpp: No such file or directory` (task `7i8rilmf`).
+/// Build-dir relative, from the script's own `-DOUTPUT=`.
+fn cl2cpp_header(cmdline: &str, build_dir: &Path) -> Option<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let script = toks
+        .windows(2)
+        .find(|w| w[0] == "-P")
+        .map(|w| w[1].trim_matches('"'))?;
+    if Path::new(script).file_name()? != "cl2cpp.cmake" {
+        return None;
+    }
+    let out = toks
+        .iter()
+        .find_map(|t| t.strip_prefix("-DOUTPUT="))?
+        .trim_matches('"');
+    let hpp = format!("{}.hpp", out.strip_suffix(".cpp")?);
+    // CMake writes OUTPUT absolute; on A the command arrives respelled
+    // relative to its leading `cd` target, so that spelling is rebased.
+    let rel = if Path::new(&hpp).is_absolute() {
+        relative_from(Path::new(&hpp), build_dir)?
+    } else {
+        let cd = match toks.as_slice() {
+            ["cd", dir, "&&", ..] if !dir.starts_with('/') => Path::new(*dir),
+            _ => Path::new(""),
+        };
+        rebase_post_cd(cd, &hpp)
+    };
+    (rel.is_relative() && !rel.starts_with("..")).then_some(rel)
+}
+
 fn undeclared_outputs(
     declared: &[PathBuf],
     cmdline: Option<&str>,
@@ -7637,6 +7684,11 @@ fn undeclared_outputs(
                         }
                     }
                 }
+            }
+        }
+        if let Some(hpp) = cl2cpp_header(c, build_dir) {
+            if !v.contains(&hpp) {
+                v.push(hpp);
             }
         }
         // AN EXTERNALPROJECT DOWNLOAD EXTRACTS INTO `SOURCE_DIR` AND
@@ -18375,6 +18427,32 @@ mod external_project_extract_tests {
 #[cfg(test)]
 mod create_symlink_undeclared_output_tests {
     use super::*;
+
+    /// opencv 4.13.0's core kernel edge, verbatim from the kept build.ninja.
+    const CL2CPP: &str = "cd /build/source/build/modules/core && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -DMODULE_NAME=core -DCL_DIR=/build/source/modules/core/src/opencl -DOUTPUT=/build/source/build/modules/core/opencl_kernels_core.cpp -P /build/source/cmake/cl2cpp.cmake";
+
+    #[test]
+    fn opencvs_kernel_generator_declares_its_header() {
+        let bd = Path::new("/build/source/build");
+        let hpp = PathBuf::from("modules/core/opencl_kernels_core.hpp");
+        assert_eq!(cl2cpp_header(CL2CPP, bd), Some(hpp.clone()));
+        let declared = [PathBuf::from("modules/core/opencl_kernels_core.cpp")];
+        assert_eq!(undeclared_outputs(&declared, Some(CL2CPP), bd), vec![hpp]);
+        // Another -P script with the same -DOUTPUT declares nothing.
+        let other = CL2CPP.replace("cl2cpp.cmake", "cl2cpp_other.cmake");
+        assert!(cl2cpp_header(&other, bd).is_none());
+        assert!(undeclared_outputs(&declared, Some(&other), bd).is_empty());
+        // An OUTPUT outside the build dir is not this task's to declare.
+        let outside = CL2CPP.replace("-DOUTPUT=/build/source/build/", "-DOUTPUT=/build/source/");
+        assert!(cl2cpp_header(&outside, bd).is_none());
+        // The A spelling: the same edge as rewrite_cmdline respells it.
+        let rewritten = rewrite_cmdline(CL2CPP, bd);
+        assert!(rewritten.contains("-DOUTPUT=../../"), "{rewritten}");
+        assert_eq!(
+            cl2cpp_header(&rewritten, bd),
+            Some(PathBuf::from("modules/core/opencl_kernels_core.hpp"))
+        );
+    }
 
     #[test]
     fn create_symlink_link_is_an_output_with_and_without_cd() {
