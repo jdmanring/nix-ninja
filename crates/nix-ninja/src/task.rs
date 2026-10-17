@@ -1257,6 +1257,10 @@ impl Runner {
                     // recording its edge inputs lets the worklist's phony
                     // expansion materialize them for the consumer.
                     || c.contains("generate_grd.py")
+                    // A gtkdoc run's consumer (flatpak's xmlto of the copied
+                    // main file) xi:includes the docbook files the gtkdoc edge
+                    // takes as content files and orders on nothing else.
+                    || c.contains("--internal gtkdoc")
         }) || external_project_step(build.outs().iter().map(|f| files.by_id[*f].name.as_str()))
         {
             let ins: Vec<FileId> = build.dirtying_ins().to_vec();
@@ -1591,7 +1595,7 @@ impl Runner {
                             &config.build_dir,
                             &paths,
                         ))
-                        .chain(gtkdoc_html_dir(c, &config.build_dir))
+                        .chain(gtkdoc_written_outputs(c, &config.build_dir))
                         .collect();
                     undeclared_dirs = external_project_extract_dirs(c, &config.build_dir)
                         .into_iter()
@@ -8455,9 +8459,9 @@ fn undeclared_outputs(
                 v.push(vapi);
             }
         }
-        if let Some(html) = gtkdoc_html_dir(c, build_dir) {
-            if !v.contains(&html) && !declared.contains(&html) {
-                v.push(html);
+        for w in gtkdoc_written_outputs(c, build_dir) {
+            if !v.contains(&w) && !declared.contains(&w) {
+                v.push(w);
             }
         }
         for w in gdbus_docbook_interface_outputs(c, build_dir, declared) {
@@ -12121,36 +12125,83 @@ fn gtkdoc_make_dirs(build_dir: &Path, cmdline: &str) -> Vec<String> {
     out
 }
 
-/// The `html` directory a `meson --internal gtkdoc` run writes under
-/// `<builddir>/<subdir>`, relative to the build dir. No edge declares it, and
-/// meson's install step copies it from the build tree (gtkdochelper's
-/// `install_gtkdoc`), where real ninja leaves it and a task does not.
-/// Declared as a directory output so it is stored and placed.
-fn gtkdoc_html_dir(cmdline: &str, build_dir: &Path) -> Option<PathBuf> {
-    let args = shell_words::split(cmdline).ok()?;
+/// What a `meson --internal gtkdoc` run writes into `<builddir>/<subdir>`,
+/// relative to the build dir, none of it declared by any edge: the
+/// directories `html` (meson's install copies it from the build tree) and
+/// `xml` (gtkdoc-mkdb's default output, which the main file xi:includes), and
+/// the files gtkdochelper COPIES there: the `--mainfile`, the module's
+/// `-sections.txt` and `-overrides.txt` when the source doc dir has them, and
+/// each `--content-files` entry outside the build tree. flatpak's xmlto edge
+/// reads the copied `libflatpak-docs.xml` from the build dir and died
+/// `Input file ... not found`. Declared as outputs so they are stored and
+/// placed and ride the declared `-decl.txt` to consumers.
+fn gtkdoc_written_outputs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    let Ok(args) = shell_words::split(cmdline) else {
+        return Vec::new();
+    };
     if !args
         .windows(2)
         .any(|w| w[0] == "--internal" && w[1] == "gtkdoc")
     {
-        return None;
+        return Vec::new();
     }
     let value = |flag: &str| {
         args.iter()
             .find_map(|a| a.strip_prefix(flag).and_then(|v| v.strip_prefix('=')))
     };
-    let (bdir, sub) = (value("--builddir")?, value("--subdir")?);
-    let cd = rewritten_cd_dir(&args);
-    let bdir = if bdir.starts_with('/') {
-        lexical_join(Path::new(""), Path::new(bdir))
-    } else {
-        lexical_join(build_dir, &rebase_post_cd(&cd, bdir))
+    let (Some(bdir), Some(sub)) = (value("--builddir"), value("--subdir")) else {
+        return Vec::new();
     };
-    let html = lexical_join(&bdir, Path::new(sub)).join("html");
-    let rel = html.strip_prefix(build_dir).ok()?.to_path_buf();
-    rel.components()
-        .next()
-        .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
-        .then_some(rel)
+    let cd = rewritten_cd_dir(&args);
+    let abs = |v: &str| {
+        if v.starts_with('/') {
+            lexical_join(Path::new(""), Path::new(v))
+        } else {
+            lexical_join(build_dir, &rebase_post_cd(&cd, v))
+        }
+    };
+    let out_dir = lexical_join(&abs(bdir), Path::new(sub));
+    let doc_src = value("--sourcedir").map(|s| lexical_join(&abs(s), Path::new(sub)));
+    let mut names: Vec<String> = vec!["html".into(), "xml".into()];
+    if let Some(m) = value("--mainfile").filter(|m| !m.is_empty()) {
+        names.push(m.to_string());
+    }
+    if let (Some(module), Some(src)) = (value("--modulename"), &doc_src) {
+        for suffix in ["-sections.txt", "-overrides.txt"] {
+            let n = format!("{module}{suffix}");
+            if src.join(&n).is_file() {
+                names.push(n);
+            }
+        }
+    }
+    if let Some(cf) = value("--content-files") {
+        for f in cf.split("@@").filter(|f| !f.is_empty()) {
+            if !abs(f).starts_with(build_dir) || !f.starts_with('/') {
+                if let Some(base) = Path::new(f).file_name() {
+                    names.push(base.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for n in names {
+        let Ok(rel) = out_dir
+            .join(&n)
+            .strip_prefix(build_dir)
+            .map(Path::to_path_buf)
+        else {
+            continue;
+        };
+        if rel
+            .components()
+            .next()
+            .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
+            && !out.contains(&rel)
+        {
+            out.push(rel);
+        }
+    }
+    out
 }
 
 /// The directory a command runs in, relative to the build dir, read from the
@@ -12672,8 +12723,8 @@ mod cmake_script_reference_tests {
         cmake_definitions, cmake_dotted_stamp_outputs, cmake_p_references,
         cmake_p_stamp_edge_writes, cmake_script_arg, cmake_script_included_modules,
         cmake_script_included_paths, cmake_script_referenced_paths, expand_cmake_vars,
-        gtkdoc_dirs_to_carry, gtkdoc_html_dir, gtkdoc_make_dirs, lexical_join, referenced_file_rel,
-        rewrite_cmdline, rewritten_cd_dir, undeclared_outputs, StoreDir,
+        gtkdoc_dirs_to_carry, gtkdoc_make_dirs, gtkdoc_written_outputs, lexical_join,
+        referenced_file_rel, rewrite_cmdline, rewritten_cd_dir, undeclared_outputs, StoreDir,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
@@ -13336,6 +13387,7 @@ endforeach()
         touch(&src.join("common/flatpak.h"), "");
         touch(&build.join("common/flatpak-enum-types.h"), "");
         touch(&src.join("subprojects/libglnx/libglnx.h"), "");
+        touch(&src.join("doc/reference/flatpak-sections.txt"), "");
         std::fs::create_dir_all(build.join("subprojects/libglnx")).unwrap();
         let s = src.display();
         // `--cflags` is ONE quoted argument, as meson writes it.
@@ -13358,8 +13410,8 @@ endforeach()
         .unwrap();
         let none = gtkdoc_dirs_to_carry(&build, &store, &rewritten_cd_dir(&other), &other);
         let made = gtkdoc_make_dirs(&build, &cmdline);
-        let html = gtkdoc_html_dir(&cmdline, &build);
-        let html_rw = gtkdoc_html_dir(&rewrite_cmdline(&cmdline, &build), &build);
+        let written = gtkdoc_written_outputs(&cmdline, &build);
+        let written_rw = gtkdoc_written_outputs(&rewrite_cmdline(&cmdline, &build), &build);
         let decl = vec![PathBuf::from("doc/reference/flatpak-decl.txt")];
         let via_undeclared = undeclared_outputs(&decl, Some(&cmdline), &build);
         let made_other = gtkdoc_make_dirs(
@@ -13385,19 +13437,27 @@ endforeach()
             vec!["common".to_string(), "subprojects/libglnx".to_string()]
         );
         assert!(made_other.is_empty(), "{made_other:?}");
-        // meson's install step copies `<builddir>/<subdir>/html`, so the
-        // edge declares it, read from either spelling of the command.
-        assert_eq!(html, Some(PathBuf::from("doc/reference/html")));
-        assert_eq!(html_rw, html);
-        assert!(
-            via_undeclared.contains(&PathBuf::from("doc/reference/html")),
-            "{via_undeclared:?}"
-        );
-        assert!(gtkdoc_html_dir(
+        // What gtkdochelper writes into the build doc dir: html (meson's
+        // install copies it), xml (mkdb), the copied main file, and the
+        // module's sections file the source dir has; read from either
+        // spelling of the command, and nothing for another subcommand.
+        let want: Vec<PathBuf> = ["html", "xml", "libflatpak-docs.xml", "flatpak-sections.txt"]
+            .iter()
+            .map(|n| PathBuf::from("doc/reference").join(n))
+            .collect();
+        assert_eq!(written, want);
+        assert_eq!(written_rw, want);
+        for w in &want {
+            assert!(
+                via_undeclared.contains(w),
+                "{w:?} not in {via_undeclared:?}"
+            );
+        }
+        assert!(gtkdoc_written_outputs(
             &format!("meson --internal exe --builddir={s}/build --subdir=x"),
             &build
         )
-        .is_none());
+        .is_empty());
     }
 }
 
