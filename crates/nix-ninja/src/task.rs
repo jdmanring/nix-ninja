@@ -4064,6 +4064,7 @@ fn build_task_derivation(
         .map(|c| {
             let mut v = vapigen_unwritten_outputs(c, &task.build_dir, &task.outputs);
             v.extend(gdbus_unwritten_outputs(c, &task.build_dir, &task.outputs));
+            v.extend(cmake_dotted_stamp_outputs(&task.outputs));
             v
         })
         .unwrap_or_default();
@@ -7756,6 +7757,29 @@ pub fn vapigen_unwritten_outputs(
                 p.extension().and_then(|e| e.to_str()),
                 Some("vapi" | "deps")
             )
+        })
+        .cloned()
+        .collect()
+}
+
+/// A CMake custom-target stamp whose name carries a dot: freerdp's
+/// `add_custom_target(${manpage}.target ALL COMMAND ...)` declares
+/// `client/X11/man/CMakeFiles/xfreerdp.1.target`, which nothing writes, and
+/// CMake's own utility targets declare `CMakeFiles/install.util` and the like.
+/// Real ninja never checks them. The task binary creates a missing stamp only
+/// for an EXTENSIONLESS name under `CMakeFiles/`, so these failed the task
+/// after the command succeeded. Only a direct child of a `CMakeFiles`
+/// directory with an extension: the extensionless stamps keep the task's
+/// rule and their emission, and `<target>.dir/` contents are never direct
+/// children.
+pub fn cmake_dotted_stamp_outputs(declared: &[PathBuf]) -> Vec<PathBuf> {
+    declared
+        .iter()
+        .filter(|p| {
+            p.extension().is_some()
+                && p.parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|d| d == "CMakeFiles")
         })
         .cloned()
         .collect()
@@ -11730,13 +11754,13 @@ fn included_paths_walk(
             continue;
         }
         out.push(path.clone());
-        // A regular file only: a composed path can name a device or fifo,
-        // and reading one would hang the driver.
         // A RELATIVE include is read against the directory the command runs
         // in, which is where cmake resolves it: `rewrite_cmdline` turns
         // opencv's `-DCMAKE_HELPER_SCRIPT=/build/source/build/...info.cmake`
         // into a bare name, and an absolute-only walk never read the helper
         // whose `set(OpenCV_SOURCE_DIR ...)` composes the next include.
+        // A regular file only: a composed path can name a device or fifo,
+        // and reading one would hang the driver.
         let on_disk = if path.starts_with('/') {
             PathBuf::from(&path)
         } else {
@@ -11745,6 +11769,21 @@ fn included_paths_walk(
         if depth < 4 && on_disk.is_file() {
             if let Ok(child) = std::fs::read_to_string(&on_disk) {
                 included_paths_walk(Path::new(&path), &child, vars, out, depth + 1, cwd);
+            }
+        }
+    }
+    // A `configure_file` INPUT composed from what the includes set is read
+    // AFTER them, once their `set` calls are in `vars`: opencv's pkg-config
+    // script builds `${OpenCV_SOURCE_DIR}/cmake/templates/opencv-XXX.pc.in`
+    // from the helper's `set`, a path no argument names. The caller keeps only files
+    // that exist.
+    for body in cmake_call_bodies(text, "configure_file") {
+        let Some(raw) = body.split_whitespace().next() else {
+            continue;
+        };
+        if let Some(path) = expand_cmake_vars(raw.trim_matches('"'), vars) {
+            if path.contains('/') && !out.contains(&path) {
+                out.push(path);
             }
         }
     }
@@ -11925,9 +11964,10 @@ fn sibling_dirs_of(dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod cmake_script_reference_tests {
     use super::{
-        cmake_definitions, cmake_p_references, cmake_script_arg, cmake_script_included_modules,
-        cmake_script_included_paths, cmake_script_referenced_paths, expand_cmake_vars,
-        lexical_join, referenced_file_rel, rewrite_cmdline, rewritten_cd_dir, StoreDir,
+        cmake_definitions, cmake_dotted_stamp_outputs, cmake_p_references, cmake_script_arg,
+        cmake_script_included_modules, cmake_script_included_paths, cmake_script_referenced_paths,
+        expand_cmake_vars, lexical_join, referenced_file_rel, rewrite_cmdline, rewritten_cd_dir,
+        StoreDir,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
@@ -12475,9 +12515,13 @@ endforeach()
             touch(
                 &src.join("cmake/OpenCVGenPkgconfig.cmake"),
                 "include(\"${CMAKE_HELPER_SCRIPT}\")\n\
-                 include(\"${OpenCV_SOURCE_DIR}/cmake/OpenCVUtils.cmake\")\n",
+                 include(\"${OpenCV_SOURCE_DIR}/cmake/OpenCVUtils.cmake\")\n\
+                 configure_file(\"${OpenCV_SOURCE_DIR}/cmake/templates/opencv-XXX.pc.in\"\n\
+                 \x20              \"${CMAKE_BINARY_DIR}/unix-install/${OPENCV_PC_FILE_NAME}\"\n\
+                 \x20              @ONLY)\n",
             );
             touch(&src.join("cmake/OpenCVUtils.cmake"), "");
+            touch(&src.join("cmake/templates/opencv-XXX.pc.in"), "");
             let cmdline = format!(
                 "cd {b} && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake \
                  -DCMAKE_HELPER_SCRIPT={b}/OpenCVGenPkgConfig.info.cmake \
@@ -12495,8 +12539,39 @@ endforeach()
                 want_utils,
                 "helper sets OpenCV_SOURCE_DIR: {sets}; staged {got:?}"
             );
+            // Line 148's template, composed from the same helper `set`.
+            assert_eq!(
+                got.contains(Path::new("../cmake/templates/opencv-XXX.pc.in")),
+                want_utils,
+                "helper sets OpenCV_SOURCE_DIR: {sets}; staged {got:?}"
+            );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// freerdp's manpage edge, its own declared output: after the sections
+    /// were staged the task died `declared output
+    /// client/X11/man/CMakeFiles/xfreerdp.1.target was not written by the
+    /// command`. The controls are the stamps whose emission must not move:
+    /// an extensionless stamp (the task binary creates it), an object under
+    /// `<target>.dir/`, and the manpage the command does write.
+    #[test]
+    fn a_dotted_custom_target_stamp_is_stamped_and_nothing_else_is() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(
+            cmake_dotted_stamp_outputs(&[p("client/X11/man/CMakeFiles/xfreerdp.1.target")]),
+            vec![p("client/X11/man/CMakeFiles/xfreerdp.1.target")]
+        );
+        assert_eq!(
+            cmake_dotted_stamp_outputs(&[p("src/CMakeFiles/install.util")]),
+            vec![p("src/CMakeFiles/install.util")]
+        );
+        assert!(cmake_dotted_stamp_outputs(&[
+            p("client/X11/man/CMakeFiles/manpages"),
+            p("client/X11/man/CMakeFiles/xfreerdp.dir/main.c.o"),
+            p("client/X11/man/xfreerdp.1"),
+        ])
+        .is_empty());
     }
 }
 
