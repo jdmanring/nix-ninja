@@ -1274,6 +1274,7 @@ impl Runner {
                     undeclared_files = cl2cpp_header(c, &config.build_dir)
                         .into_iter()
                         .chain(vapigen_vapi(c, &config.build_dir))
+                        .chain(cmake_p_stamp_edge_writes(&paths, c, &config.build_dir))
                         .collect();
                     undeclared_dirs = external_project_extract_dirs(c, &config.build_dir)
                         .into_iter()
@@ -7762,6 +7763,86 @@ pub fn vapigen_unwritten_outputs(
         .collect()
 }
 
+/// The build-tree files a dotted-stamp `cmake -P` edge's script writes with
+/// `file(WRITE <path> ...)`. freerdp's manpage target declares only
+/// `CMakeFiles/xfreerdp.1.target`, its script writes
+/// `${CURRENT_BINARY_DIR}/${manpage}`, and `install_freerdp_man` installs
+/// that file from the build tree, where real ninja leaves it and a task
+/// does not: an undeclared write stays in the task's sandbox. Declared here
+/// as an output so it is stored, placed, and rides the stamp to consumers.
+/// Gated on `cmake_dotted_stamp_outputs`, the edges that fail today, so
+/// every other `-P` edge emits what it did. Reads either spelling of the
+/// command: the original under the `/build` mirror, the rewritten one
+/// elsewhere.
+fn cmake_p_stamp_edge_writes(
+    declared: &[PathBuf],
+    cmdline: &str,
+    build_dir: &Path,
+) -> Vec<PathBuf> {
+    if cmake_dotted_stamp_outputs(declared).is_empty() {
+        return Vec::new();
+    }
+    let Ok(args) = shell_words::split(cmdline) else {
+        return Vec::new();
+    };
+    let cd = match args.as_slice() {
+        [cd, dir, and, ..] if cd == "cd" && and == "&&" => {
+            if dir.starts_with('/') {
+                relative_from(Path::new(dir), build_dir).unwrap_or_default()
+            } else {
+                PathBuf::from(dir)
+            }
+        }
+        _ => PathBuf::new(),
+    };
+    let Some(script) = cmake_script_arg(&args) else {
+        return Vec::new();
+    };
+    let script_path = if script.starts_with('/') {
+        PathBuf::from(script)
+    } else {
+        build_dir.join(rebase_post_cd(&cd, script))
+    };
+    let Ok(text) = fs::read_to_string(&script_path) else {
+        return Vec::new();
+    };
+    let mut vars = cmake_definitions(&args);
+    for (name, raw) in cmake_set_calls(&text) {
+        if let Some(v) = expand_cmake_vars(&raw, &vars) {
+            vars.insert(name, v);
+        }
+    }
+    let mut out = Vec::new();
+    for body in cmake_call_bodies(&text, "file") {
+        let mut toks = body.split_whitespace();
+        if toks.next() != Some("WRITE") {
+            continue;
+        }
+        let Some(p) = toks
+            .next()
+            .and_then(|raw| expand_cmake_vars(raw.trim_matches('"'), &vars))
+        else {
+            continue;
+        };
+        let rel = if p.starts_with('/') {
+            relative_from(Path::new(&p), build_dir)
+        } else {
+            Some(rebase_post_cd(&cd, &p))
+        };
+        let Some(rel) = rel.map(|r| lexical_join(Path::new(""), &r)) else {
+            continue;
+        };
+        let inside = rel
+            .components()
+            .next()
+            .is_some_and(|c| matches!(c, std::path::Component::Normal(_)));
+        if inside && !out.contains(&rel) {
+            out.push(rel);
+        }
+    }
+    out
+}
+
 /// A CMake custom-target stamp whose name carries a dot: freerdp's
 /// `add_custom_target(${manpage}.target ALL COMMAND ...)` declares
 /// `client/X11/man/CMakeFiles/xfreerdp.1.target`, which nothing writes, and
@@ -7904,6 +7985,11 @@ fn undeclared_outputs(
         if let Some(vapi) = vapigen_vapi(c, build_dir) {
             if !v.contains(&vapi) {
                 v.push(vapi);
+            }
+        }
+        for w in cmake_p_stamp_edge_writes(declared, c, build_dir) {
+            if !v.contains(&w) {
+                v.push(w);
             }
         }
         // AN EXTERNALPROJECT DOWNLOAD EXTRACTS INTO `SOURCE_DIR` AND
@@ -11964,9 +12050,10 @@ fn sibling_dirs_of(dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod cmake_script_reference_tests {
     use super::{
-        cmake_definitions, cmake_dotted_stamp_outputs, cmake_p_references, cmake_script_arg,
-        cmake_script_included_modules, cmake_script_included_paths, cmake_script_referenced_paths,
-        expand_cmake_vars, lexical_join, referenced_file_rel, rewrite_cmdline, rewritten_cd_dir,
+        cmake_definitions, cmake_dotted_stamp_outputs, cmake_p_references,
+        cmake_p_stamp_edge_writes, cmake_script_arg, cmake_script_included_modules,
+        cmake_script_included_paths, cmake_script_referenced_paths, expand_cmake_vars,
+        lexical_join, referenced_file_rel, rewrite_cmdline, rewritten_cd_dir, undeclared_outputs,
         StoreDir,
     };
     use std::collections::{BTreeSet, HashMap};
@@ -12572,6 +12659,42 @@ endforeach()
             p("client/X11/man/xfreerdp.1"),
         ])
         .is_empty());
+    }
+
+    /// freerdp's manpage edge writes `client/X11/man/xfreerdp.1` and declares
+    /// only its dotted stamp; `install_freerdp_man` installs the file from
+    /// the build tree. Both spellings production hands over are read: the
+    /// original command (the `/build` mirror) and the rewritten one. The
+    /// control is the same edge with an extensionless stamp, which must emit
+    /// exactly what it did.
+    #[test]
+    fn a_dotted_stamp_edge_declares_the_manpage_its_script_writes() {
+        let root = std::env::temp_dir().join(format!("nn-manpage-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, build) = (root.join("source"), root.join("source/build"));
+        std::fs::create_dir_all(build.join("client/X11/man")).unwrap();
+        touch(
+            &src.join("cmake/GenerateManpages.cmake"),
+            FREERDP_MANPAGE_SCRIPT,
+        );
+        let cmdline = format!(
+            r#"cd {b}/client/X11/man && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -Dtemplate="xfreerdp.1" -DMANPAGE_NAME="xfreerdp" -Dmanpage="xfreerdp.1" -DMAN_TODAY="1980-01-01" -DCURRENT_SOURCE_DIR="{s}/client/X11/man" -DCURRENT_BINARY_DIR="{b}/client/X11/man" -Dtarget="xfreerdp" -Dsection="1" -Ddependencies="../../common/man/freerdp-global-options.1 xfreerdp-shortcuts.1" -P "{s}/cmake/GenerateManpages.cmake""#,
+            b = build.display(),
+            s = src.display()
+        );
+        let rewritten = rewrite_cmdline(&cmdline, &build);
+        let stamp = vec![PathBuf::from("client/X11/man/CMakeFiles/xfreerdp.1.target")];
+        let plain = vec![PathBuf::from("client/X11/man/CMakeFiles/manpages")];
+        let want = vec![PathBuf::from("client/X11/man/xfreerdp.1")];
+        let got_orig = cmake_p_stamp_edge_writes(&stamp, &cmdline, &build);
+        let got_rw = cmake_p_stamp_edge_writes(&stamp, &rewritten, &build);
+        let via_undeclared = undeclared_outputs(&stamp, Some(&cmdline), &build);
+        let control = undeclared_outputs(&plain, Some(&cmdline), &build);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got_orig, want);
+        assert_eq!(got_rw, want);
+        assert!(via_undeclared.contains(&want[0]), "{via_undeclared:?}");
+        assert!(!control.contains(&want[0]), "{control:?}");
     }
 }
 
