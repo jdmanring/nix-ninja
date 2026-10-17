@@ -2510,7 +2510,7 @@ impl Runner {
             // Files ride `referenced`; directories take the guarded directory
             // upload the autogen plan uses.
             if let Some(doxyfile) = &doxyfile {
-                for p in doxygen_referenced_paths(&cmd_cwd, doxyfile) {
+                for p in doxygen_referenced_paths(&self.config.build_dir, &cmd_cwd, doxyfile) {
                     if p.is_dir() {
                         if p.starts_with(&self.config.store_dir)
                             || !same_project_tree(&self.config.build_dir, &p)
@@ -10846,13 +10846,17 @@ const DOXYFILE_PATH_TAGS: [&str; 15] = [
 /// values; `$(ENV)` expansion and `@INCLUDE` transitivity are not followed
 /// (the included file itself is carried). A Doxyfile that needs either
 /// names the next arm.
-fn doxygen_referenced_paths(cwd: &Path, doxyfile: &Path) -> Vec<PathBuf> {
-    let path = if doxyfile.is_absolute() {
-        doxyfile.to_path_buf()
-    } else {
-        cwd.join(doxyfile)
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+fn doxygen_referenced_paths(build_dir: &Path, cwd: &Path, doxyfile: &Path) -> Vec<PathBuf> {
+    // The Doxyfile comes from the DISCOVERY argv, which `rewrite_cmdline`
+    // has respelled build-root relative and stripped of a `cd` above the
+    // build dir (`cd /build/source && doxygen /build/source/build/doc/Doxyfile`
+    // reaches here as `doxygen doc/Doxyfile`), so the cwd alone names a file
+    // that does not exist. The values inside it are not respelled and stay
+    // relative to the cwd. Same two candidates as the glib-mkenums reader.
+    let path = [cwd.join(doxyfile), build_dir.join(doxyfile)]
+        .into_iter()
+        .find(|p| p.is_file());
+    let Some(text) = path.and_then(|p| std::fs::read_to_string(p).ok()) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -19870,15 +19874,30 @@ TAGFILES               = "../qt.tag=https://doc.qt.io" other.tag
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("build/doc")).expect("mkdir");
         std::fs::write(root.join("build/doc/Doxyfile"), RAPIDJSON).expect("write");
-        let got = doxygen_referenced_paths(&root, &root.join("build/doc/Doxyfile"));
+        // The Doxyfile argument as production derives it: from the DISCOVERY
+        // argv `rewrite_cmdline` makes of rapidjson's edge, where the `cd`
+        // above the build dir is dropped and the path is build-root relative.
+        let build_dir = root.join("build");
+        let orig = format!(
+            "cd {} && doxygen {}/build/doc/Doxyfile",
+            root.display(),
+            root.display()
+        );
+        let args = shell_words::split(&super::rewrite_cmdline(&orig, &build_dir)).expect("split");
+        let doxyfile = doxygen_invocation(&args).expect("a doxygen edge");
+        assert!(doxyfile.is_relative(), "{doxyfile:?}");
+        let got = doxygen_referenced_paths(&build_dir, &root, &doxyfile);
         assert_eq!(got[0], root.join("readme.md"));
         assert!(got.contains(&root.join("./doc/misc/header.html")));
         assert!(got.contains(&root.join("include/")));
         assert!(got.contains(&root.join("../qt.tag")), "{got:?}");
         assert!(!got.iter().any(|p| p.ends_with("commented.md")));
-        assert!(
-            doxygen_referenced_paths(Path::new("/nonexistent"), Path::new("Doxyfile")).is_empty()
-        );
+        assert!(doxygen_referenced_paths(
+            Path::new("/nonexistent"),
+            Path::new("/nonexistent"),
+            Path::new("Doxyfile")
+        )
+        .is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
