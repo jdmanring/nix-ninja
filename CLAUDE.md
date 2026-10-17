@@ -4,7 +4,11 @@ measurement and retraction: `local/incidents/2026-09-04-claude-md-full-record.md
 `local/incidents/2026-10-16-claude-md-full-record.md` (the file this one
 replaced); read them before changing any status here.
 
-@local/claude-md-detail.md
+Reference, read on demand and never imported (it is 65 KB and the
+instruction budget is 120 KB across all files): `local/claude-md-detail.md`
+holds the error signatures (log line to status row), gate controls and
+instruments, counters and variables, verification revisions and consumer
+references. Open it when a round fails or a gate needs its control.
 
 ## What this is
 
