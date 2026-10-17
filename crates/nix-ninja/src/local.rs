@@ -4,7 +4,8 @@ use harmonia_store_path::StoreDir;
 use nix_builder_rpc_client::{BuilderRpcClient, Patience};
 use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub fn build_derived_files(
@@ -126,8 +127,17 @@ pub fn symlink_derived_files(
         );
         derived_files.extend(extra);
     }
-    let derived_files = &derived_files;
+    place_realised(store_dir, prefix, &derived_files, &store_paths)
+}
 
+/// Place realised outputs: the half of `symlink_derived_files` after the
+/// daemon has answered, so a test can drive every placement route.
+fn place_realised(
+    store_dir: &StoreDir,
+    prefix: &Path,
+    derived_files: &[DerivedFile],
+    store_paths: &[harmonia_store_path::StorePath],
+) -> Result<()> {
     // Create new DerivedFiles with opaque store paths instead of placeholders
     let opaque_files: Vec<DerivedFile> = derived_files
         .iter()
@@ -224,7 +234,37 @@ pub fn symlink_derived_files(
     }
     placed?;
     refresh_placed_mtimes(prefix, store_dir, &symlink_files);
+    scrub_placed_runpaths(prefix, &opaque_files);
     Ok(())
+}
+
+/// Scrub every placement that is a regular file by now, whichever route
+/// made it one: a link `refresh_placed_mtimes` turned into bytes, a
+/// `$ORIGIN`-relative file `create_symlinks` copied, or a placeholder
+/// restore. Placed links and directories are not read. A failure leaves
+/// the file as placed and is counted on one line, since the only later
+/// symptom is the fixup audit's refusal.
+///
+/// DEFER(a refused library inside a placed directory output): the files of
+/// a directory input are not walked here, though `refresh_tree_mtimes`
+/// walks them.
+fn scrub_placed_runpaths(prefix: &Path, files: &[DerivedFile]) {
+    let mut failed: Vec<String> = Vec::new();
+    for df in files {
+        let dest = prefix.join(&df.build_path);
+        if !dest.is_file() || dest.is_symlink() {
+            continue;
+        }
+        if let Err(e) = scrub_placed_runpath(&dest, dest.parent().unwrap_or(Path::new(""))) {
+            failed.push(format!("{}: {e}", dest.display()));
+        }
+    }
+    if let Some(first) = failed.first() {
+        eprintln!(
+            "nix-ninja: runpath scrub failed on {} placed file(s); first {first}",
+            failed.len()
+        );
+    }
 }
 
 /// Outputs left unplaced because a restore could not reach their placeholder
@@ -441,6 +481,365 @@ fn clone_or_copy(src: &Path, dest: &Path) -> std::io::Result<()> {
     drop(df);
     std::fs::copy(src, dest)?;
     Ok(())
+}
+
+/// Drop from a placed ELF file's runpath every absolute entry that repeats
+/// the expansion of an EARLIER `$ORIGIN` entry against `dir`, the directory
+/// the file is placed in.
+///
+/// The task binary resolves a needed library through a `$ORIGIN` climb into
+/// the build tree and appends that directory as an absolute entry as well
+/// (weston's plugins: `$ORIGIN/../frontend` then `/build/source/build/frontend`).
+/// The fixup's `patchelf --shrink-rpath` keeps it, since the library is
+/// there, and the audit then refuses the installed file for naming `/build`.
+/// Every other entry, empty and `$ORIGIN` included, stays in place and in
+/// order. The string is rewritten in place, NUL-padded to its old length,
+/// the way meson's depfixer does; the rest of the file and its mode are
+/// untouched.
+///
+/// The drop changes no lookup in the build tree: the loader reaches that
+/// directory through the earlier `$ORIGIN` entry first. That holds while
+/// the lexical expansion and the kernel's agree, which a symlinked
+/// directory between the file and the climb's target would break; and an
+/// in-place write reaches every hard link of the file, where placements
+/// are fresh inodes.
+///
+/// `Ok` for anything the scrub does not apply to (not ELF64 little-endian,
+/// not an executable or shared library, no runpath, nothing to drop); `Err`
+/// from the open, read, seek or write.
+///
+/// DEFER(a refused install naming a deepened task build dir): the
+/// expansion assumes the placed file's dir is the one the task ran in.
+/// DEFER(an ELF32 output refused for the same entry): ELF64 only.
+fn scrub_placed_runpath(path: &Path, dir: &Path) -> std::io::Result<()> {
+    // Read-only until there is something to drop: most placements are not
+    // rewritten, and a write open of a running or read-only file fails.
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut head = [0u8; 0x40];
+    if f.read_exact(&mut head).is_err() || !crate::task::is_elf64_le(&head) {
+        return Ok(());
+    }
+    // e_type: ET_EXEC 2, ET_DYN 3. An object file carries no runpath, and
+    // objects are most of what is placed, so they are never read whole.
+    if !matches!(u16::from_le_bytes([head[0x10], head[0x11]]), 2 | 3) {
+        return Ok(());
+    }
+    let mut data = head.to_vec();
+    f.read_to_end(&mut data)?;
+    let Some((off, len)) = runpath_string(&data) else {
+        return Ok(());
+    };
+    let Some(new) = std::str::from_utf8(&data[off..off + len])
+        .ok()
+        .and_then(|old| scrub_runpath(old, dir))
+    else {
+        return Ok(());
+    };
+    let mut bytes = new.into_bytes();
+    bytes.resize(len, 0);
+    // Every placement route leaves the file owner-writable: a refresh and a
+    // restore add owner write, and `create_symlinks` clears read-only on the
+    // copies it makes. The write goes only to the inode that was read.
+    let mut w = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let (r, m) = (f.metadata()?, w.metadata()?);
+    if (r.dev(), r.ino()) != (m.dev(), m.ino()) {
+        return Err(std::io::Error::other("replaced between read and write"));
+    }
+    w.seek(SeekFrom::Start(off as u64))?;
+    w.write_all(&bytes)
+}
+
+/// The file offset and length of an ELF64 little-endian file's
+/// `DT_RUNPATH` string (else `DT_RPATH`), mapped through the `PT_LOAD`
+/// segments the way the loader maps `DT_STRTAB`; `None` for anything the
+/// walk cannot read.
+fn runpath_string(data: &[u8]) -> Option<(usize, usize)> {
+    let at = |o: usize, n: usize| data.get(o..o.checked_add(n)?);
+    let u16le = |o| Some(u16::from_le_bytes(at(o, 2)?.try_into().ok()?) as usize);
+    let u32le = |o| Some(u32::from_le_bytes(at(o, 4)?.try_into().ok()?));
+    let u64le = |o| usize::try_from(u64::from_le_bytes(at(o, 8)?.try_into().ok()?)).ok();
+    // A field read past the end of the address space is a miss, not a panic.
+    let fld = |base: usize, off: usize| u64le(base.saturating_add(off));
+    // Elf64_Phdr: p_type u32 at +0, p_offset +8, p_vaddr +0x10, p_filesz +0x20.
+    let (phoff, phentsize) = (u64le(0x20)?, u16le(0x36)?);
+    let phdrs = (0..u16le(0x38)?).filter_map(|i| phoff.checked_add(i.checked_mul(phentsize)?));
+    let dynamic = phdrs.clone().find(|&p| u32le(p) == Some(2))?;
+    let (dyn_off, dyn_size) = (fld(dynamic, 8)?, fld(dynamic, 0x20)?);
+    // Elf64_Dyn: d_tag at +0, d_val at +8. DT_STRTAB is an address; the
+    // runpath tags are offsets into that table.
+    let (mut strtab, mut runpath, mut rpath) = (None, None, None);
+    for e in (dyn_off..dyn_off.saturating_add(dyn_size)).step_by(16) {
+        match u64le(e)? {
+            0 => break,
+            5 => strtab = fld(e, 8),
+            29 => runpath = fld(e, 8),
+            15 => rpath = fld(e, 8),
+            _ => {}
+        }
+    }
+    let vaddr = strtab?.checked_add(runpath.or(rpath)?)?;
+    let off = phdrs.filter(|&p| u32le(p) == Some(1)).find_map(|p| {
+        let (o, va, sz) = (fld(p, 8)?, fld(p, 0x10)?, fld(p, 0x20)?);
+        if !(va..va.checked_add(sz)?).contains(&vaddr) {
+            return None;
+        }
+        o.checked_add(vaddr - va)
+    })?;
+    let len = data.get(off..)?.iter().position(|&b| b == 0)?;
+    Some((off, len))
+}
+
+/// `runpath` without each absolute entry equal to the lexical expansion of
+/// an earlier `$ORIGIN` entry against `dir`; `None` when nothing is dropped.
+pub(crate) fn scrub_runpath(runpath: &str, dir: &Path) -> Option<String> {
+    let mut origins: Vec<PathBuf> = Vec::new();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped = false;
+    for e in runpath.split(':') {
+        let rest = e
+            .strip_prefix("$ORIGIN")
+            .or_else(|| e.strip_prefix("${ORIGIN}"))
+            .filter(|r| r.is_empty() || r.starts_with('/'));
+        if let Some(rest) = rest {
+            let climb = Path::new(rest.trim_start_matches('/'));
+            origins.push(crate::task::lexical_join(dir, climb));
+        } else if e.starts_with('/') && origins.iter().any(|o| o == Path::new(e)) {
+            dropped = true;
+            continue;
+        }
+        kept.push(e);
+    }
+    dropped.then(|| kept.join(":"))
+}
+
+#[cfg(test)]
+mod scrub_runpath_tests {
+    use super::{place_realised, scrub_runpath, SingleDerivedPath};
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::DerivedFile;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    #[test]
+    fn only_a_later_absolute_repeat_of_an_origin_expansion_is_dropped() {
+        let dir = Path::new("/b/plugin");
+        let cases: &[(&str, Option<&str>)] = &[
+            // weston's shape: the climb, the store entries, the repeat.
+            (
+                "$ORIGIN/../frontend:/s/lib:/b/frontend",
+                Some("$ORIGIN/../frontend:/s/lib"),
+            ),
+            (
+                "${ORIGIN}/../frontend:/b/frontend",
+                Some("${ORIGIN}/../frontend"),
+            ),
+            ("$ORIGIN:::/b/plugin", Some("$ORIGIN::")),
+            // An absolute entry ahead of the climb is a first occurrence.
+            ("/b/frontend:$ORIGIN/../frontend", None),
+            // An empty entry is not `$ORIGIN`, whatever the loader does with it.
+            (":/b/plugin", None),
+            // Read as `$ORIGIN` + `AL/../..`, this would land on /b/frontend.
+            ("$ORIGINAL/../../frontend:/b/frontend", None),
+            ("$ORIGIN/../frontend:/b/other", None),
+            ("/s/lib", None),
+        ];
+        for (runpath, want) in cases {
+            assert_eq!(scrub_runpath(runpath, dir).as_deref(), *want, "{runpath}");
+        }
+    }
+
+    fn have(tool: &str) -> bool {
+        Command::new(tool).arg("--version").output().is_ok()
+    }
+
+    /// `readelf -d`'s runpath (or rpath) line: a reader independent of the
+    /// one under test.
+    fn readelf_runpath(f: &Path) -> String {
+        let out = Command::new("readelf").arg("-d").arg(f).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.lines()
+            .find(|l| l.contains("(RUNPATH)") || l.contains("(RPATH)"))
+            .and_then(|l| Some(l.split_once('[')?.1.trim_end_matches(']').to_string()))
+            .unwrap_or_else(|| panic!("no runpath in {}: {text}", f.display()))
+    }
+
+    /// `$out` for the restore arm, and the placeholder a task output carries
+    /// in its place (`outer_rewrite_map`, which hashes the output name).
+    const OUT: &str = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-wtest-1";
+
+    fn with_out<T>(out: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _env = crate::task::OUT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match out {
+            Some(o) => {
+                std::env::set_var("outputs", "out");
+                std::env::set_var("out", o);
+            }
+            None => {
+                std::env::remove_var("outputs");
+                std::env::remove_var("out");
+            }
+        }
+        let r = f();
+        std::env::remove_var("outputs");
+        std::env::remove_var("out");
+        r
+    }
+
+    fn placeholder() -> String {
+        with_out(Some(OUT), crate::task::outer_rewrite_map)[0]
+            .1
+            .clone()
+    }
+
+    /// Link with gcc into a store-shaped dir (read-only, as the store is)
+    /// and place it through `place_realised`, the half of
+    /// `symlink_derived_files` after the daemon answers, so production picks
+    /// the route: a link refreshed into bytes, a `$ORIGIN`-relative copy, or
+    /// a placeholder restore when `out` is set.
+    fn place(
+        d: &Path,
+        tag: &str,
+        args: &[&str],
+        build_path: &str,
+        out: Option<&str>,
+    ) -> (PathBuf, PathBuf) {
+        let store_root = d.join("store");
+        std::fs::create_dir_all(&store_root).unwrap();
+        let unit = "int f(void) { return 1; }\nint main(void) { return f(); }\n";
+        std::fs::write(d.join("x.c"), unit).unwrap();
+        let src = store_root.join(format!(
+            "1ccccccccccccccccccccccccccccccc-ninja-build-{tag}"
+        ));
+        let st = Command::new("gcc")
+            .args(args)
+            .arg(d.join("x.c"))
+            .arg("-o")
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(st.success(), "gcc {args:?}");
+        let ro = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(&src, ro).unwrap();
+        let store_dir = StoreDir::new(&store_root).unwrap();
+        let df = DerivedFile::from_encoded(&store_dir, &format!("{}:{build_path}:", src.display()))
+            .unwrap();
+        let SingleDerivedPath::Opaque(sp) = df.derived_path.clone() else {
+            unreachable!("an encoded store file is opaque")
+        };
+        let build = d.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        with_out(out, || place_realised(&store_dir, &build, &[df], &[sp])).unwrap();
+        let dest = build.join(build_path);
+        assert!(!dest.is_symlink(), "{build_path} was placed as bytes");
+        (src, dest)
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("nn-rps-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// The bytes differ only inside one window shorter than `max`.
+    fn differ_within(a: &[u8], b: &[u8], max: usize) -> bool {
+        let diff: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+        a.len() == b.len() && diff.last().is_some_and(|l| l - diff[0] < max)
+    }
+
+    #[test]
+    fn a_placed_library_loses_the_build_tree_repeat_and_nothing_else() {
+        if !have("gcc") || !have("readelf") {
+            eprintln!("SKIP: gcc and readelf are both needed to link a real library");
+            return;
+        }
+        // The non-PIE executable is ET_EXEC with its first PT_LOAD at
+        // 0x400000 against file offset 0, so `.dynstr`'s address and file
+        // offset differ; in a shared library they coincide. p_paddr equals
+        // p_vaddr in anything ld emits, so reading one for the other is not
+        // a defect these arms can see.
+        let fake = placeholder();
+        for (tag, dtags, exec, restored) in [
+            ("runpath", "--enable-new-dtags", false, false),
+            ("rpath", "--disable-new-dtags", false, false),
+            ("exec", "--enable-new-dtags", true, false),
+            // weston's plugins: the stdenv self-rpath arrives as the `out`
+            // placeholder, so the file takes the restore route.
+            ("restored", "--enable-new-dtags", false, true),
+        ] {
+            let d = scratch(tag);
+            let repeat = format!("{}/build/frontend", d.display());
+            let mid = if restored {
+                format!("{fake}/lib")
+            } else {
+                "/s/lib".into()
+            };
+            let flag = format!("-Wl,{dtags},-rpath,$ORIGIN/../frontend:{mid}:{repeat}");
+            let args: &[&str] = if exec {
+                &["-no-pie", &flag]
+            } else {
+                &["-shared", "-fPIC", &flag]
+            };
+            let out = restored.then_some(OUT);
+            let (src, dest) = place(&d, tag, args, "plugin/x", out);
+            if exec {
+                let h = Command::new("readelf")
+                    .arg("-h")
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                let h = String::from_utf8_lossy(&h.stdout).into_owned();
+                assert!(h.contains("EXEC (Executable file)"), "{tag}: {h}");
+            }
+            let before = readelf_runpath(&src);
+            let after = readelf_runpath(&dest);
+            // Control: the real linker wrote the shape the scrub is for.
+            let shape = format!("$ORIGIN/../frontend:{mid}:{repeat}");
+            assert!(before.contains(&shape), "{tag}: {before}");
+            let want: Vec<&str> = before.split(':').filter(|e| *e != repeat).collect();
+            let want = want.join(":").replace(&fake, OUT);
+            assert_eq!(after, want, "{tag}: only the repeat goes");
+            // The restore's swap lies inside the same string, so one window
+            // still holds every changed byte.
+            let (a, b) = (std::fs::read(&src).unwrap(), std::fs::read(&dest).unwrap());
+            assert!(
+                differ_within(&a, &b, before.len()),
+                "{tag}: only the string moved"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    #[test]
+    fn an_object_and_a_library_without_the_repeat_are_left_byte_for_byte() {
+        if !have("gcc") || !have("readelf") {
+            eprintln!("SKIP: gcc and readelf are both needed to link a real library");
+            return;
+        }
+        // Placed one level shallower, the climb lands outside the tree and
+        // the same absolute entry repeats nothing.
+        let d = scratch("norep");
+        let flag = format!(
+            "-Wl,-rpath,$ORIGIN/../frontend:{}/build/frontend",
+            d.display()
+        );
+        let (src, dest) = place(&d, "norep", &["-shared", "-fPIC", &flag], "x.so", None);
+        assert_eq!(std::fs::read(&src).unwrap(), std::fs::read(&dest).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+        // An object carrying a runpath-shaped string is never read as one.
+        let d = scratch("obj");
+        let (src, dest) = place(&d, "obj", &["-c", "-fPIC"], "plugin/x.o", None);
+        assert_eq!(std::fs::read(&src).unwrap(), std::fs::read(&dest).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 #[cfg(test)]

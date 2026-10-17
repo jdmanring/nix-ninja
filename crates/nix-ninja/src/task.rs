@@ -6880,6 +6880,12 @@ fn placeholder_residue_plain(data: &[u8], restore: &[(String, String)]) -> Optio
         .map(|p| p.to_string())
 }
 
+/// ELFCLASS64, ELFDATA2LSB: the only shape a task on this platform writes,
+/// and the one the residue scan and the placed-runpath scrub both parse.
+pub(crate) fn is_elf64_le(data: &[u8]) -> bool {
+    data.len() >= 0x40 && data[..4] == *b"\x7fELF" && data[4] == 2 && data[5] == 1
+}
+
 /// The data of every `SHF_COMPRESSED` zlib section of a 64-bit little-endian
 /// ELF file, inflated; empty for anything else, which the caller has already
 /// scanned raw. Parsed by hand: the ELF header, one section-header walk and
@@ -6897,8 +6903,7 @@ fn compressed_sections(data: &[u8]) -> Vec<Vec<u8>> {
         data.get(o..o + 8)
             .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
     };
-    // ELFCLASS64, ELFDATA2LSB: the only shape a task on this platform writes.
-    if data.len() < 0x40 || &data[..4] != b"\x7fELF" || data[4] != 2 || data[5] != 1 {
+    if !is_elf64_le(data) {
         return Vec::new();
     }
     let (Some(shoff), Some(shentsize), Some(shnum)) = (u64le(0x28), u16le(0x3a), u16le(0x3c))
@@ -9884,7 +9889,7 @@ fn leading_parent_components(p: &Path) -> usize {
 /// becomes ../../../../../src/x against the build dir - resolvable by
 /// the existing five-up sandbox mirror, where the raw twenty-component
 /// climb is not. Pops past the base accumulate as leading `..`.
-fn lexical_join(base: &Path, rel: &Path) -> PathBuf {
+pub(crate) fn lexical_join(base: &Path, rel: &Path) -> PathBuf {
     let mut stack: Vec<std::path::Component> = base.components().collect();
     for c in rel.components() {
         match c {
@@ -20551,7 +20556,7 @@ mod self_rss_tests {
 /// same variables unlocked, which failed the pair inside `nix build` while
 /// every local run passed.
 #[cfg(test)]
-static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// THE SAME DEFECT AS THE LOCK ABOVE, ONE LEVEL DOWN, and it is why this file
 /// has a second file-scope lock rather than a second per-module one. The
