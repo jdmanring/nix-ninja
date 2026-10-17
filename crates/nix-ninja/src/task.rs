@@ -10,7 +10,8 @@ use harmonia_store_derivation::placeholder::Placeholder;
 use harmonia_store_path::{StoreDir, StorePath};
 use n2::{
     canon,
-    graph::{self, Build, BuildDependencies, BuildId, File, FileId},
+    densemap::Index,
+    graph::{self, Build, BuildDependencies, BuildId, File, FileId, Graph},
 };
 use nix_builder_rpc_client::BuilderRpcClient;
 use nix_ninja_task::derived_file::{DerivedFile, ENCODED_LIST_SEP};
@@ -213,6 +214,22 @@ struct Task {
     // (Runner::empty_dirs), and a compile gets every include directory its
     // command names that exists in the tree.
     make_dirs: Vec<String>,
+    /// UNRESOLVED-HEADER DEFERRAL, set by the discovery worker on a miss
+    /// the producer index answers. None for every task whose discovery
+    /// declares no indexed miss, which is the byte-identity case: the
+    /// deferral reaches the graph only through `DeferMiss::new_ids`, and
+    /// a miss the task already carries answers nothing.
+    defer: Option<DeferMiss>,
+    /// The producer index this task's discovery consults for misses. `Arc`
+    /// so the shared read-only table is handed to the worker threads;
+    /// `None` is the byte-identity case, which pays one `None` check.
+    producer_index: Option<Arc<ProducerIndex>>,
+    /// Whether this edge is a compile task (`is_compile_task`): the
+    /// miss-detection half of discovery consults the producer index only
+    /// for compiles, which is the population that fails on an unordered
+    /// header. A non-compile edge misses nothing this way and pays no
+    /// index lookups.
+    is_gcc_task: bool,
 }
 
 impl Deref for Task {
@@ -221,6 +238,145 @@ impl Deref for Task {
     fn deref(&self) -> &Self::Target {
         &self.build_deps
     }
+}
+
+/// One pass's producer index, built from the graph's own file entries
+/// before the schedule starts.
+///
+/// The class this exists for: a generated header the consumer reaches
+/// through an include directory but that NO edge orders after its
+/// producer - qtbase's gtk3 `QtWidgets/QWidget` in the Widgets syncqt tree,
+/// libsecret's `secret-enum-types.h`. Real ninja wins by timing on a shared
+/// filesystem; a sandbox task that declares only its graph inputs cannot.
+///
+/// Built from `graph.files` entries that carry a producing edge, never from
+/// the disk: the entries exist in every configuration, and the index is the
+/// same graph edit the dynamic pass already makes for an edge's declared
+/// inputs, only one pass early.
+#[derive(Clone)]
+pub struct ProducerIndex {
+    /// produced FILE path (canonical build-dir-relative spelling) -> the
+    /// graph node the edge that produces it writes.
+    pub files: rustc_hash::FxHashMap<String, FileId>,
+    /// module TREE directory -> one representative declared FileId of the
+    /// edge that produces the tree. A tree is not a graph node: its fids
+    /// are the edge's declared outputs, and the tree rides them as a
+    /// co-output. The representative is the tree's SMALLEST declared
+    /// spelling, which is deterministic and is one of the edge's outs.
+    pub trees: rustc_hash::FxHashMap<String, FileId>,
+}
+
+impl ProducerIndex {
+    /// The index entry a produced path reaches, by its canonical
+    /// build-dir-relative spelling: first the produced FILE entries, then
+    /// a path strictly inside an indexed TREE dir, which answers with the
+    /// tree's representative. The keys are the graph's own canonical
+    /// spellings, so an interior spelling and a tree directory that
+    /// differ only in a `..` compare equal.
+    pub fn fid_of_path(&self, p: &Path, build_dir: &Path) -> Option<FileId> {
+        // The candidate is an absolute path under the build dir (or the
+        // command's absolute include dir spelling); rebase to build-dir-
+        // relative so it compares against the graph's own names.
+        let rel = p.strip_prefix(build_dir).unwrap_or(p);
+        let normalized = normalize_build_path_lexical(rel);
+        let key = n2::canon::to_owned_canon_path(normalized.to_string_lossy().into_owned());
+        if let Some(fid) = self.files.get(&key) {
+            return Some(*fid);
+        }
+        self.trees
+            .iter()
+            .find(|(tree, _)| key.starts_with(&format!("{tree}/")))
+            .map(|(_, fid)| *fid)
+    }
+
+    /// The first index hit for a directive spelling, walking the
+    /// preprocessor search order the scanner walks: the quoted includer
+    /// directory, then the command's `-I` directories in the order
+    /// `include_dirs_as_given` returns them. The search is miss-only in
+    /// effect: a hit the task already carries is filtered by
+    /// `DeferMiss::new_ids` at the caller, so a task with no miss pays a
+    /// map lookup and nothing else, which is the byte-identity guarantee
+    /// this whole feature rests on.
+    pub fn hit(
+        &self,
+        name: &Path,
+        includer_dir: Option<&Path>,
+        dirs: &[String],
+        build_dir: &Path,
+    ) -> Option<FileId> {
+        if let Some(dir) = includer_dir {
+            if let Some(fid) = self.fid_of_path(&dir.join(name), build_dir) {
+                return Some(fid);
+            }
+        }
+        for d in dirs {
+            if let Some(fid) = self.fid_of_path(&Path::new(d).join(name), build_dir) {
+                return Some(fid);
+            }
+        }
+        None
+    }
+}
+
+/// One task's answer to its unresolved include: the sorted, deduplicated
+/// FileIds to add as implicit inputs - the producer's file node and the
+/// tree's representative - and the header's own spelling so the refusal
+/// names it.
+#[derive(Clone)]
+pub struct DeferMiss {
+    pub fids: Vec<FileId>,
+    pub header: String,
+}
+
+impl DeferMiss {
+    /// The FileIds in the deferral that are not already among the edge's
+    /// inputs. Empty means the task already carries everything, so the
+    /// deferral is a no-op and the ordinary emission stands.
+    pub fn new_ids(&self, edge: &Build) -> Vec<FileId> {
+        let have: HashSet<FileId> = edge.ordering_ins().iter().copied().collect();
+        let mut out: Vec<FileId> = self
+            .fids
+            .iter()
+            .filter(|f| !have.contains(f))
+            .copied()
+            .collect();
+        // FileId is a u32 wrapper with no Ord derive; sort by index so
+        // the implicit-input edit is a function of the SET rather of the
+        // order discovery found the misses.
+        out.sort_by_key(|a| a.index());
+        out.dedup();
+        out
+    }
+}
+
+/// Whether adding `producers` as the inputs of `consumer` would order the
+/// consumer after one of its own producers: a producer that transitively
+/// reaches the consumer through its ordering inputs. One DFS per
+/// deferral, cheap compared to the emission it answers.
+pub fn producer_cycle(graph: &Graph, consumer: BuildId, producers: &[BuildId]) -> Option<BuildId> {
+    let mut visited: HashSet<BuildId> = HashSet::new();
+    let mut stack: Vec<BuildId> = Vec::new();
+    for &p in producers {
+        if p == consumer {
+            return Some(p);
+        }
+        stack.push(p);
+    }
+    while let Some(bid) = stack.pop() {
+        if !visited.insert(bid) {
+            continue;
+        }
+        let build = &graph.builds[bid];
+        for &fid in build.ordering_ins() {
+            if let Some(p) = graph.files.by_id[fid].input {
+                if p == consumer {
+                    return Some(p);
+                }
+                stack.push(p);
+            }
+        }
+    }
+    None
 }
 
 /// BuildResult is the output of a Task.
@@ -242,6 +398,11 @@ pub struct BuildResult {
     /// Undeclared FILES among `derived_files` that a consumer must reach,
     /// attached to the rule's co-outputs the same way (`cl2cpp_header`).
     pub undeclared_files: Vec<PathBuf>,
+    /// The graph edit that turns this task's unresolved-include miss into
+    /// an input instead of a failing derivation. `None` unless discovery
+    /// ran and found an indexed miss, so every other task's result is
+    /// what it was before this field existed.
+    pub defer: Option<DeferMiss>,
     pub err: Option<Error>,
 }
 
@@ -635,6 +796,12 @@ pub struct Runner {
     /// carry them: the blanket's own gate, and a compile writes nothing
     /// beside its object.
     empty_dirs: Vec<String>,
+    /// The producer index this discovery pass reads, set once from
+    /// `build.rs` before the schedule starts. The Runner keeps it as
+    /// `Option`: a run with no produced graph entries is `None`, and the
+    /// byte-identity case (a task with no miss) pays a single `None`
+    /// check and emits exactly what it did without the field.
+    producer_index: Option<ProducerIndex>,
 
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
@@ -735,6 +902,7 @@ impl Runner {
             build_dir_inputs: HashMap::new(),
             alias_symlinks: Vec::new(),
             empty_dirs: Vec::new(),
+            producer_index: None,
             phony_aliases: HashMap::new(),
             stamp_inputs: HashMap::new(),
             stamp_input_files: HashMap::new(),
@@ -759,6 +927,65 @@ impl Runner {
     // Build systems like Meson may generate files via `configure_file` that are
     // not listed as implicit inputs in the build.ninja file. So we must read
     // the build directory and consider them implict inputs for all tasks.
+    /// Build the producer index from the graph's own file entries and
+    /// install it on this Runner. Called once, before the schedule
+    /// starts, so the miss-detection inside discovery runs against the
+    /// static answer rather than re-realising outputs. Returns the
+    /// Runner's index as the task threads will read it: `None` when the
+    /// graph declares no produced entries at all, which is the
+    /// byte-identity case - no task's discovery consults a table.
+    pub fn build_producer_index(&mut self, graph: &graph::Graph) {
+        use n2::densemap::Index as _;
+        use std::collections::BTreeMap;
+        let mut files: BTreeMap<String, Vec<FileId>> = BTreeMap::new();
+        // A tree directory is a produced path whose parent's own
+        // `is_tree_path` predicate answers `true`: the `include/<Module>`
+        // syncqt tree, the `<T>_autogen` tree. The representative is the
+        // SMALLEST declared spelling of the producer, which is
+        // deterministic and lands in `outs`.
+        let mut trees: BTreeMap<String, Vec<FileId>> = BTreeMap::new();
+        for fid in graph.files.by_id.all_ids() {
+            let file = &graph.files.by_id[fid];
+            let Some(bid) = file.input else {
+                continue;
+            };
+            let name = file.name.clone();
+            if !graph.builds[bid].outs().contains(&fid) {
+                continue;
+            }
+            if is_tree_path(Path::new(&name)) {
+                // A tree interior file: `include/QtWidgets/QtWidgetsVersion`
+                // or `include/QtWidgets/QtWidgets` (the directory node
+                // itself). The tree dir is the parent; for the directory
+                // node the parent is `include/`, which is not a tree, so
+                // fall back to the node's own name.
+                let dir = Path::new(&name)
+                    .parent()
+                    .filter(|p| is_tree_path(p))
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or(name.clone());
+                trees.entry(dir).or_default().push(fid);
+            } else {
+                files.entry(name).or_default().push(fid);
+            }
+        }
+        let files = files
+            .into_iter()
+            .filter_map(|(name, fids)| fids.into_iter().next().map(|fid| (name, fid)))
+            .collect();
+        let trees = trees
+            .into_iter()
+            .filter_map(|(dir, fids)| {
+                fids.iter()
+                    .min_by_key(|f| f.index())
+                    .copied()
+                    .map(|fid| (dir, fid))
+            })
+            .collect();
+        let index = ProducerIndex { files, trees };
+        self.producer_index = Some(index);
+    }
+
     pub fn read_build_dir(&mut self, graph: &mut graph::Graph) -> Result<()> {
         // A DEPFILE IS AN EDGE'S PRODUCT WITHOUT A NODE. The graph declares
         // it on the edge (`depfile =`), the compiler writes it, and it is
@@ -944,6 +1171,7 @@ impl Runner {
                 derived_files: Vec::new(),
                 undeclared_dirs: Vec::new(),
                 undeclared_files: Vec::new(),
+                defer: None,
                 err: None,
             })
             .context("completing phony build")?;
@@ -1173,37 +1401,50 @@ impl Runner {
 
         let config = self.config.clone();
         let rpc_client = self.rpc_client.clone();
+        // A DISCOVERED DEFERRAL CARRIES OUT OF THE THREAD AS THE RESULT'S
+        // OWN FIELD. The miss-detection set `task.defer` in
+        // `build_task_derivation` (the static arm), so the graph edit
+        // lands on the next pass: no derived path, no derived files, the
+        // scheduler makes the implicit-input edit and re-queues the edge.
+        // The byte-identity case is `defer_out = None`, which is what every
+        // task gets until a miss the producer index answers shows up.
+        let defer_out = task.defer.clone();
         std::thread::spawn(move || {
             let _permit = permit;
             let _pool_permit = pool_permit;
-            let (derived_path, err) = match build_task_derivation(
-                tools.clone(),
-                &rpc_client,
-                task.clone(),
-            ) {
-                Ok(drv) => match handle_derivation_result(
-                    tools.clone(),
-                    &rpc_client,
-                    task.clone(),
-                    drv.clone(),
-                    &config,
-                ) {
-                    Ok(final_derived_path) => (Some(final_derived_path), None),
-                    Err(err) => {
-                        // Cause FIRST and no multi-megabyte JSON dump:
-                        // at Chromium scale the dump swallowed the cause
-                        // chain and cost blind debugging rounds.
-                        (None, Some(err.context(format!(
+            let (derived_path, err) = if task.defer.is_some() {
+                // The miss was answered by the producer index before any
+                // store write: the task's own derivation stays unwritten,
+                // and the graph edit the scheduler makes on the re-run
+                // resolves it like any declared input. Nothing below
+                // touches the daemon on this path.
+                (None, None)
+            } else {
+                match build_task_derivation(tools.clone(), &rpc_client, task.clone()) {
+                    Ok(drv) => match handle_derivation_result(
+                        tools.clone(),
+                        &rpc_client,
+                        task.clone(),
+                        drv.clone(),
+                        &config,
+                    ) {
+                        Ok(final_derived_path) => (Some(final_derived_path), None),
+                        Err(err) => {
+                            // Cause FIRST and no multi-megabyte JSON dump:
+                            // at Chromium scale the dump swallowed the cause
+                            // chain and cost blind debugging rounds.
+                            (None, Some(err.context(format!(
                                 "Failed to handle derivation result for task (derivation: {}, {} inputs)",
                                 drv.name,
                                 task.inputs.len()
                             ))))
-                    }
-                },
-                Err(err) => (
-                    None,
-                    Some(err.context("Failed to build task derivation for task".to_string())),
-                ),
+                        }
+                    },
+                    Err(err) => (
+                        None,
+                        Some(err.context("Failed to build task derivation for task".to_string())),
+                    ),
+                }
             };
 
             // Create DerivedFiles for all outputs if successful
@@ -1329,6 +1570,7 @@ impl Runner {
                 derived_files,
                 undeclared_dirs,
                 undeclared_files,
+                defer: defer_out,
                 err,
             };
             let _ = tx.send(result);
@@ -1342,7 +1584,10 @@ impl Runner {
     /// whether it is fatal - under keep-going it abandons the failed
     /// subtree and drains the rest, so one round surfaces every
     /// independent failure instead of the first.
-    pub fn wait(&mut self, files: &mut graph::GraphFiles) -> Result<(BuildId, bool)> {
+    pub fn wait(
+        &mut self,
+        files: &mut graph::GraphFiles,
+    ) -> Result<(BuildId, bool, Option<DeferMiss>)> {
         let result = self.rx.recv().unwrap();
         if let Some(err) = result.err {
             // PREFIXED, because the failure path was the one part of the
@@ -1367,7 +1612,7 @@ impl Runner {
                 result.label, debug_info, result.bid
             );
 
-            return Ok((result.bid, false));
+            return Ok((result.bid, false, None));
         }
 
         // A DIRECTORY OUTPUT REACHES CONSUMERS ONLY BY RIDING A REAL ONE.
@@ -1410,7 +1655,13 @@ impl Runner {
             }
         }
 
-        Ok((result.bid, true))
+        // A DEFERRAL REACHES THE SCHEDULER HERE, not in a store write. The
+        // task's miss was answered by the producer index in
+        // `discover_c_includes`, and the deferral skips the emission above;
+        // the graph edit (an implicit input on the edge, added by the
+        // scheduler from `defer.new_ids`) lands on the next pass, and the
+        // task's `new_task` then resolves the input like any declared one.
+        Ok((result.bid, true, result.defer))
     }
 
     #[track_caller]
@@ -3236,6 +3487,10 @@ impl Runner {
                 .map(|r| (r.path.clone(), r.content.clone()))
                 .or(extra_rspfile),
             depfile: build.depfile.clone(),
+            producer_index: self
+                .producer_index
+                .as_ref()
+                .map(|idx| Arc::new(idx.clone())),
             verbose: self.config.verbose,
             files: build_files,
             inputs,
@@ -3244,6 +3499,11 @@ impl Runner {
             outer_stage_outputs,
             alias_symlinks: self.alias_symlinks.clone(),
             make_dirs,
+            // Set by the discovery worker when a miss the producer index
+            // answers; None is the byte-identity case, and the guard at the
+            // top of build_task_derivation reads it.
+            defer: None,
+            is_gcc_task,
         })
     }
 }
@@ -4012,8 +4272,35 @@ const VERBOSE_LOG_SUFFIX: &str = ".nn-verbose-log";
 fn build_task_derivation(
     tools: Tools,
     rpc_client: &Arc<BuilderRpcClient>,
-    task: Task,
+    mut task: Task,
 ) -> Result<Derivation> {
+    // A DISCOVERED DEFERRAL SKIPS THE EMISSION. The miss-detection in
+    // `discover_c_includes` set `task.defer` the moment it found a
+    // spelling the producer index answers; the graph edit lands on the
+    // next pass, where `new_task` resolves the added input like any
+    // declared one, so the task's own derivation is never written and
+    // no store write happens on this path. The spawn site checks
+    // `task.defer` before calling `handle_derivation_result` and drops
+    // the result, so this early return is the empty derivation and the
+    // only thing it needs is a well-formed name.
+    if task.defer.is_some() {
+        let name = task
+            .outs()
+            .first()
+            .and_then(|fid| task.files.get(fid))
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| "ninja-build".to_string());
+        let drv_name: harmonia_store_path::StorePathName = name
+            .parse()
+            .with_context(|| format!("parsing task name {name}"))?;
+        return Ok(Derivation::new(
+            drv_name,
+            task.system.clone().into_bytes().into(),
+            task_builder_path(&keyed_store_path(&task.store_dir, &tools.nix_ninja_task))?
+                .into_bytes()
+                .into(),
+        ));
+    }
     let cmdline = match &task.cmdline {
         Some(c) => c,
         None => {
@@ -4356,11 +4643,14 @@ fn build_task_derivation(
                 .map(|i| (i.build_path.clone(), i.build_path.clone()))
                 .collect();
 
-            let Discovered {
-                deps: discovered_deps,
-                store_paths: discovered_store_paths,
-                dotdot_dirs,
-            } = discover_c_includes(
+            let (
+                Discovered {
+                    deps: discovered_deps,
+                    store_paths: discovered_store_paths,
+                    dotdot_dirs,
+                },
+                defer,
+            ) = discover_c_includes(
                 rpc_client,
                 &task.store_dir,
                 &task.build_dir,
@@ -4368,7 +4658,15 @@ fn build_task_derivation(
                 files,
                 Some(virtual_paths),
                 task.depfile.as_deref().map(Path::new),
+                task.is_gcc_task
+                    .then(|| task.producer_index.as_ref().map(|v| v.as_ref()))
+                    .flatten(),
             )?;
+            // The deferral is recorded on the task for the worker to
+            // carry in the BuildResult. `build_task_derivation` skips
+            // the emission on a miss (see the guard at its top); the
+            // graph edit is made by the Scheduler from `defer.new_ids`.
+            task.defer = defer;
 
             declare_dotdot_dirs(&mut drv, &task.build_dir, &dotdot_dirs);
 
@@ -14143,7 +14441,7 @@ mod task_needs_cc_tests {
     }
 }
 
-fn is_compile_task<'a>(deps: Option<&str>, outs: impl Iterator<Item = &'a str>) -> bool {
+pub fn is_compile_task<'a>(deps: Option<&str>, outs: impl Iterator<Item = &'a str>) -> bool {
     deps == Some("gcc") && object_shaped_outputs(outs)
 }
 
@@ -16796,6 +17094,105 @@ pub struct Discovered {
     pub dotdot_dirs: Vec<PathBuf>,
 }
 
+/// The first unresolved include spelling the producer index answers, or
+/// None. Pure: reads the filesystem through `scan_directives` and
+/// `canonicalize_cached`, never the daemon, so the tests drive it over
+/// fixture trees. The one caller is the miss-detection in
+/// `discover_c_includes` below.
+///
+/// The walk resolved every spelling it could - a spelling the walk could
+/// not resolve is NOT in `c_includes` - so the miss is found by re-asking
+/// the question the scanner would have asked of the files it opened: for
+/// each seed file, take its directives and ask, in the compiler's own
+/// search order, whether each spelling resolves anywhere. The quoted
+/// spelling walks the includer's own directory first, then the `-I`
+/// directories in argv order; the angle spelling walks the `-I`
+/// directories only. `Scan.incomplete` is NOT the miss signal: it is set
+/// only for computed and macro includes that need real expansion, and a
+/// plain spelling that walks to nothing is the miss even when the scan
+/// reports itself complete.
+fn find_unresolved_miss(
+    idx: &ProducerIndex,
+    files: &[PathBuf],
+    cmdline: &str,
+    build_dir: &Path,
+    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+) -> Option<DeferMiss> {
+    let dirs = include_dirs_as_given(cmdline);
+    let mut seen: rustc_hash::FxHashSet<String> = Default::default();
+    for file in files {
+        let Ok(scan) = c_include_parser::scan_directives(file) else {
+            continue;
+        };
+        let includer_dir = file.parent().unwrap_or(file);
+        let quoted = scan.directives.iter().filter(|d| d.quoted).map(|d| &d.name);
+        let angled = scan
+            .directives
+            .iter()
+            .filter(|d| !d.quoted)
+            .map(|d| &d.name);
+        for name in quoted {
+            // Quoted spelling: includer dir first, then -I dirs.
+            // `canonicalize_cached` answers `Ok(None)` for absence, so
+            // only `Some` is a resolution; `is_ok` alone would read every
+            // missing header as found and no miss would ever fire.
+            let resolved = c_include_parser::canonicalize_cached(
+                includer_dir.join(name.clone()),
+                virtual_paths,
+            )
+            .is_ok_and(|o| o.is_some())
+                || dirs.iter().any(|i| {
+                    c_include_parser::canonicalize_cached(
+                        Path::new(i).join(name.clone()),
+                        virtual_paths,
+                    )
+                    .is_ok_and(|o| o.is_some())
+                });
+            if !resolved {
+                let key = n2::canon::to_owned_canon_path(
+                    normalize_build_path_lexical(name)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                if seen.insert(key) {
+                    if let Some(fid) = idx.hit(name, Some(includer_dir), &dirs, build_dir) {
+                        return Some(DeferMiss {
+                            fids: vec![fid],
+                            header: name.display().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        for name in angled {
+            let resolved = dirs.iter().any(|i| {
+                c_include_parser::canonicalize_cached(
+                    Path::new(i).join(name.clone()),
+                    virtual_paths,
+                )
+                .is_ok_and(|o| o.is_some())
+            });
+            if !resolved {
+                let key = n2::canon::to_owned_canon_path(
+                    normalize_build_path_lexical(name)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                if seen.insert(key) {
+                    if let Some(fid) = idx.hit(name, None, &dirs, build_dir) {
+                        return Some(DeferMiss {
+                            fids: vec![fid],
+                            header: name.display().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn discover_c_includes(
     rpc_client: &Arc<BuilderRpcClient>,
     store_dir: &StoreDir,
@@ -16804,7 +17201,8 @@ pub fn discover_c_includes(
     files: Vec<PathBuf>,
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
     depfile: Option<&Path>,
-) -> Result<Discovered> {
+    producer: Option<&ProducerIndex>,
+) -> Result<(Discovered, Option<DeferMiss>)> {
     // The virtual set is consumed by the scan below; the UPLOAD filter
     // further down needs it too, so keep a copy. See generated_not_yet_written.
     let virtual_declared: Option<HashMap<PathBuf, PathBuf>> = virtual_paths.clone();
@@ -17075,6 +17473,35 @@ pub fn discover_c_includes(
         }
         v
     };
+    // UNRESOLVED-HEADER DEFERRAL, the graph edit instead of a store write.
+    // The walk resolved every spelling it could - a spelling it could not
+    // resolve is NOT in `c_includes` - so the miss is found by re-asking the
+    // question the scanner would have asked of the files it opened: for
+    // each file the scan seeded, take its directives and ask, in the
+    // compiler's own search order, whether each spelling resolves
+    // anywhere. The quoted spelling walks the includer's own directory
+    // first, then the `-I` directories in argv order (the
+    // `include_dirs_as_given` list); the angle spelling walks the `-I`
+    // directories only. `Scan.incomplete` is NOT the miss signal: it is
+    // set only for computed and macro includes that need real expansion,
+    // and a plain spelling that walks to nothing is the miss even when
+    // the scan reports itself complete.
+    //
+    // The index answers it by name. A spelling that reaches a produced
+    // file, or a path strictly inside a module tree directory the
+    // producer edge declares, names the producer: the task defers until
+    // that producer has run. `incomplete` is a signal about the scan,
+    // not the producer index, and the two halves of the question stay
+    // apart.
+    //
+    // A pure function (`find_unresolved_miss`) so the search order the
+    // scanner walks is pinned without a daemon: `scan_directives` and
+    // `canonicalize_cached` read the filesystem alone, and the rpc client
+    // the upload needs never enters. The one call site is here; the tests
+    // drive that function over fixture trees.
+    let defer_miss = producer.as_ref().and_then(|idx| {
+        find_unresolved_miss(idx, &files, cmdline, build_dir, virtual_declared.as_ref())
+    });
     let c_include_count = c_includes.len();
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
@@ -17274,11 +17701,14 @@ pub fn discover_c_includes(
         std::sync::atomic::Ordering::Relaxed,
     );
 
-    Ok(Discovered {
-        deps: discovered_deps,
-        store_paths: discovered_store_paths,
-        dotdot_dirs,
-    })
+    Ok((
+        Discovered {
+            deps: discovered_deps,
+            store_paths: discovered_store_paths,
+            dotdot_dirs,
+        },
+        defer_miss,
+    ))
 }
 
 /// The build-path field of an encoded `store:build_path:rel` input.
@@ -21636,5 +22066,348 @@ mod vapigen_outputs_tests {
         let not_vapigen = "cd /build/source/build && valac --library=x a.vala";
         assert!(vapigen_vapi(not_vapigen, bd).is_none());
         assert!(vapigen_unwritten_outputs(not_vapigen, bd, &declared).is_empty());
+    }
+}
+
+/// THE UNORDERED-HEADER DEFERRAL, driven through the PRODUCTION function.
+/// The miss-detection half of `discover_c_includes` is the one function both
+/// discovery arms route through (the static arm in `build_task_derivation`
+/// and the local-mode arm through `handle_derivation_result`), so these
+/// drive it, not the loop around it, with the production argv shape read
+/// from the failing task drvs (the gtk3 compile's `-I.../build/include`
+/// array, the libsecret compile's `-Ilibsecret` family, the flatpak
+/// compile's `-Iapp` family).
+///
+/// A CONTROL READS A DIFFERENT SOURCE THAN ITS SUBJECT: the negative
+/// controls build the fixture from the same argv but put the header where
+/// the compiler would open it (an earlier include dir, the carried set),
+/// so the miss answers nothing for a reason the production code computed,
+/// not a reason the test invented. The lender is the repo's own loader:
+/// every `Graph` here is parsed from a real build.ninja through
+/// `n2::load::Loader`, which is how the scheduler reads it too.
+#[cfg(test)]
+mod unresolved_include_defer_tests {
+    use super::{find_unresolved_miss, DeferMiss, ProducerIndex};
+    use deps_infer::c_include_parser;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    fn graph_of(text: &str) -> n2::graph::Graph {
+        // Via Loader rather than n2::load::parse: inside load.rs that name
+        // is shadowed by the private `parse` module it imports, so the
+        // free function is not reachable from outside the crate.
+        let mut loader = n2::load::Loader::new();
+        let mut content = text.as_bytes().to_vec();
+        content.push(0);
+        loader
+            .parse(std::path::PathBuf::from("build.ninja"), &content)
+            .unwrap();
+        loader.graph
+    }
+
+    /// A producer index whose only tree is `include/QtWidgets`, as the
+    /// Widgets syncqt edge declares it: the tree rides its declared file
+    /// outputs, and the representative is the smallest one.
+    fn qt_widgets_index() -> (ProducerIndex, n2::graph::FileId) {
+        let g = graph_of(
+            "rule syncqt\n  command = syncqt $out\n\
+             build include/QtWidgets/QtWidgetsVersion include/QtWidgets/QtWidgets: syncqt\n\
+             rule cc\n  command = gcc -c $in -o $out\n\
+             build main.o: cc main.cpp\n",
+        );
+        let rep = g
+            .files
+            .lookup("include/QtWidgets/QtWidgetsVersion")
+            .unwrap();
+        let mut idx = ProducerIndex {
+            files: Default::default(),
+            trees: Default::default(),
+        };
+        idx.trees.insert("include/QtWidgets".to_string(), rep);
+        (idx, rep)
+    }
+
+    /// The gtk3 fixture, argv as its task drv carried it: the TU includes
+    /// `QtWidgets/QWidget` by angle, reachable only through
+    /// `-I<build>/include`, where the Widgets syncqt tree lands. The
+    /// header is absent - the producer is unordered - so the scan cannot
+    /// resolve it and the index must.
+    fn gtk_fixture(d: &super::Scratch) -> (PathBuf, String) {
+        let build = d.join("build");
+        let src = d.join("src");
+        std::fs::create_dir_all(build.join("include")).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        let tu = src.join("main.cpp");
+        std::fs::write(&tu, "#include <QtWidgets/QWidget>\nint main(){return 0;}\n").unwrap();
+        let cmd = format!(
+            "c++ -DQT_CORE_LIB -I{}/include -c {} -o main.o",
+            build.display(),
+            tu.display()
+        );
+        (tu, cmd)
+    }
+
+    /// POSITIVE, TREE ARM: an unresolved `QtWidgets/QWidget` spelling
+    /// inside the indexed `include/QtWidgets` tree defers, naming the
+    /// tree's representative fid.
+    #[test]
+    fn an_unresolved_spelling_inside_an_indexed_tree_defers() {
+        let _g = super::CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        let d = super::Scratch::new(format!("nn-defer-gtk3-{}", std::process::id()));
+        let (tu, cmd) = gtk_fixture(&d);
+        std::env::set_current_dir(d.join("build")).unwrap();
+        let (idx, rep) = qt_widgets_index();
+        let build = d.join("build");
+        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None);
+        std::env::set_current_dir(prev).unwrap();
+        let miss = got.expect("the unordered tree header must defer");
+        assert_eq!(miss.fids, vec![rep]);
+        assert_eq!(miss.header, "QtWidgets/QWidget");
+    }
+
+    /// NEGATIVE CONTROL, SAME SHAPE, DIFFERENT ANSWER: the same argv, but
+    /// the shadow header sits in an earlier include dir the task carries,
+    /// so the spelling resolves on disk and nothing defers.
+    #[test]
+    fn a_spelling_resolved_by_an_earlier_include_dir_is_not_a_miss() {
+        let _g = super::CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        let d = super::Scratch::new(format!("nn-defer-shadow-{}", std::process::id()));
+        let build = d.join("build");
+        let sys = d.join("sys");
+        let src = d.join("src");
+        std::fs::create_dir_all(sys.join("QtWidgets")).unwrap();
+        std::fs::create_dir_all(build.join("include")).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        // A stand-in the earlier dir resolves: QWidget exists HERE.
+        std::fs::write(sys.join("QtWidgets/QWidget"), "#pragma once\n").unwrap();
+        let tu = src.join("main.cpp");
+        std::fs::write(&tu, "#include <QtWidgets/QWidget>\nint main(){return 0;}\n").unwrap();
+        let cmd = format!(
+            "c++ -DQT_CORE_LIB -I{} -I{}/include -c {} -o main.o",
+            sys.display(),
+            build.display(),
+            tu.display()
+        );
+        std::env::set_current_dir(&build).unwrap();
+        let (idx, _) = qt_widgets_index();
+        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None);
+        std::env::set_current_dir(prev).unwrap();
+        assert!(got.is_none(), "the shadowed header resolves, so no miss");
+    }
+
+    /// NEGATIVE CONTROL: a system header with no index hit defers nothing,
+    /// even unresolved.
+    #[test]
+    fn an_unresolved_system_header_with_no_index_hit_defers_nothing() {
+        let _g = super::CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        let d = super::Scratch::new(format!("nn-defer-sys-{}", std::process::id()));
+        let build = d.join("build");
+        let src = d.join("src");
+        std::fs::create_dir_all(build.join("include")).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        let tu = src.join("main.cpp");
+        std::fs::write(&tu, "#include <stdio.h>\nint main(){return 0;}\n").unwrap();
+        let cmd = format!(
+            "c++ -I{}/include -c {} -o main.o",
+            build.display(),
+            tu.display()
+        );
+        std::env::set_current_dir(&build).unwrap();
+        let (idx, _) = qt_widgets_index();
+        // No `stdio.h` producer is indexed. Whether or not the host header
+        // resolves, the index answers nothing: the ordinary failure stands.
+        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None);
+        std::env::set_current_dir(prev).unwrap();
+        assert!(got.is_none());
+    }
+
+    /// POSITIVE, EXACT-FILE ARM: libsecret's `secret-enum-types.h`,
+    /// produced by the mkenums edge and reached through `-Ilibsecret`.
+    /// The argv spells the flatpak shape too (`-Iapp` reaching
+    /// `flatpak-permission-dbus-generated.h`): a declared output of an
+    /// unordered edge, included by quoted spelling from a header the task
+    /// carries. The header is absent, so the scan cannot resolve it and
+    /// the index must.
+    #[test]
+    fn an_unresolved_spelling_matching_a_produced_file_defers() {
+        let _g = super::CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        let d = super::Scratch::new(format!("nn-defer-enum-{}", std::process::id()));
+        let build = d.join("build");
+        std::fs::create_dir_all(build.join("libsecret")).unwrap();
+        let tu = build.join("libsecret/test.c");
+        std::fs::write(
+            &tu,
+            "#include \"secret-enum-types.h\"\nint x(){return 0;}\n",
+        )
+        .unwrap();
+        std::fs::write(build.join("libsecret/secret.h"), "#pragma once\n").unwrap();
+        let cmd = format!(
+            "gcc -Ilibsecret/test.p -Ilibsecret -I../libsecret -c {} -o test.o",
+            tu.display()
+        );
+        std::env::set_current_dir(&build).unwrap();
+        let g = graph_of(
+            "rule mkenums\n  command = glib-mkenums $in > $out\n\
+             build libsecret/secret-enum-types.h: mkenums libsecret/secret.h\n",
+        );
+        let fid = g.files.lookup("libsecret/secret-enum-types.h").unwrap();
+        let mut idx = ProducerIndex {
+            files: Default::default(),
+            trees: Default::default(),
+        };
+        idx.files
+            .insert("libsecret/secret-enum-types.h".to_string(), fid);
+        let got = find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None);
+        std::env::set_current_dir(prev).unwrap();
+        let miss = got.expect("the unordered generated header must defer");
+        assert_eq!(miss.fids, vec![fid]);
+        assert_eq!(miss.header, "secret-enum-types.h");
+    }
+
+    /// VIRTUAL MAP: a spelling the task already carries through its
+    /// identity virtual map is resolved, not a miss. This is the polarity
+    /// the byte-identity guarantee rests on: declared inputs never defer.
+    #[test]
+    fn a_spelling_the_task_already_carries_is_not_a_miss() {
+        let _g = super::CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        let d = super::Scratch::new(format!("nn-defer-carried-{}", std::process::id()));
+        let build = d.join("build");
+        std::fs::create_dir_all(build.join("libsecret")).unwrap();
+        let tu = build.join("libsecret/test.c");
+        std::fs::write(
+            &tu,
+            "#include \"secret-enum-types.h\"\nint x(){return 0;}\n",
+        )
+        .unwrap();
+        // The header EXISTS here, and the virtual map declares it: the
+        // scan resolves it, so the index is never consulted.
+        std::fs::write(
+            build.join("libsecret/secret-enum-types.h"),
+            "#pragma once\n",
+        )
+        .unwrap();
+        let cmd = format!(
+            "gcc -Ilibsecret/test.p -Ilibsecret -I../libsecret -c {} -o test.o",
+            tu.display()
+        );
+        std::env::set_current_dir(&build).unwrap();
+        let g = graph_of(
+            "rule mkenums\n  command = glib-mkenums $in > $out\n\
+             build libsecret/secret-enum-types.h: mkenums libsecret/secret.h\n",
+        );
+        let fid = g.files.lookup("libsecret/secret-enum-types.h").unwrap();
+        let mut idx = ProducerIndex {
+            files: Default::default(),
+            trees: Default::default(),
+        };
+        idx.files
+            .insert("libsecret/secret-enum-types.h".to_string(), fid);
+        let mut vp: HashMap<PathBuf, PathBuf> = HashMap::new();
+        let rel = PathBuf::from("libsecret/secret-enum-types.h");
+        vp.insert(rel.clone(), rel);
+        let got = find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, Some(&vp));
+        std::env::set_current_dir(prev).unwrap();
+        assert!(got.is_none(), "a carried header resolves, so no miss");
+    }
+
+    /// THE NEW-IDS FILTER, the byte-identity half: a deferral whose fids
+    /// the task already carries answers nothing new, so the ordinary
+    /// emission stands. Run on the production predicate, not a copy:
+    /// `DeferMiss::new_ids` against a `Build` the loader parsed.
+    #[test]
+    fn a_deferral_the_task_already_carries_adds_nothing() {
+        let g = graph_of(
+            "rule mkenums\n  command = glib-mkenums $in > $out\n\
+             build gen.h: mkenums src.h\n\
+             rule cc\n  command = gcc -c $in -o $out\n\
+             build a.o: cc a.c | gen.h\n",
+        );
+        let gen = g.files.lookup("gen.h").unwrap();
+        let consumer = g.files.by_id[g.files.lookup("a.o").unwrap()].input.unwrap();
+        let defer = DeferMiss {
+            fids: vec![gen],
+            header: "gen.h".to_string(),
+        };
+        // `a.o` already carries `gen.h` as an order-only input.
+        assert!(defer.new_ids(&g.builds[consumer]).is_empty());
+    }
+
+    /// THE NEW-IDS FILTER, POSITIVE HALF: a deferral naming a fid the edge
+    /// does NOT carry returns it, sorted and deduplicated. The mutant this
+    /// catches returns empty unconditionally (or skips the have-filter),
+    /// which would silently drop every deferral and re-emit the failing
+    /// derivation.
+    #[test]
+    fn a_deferral_the_task_does_not_carry_names_its_fids() {
+        let g = graph_of(
+            "rule mkenums\n  command = glib-mkenums $in > $out\n\
+             build gen.h: mkenums src.h\n\
+             build other.h: mkenums src.h\n\
+             rule cc\n  command = gcc -c $in -o $out\n\
+             build a.o: cc a.c\n",
+        );
+        let gen = g.files.lookup("gen.h").unwrap();
+        let other = g.files.lookup("other.h").unwrap();
+        let consumer = g.files.by_id[g.files.lookup("a.o").unwrap()].input.unwrap();
+        let defer = DeferMiss {
+            // Unsorted with a duplicate: the answer is the SET, not the
+            // order discovery found the misses.
+            fids: vec![other, gen, other],
+            header: "gen.h".to_string(),
+        };
+        let mut want = vec![gen, other];
+        want.sort_by_key(n2::densemap::Index::index);
+        assert_eq!(defer.new_ids(&g.builds[consumer]), want);
+    }
+
+    /// THE CYCLE GUARD, on the production predicate: a producer that
+    /// transitively reaches the consumer through its ordering inputs
+    /// refuses the deferral. Two UNORDERED edges pass (None); a producer
+    /// whose inputs reach the consumer fails (Some).
+    #[test]
+    fn a_producer_that_reaches_the_consumer_is_a_cycle() {
+        let mut g = graph_of(
+            "rule cc\n  command = gcc -c $in -o $out\n\
+             build a.o: cc a.c\n\
+             build b.h: cc b.c\n",
+        );
+        let consumer = g.files.by_id[g.files.lookup("a.o").unwrap()].input.unwrap();
+        let producer = g.files.by_id[g.files.lookup("b.h").unwrap()].input.unwrap();
+        // Unordered: no cycle.
+        assert!(super::producer_cycle(&g, consumer, &[producer]).is_none());
+        // Now order the producer after the consumer: b.h's edge gains the
+        // consumer's produced node as an implicit input (through the same
+        // graph edit the deferral makes), which the DFS follows back to
+        // the consumer.
+        let a_fid = g.files.lookup("a.o").unwrap();
+        crate::dyndep::add_implicit_input(&mut g, producer, a_fid);
+        assert_eq!(
+            super::producer_cycle(&g, consumer, &[producer]),
+            Some(consumer)
+        );
+    }
+
+    /// THE RESOLVER'S OWN ANSWER: `canonicalize_cached` is what the scan
+    /// walks, so this pins that a file the fixture wrote resolves. A
+    /// control for the two negatives above: if this failed, their `None`
+    /// would be evidence about the fixture, not the subject.
+    #[test]
+    fn a_fixture_header_the_fixture_wrote_resolves() {
+        let _g = super::CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        let d = super::Scratch::new(format!("nn-defer-resolves-{}", std::process::id()));
+        let build = d.join("build");
+        std::fs::create_dir_all(build.join("inc")).unwrap();
+        std::fs::write(build.join("inc/real.h"), "#pragma once\n").unwrap();
+        std::env::set_current_dir(&build).unwrap();
+        let got =
+            c_include_parser::canonicalize_cached(Path::new("inc").join("real.h"), None).is_ok();
+        std::env::set_current_dir(prev).unwrap();
+        assert!(got, "the fixture header must resolve");
     }
 }

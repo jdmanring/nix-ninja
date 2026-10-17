@@ -132,6 +132,12 @@ pub fn build(
         runner.read_build_dir(&mut loader.graph)?;
     }
 
+    // THE STATIC PRODUCER INDEX, built before the schedule starts and
+    // shared read-only with the worker threads. A miss that an unordered
+    // producer answers defers the task instead of emitting a derivation
+    // that would fail in the sandbox; the index is the static answer.
+    runner.build_producer_index(&loader.graph);
+
     let mut scheduler = Scheduler::new(&mut loader.graph, &mut runner);
 
     // DYNDEP, AND IT HAS TO HAPPEN BEFORE ANY REAL TARGET IS WANTED.
@@ -603,6 +609,64 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    /// The deferral graph edit: add the producer's fids as implicit inputs
+    /// of the consumer, move the edge from Running back to Want, and make
+    /// it Ready at once if `recheck_ready` now passes. Returns an error
+    /// when the cycle guard fires: adding the producer would order the
+    /// consumer after one of its own producers, which is the shape a
+    /// producer that already depends on the consumer would create.
+    fn handle_deferred_input(
+        &mut self,
+        consumer: BuildId,
+        defer: &task::DeferMiss,
+        new: &[n2::graph::FileId],
+    ) -> Result<()> {
+        if new.is_empty() {
+            // Nothing new to add: the task already carries every producer
+            // the miss answers, so the ordinary emission was correct and
+            // this deferral is a no-op.
+            return Ok(());
+        }
+        // The cycle guard answers the question before any graph edit: a
+        // producer that transitively reaches the consumer means the
+        // deferral would order the consumer after itself, which the
+        // scheduler would then wait on forever. Refuse it loudly rather
+        // than add the input.
+        let producers: Vec<n2::graph::BuildId> = new
+            .iter()
+            .filter_map(|fid| self.graph.files.by_id[*fid].input)
+            .collect();
+        if let Some(cycle) = task::producer_cycle(self.graph, consumer, &producers) {
+            let name = self.graph.builds[cycle]
+                .outs()
+                .first()
+                .map(|fid| self.graph.files.by_id[*fid].name.clone())
+                .unwrap_or_default();
+            anyhow::bail!(
+                "deferral refused: header {} names a producer that already depends on this edge ({name})",
+                defer.header
+            );
+        }
+        // Add the inputs using the same graph edit a dyndep entry makes,
+        // so the implicit-input run and the counts stay in step.
+        for fid in new {
+            dyndep::add_implicit_input(self.graph, consumer, *fid);
+        }
+        // Move the edge back to Want. It is Running now, and the implicit
+        // input lands inside that run, so the edge's ordering inputs are no
+        // longer all Done. `set` updates `total_pending` only on the
+        // Unneeded->X transition; a Running->Want move keeps the counters
+        // untouched, which is correct: the edge is still one the build owes.
+        self.build_states.set(consumer, BuildState::Want);
+        // Make it Ready at once if the producer is already done; otherwise
+        // `ready_dependents` re-checks it when the producer completes,
+        // through the file's `dependents` list `add_implicit_input` updated.
+        if self.recheck_ready(&self.graph.builds[consumer]) {
+            self.build_states.set(consumer, BuildState::Ready);
+        }
+        Ok(())
+    }
+
     fn run(&mut self) -> Result<()> {
         // NIX_NINJA_KEEP_GOING=1 is ninja's -k: a failed task abandons its
         // dependents (they stay unready forever) while every independent
@@ -634,10 +698,33 @@ impl<'a> Scheduler<'a> {
                 break;
             }
 
-            let (bid, ok) = self.runner.wait(&mut self.graph.files)?;
+            let (bid, ok, defer) = self.runner.wait(&mut self.graph.files)?;
             running -= 1;
             if ok {
-                self.ready_dependents(bid);
+                if let Some(defer) = defer {
+                    // A DISCOVERED DEFERRAL: the task's own miss was answered
+                    // by the producer index before any store write, so the
+                    // edge is re-queued with the producer's node added as an
+                    // implicit input. The re-run resolves that input like
+                    // any declared one and co-output expansion carries the
+                    // tree. `new_ids` is empty when the task already
+                    // carries everything the miss answers, which is the
+                    // no-op case; the cycle guard refuses a deferral that
+                    // would order the edge after itself.
+                    let build = &self.graph.builds[bid];
+                    let new = defer.new_ids(build);
+                    if let Err(e) = self.handle_deferred_input(bid, &defer, &new) {
+                        failed += 1;
+                        eprintln!("nix-ninja: deferred input {e}");
+                        if !keep_going {
+                            anyhow::bail!(
+                                "a deferral failed (set NIX_NINJA_KEEP_GOING=1 to collect all failures in one run)"
+                            );
+                        }
+                    }
+                } else {
+                    self.ready_dependents(bid);
+                }
             } else {
                 failed += 1;
                 if !keep_going {
@@ -687,5 +774,75 @@ mod system_tests {
         std::env::set_var("NIX_NINJA_SYSTEM", "");
         assert_ne!(host_nix_system(), "");
         std::env::remove_var("NIX_NINJA_SYSTEM");
+    }
+}
+
+/// THE DEFERRAL REQUEUE, run on the production state machine without a
+/// Runner. `handle_deferred_input` is the scheduler half; it needs a
+/// `Scheduler`, which needs a `Runner`, which needs a store. What the
+/// design pins here is the state the graph edit must leave behind, and
+/// that is all `BuildStates`: a Running edge moves back to Want with
+/// `total_pending` untouched (it is still one the build owes), the
+/// implicit input lands inside the implicit run (the same edit
+/// `add_implicit_input` makes), and the edge is Ready at once when its
+/// producer is Done. A cycle refuses loudly rather than waiting forever.
+///
+/// The graph edit itself (`add_implicit_input`) is pinned in dyndep's own
+/// tests; the deferral filter (`new_ids`) and the cycle predicate
+/// (`producer_cycle`) are pinned in task's tests. This module pins the
+/// transition what `run` performs between them.
+#[cfg(test)]
+mod deferred_input_tests {
+    use super::{BuildState, BuildStates};
+    use n2::graph::BuildId;
+
+    /// A Running edge moves back to Want with the pending count
+    /// UNTOUCHED, and then to Ready, which queues it. The mutant this
+    /// catches: `set` decrementing `total_pending` on Running->Want (the
+    /// run would end early, abandoning the edge) or skipping the Ready
+    /// push (the edge would never run).
+    #[test]
+    fn a_deferred_edge_returns_to_want_and_runs_again() {
+        let mut states = BuildStates::new(BuildId::from(1));
+        states.set(BuildId::from(0), BuildState::Want);
+        states.set(BuildId::from(0), BuildState::Ready);
+        assert_eq!(states.pop_ready(), Some(BuildId::from(0)));
+        // The edge is picked up and starts running.
+        states.set(BuildId::from(0), BuildState::Running);
+        // The miss is answered: back to Want. total_pending is untouched -
+        // the edge was never Done, so nothing was owed and repaid.
+        states.set(BuildId::from(0), BuildState::Want);
+        assert!(states.unfinished());
+        // The producer is done, so the edge is Ready at once.
+        states.set(BuildId::from(0), BuildState::Ready);
+        assert_eq!(states.pop_ready(), Some(BuildId::from(0)));
+        // And the second run completes normally.
+        states.set(BuildId::from(0), BuildState::Done);
+        assert!(!states.unfinished());
+    }
+
+    /// The `set` bookkeeping the transition above rests on: only
+    /// Unneeded->* grows the pending count, only *->Done shrinks it. A
+    /// Running->Want move keeps both counters, which is what makes the
+    /// requeue free.
+    #[test]
+    fn only_unneeded_grows_and_only_done_shrinks_the_pending_count() {
+        let mut states = BuildStates::new(BuildId::from(1));
+        // Unneeded -> Want grows.
+        states.set(BuildId::from(0), BuildState::Want);
+        assert!(states.unfinished());
+        // Want -> Running keeps.
+        states.set(BuildId::from(0), BuildState::Running);
+        assert!(states.unfinished());
+        // Running -> Want keeps (the deferral requeue).
+        states.set(BuildId::from(0), BuildState::Want);
+        assert!(states.unfinished());
+        // Want -> Ready keeps, and queues.
+        states.set(BuildId::from(0), BuildState::Ready);
+        assert!(states.unfinished());
+        assert_eq!(states.pop_ready(), Some(BuildId::from(0)));
+        // Only Done shrinks.
+        states.set(BuildId::from(0), BuildState::Done);
+        assert!(!states.unfinished());
     }
 }
