@@ -344,6 +344,53 @@ impl ProducerIndex {
     }
 }
 
+/// The producer index of a loaded graph: every produced file by name, and
+/// every module tree (`is_tree_path`) whose files an edge declares, keyed
+/// by the tree directory with the smallest-id declared file as its
+/// representative.
+///
+/// THE TREE IS A DECLARED FILE'S PARENT. The first version asked
+/// `is_tree_path` of the file name itself, which `include/QtWidgets/
+/// QtWidgetsVersion` never satisfies, so the syncqt trees the class is
+/// about were never indexed and qtbase's gtk3 compile never deferred.
+pub fn producer_index_of(graph: &graph::Graph) -> ProducerIndex {
+    use n2::densemap::Index as _;
+    use std::collections::BTreeMap;
+    let mut files: BTreeMap<String, Vec<FileId>> = BTreeMap::new();
+    let mut trees: BTreeMap<String, Vec<FileId>> = BTreeMap::new();
+    for fid in graph.files.by_id.all_ids() {
+        let file = &graph.files.by_id[fid];
+        let Some(bid) = file.input else {
+            continue;
+        };
+        if !graph.builds[bid].outs().contains(&fid) {
+            continue;
+        }
+        let name = file.name.clone();
+        let p = Path::new(&name);
+        if let Some(dir) = p.parent().filter(|d| is_tree_path(d)) {
+            trees
+                .entry(dir.to_string_lossy().into_owned())
+                .or_default()
+                .push(fid);
+        } else if is_tree_path(p) {
+            trees.entry(name.clone()).or_default().push(fid);
+        }
+        files.entry(name).or_default().push(fid);
+    }
+    let pick = |fids: Vec<FileId>| fids.into_iter().min_by_key(|f| f.index());
+    ProducerIndex {
+        files: files
+            .into_iter()
+            .filter_map(|(n, f)| pick(f).map(|fid| (n, fid)))
+            .collect(),
+        trees: trees
+            .into_iter()
+            .filter_map(|(d, f)| pick(f).map(|fid| (d, fid)))
+            .collect(),
+    }
+}
+
 /// One task's answer to its unresolved include: the sorted, deduplicated
 /// FileIds to add as implicit inputs - the producer's file node and the
 /// tree's representative - and the header's own spelling so the refusal
@@ -987,55 +1034,7 @@ impl Runner {
     /// graph declares no produced entries at all, which is the
     /// byte-identity case - no task's discovery consults a table.
     pub fn build_producer_index(&mut self, graph: &graph::Graph) {
-        use n2::densemap::Index as _;
-        use std::collections::BTreeMap;
-        let mut files: BTreeMap<String, Vec<FileId>> = BTreeMap::new();
-        // A tree directory is a produced path whose parent's own
-        // `is_tree_path` predicate answers `true`: the `include/<Module>`
-        // syncqt tree, the `<T>_autogen` tree. The representative is the
-        // SMALLEST declared spelling of the producer, which is
-        // deterministic and lands in `outs`.
-        let mut trees: BTreeMap<String, Vec<FileId>> = BTreeMap::new();
-        for fid in graph.files.by_id.all_ids() {
-            let file = &graph.files.by_id[fid];
-            let Some(bid) = file.input else {
-                continue;
-            };
-            let name = file.name.clone();
-            if !graph.builds[bid].outs().contains(&fid) {
-                continue;
-            }
-            if is_tree_path(Path::new(&name)) {
-                // A tree interior file: `include/QtWidgets/QtWidgetsVersion`
-                // or `include/QtWidgets/QtWidgets` (the directory node
-                // itself). The tree dir is the parent; for the directory
-                // node the parent is `include/`, which is not a tree, so
-                // fall back to the node's own name.
-                let dir = Path::new(&name)
-                    .parent()
-                    .filter(|p| is_tree_path(p))
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or(name.clone());
-                trees.entry(dir).or_default().push(fid);
-            } else {
-                files.entry(name).or_default().push(fid);
-            }
-        }
-        let files = files
-            .into_iter()
-            .filter_map(|(name, fids)| fids.into_iter().next().map(|fid| (name, fid)))
-            .collect();
-        let trees = trees
-            .into_iter()
-            .filter_map(|(dir, fids)| {
-                fids.iter()
-                    .min_by_key(|f| f.index())
-                    .copied()
-                    .map(|fid| (dir, fid))
-            })
-            .collect();
-        let index = ProducerIndex { files, trees };
-        self.producer_index = Some(Arc::new(index));
+        self.producer_index = Some(Arc::new(producer_index_of(graph)));
     }
 
     /// Build `bid` once more with no producer index (see `no_defer`).
@@ -23351,7 +23350,7 @@ mod vapigen_outputs_tests {
 /// `n2::load::Loader`, which is how the scheduler reads it too.
 #[cfg(test)]
 mod unresolved_include_defer_tests {
-    use super::{find_unresolved_miss, DeferMiss, ProducerIndex};
+    use super::{find_unresolved_miss, producer_index_of, DeferMiss, ProducerIndex};
     use deps_infer::c_include_parser;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -23751,5 +23750,38 @@ mod unresolved_include_defer_tests {
         let got = find_unresolved_miss(&idx, &[pch], &cmd, &build, Some(&vp));
         std::env::set_current_dir(prev).unwrap();
         assert!(got.is_none(), "a header the task holds must not defer");
+    }
+
+    /// The index of qtbase's real Widgets syncqt edge (build.ninja:19254,
+    /// relative outputs): `include/QtWidgets` is a tree, its representative
+    /// one of the files the edge declares, and the timestamp beside it is a
+    /// plain file. The first index never held this tree.
+    #[test]
+    fn the_syncqt_edge_indexes_its_module_tree() {
+        let g = graph_of(
+            "rule CUSTOM_COMMAND\n  command = $COMMAND\n\
+             build src/widgets/Widgets_syncqt_timestamp include/QtWidgets/QtWidgetsVersion \
+             include/QtWidgets/qtwidgetsversion.h src/widgets/Widgets.version.private_content \
+             include/QtWidgets/QtWidgets: CUSTOM_COMMAND\n  COMMAND = syncqt\n",
+        );
+        let idx = producer_index_of(&g);
+        let rep = idx
+            .trees
+            .get("include/QtWidgets")
+            .copied()
+            .expect("the tree is indexed");
+        let declared: Vec<_> = [
+            "include/QtWidgets/QtWidgetsVersion",
+            "include/QtWidgets/qtwidgetsversion.h",
+            "include/QtWidgets/QtWidgets",
+        ]
+        .iter()
+        .map(|n| g.files.lookup(n).unwrap())
+        .collect();
+        assert!(declared.contains(&rep));
+        assert!(idx
+            .files
+            .contains_key("src/widgets/Widgets_syncqt_timestamp"));
+        assert!(!idx.trees.contains_key("src/widgets"));
     }
 }
