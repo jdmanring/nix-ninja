@@ -291,39 +291,26 @@ impl ProducerIndex {
     /// `DeferMiss::new_ids` at the caller, so a task with no miss pays a
     /// map lookup and nothing else, which is the byte-identity guarantee
     /// this whole feature rests on.
-    pub fn hit(
-        &self,
-        name: &Path,
-        includer_dir: Option<&Path>,
-        dirs: &[String],
-        build_dir: &Path,
-    ) -> Option<FileId> {
+    /// The producer of `base/name`, if the index knows one.
+    pub fn hit_at(&self, base: &Path, name: &Path, build_dir: &Path) -> Option<FileId> {
         // A name no compiler would look up (a macro continuation the
         // directive parser kept, a stray space) answers nothing.
         let n = name.to_string_lossy();
         if n.is_empty() || n.contains(char::is_whitespace) || n.contains('\\') {
             return None;
         }
-        let bases = includer_dir.into_iter().chain(dirs.iter().map(Path::new));
-        for base in bases {
-            let Some(fid) = self.fid_of_path(&base.join(name), build_dir) else {
-                continue;
-            };
-            // A TREE MATCH COUNTS ONLY FROM OUTSIDE THE TREE. qtbase passes
-            // module trees themselves as include dirs (`-I<build>/include/
-            // QtCore`), and every spelling those miss - `<memory>`, whose
-            // directory is the compiler's own - landed "inside" the tree and
-            // deferred hundreds of compiles that build today. The real case
-            // is `-I<build>/include` with `QtWidgets/QWidget`.
-            if self
-                .files
-                .contains_key(&self.key(&base.join(name), build_dir))
-                || !self.in_tree(base, build_dir)
-            {
-                return Some(fid);
-            }
-        }
-        None
+        let fid = self.fid_of_path(&base.join(name), build_dir)?;
+        // A TREE MATCH COUNTS ONLY FROM OUTSIDE THE TREE. qtbase passes
+        // module trees themselves as include dirs (`-I<build>/include/
+        // QtCore`), and every spelling those miss - `<memory>`, whose
+        // directory is the compiler's own - landed "inside" the tree and
+        // deferred hundreds of compiles that build today. The real case
+        // is `-I<build>/include` with `QtWidgets/QWidget`.
+        (self
+            .files
+            .contains_key(&self.key(&base.join(name), build_dir))
+            || !self.in_tree(base, build_dir))
+        .then_some(fid)
     }
 
     /// Whether `p` is a module tree directory or lies inside one.
@@ -18192,25 +18179,36 @@ fn find_unresolved_miss(
 ) -> Option<DeferMiss> {
     let dirs = include_dirs_as_given(cmdline);
     let mut seen: rustc_hash::FxHashSet<String> = Default::default();
-    // A CANDIDATE INSIDE THE BUILD DIR IS ALSO ASKED IN ITS RELATIVE FORM,
-    // which is how the virtual map is keyed: an absolute `-I<build>/include`
-    // or an absolute spelling (a PCH header's `#include "<build>/include/
-    // QtCore/QtCore"`) otherwise reads as absent for every generated file not
-    // yet on disk, and qtbase's DBus PCH, which builds today, deferred on it.
-    // A CANDIDATE INSIDE A TREE THE TASK CARRIES IS RESOLVED. The static
-    // arm cannot see into a built tree, and read qtbase's Bootstrap compiles
-    // as missing QtCore headers their carried include/QtCore tree supplies;
-    // answering "carried" fails toward no deferral, the emission of today.
-    let resolves = |cand: PathBuf| -> bool {
-        let cand = lexical_join(Path::new(""), &cand);
-        let rel = cand.strip_prefix(build_dir).ok().map(Path::to_path_buf);
-        let rel_or = rel.clone().unwrap_or_else(|| cand.clone());
-        if carried_trees.iter().any(|t| rel_or.starts_with(t)) {
-            return true;
-        }
-        rel.into_iter().chain(std::iter::once(cand)).any(|c| {
-            c_include_parser::canonicalize_cached(c, virtual_paths).is_ok_and(|o| o.is_some())
-        })
+    // EACH CANDIDATE IN THE COMPILER'S SEARCH ORDER, three questions in turn:
+    //
+    //   held      the task carries it: a virtual-map key (the inputs) or a
+    //             path inside a module tree it carries. Resolved. The static
+    //             arm cannot look into a built tree, and qtbase's Bootstrap
+    //             compiles read as missing the QtCore headers theirs supplies.
+    //   produced  the index says another edge writes it. THE MISS. Asked
+    //             before the disk: a copy a previous or parallel run placed
+    //             in the build dir is exactly what the sandbox does not
+    //             have, and qtbase's gtk3 compile read `QtWidgets/QWidget`
+    //             as resolved off the kept tree's disk.
+    //   on disk   the source tree, the system, a configure-time file no
+    //             edge produces. Resolved.
+    //
+    // A candidate inside the build dir is asked in its relative form, how
+    // the virtual map is keyed (an absolute `-I<build>/include` or a PCH
+    // header's absolute spelling otherwise reads as absent).
+    let rel_of = |cand: &Path| -> PathBuf {
+        let cand = lexical_join(Path::new(""), cand);
+        cand.strip_prefix(build_dir)
+            .map(Path::to_path_buf)
+            .unwrap_or(cand)
+    };
+    let held = |cand: &Path| -> bool {
+        let rel = rel_of(cand);
+        carried_trees.iter().any(|t| rel.starts_with(t))
+            || virtual_paths.is_some_and(|v| v.contains_key(&rel) || v.contains_key(cand))
+    };
+    let on_disk = |cand: &Path| -> bool {
+        c_include_parser::canonicalize_cached(cand.to_path_buf(), None).is_ok_and(|o| o.is_some())
     };
     for file in files {
         // Read through the virtual map: a generated header the task holds is
@@ -18224,51 +18222,36 @@ fn find_unresolved_miss(
             continue;
         };
         let includer_dir = file.parent().unwrap_or(file);
-        let quoted = scan.directives.iter().filter(|d| d.quoted).map(|d| &d.name);
-        let angled = scan
-            .directives
-            .iter()
-            .filter(|d| !d.quoted)
-            .map(|d| &d.name);
-        for name in quoted {
-            // Quoted spelling: includer dir first, then -I dirs.
-            // `canonicalize_cached` answers `Ok(None)` for absence, so
-            // only `Some` is a resolution; `is_ok` alone would read every
-            // missing header as found and no miss would ever fire.
-            let resolved = resolves(includer_dir.join(name))
-                || dirs.iter().any(|i| resolves(Path::new(i).join(name)));
-            if !resolved {
-                let key = n2::canon::to_owned_canon_path(
-                    normalize_build_path_lexical(name)
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-                if seen.insert(key) {
-                    if let Some(fid) = idx.hit(name, Some(includer_dir), &dirs, build_dir) {
-                        return Some(DeferMiss {
-                            fids: vec![fid],
-                            header: name.display().to_string(),
-                        });
-                    }
-                }
+        for d in &scan.directives {
+            let name = &d.name;
+            let key = n2::canon::to_owned_canon_path(
+                normalize_build_path_lexical(name)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            if !seen.insert(format!("{}:{key}", d.quoted)) {
+                continue;
             }
-        }
-        for name in angled {
-            let resolved = resolves(PathBuf::from(name)) && name.is_absolute()
-                || dirs.iter().any(|i| resolves(Path::new(i).join(name)));
-            if !resolved {
-                let key = n2::canon::to_owned_canon_path(
-                    normalize_build_path_lexical(name)
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-                if seen.insert(key) {
-                    if let Some(fid) = idx.hit(name, None, &dirs, build_dir) {
-                        return Some(DeferMiss {
-                            fids: vec![fid],
-                            header: name.display().to_string(),
-                        });
-                    }
+            // Quoted: the includer's own directory first, then the `-I`
+            // directories; angled: the `-I` directories only.
+            let bases = d
+                .quoted
+                .then_some(includer_dir)
+                .into_iter()
+                .chain(dirs.iter().map(Path::new));
+            for base in bases {
+                let cand = base.join(name);
+                if held(&cand) {
+                    break;
+                }
+                if let Some(fid) = idx.hit_at(base, name, build_dir) {
+                    return Some(DeferMiss {
+                        fids: vec![fid],
+                        header: name.display().to_string(),
+                    });
+                }
+                if on_disk(&cand) {
+                    break;
                 }
             }
         }
@@ -23848,5 +23831,37 @@ mod unresolved_include_defer_tests {
         std::env::set_current_dir(prev).unwrap();
         assert!(carried.is_none(), "a carried tree supplies the header");
         assert!(bare.is_some(), "without the tree it is the miss");
+    }
+
+    /// THE KEPT TREE'S CASE: a previous or parallel run placed
+    /// `include/QtWidgets/QWidget` in the build dir, so it is on disk, while
+    /// the task does not hold it and its sandbox will not have it. That copy
+    /// must not hide the miss: the index is asked before the disk. The
+    /// control is the same file HELD (a virtual-map key), which resolves.
+    #[test]
+    fn a_produced_header_on_disk_but_not_held_is_still_the_miss() {
+        let _g = super::CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        let d = super::Scratch::new(format!("nn-defer-ondisk-{}", std::process::id()));
+        let (tu, cmd) = gtk_fixture(&d);
+        let build = d.join("build");
+        std::fs::create_dir_all(build.join("include/QtWidgets")).unwrap();
+        std::fs::write(build.join("include/QtWidgets/QWidget"), "").unwrap();
+        std::env::set_current_dir(&build).unwrap();
+        let (idx, rep) = qt_widgets_index();
+        let on_disk =
+            find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None, &[]);
+        let mut vp = HashMap::new();
+        vp.insert(
+            PathBuf::from("include/QtWidgets/QWidget"),
+            build.join("include/QtWidgets/QWidget"),
+        );
+        let held = find_unresolved_miss(&idx, &[tu], &cmd, &build, Some(&vp), &[]);
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(
+            on_disk.expect("a disk copy is not the task's").fids,
+            vec![rep]
+        );
+        assert!(held.is_none(), "a held header resolves");
     }
 }
