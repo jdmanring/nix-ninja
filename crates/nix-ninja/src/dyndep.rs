@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use n2::canon;
-use n2::graph::{BuildId, Graph};
+use n2::graph::{BuildId, FileId, Graph};
 use n2::parse::{Parser, Statement};
 
 /// What a dyndep file adds to one already-declared build edge.
@@ -302,23 +302,30 @@ pub fn mentions_dyndep(bytes: &[u8]) -> bool {
 /// The implicit-OUTPUT half is the load-bearing one. Implicit inputs alone
 /// would give a consumer whose `.mod` has no producing derivation, which
 /// fails no differently from today.
+/// One dyndep file's implicit-input addition to an edge, the same graph
+/// edit an unresolved-include deferral makes. Factored out of `apply_entry`
+/// so the two sites stay in step: `ins.ids` is laid out explicit,
+/// implicit, order-only, validation, with the counts naming the
+/// boundaries; an implicit input has to land inside its own run or every
+/// later count is off by one and an order-only input silently becomes
+/// dirtying.
+pub fn add_implicit_input(graph: &mut Graph, bid: BuildId, fid: FileId) {
+    let ins = &mut graph.builds[bid].dependencies.ins;
+    if ins.ids.contains(&fid) {
+        return;
+    }
+    let pos = ins.explicit + ins.implicit;
+    ins.ids.insert(pos, fid);
+    ins.implicit += 1;
+    graph.files.by_id[fid].dependents.push(bid);
+}
+
 pub fn apply_entry(graph: &mut Graph, bid: BuildId, entry: &DyndepEntry) -> Result<()> {
     for name in &entry.implicit_ins {
         let fid = graph
             .files
             .id_from_canonical(canon::to_owned_canon_path(name.as_str()));
-        let ins = &mut graph.builds[bid].dependencies.ins;
-        if ins.ids.contains(&fid) {
-            continue;
-        }
-        // ins.ids is laid out explicit, implicit, order-only, validation,
-        // with the counts naming the boundaries; an implicit input has to
-        // land inside its own run or every later count is off by one and
-        // an order-only input silently becomes dirtying.
-        let pos = ins.explicit + ins.implicit;
-        ins.ids.insert(pos, fid);
-        ins.implicit += 1;
-        graph.files.by_id[fid].dependents.push(bid);
+        add_implicit_input(graph, bid, fid);
     }
 
     for name in &entry.implicit_outs {

@@ -269,7 +269,7 @@ pub fn discover_dynamic_dependencies(
 
     let (files, built_paths) = scan_inputs(built_paths);
 
-    discover_c_includes(
+    let (discovered, _defer) = discover_c_includes(
         rpc_client,
         store_dir,
         build_dir,
@@ -281,7 +281,9 @@ pub fn discover_dynamic_dependencies(
         // the only source. Upstream #17's read-back applies to the outer,
         // persistent build dir path only.
         None,
-    )
+        None,
+    )?;
+    Ok(discovered)
 }
 
 /// Stage 3: Update derivation with discovered dependencies and store paths
