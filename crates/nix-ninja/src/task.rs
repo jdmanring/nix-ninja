@@ -3071,8 +3071,28 @@ impl Runner {
                     })
                     .collect();
                 if let Some(orig) = &build.cmdline {
-                    for p in gir_header_closure(orig, &self.config.build_dir, &seeds) {
-                        referenced.push(p);
+                    // Every file an already resolved edge produces, by
+                    // absolute path. One the walk reaches is carried as
+                    // that edge's output; it is not on disk to upload.
+                    let produced: HashMap<PathBuf, DerivedFile> = self
+                        .derived_files
+                        .values()
+                        .filter(|d| matches!(d.derived_path, SingleDerivedPath::Built { .. }))
+                        .map(|d| {
+                            (
+                                lexical_join(&self.config.build_dir, &d.build_path),
+                                d.clone(),
+                            )
+                        })
+                        .collect();
+                    let keys = produced.keys().map(|k| (k.clone(), k.clone())).collect();
+                    for p in gir_header_closure(orig, &self.config.build_dir, &seeds, Some(keys)) {
+                        match produced.get(Path::new(&p)) {
+                            Some(df) => {
+                                input_set.insert(df.build_path.clone(), df.clone());
+                            }
+                            None => referenced.push(p),
+                        }
                     }
                 }
             }
@@ -10728,7 +10748,18 @@ fn gir_filelist_referenced_paths(
 /// `cmdline` is the ORIGINAL command, whose `-I` values are absolute, so the
 /// walk does not depend on the process cwd. Paths outside the project tree
 /// and in the store are left to the consumer's filters.
-pub fn gir_header_closure(cmdline: &str, build_dir: &Path, seeds: &[PathBuf]) -> Vec<String> {
+///
+/// `produced` maps the absolute path of each file another edge PRODUCES to
+/// itself, so a generated header resolves before it is written: gcr
+/// 4.4.0.1's `gck/gck.h` includes `gck/gck-enum-types.h`, which the
+/// glib-mkenums edge writes and nothing has placed on disk when the gir
+/// edge resolves, and its task died on it.
+pub fn gir_header_closure(
+    cmdline: &str,
+    build_dir: &Path,
+    seeds: &[PathBuf],
+    produced: Option<HashMap<PathBuf, PathBuf>>,
+) -> Vec<String> {
     let seeds: Vec<PathBuf> = seeds.iter().filter(|p| p.is_file()).cloned().collect();
     if seeds.is_empty() {
         return Vec::new();
@@ -10736,7 +10767,7 @@ pub fn gir_header_closure(cmdline: &str, build_dir: &Path, seeds: &[PathBuf]) ->
     let scan = match deps_infer::c_include_parser::retrieve_c_includes_checked(
         cmdline,
         seeds.clone(),
-        None,
+        produced,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -23587,14 +23618,49 @@ mod gir_header_closure_tests {
              -I{s}/libgnome-desktop/.. --cflags-end",
             s = src.display()
         );
-        let got = gir_header_closure(&cmd, &build, std::slice::from_ref(&bg));
+        let got = gir_header_closure(&cmd, &build, std::slice::from_ref(&bg), None);
         assert_eq!(got, vec![thumb.to_string_lossy().into_owned()], "{got:?}");
 
         // THE CONTROL: without the include path the header is not reached,
         // so the arm above cannot pass on a walk that returns every file.
-        let bare = gir_header_closure("g-ir-scanner --filelist=x", &build, &[bg]);
+        let bare = gir_header_closure("g-ir-scanner --filelist=x", &build, &[bg], None);
         assert!(bare.is_empty(), "{bare:?}");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    // gcr 4.4.0.1's Gcr gir edge: `gck/gck.h` in the source tree includes
+    // `<gck/gck-enum-types.h>`, which a glib-mkenums edge writes into the
+    // build dir and which is not on disk when the gir edge resolves. The
+    // include dirs are the edge's own (`-I<src>/gck/..`, `-I<build>/gck/..`).
+    #[test]
+    fn a_header_another_edge_produces_is_reached_before_it_exists() {
+        let d = std::env::temp_dir().join(format!("nn-gir-produced-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let src = d.join("gcr-4.4.0.1");
+        let build = src.join("build");
+        fs::create_dir_all(src.join("gck")).unwrap();
+        fs::create_dir_all(build.join("gck")).unwrap();
+        let gck = src.join("gck/gck.h");
+        fs::write(&gck, "#include <glib.h>\n#include <gck/gck-enum-types.h>\n").unwrap();
+        let enum_types = build.join("gck/gck-enum-types.h");
+        let cmd = format!(
+            "g-ir-scanner -I{s}/gck/.. -I{b}/gck/.. --filelist=x",
+            s = src.display(),
+            b = build.display()
+        );
+        let produced: HashMap<PathBuf, PathBuf> = [(enum_types.clone(), enum_types.clone())]
+            .into_iter()
+            .collect();
+        let got = gir_header_closure(&cmd, &build, std::slice::from_ref(&gck), Some(produced));
+        // THE CONTROL: without the map the unwritten header is not reached.
+        let bare = gir_header_closure(&cmd, &build, &[gck], None);
+        let _ = fs::remove_dir_all(&d);
+        assert_eq!(
+            got,
+            vec![enum_types.to_string_lossy().into_owned()],
+            "{got:?}"
+        );
+        assert!(bare.is_empty(), "{bare:?}");
     }
 }
 
