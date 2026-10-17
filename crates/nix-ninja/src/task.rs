@@ -1664,6 +1664,7 @@ impl Runner {
                         .into_iter()
                         .chain(vapigen_vapi(c, &config.build_dir))
                         .chain(cmake_p_stamp_edge_writes(&paths, c, &config.build_dir))
+                        .chain(cmake_e_copy_stamp_edge_writes(&paths, c, &config.build_dir))
                         .chain(gdbus_docbook_interface_outputs(
                             c,
                             &config.build_dir,
@@ -8320,6 +8321,84 @@ fn cmake_p_stamp_edge_writes(
     out
 }
 
+/// The build-tree files a custom target's `cmake -E copy` (or
+/// `copy_if_different`) writes, when the edge declares nothing but its
+/// stamps. openblas's `genlapacke` target copies `lapacke_mangling.h` into
+/// the build dir and `install(FILES ${CMAKE_BINARY_DIR}/lapacke_mangling.h)`
+/// reads it there; freerdp's `ct-*` targets copy man pages (`winpr/wlog.7`)
+/// that its install reads the same way. Real ninja leaves the copy in the
+/// shared tree; a task's undeclared write stays in its sandbox, so install
+/// found nothing. Declared as outputs so they are stored, placed, and ride
+/// the stamp. Read through a leading `cd` and each `&&` segment; a
+/// destination that is an existing directory, or one given several sources,
+/// receives each source's file name.
+fn cmake_e_copy_stamp_edge_writes(
+    declared: &[PathBuf],
+    cmdline: &str,
+    build_dir: &Path,
+) -> Vec<PathBuf> {
+    let stamp = |p: &PathBuf| {
+        p.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|d| d == "CMakeFiles")
+    };
+    if declared.is_empty() || !declared.iter().all(stamp) {
+        return Vec::new();
+    }
+    let mut cd = PathBuf::new();
+    let mut out = Vec::new();
+    for seg in cmdline.split("&&") {
+        let Ok(toks) = shell_words::split(seg) else {
+            continue;
+        };
+        match toks.as_slice() {
+            [c, dir] if c == "cd" => {
+                cd = if dir.starts_with('/') {
+                    relative_from(Path::new(dir), build_dir).unwrap_or_default()
+                } else {
+                    cd.join(dir)
+                };
+            }
+            [prog, e, op, rest @ ..]
+                if Path::new(prog).file_name().is_some_and(|n| n == "cmake")
+                    && e == "-E"
+                    && (op == "copy" || op == "copy_if_different")
+                    && rest.len() >= 2 =>
+            {
+                let (srcs, dst) = rest.split_at(rest.len() - 1);
+                let dst = if dst[0].starts_with('/') {
+                    PathBuf::from(&dst[0])
+                } else {
+                    build_dir.join(&cd).join(&dst[0])
+                };
+                let into_dir = srcs.len() > 1 || dst.is_dir();
+                for src in srcs {
+                    let target = if into_dir {
+                        match Path::new(src).file_name() {
+                            Some(n) => dst.join(n),
+                            None => continue,
+                        }
+                    } else {
+                        dst.clone()
+                    };
+                    let target = lexical_join(Path::new(""), &target);
+                    if let Some(rel) = relative_from(&target, build_dir) {
+                        let inside = rel
+                            .components()
+                            .next()
+                            .is_some_and(|c| matches!(c, std::path::Component::Normal(_)));
+                        if inside && !out.contains(&rel) {
+                            out.push(rel);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// A CMake custom-target stamp whose name carries a dot: freerdp's
 /// `add_custom_target(${manpage}.target ALL COMMAND ...)` declares
 /// `client/X11/man/CMakeFiles/xfreerdp.1.target`, which nothing writes, and
@@ -8555,6 +8634,11 @@ fn undeclared_outputs(
             }
         }
         for w in gdbus_docbook_interface_outputs(c, build_dir, declared) {
+            if !v.contains(&w) {
+                v.push(w);
+            }
+        }
+        for w in cmake_e_copy_stamp_edge_writes(declared, c, build_dir) {
             if !v.contains(&w) {
                 v.push(w);
             }
@@ -13548,6 +13632,49 @@ endforeach()
             &build
         )
         .is_empty());
+    }
+
+    /// openblas's `genlapacke` and freerdp's `ct-*` custom targets, commands
+    /// verbatim from build.ninja: each declares only its stamp and copies a
+    /// file its install later reads from the build tree. Controls: an edge
+    /// with a real declared output, and a copy whose destination is outside
+    /// the build dir, declare nothing more.
+    #[test]
+    fn a_stamp_only_copy_target_declares_what_it_copies() {
+        let build = Path::new("/build/source/build");
+        let openblas = "cd /build/source/build && /nix/store/vkdqhg9dd6x11phhdj28p5vbpwirkj7c-cmake-4.4.3/bin/cmake -E copy /build/source/lapack-netlib/LAPACKE/include/lapacke_mangling_with_flags.h.in /build/source/build/lapacke_mangling.h";
+        let freerdp = "cd /build/source/build/winpr && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -E make_directory /build/source/build/winpr && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -E copy_if_different /build/source/build/winpr/cfg/wlog.7_Release /build/source/build/winpr/wlog.7";
+        let stamp = |s: &str| vec![PathBuf::from(s)];
+        assert_eq!(
+            super::cmake_e_copy_stamp_edge_writes(&stamp("CMakeFiles/genlapacke"), openblas, build),
+            vec![PathBuf::from("lapacke_mangling.h")]
+        );
+        assert_eq!(
+            super::cmake_e_copy_stamp_edge_writes(
+                &stamp("winpr/CMakeFiles/ct-c6620a4a"),
+                freerdp,
+                build
+            ),
+            vec![PathBuf::from("winpr/wlog.7")]
+        );
+        assert!(super::cmake_e_copy_stamp_edge_writes(
+            &[
+                PathBuf::from("CMakeFiles/genlapacke"),
+                PathBuf::from("lapacke.h")
+            ],
+            openblas,
+            build
+        )
+        .is_empty());
+        let outside = "cd /build/source/build && cmake -E copy a.h /tmp/elsewhere.h";
+        assert!(
+            super::cmake_e_copy_stamp_edge_writes(&stamp("CMakeFiles/x"), outside, build)
+                .is_empty()
+        );
+        assert!(
+            super::undeclared_outputs(&stamp("CMakeFiles/genlapacke"), Some(openblas), build)
+                .contains(&PathBuf::from("lapacke_mangling.h"))
+        );
     }
 }
 
