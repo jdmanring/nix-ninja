@@ -24353,4 +24353,23 @@ mod unresolved_include_defer_tests {
         assert_eq!(with_view.len(), 1, "the view holds the unit and the config");
         assert!(without.is_empty(), "the bare disk has no translation unit");
     }
+
+    /// CMake writes a phony edge over every file the configure step read;
+    /// opencv's source `opencv2/core/version.hpp` is one, and indexing it as
+    /// produced deferred 210 compiles. A phony output is not produced; the
+    /// control is a real edge's output in the same graph.
+    #[test]
+    fn a_phony_output_is_not_indexed() {
+        let g = graph_of(
+            "rule gen\n  command = gen $out\n\
+             build gen/config.h: gen\n\
+             build /src/modules/core/include/opencv2/core/version.hpp: phony\n",
+        );
+        let idx = producer_index_of(&g);
+        assert!(idx.files.contains_key("gen/config.h"));
+        assert!(!idx
+            .files
+            .keys()
+            .any(|k| k.ends_with("opencv2/core/version.hpp")));
+    }
 }
