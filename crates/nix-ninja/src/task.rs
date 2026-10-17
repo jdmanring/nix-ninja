@@ -2725,6 +2725,13 @@ impl Runner {
                     self.config.build_dir.join(rebase_post_cd(&cd_dir, info))
                 };
                 if let Ok(text) = std::fs::read_to_string(&info_path) {
+                    // Generated entries live in the build dir and arrive as
+                    // derived inputs; only source files ride `referenced`.
+                    for f in cmake_autogen_referenced_files(&text) {
+                        if !Path::new(&f).starts_with(&self.config.build_dir) {
+                            referenced.push(f);
+                        }
+                    }
                     for d in cmake_autogen_referenced_dirs(&text) {
                         let p = Path::new(&d);
                         if p.starts_with(&self.config.store_dir)
@@ -11197,6 +11204,34 @@ pub fn cmake_autogen_referenced_dirs(text: &str) -> Vec<String> {
         };
         for e in arr {
             let Some(p) = e.as_str() else { continue };
+            if p.starts_with('/') && !out.contains(&p.to_string()) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The files an `AutogenInfo.json` lists in `HEADERS` and `SOURCES`, each
+/// entry `[path, flags, ...]`. cmake_autogen checks every one exists before
+/// it runs moc. MEASURED 2026-10-16 on qtbase 6.11.2 (KDE round, task
+/// `cckhnws9`): `QTlsBackendCertOnlyPlugin` lists
+/// `src/plugins/tls/shared/qasn1element_p.h`, a SIBLING of its own source
+/// dir that no `MOC_INCLUDES` directory covers, and died `The header file
+/// "SRC:/src/plugins/tls/shared/qasn1element_p.h" does not exist`.
+pub fn cmake_autogen_referenced_files(text: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in ["HEADERS", "SOURCES"] {
+        let Some(arr) = v.get(key).and_then(|a| a.as_array()) else {
+            continue;
+        };
+        for e in arr {
+            let Some(p) = e.get(0).and_then(|p| p.as_str()) else {
+                continue;
+            };
             if p.starts_with('/') && !out.contains(&p.to_string()) {
                 out.push(p.to_string());
             }
@@ -20697,7 +20732,36 @@ mod collision_emitter_agrees_with_grouper_tests {
 
 #[cfg(test)]
 mod cmake_autogen_reader_tests {
-    use super::{cmake_autogen_info_arg, cmake_autogen_referenced_dirs};
+    use super::{
+        cmake_autogen_info_arg, cmake_autogen_referenced_dirs, cmake_autogen_referenced_files,
+    };
+
+    /// `HEADERS` and `SOURCES` entries are `[path, flags, ...]`, as in qtbase
+    /// 6.11.2's kept `Core_autogen.dir/AutogenInfo.json`; the sibling-dir
+    /// header is the one `QTlsBackendCertOnlyPlugin`'s autogen died on.
+    #[test]
+    fn an_autogen_plan_names_its_header_and_source_files() {
+        let plan = r#"{
+  "HEADERS": [
+    ["/b/build/include/QtCore/qtcoreexports.h", "Mu", "LYSTEIFZSX/moc_qtcoreexports.cpp", null],
+    ["/b/src/plugins/tls/shared/qasn1element_p.h", "Mu", "X/moc_qasn1element_p.cpp", null]
+  ],
+  "SOURCES": [["/b/src/plugins/tls/certonly/qtlsbackend_cert.cpp", "Mu", null]],
+  "MOC_INCLUDES": ["/b/src/plugins/tls/certonly"]
+}"#;
+        assert_eq!(
+            cmake_autogen_referenced_files(plan),
+            vec![
+                "/b/build/include/QtCore/qtcoreexports.h".to_string(),
+                "/b/src/plugins/tls/shared/qasn1element_p.h".to_string(),
+                "/b/src/plugins/tls/certonly/qtlsbackend_cert.cpp".to_string(),
+            ]
+        );
+        assert!(cmake_autogen_referenced_files("not json").is_empty());
+        assert!(
+            cmake_autogen_referenced_files(r#"{"HEADERS": [["rel.h", "Mu"], "x"]}"#).is_empty()
+        );
+    }
 
     /// THE REAL PLAN, reduced to the lists that matter, from qtbase 6.11.2's
     /// `Core_autogen.dir/AutogenInfo.json`. The directories are what cmake
