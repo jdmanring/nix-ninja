@@ -4704,17 +4704,18 @@ fn build_task_derivation(
                 files,
                 Some(virtual_paths),
                 task.depfile.as_deref().map(Path::new),
-                // Only where this view is complete: a task with a built
-                // input is decided in `handle_derivation_result`, after the
-                // realise, because its trees and generated sources are not
-                // readable here.
-                (task.is_gcc_task
-                    && !task
-                        .inputs
-                        .iter()
-                        .any(|i| matches!(i.derived_path, SingleDerivedPath::Built { .. })))
-                .then_some(task.producer_index.as_deref())
-                .flatten(),
+                task.is_gcc_task
+                    .then_some(task.producer_index.as_deref())
+                    .flatten(),
+                &task
+                    .inputs
+                    .iter()
+                    .filter_map(|i| {
+                        let bp = i.build_path.to_string_lossy();
+                        let bp = bp.strip_suffix("/.nn-tree").unwrap_or(&bp);
+                        is_tree_path(Path::new(bp)).then(|| PathBuf::from(bp))
+                    })
+                    .collect::<Vec<_>>(),
             )?;
             // A miss the producer index answers ends the emission here,
             // before the derivation is written; the spawn site turns it
@@ -18187,6 +18188,7 @@ fn find_unresolved_miss(
     cmdline: &str,
     build_dir: &Path,
     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+    carried_trees: &[PathBuf],
 ) -> Option<DeferMiss> {
     let dirs = include_dirs_as_given(cmdline);
     let mut seen: rustc_hash::FxHashSet<String> = Default::default();
@@ -18195,9 +18197,17 @@ fn find_unresolved_miss(
     // or an absolute spelling (a PCH header's `#include "<build>/include/
     // QtCore/QtCore"`) otherwise reads as absent for every generated file not
     // yet on disk, and qtbase's DBus PCH, which builds today, deferred on it.
+    // A CANDIDATE INSIDE A TREE THE TASK CARRIES IS RESOLVED. The static
+    // arm cannot see into a built tree, and read qtbase's Bootstrap compiles
+    // as missing QtCore headers their carried include/QtCore tree supplies;
+    // answering "carried" fails toward no deferral, the emission of today.
     let resolves = |cand: PathBuf| -> bool {
         let cand = lexical_join(Path::new(""), &cand);
         let rel = cand.strip_prefix(build_dir).ok().map(Path::to_path_buf);
+        let rel_or = rel.clone().unwrap_or_else(|| cand.clone());
+        if carried_trees.iter().any(|t| rel_or.starts_with(t)) {
+            return true;
+        }
         rel.into_iter().chain(std::iter::once(cand)).any(|c| {
             c_include_parser::canonicalize_cached(c, virtual_paths).is_ok_and(|o| o.is_some())
         })
@@ -18276,6 +18286,7 @@ pub fn discover_c_includes(
     virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
     depfile: Option<&Path>,
     producer: Option<&ProducerIndex>,
+    carried_trees: &[PathBuf],
 ) -> Result<(Discovered, Option<DeferMiss>)> {
     // The virtual set is consumed by the scan below; the UPLOAD filter
     // further down needs it too, so keep a copy. See generated_not_yet_written.
@@ -18585,7 +18596,14 @@ pub fn discover_c_includes(
                 walk.push(p.clone());
             }
         }
-        find_unresolved_miss(idx, &walk, cmdline, build_dir, virtual_declared.as_ref())
+        find_unresolved_miss(
+            idx,
+            &walk,
+            cmdline,
+            build_dir,
+            virtual_declared.as_ref(),
+            carried_trees,
+        )
     });
     let c_include_count = c_includes.len();
     let mut discovered_deps = Vec::new();
@@ -23422,7 +23440,7 @@ mod unresolved_include_defer_tests {
         std::env::set_current_dir(d.join("build")).unwrap();
         let (idx, rep) = qt_widgets_index();
         let build = d.join("build");
-        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None);
+        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None, &[]);
         std::env::set_current_dir(prev).unwrap();
         let miss = got.expect("the unordered tree header must defer");
         assert_eq!(miss.fids, vec![rep]);
@@ -23455,7 +23473,7 @@ mod unresolved_include_defer_tests {
         );
         std::env::set_current_dir(&build).unwrap();
         let (idx, _) = qt_widgets_index();
-        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None);
+        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None, &[]);
         std::env::set_current_dir(prev).unwrap();
         assert!(got.is_none(), "the shadowed header resolves, so no miss");
     }
@@ -23482,7 +23500,7 @@ mod unresolved_include_defer_tests {
         let (idx, _) = qt_widgets_index();
         // No `stdio.h` producer is indexed. Whether or not the host header
         // resolves, the index answers nothing: the ordinary failure stands.
-        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None);
+        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None, &[]);
         std::env::set_current_dir(prev).unwrap();
         assert!(got.is_none());
     }
@@ -23524,7 +23542,7 @@ mod unresolved_include_defer_tests {
         };
         idx.files
             .insert("libsecret/secret-enum-types.h".to_string(), fid);
-        let got = find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None);
+        let got = find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None, &[]);
         std::env::set_current_dir(prev).unwrap();
         let miss = got.expect("the unordered generated header must defer");
         assert_eq!(miss.fids, vec![fid]);
@@ -23573,7 +23591,14 @@ mod unresolved_include_defer_tests {
         let mut vp: HashMap<PathBuf, PathBuf> = HashMap::new();
         let rel = PathBuf::from("libsecret/secret-enum-types.h");
         vp.insert(rel.clone(), rel);
-        let got = find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, Some(&vp));
+        let got = find_unresolved_miss(
+            &idx,
+            std::slice::from_ref(&tu),
+            &cmd,
+            &build,
+            Some(&vp),
+            &[],
+        );
         std::env::set_current_dir(prev).unwrap();
         assert!(got.is_none(), "a carried header resolves, so no miss");
     }
@@ -23699,8 +23724,8 @@ mod unresolved_include_defer_tests {
         );
         std::env::set_current_dir(&build).unwrap();
         let (idx, rep) = qt_widgets_index();
-        let memory = find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None);
-        let real = find_unresolved_miss(&idx, &[tu2], &cmd, &build, None);
+        let memory = find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None, &[]);
+        let real = find_unresolved_miss(&idx, &[tu2], &cmd, &build, None, &[]);
         std::env::set_current_dir(prev).unwrap();
         assert!(
             memory.is_none(),
@@ -23747,7 +23772,7 @@ mod unresolved_include_defer_tests {
             pch.display()
         );
         std::env::set_current_dir(&build).unwrap();
-        let got = find_unresolved_miss(&idx, &[pch], &cmd, &build, Some(&vp));
+        let got = find_unresolved_miss(&idx, &[pch], &cmd, &build, Some(&vp), &[]);
         std::env::set_current_dir(prev).unwrap();
         assert!(got.is_none(), "a header the task holds must not defer");
     }
@@ -23783,5 +23808,45 @@ mod unresolved_include_defer_tests {
             .files
             .contains_key("src/widgets/Widgets_syncqt_timestamp"));
         assert!(!idx.trees.contains_key("src/widgets"));
+    }
+
+    /// qtbase's Bootstrap compiles, which build today: `<QtCore/
+    /// qcompilerdetection.h>` through `-I<build>/include`, supplied by the
+    /// include/QtCore tree the task CARRIES, which the static arm cannot look
+    /// into. Carried, it resolves and nothing defers; the control is the
+    /// same task without the tree, which defers on it.
+    #[test]
+    fn a_spelling_inside_a_carried_tree_is_not_a_miss() {
+        let _g = super::CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        let d = super::Scratch::new(format!("nn-defer-carried-tree-{}", std::process::id()));
+        let build = d.join("build");
+        std::fs::create_dir_all(build.join("include")).unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let tu = d.join("src/qhash.cpp");
+        std::fs::write(&tu, "#include <QtCore/qcompilerdetection.h>\n").unwrap();
+        let cmd = format!(
+            "c++ -I{}/include -c {} -o qhash.o",
+            build.display(),
+            tu.display()
+        );
+        let g = graph_of(
+            "rule syncqt\n  command = syncqt $out\n\
+             build include/QtCore/QtCoreVersion include/QtCore/QtCore: syncqt\n",
+        );
+        let idx = super::producer_index_of(&g);
+        std::env::set_current_dir(&build).unwrap();
+        let carried = find_unresolved_miss(
+            &idx,
+            std::slice::from_ref(&tu),
+            &cmd,
+            &build,
+            None,
+            &[PathBuf::from("include/QtCore")],
+        );
+        let bare = find_unresolved_miss(&idx, &[tu], &cmd, &build, None, &[]);
+        std::env::set_current_dir(prev).unwrap();
+        assert!(carried.is_none(), "a carried tree supplies the header");
+        assert!(bare.is_some(), "without the tree it is the miss");
     }
 }

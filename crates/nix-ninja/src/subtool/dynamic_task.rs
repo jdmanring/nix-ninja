@@ -284,6 +284,8 @@ pub fn discover_dynamic_dependencies(
         // persistent build dir path only.
         None,
         producer,
+        // The realised view: built trees are expanded in `built_paths`.
+        &[],
     )
 }
 
