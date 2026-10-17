@@ -1275,6 +1275,11 @@ impl Runner {
                         .into_iter()
                         .chain(vapigen_vapi(c, &config.build_dir))
                         .chain(cmake_p_stamp_edge_writes(&paths, c, &config.build_dir))
+                        .chain(gdbus_docbook_interface_outputs(
+                            c,
+                            &config.build_dir,
+                            &paths,
+                        ))
                         .collect();
                     undeclared_dirs = external_project_extract_dirs(c, &config.build_dir)
                         .into_iter()
@@ -7866,31 +7871,10 @@ pub fn cmake_dotted_stamp_outputs(declared: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Declared docbook outputs of a `gdbus-codegen --generate-docbook` edge
-/// that the tool does not write, so the command can stamp them the way
-/// real ninja's shared tree simply never misses them. Empty for every
-/// other edge.
-///
-/// meson's `gnome.gdbus_codegen(docbook: 'dbus')` declares one docbook
-/// output per input xml, each named `<output-directory>/dbus-<input-stem>.
-/// xml`. `gdbus-codegen --generate-docbook dbus` writes one file per
-/// interface in the xml (`dbus-<input-stem>-<Interface>.xml`), and for an
-/// input with several interfaces it never writes the bare stem name.
-/// flatpak 1.18.4's task `cv596rws` died in the task's written-output
-/// check on `doc/reference/dbus-org.freedesktop.Flatpak.xml`, which
-/// `gdbus-codegen` does not write (it writes
-/// `dbus-org.freedesktop.Flatpak.{SessionHelper,Development,
-/// SystemHelper}.xml` instead). Stamping the bare stem is harmless for a
-/// single-interface input the tool did write: `touch` on an existing file
-/// is a no-op.
-///
-/// GATED on `gdbus-codegen` and `--generate-docbook`: an ordinary run and
-/// every other command yield nothing, and no other edge's emission moves.
-pub fn gdbus_unwritten_outputs(
-    cmdline: &str,
-    _build_dir: &Path,
-    declared: &[PathBuf],
-) -> Vec<PathBuf> {
+/// The output directory and input xmls of a `gdbus-codegen
+/// --generate-docbook` command, or None for any other command. An input is
+/// a `.xml` argument that is not a flag, as spelled.
+fn gdbus_docbook_args(cmdline: &str) -> Option<(String, Vec<String>)> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
     let is_gdbus = toks.iter().any(|t| {
         Path::new(t)
@@ -7898,17 +7882,14 @@ pub fn gdbus_unwritten_outputs(
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("gdbus-codegen"))
     });
-    if !is_gdbus {
-        return Vec::new();
-    }
     let has_docbook_flag = toks
         .iter()
         .any(|t| *t == "--generate-docbook" || t.starts_with("--generate-docbook="));
-    if !has_docbook_flag {
-        return Vec::new();
+    if !is_gdbus || !has_docbook_flag {
+        return None;
     }
     let mut out_dir = None;
-    let mut inputs: Vec<&str> = Vec::new();
+    let mut inputs = Vec::new();
     let mut it = toks.iter();
     while let Some(t) = it.next() {
         match *t {
@@ -7919,15 +7900,45 @@ pub fn gdbus_unwritten_outputs(
             _ => {
                 if let Some(v) = t.strip_prefix("--output-directory=") {
                     out_dir = Some(v);
-                } else if t.ends_with(".xml") && t.starts_with('/') {
-                    inputs.push(t);
+                } else if t.ends_with(".xml") && !t.starts_with('-') {
+                    inputs.push(t.trim_matches('"').to_string());
                 }
             }
         }
     }
     let od = out_dir.map(|s| s.trim_matches('"')).unwrap_or(".");
-    // Each absolute input xml names one declared docbook output:
-    // `<od>/dbus-<input-stem>.xml`, the spelling meson declares.
+    Some((od.to_string(), inputs))
+}
+
+/// Declared docbook outputs of a `gdbus-codegen --generate-docbook` edge
+/// that the tool does not write, so the command can stamp them the way
+/// real ninja's shared tree simply never misses them. Empty for every
+/// other edge.
+///
+/// meson's `gnome.gdbus_codegen(docbook: 'dbus')` declares one docbook
+/// output per input xml, each named `<output-directory>/dbus-<input-stem>.
+/// xml`. `gdbus-codegen --generate-docbook dbus` writes one file per
+/// INTERFACE, named for the interface (`dbus-<interface>.xml`), so an input
+/// with several interfaces never gets the bare stem name. flatpak 1.18.4's
+/// task `cv596rws` died in the task's written-output check on
+/// `doc/reference/dbus-org.freedesktop.Flatpak.xml`, which `gdbus-codegen`
+/// does not write (it writes `dbus-org.freedesktop.Flatpak.{SessionHelper,
+/// Development,SystemHelper}.xml` instead). Stamping the bare stem is
+/// harmless for a single-interface input the tool did write: `touch` on an
+/// existing file is a no-op.
+///
+/// GATED on `gdbus-codegen` and `--generate-docbook`: an ordinary run and
+/// every other command yield nothing, and no other edge's emission moves.
+pub fn gdbus_unwritten_outputs(
+    cmdline: &str,
+    build_dir: &Path,
+    declared: &[PathBuf],
+) -> Vec<PathBuf> {
+    let Some((od, inputs)) = gdbus_docbook_args(cmdline) else {
+        return Vec::new();
+    };
+    // Each input xml names one declared docbook output:
+    // `<od>/dbus-<input-stem>`, the spelling meson declares.
     let candidates: Vec<String> = inputs
         .iter()
         .map(|input| {
@@ -7935,14 +7946,88 @@ pub fn gdbus_unwritten_outputs(
             format!("{od}/dbus-{stem}")
         })
         .collect();
+    // ONLY THE NAMES NO INTERFACE PRODUCES. An input whose single interface
+    // carries its stem is written by the tool; stamping it anyway appended
+    // `&& touch` to every docbook edge that builds today and moved its key.
+    let written = gdbus_docbook_written(&od, &inputs, build_dir);
     declared
         .iter()
         .filter(|p| {
             let s = p.to_string_lossy();
-            candidates.iter().any(|c| s == c.as_str())
+            candidates.iter().any(|c| s == c.as_str()) && !written.contains(*p)
         })
         .cloned()
         .collect()
+}
+
+/// The docbook files a `gdbus-codegen --generate-docbook dbus` run DOES
+/// write, one per interface, as build-dir-relative paths. meson declares
+/// none of them except where an input's single interface carries the
+/// file's own stem, so the gtkdoc edge that xi:includes them (flatpak's
+/// `libflatpak-docs.xml` names `dbus-org.freedesktop.Flatpak.SessionHelper.xml`
+/// and eight more) was never handed them. Declared as outputs, they are
+/// stored and ride the declared names to consumers. Interface names are read
+/// from each input with comments removed, in either quote style; an input
+/// that cannot be read contributes nothing.
+///
+/// An edge that builds today writes every declared name, which needs each
+/// input's only interface to carry its stem, and then every name here is
+/// already declared: no such edge's emission moves.
+pub fn gdbus_docbook_interface_outputs(
+    cmdline: &str,
+    build_dir: &Path,
+    declared: &[PathBuf],
+) -> Vec<PathBuf> {
+    let Some((od, inputs)) = gdbus_docbook_args(cmdline) else {
+        return Vec::new();
+    };
+    gdbus_docbook_written(&od, &inputs, build_dir)
+        .into_iter()
+        .filter(|p| !declared.contains(p))
+        .collect()
+}
+
+/// Every `<od>/dbus-<interface>.xml` the inputs' interfaces name.
+fn gdbus_docbook_written(od: &str, inputs: &[String], build_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for input in inputs {
+        let path = if input.starts_with('/') {
+            PathBuf::from(input)
+        } else {
+            build_dir.join(input)
+        };
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut body = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find("<!--") {
+            body.push_str(&rest[..i]);
+            rest = rest[i..].find("-->").map_or("", |j| &rest[i + j + 3..]);
+        }
+        body.push_str(rest);
+        let mut rest = body.as_str();
+        while let Some(i) = rest.find("<interface") {
+            rest = &rest[i + "<interface".len()..];
+            let Some(attr) = rest.trim_start().strip_prefix("name=") else {
+                continue;
+            };
+            let Some(q) = attr.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                continue;
+            };
+            let Some(name) = attr[1..].split(q).next() else {
+                continue;
+            };
+            let rel = lexical_join(
+                Path::new(""),
+                &Path::new(od).join(format!("dbus-{name}.xml")),
+            );
+            if !out.contains(&rel) {
+                out.push(rel);
+            }
+        }
+    }
+    out
 }
 
 fn undeclared_outputs(
@@ -7985,6 +8070,11 @@ fn undeclared_outputs(
         if let Some(vapi) = vapigen_vapi(c, build_dir) {
             if !v.contains(&vapi) {
                 v.push(vapi);
+            }
+        }
+        for w in gdbus_docbook_interface_outputs(c, build_dir, declared) {
+            if !v.contains(&w) {
+                v.push(w);
             }
         }
         for w in cmake_p_stamp_edge_writes(declared, c, build_dir) {
@@ -11854,7 +11944,7 @@ fn included_paths_walk(
         };
         if depth < 4 && on_disk.is_file() {
             if let Ok(child) = std::fs::read_to_string(&on_disk) {
-                included_paths_walk(Path::new(&path), &child, vars, out, depth + 1, cwd);
+                included_paths_walk(&on_disk, &child, vars, out, depth + 1, cwd);
             }
         }
     }
@@ -22267,7 +22357,10 @@ mod script_bare_programs_tests {
 
 #[cfg(test)]
 mod vapigen_outputs_tests {
-    use super::{gdbus_unwritten_outputs, vapigen_unwritten_outputs, vapigen_vapi};
+    use super::{
+        gdbus_docbook_interface_outputs, gdbus_unwritten_outputs, vapigen_unwritten_outputs,
+        vapigen_vapi,
+    };
     use std::path::{Path, PathBuf};
 
     /// libayatana-appindicator 0.5.92's edge, argv as its task drv carried
@@ -22350,5 +22443,110 @@ mod vapigen_outputs_tests {
             gdbus_unwritten_outputs(cmd, bd, &no_docbook_declared).is_empty(),
             "a non-docbook declared name must not be stamped"
         );
+    }
+
+    /// flatpak's docbook edge with its five inputs as the release ships
+    /// them (interface names, both quote styles), plus a decoy interface in
+    /// a comment. Only the bare `dbus-org.freedesktop.Flatpak.xml` is never
+    /// written; the five per-interface files the gtkdoc edge xi:includes and
+    /// nobody declares become outputs. The control is an edge whose inputs
+    /// each carry one interface named for the file: it builds today and must
+    /// gain neither a stamp nor an output.
+    #[test]
+    fn a_docbook_edge_stamps_only_what_no_interface_writes_and_declares_the_rest() {
+        let root = std::env::temp_dir().join(format!("nn-gdbus-doc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let iface = |n: &str, q: char| format!("  <interface name={q}{n}{q}>\n  </interface>\n");
+        let files: [(&str, Vec<String>); 5] = [
+            (
+                "org.freedesktop.Flatpak.Authenticator",
+                vec![
+                    iface("org.freedesktop.Flatpak.Authenticator", '"'),
+                    iface("org.freedesktop.Flatpak.AuthenticatorRequest", '"'),
+                ],
+            ),
+            (
+                "org.freedesktop.Flatpak",
+                vec![
+                    "<!-- <interface name=\"org.freedesktop.Flatpak.Bogus\"> -->\n".to_string(),
+                    iface("org.freedesktop.Flatpak.SessionHelper", '\''),
+                    iface("org.freedesktop.Flatpak.Development", '\''),
+                    iface("org.freedesktop.Flatpak.SystemHelper", '\''),
+                ],
+            ),
+            (
+                "org.freedesktop.impl.portal.PermissionStore",
+                vec![iface("org.freedesktop.impl.portal.PermissionStore", '\'')],
+            ),
+            (
+                "org.freedesktop.portal.Documents",
+                vec![iface("org.freedesktop.portal.Documents", '"')],
+            ),
+            (
+                "org.freedesktop.portal.Flatpak",
+                vec![
+                    iface("org.freedesktop.portal.Flatpak", '\''),
+                    iface("org.freedesktop.portal.Flatpak.UpdateMonitor", '"'),
+                ],
+            ),
+        ];
+        for (stem, ifaces) in &files {
+            std::fs::write(
+                data.join(format!("{stem}.xml")),
+                format!("<node>\n{}</node>\n", ifaces.concat()),
+            )
+            .unwrap();
+        }
+        let gdbus =
+            "/nix/store/7y3yxnzk3yy1x8njrsa3m8804b1h1hz7-glib-2.88.3-dev/bin/gdbus-codegen \
+                     --c-generate-autocleanup all --c-namespace doc \
+                     --output-directory doc/reference --generate-docbook dbus";
+        let cmd_for = |stems: &[&str]| {
+            let xs: Vec<String> = stems
+                .iter()
+                .map(|s| data.join(format!("{s}.xml")).display().to_string())
+                .collect();
+            format!("{gdbus} {}", xs.join(" "))
+        };
+        let declared_for = |stems: &[&str]| -> Vec<PathBuf> {
+            stems
+                .iter()
+                .map(|s| PathBuf::from(format!("doc/reference/dbus-{s}.xml")))
+                .collect()
+        };
+        let all: Vec<&str> = files.iter().map(|(s, _)| *s).collect();
+        let (cmd, declared) = (cmd_for(&all), declared_for(&all));
+        let unwritten = gdbus_unwritten_outputs(&cmd, &root, &declared);
+        let extra = gdbus_docbook_interface_outputs(&cmd, &root, &declared);
+        let green = [
+            "org.freedesktop.impl.portal.PermissionStore",
+            "org.freedesktop.portal.Documents",
+        ];
+        let green_unwritten =
+            gdbus_unwritten_outputs(&cmd_for(&green), &root, &declared_for(&green));
+        let green_extra =
+            gdbus_docbook_interface_outputs(&cmd_for(&green), &root, &declared_for(&green));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            unwritten,
+            vec![PathBuf::from(
+                "doc/reference/dbus-org.freedesktop.Flatpak.xml"
+            )]
+        );
+        let want: Vec<PathBuf> = [
+            "org.freedesktop.Flatpak.AuthenticatorRequest",
+            "org.freedesktop.Flatpak.SessionHelper",
+            "org.freedesktop.Flatpak.Development",
+            "org.freedesktop.Flatpak.SystemHelper",
+            "org.freedesktop.portal.Flatpak.UpdateMonitor",
+        ]
+        .iter()
+        .map(|n| PathBuf::from(format!("doc/reference/dbus-{n}.xml")))
+        .collect();
+        assert_eq!(extra, want);
+        assert!(green_unwritten.is_empty(), "{green_unwritten:?}");
+        assert!(green_extra.is_empty(), "{green_extra:?}");
     }
 }
