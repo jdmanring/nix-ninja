@@ -11803,6 +11803,12 @@ mod cmake_script_reference_tests {
     /// climb into, named by no argument.
     #[test]
     fn a_foreach_over_a_split_definition_recovers_each_section() {
+        // THE SDL3 MANPAGES OF THE SAME FREERDP RELEASE: the edge's argv
+        // from task `gpy1sk9l` (KDE round 2026-10-17) and the release's
+        // `GenerateManpages.cmake` verbatim. `client/SDL/SDL3/man` owns
+        // two of the eight section `.in` files, the rest climb into
+        // sibling `man` trees; a DEP whose `.in` sits beside the edge's
+        // own directory is the spelling no `-D` argument names.
         let cmdline = r#"cd /build/source/build/client/SDL/SDL3/man && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -Dtemplate="sdl3-freerdp.1" -DMANPAGE_NAME="sdl-freerdp" -Dmanpage="sdl-freerdp.1" -DMAN_TODAY="1980-01-01" -DCURRENT_SOURCE_DIR="/build/source/client/SDL/SDL3/man" -DCURRENT_BINARY_DIR="/build/source/build/client/SDL/SDL3/man" -Dtarget="sdl3-freerdp" -Dsection="1" -Ddependencies="../../../common/man/freerdp-global-options.1 ../../../common/man/freerdp-global-envvar.1 sdl3-freerdp-envvar.1 ../../common/man/sdl-freerdp-config.1 ../../../common/man/freerdp-global-config.1 ../../common/man/sdl-global-config.1 ../../common/man/sdl-freerdp-examples.1 ../../../common/man/freerdp-global-links.1" -DVENDOR=FreeRDP -DPRODUCT=FreeRDP -DVENDOR_PRODUCT=freerdp -DSYSCONF_DIR=/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-freerdp-3.32.1/etc/FreeRDP -DSDL_WIKI_BASE_URL=https://wiki.libsdl.org/SDL3 -P "/build/source/cmake/GenerateManpages.cmake""#;
         let a = shell_words::split(cmdline).unwrap();
         let script = r#"get_filename_component(GENERATE_MANPAGES_SCRIPT_DIR "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
@@ -11863,6 +11869,91 @@ endforeach()
                 "{want} not recovered; got {got:?}"
             );
         }
+    }
+
+    /// THE X11 MANPAGES OF THE SAME FREERDP RELEASE: the edge's argv from
+    /// task `z0lihmjr` (X11 round 2026-10-17) and the release's
+    /// `GenerateManpages.cmake` verbatim. `client/X11/man` owns three of
+    /// the seven section `.in` files, the rest climb into
+    /// `client/common/man`; a DEP whose `.in` sits beside the edge's own
+    /// directory is the spelling no `-D` argument names.
+    #[test]
+    fn the_x11_manpage_edge_recovers_each_section_it_climbs_to() {
+        let cmdline = r#"cd /build/source/build/client/X11/man && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -Dtemplate="xfreerdp.1" -DMANPAGE_NAME="xfreerdp" -Dmanpage="xfreerdp.1" -DMAN_TODAY="1980-01-01" -DCURRENT_SOURCE_DIR="/build/source/client/X11/man" -DCURRENT_BINARY_DIR="/build/source/build/client/X11/man" -Dtarget="xfreerdp" -Dsection="1" -Ddependencies="../../common/man/freerdp-global-options.1 xfreerdp-shortcuts.1 ../../common/man/freerdp-global-envvar.1 ../../common/man/freerdp-global-config.1 xfreerdp-global-config.1 xfreerdp-examples.1 ../../common/man/freerdp-global-links.1" -DVENDOR=FreeRDP -DPRODUCT=FreeRDP -DVENDOR_PRODUCT=freerdp -DSYSCONF_DIR=/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-freerdp-3.32.1/etc/FreeRDP -P "/build/source/cmake/GenerateManpages.cmake""#;
+        let a = shell_words::split(cmdline).unwrap();
+        let script = r#"get_filename_component(GENERATE_MANPAGES_SCRIPT_DIR "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
+list(APPEND CMAKE_MODULE_PATH ${GENERATE_MANPAGES_SCRIPT_DIR})
+
+set(SRC "${CURRENT_SOURCE_DIR}/${target}.${section}.in")
+configure_file(${SRC} ${manpage}.tmp @ONLY IMMEDIATE)
+
+# write header (aka name of the manpage), truncate existing
+file(READ ${CURRENT_BINARY_DIR}/${manpage}.tmp CONTENTS)
+file(WRITE ${CURRENT_BINARY_DIR}/${manpage} "${CONTENTS}")
+
+string(REPLACE " " ";" DEPS ${dependencies})
+foreach(DEP IN LISTS DEPS)
+  get_filename_component(DNAME "${DEP}" NAME)
+  set(SRC_IN ${CURRENT_SOURCE_DIR}/${DEP}.in)
+  set(DST_IN ${CURRENT_BINARY_DIR}/${DEP}.in)
+  set(SRC ${CURRENT_SOURCE_DIR}/${DEP})
+  set(BIN ${CURRENT_BINARY_DIR}/${DEP})
+  set(DST ${CURRENT_BINARY_DIR}/${DNAME})
+
+  if(EXISTS ${SRC_IN})
+    message("using generated ${DST} from ${SRC_IN}")
+    configure_file(${SRC_IN} ${DST} @ONLY IMMEDIATE)
+  elseif(EXISTS ${DST_IN})
+    message("using generated ${DST} from ${DST_IN}")
+    configure_file(${DST_IN} ${DST} @ONLY IMMEDIATE)
+  elseif(EXISTS ${SRC})
+    set(DST ${SRC})
+    message("using ${DST}")
+  elseif(EXISTS ${BIN})
+    set(DST ${BIN})
+    message("using ${DST}")
+  elseif(EXISTS ${DST})
+    message("using ${DST}")
+  else()
+    message(WARNING "Missing manpage section, considered:")
+    message(WARNING "   ${SRC_IN}")
+    message(WARNING "   ${DST_IN}")
+    message(WARNING "   ${SRC}")
+    message(WARNING "   ${BIN}")
+    message(WARNING "   ${DST}")
+    message(FATAL_ERROR "Can not continue, terminating")
+  endif()
+
+  file(READ ${DST} CONTENTS)
+  file(APPEND ${CURRENT_BINARY_DIR}/${manpage} "${CONTENTS}")
+endforeach()
+"#;
+        let got = cmake_script_referenced_paths(script, &cmake_definitions(&a));
+        // Each source the release actually ships: the X11-owned sections in
+        // the edge's own directory, the shared ones one climb up, and the
+        // configure_file template it opens first.
+        for want in [
+            "/build/source/client/X11/man/xfreerdp.1.in",
+            "/build/source/client/X11/man/xfreerdp-shortcuts.1.in",
+            "/build/source/client/X11/man/xfreerdp-examples.1.in",
+            "/build/source/client/X11/man/xfreerdp-global-config.1.in",
+            "/build/source/client/common/man/freerdp-global-options.1.in",
+            "/build/source/client/common/man/freerdp-global-envvar.1.in",
+            "/build/source/client/common/man/freerdp-global-config.1.in",
+            "/build/source/client/common/man/freerdp-global-links.1.in",
+        ] {
+            assert!(
+                got.iter().any(|g| g == want),
+                "{want} not recovered; got {got:?}"
+            );
+        }
+        // A .in that ships NOWHERE is a candidate the reader still tests
+        // and finds nothing; what it recovers must not pretend to exist.
+        // xfreerdp-global-links.1.in is not among the X11-owned set.
+        assert!(
+            got.iter().all(|g| g != "/build/source/client/X11/man/xfreerdp-global-links.1.in"),
+            "an unshipped section was recovered: {got:?}"
+        );
     }
 
     /// ONETBB'S OWN SHAPE, taken from the failing edge and the script it
@@ -12033,6 +12124,116 @@ endforeach()
     fn a_non_path_value_is_not_offered() {
         let got = cmake_script_referenced_paths("set(V \"1.2.3\")\n", &HashMap::new());
         assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// opencv's `opencv4.pc` edge from task `w8yfcxbv` (2026-10-17): the
+    /// helper the `-D` definition names is a configure-time file in the
+    /// build dir, and the module the script's second `include` composes
+    /// from a variable the helper sets sits in the SOURCE tree one climb
+    /// above it. The walk reads the helper off the build dir, so the module
+    /// is reached only if the helper's `set` is in force when the next
+    /// `include` expands.
+    #[test]
+    fn a_composed_include_reaches_a_module_set_by_a_build_dir_helper() {
+        let root = std::env::temp_dir().join(format!(
+            "nn-cmake-build-helper-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, build) = (root.join("source"), root.join("source/build"));
+        std::fs::create_dir_all(src.join("cmake/vars")).unwrap();
+        std::fs::create_dir_all(&build).unwrap();
+        // The helper is a configure-time file: generated into the build dir,
+        // not in the source tree.
+        let helper = build.join("OpenCVGenPkgConfig.info.cmake");
+        std::fs::write(
+            &helper,
+            format!(
+                "set(BUILD_SHARED_LIBS \"ON\")\nset(OpenCV_SOURCE_DIR \"{}\")\n",
+                src.display()
+            ),
+        )
+        .unwrap();
+        // The module the second include names, one climb up into the source.
+        let module = src.join("cmake/OpenCVUtils.cmake");
+        std::fs::write(
+            &module,
+            "include(\"${CMAKE_CURRENT_LIST_DIR}/vars/EnableModeVars.cmake\")\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("cmake/vars/EnableModeVars.cmake"), "").unwrap();
+        let script = src.join("cmake/OpenCVGenPkgconfig.cmake");
+        let text = "cmake_policy(SET CMP0012 NEW)\n\
+                    include(\"${CMAKE_HELPER_SCRIPT}\")\n\
+                    include(\"${OpenCV_SOURCE_DIR}/cmake/OpenCVUtils.cmake\")\n";
+        let defs = cmake_definitions(&args(&format!(
+            "cmake -DCMAKE_HELPER_SCRIPT={} -P {}",
+            helper.display(),
+            script.display()
+        )));
+        let got = cmake_script_included_paths(&script, text, &defs);
+        // The helper and the module both ride the recovery.
+        for want in [
+            helper.to_string_lossy().into_owned(),
+            module.to_string_lossy().into_owned(),
+        ] {
+            assert!(
+                got.iter().any(|g| g == &want),
+                "{want} not recovered; got {got:?}"
+            );
+        }
+        // The sub-module the module pulls in through `CMAKE_CURRENT_LIST_DIR`
+        // is reached too.
+        assert!(
+            got.iter().any(|g| g.ends_with("/cmake/vars/EnableModeVars.cmake")),
+            "the module's own include was not recovered; got {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The negative arm of the same shape: a helper that sets no variable
+    /// the script's next `include` composes from. The second `include`
+    /// names nothing the walk can expand, so it is skipped and the module
+    /// is not recovered. A walk that invented a value here would recover
+    /// the module and let the test pass; it must not.
+    #[test]
+    fn a_composed_include_without_a_setting_helper_recovers_nothing_beyond_the_helper()
+    {
+        let root = std::env::temp_dir().join(format!(
+            "nn-cmake-build-helper-none-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, build) = (root.join("source"), root.join("source/build"));
+        std::fs::create_dir_all(src.join("cmake")).unwrap();
+        std::fs::create_dir_all(&build).unwrap();
+        let helper = build.join("OpenCVGenPkgConfig.info.cmake");
+        // No `set(OpenCV_SOURCE_DIR ...)` here.
+        std::fs::write(&helper, "set(BUILD_SHARED_LIBS \"ON\")\n").unwrap();
+        let module = src.join("cmake/OpenCVUtils.cmake");
+        std::fs::write(&module, "").unwrap();
+        let script = src.join("cmake/OpenCVGenPkgconfig.cmake");
+        let text = "cmake_policy(SET CMP0012 NEW)\n\
+                    include(\"${CMAKE_HELPER_SCRIPT}\")\n\
+                    include(\"${OpenCV_SOURCE_DIR}/cmake/OpenCVUtils.cmake\")\n";
+        let defs = cmake_definitions(&args(&format!(
+            "cmake -DCMAKE_HELPER_SCRIPT={} -P {}",
+            helper.display(),
+            script.display()
+        )));
+        let got = cmake_script_included_paths(&script, text, &defs);
+        let _ = std::fs::remove_dir_all(&root);
+        // The helper itself is still reached: it is named by a definition.
+        assert!(
+            got.iter().any(|g| g == &helper.to_string_lossy().into_owned()),
+            "the helper must ride the recovery; got {got:?}"
+        );
+        // The module is NOT reached: the variable that composes it is set by
+        // nothing the walk reads.
+        assert!(
+            got.iter().all(|g| g != &module.to_string_lossy().into_owned()),
+            "the uncomposable module was recovered; got {got:?}"
+        );
     }
 }
 
