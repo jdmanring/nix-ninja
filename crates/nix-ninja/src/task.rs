@@ -8515,13 +8515,15 @@ pub fn cmake_dotted_stamp_outputs(declared: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The output directory, docbook prefix and input xmls of a `gdbus-codegen
-/// --generate-docbook` command, or None for any other command. An input is
-/// a `.xml` argument that is not a flag, as spelled. The prefix is the
-/// flag's value: `gdbus-codegen` names each file `<prefix>-<interface>.xml`
-/// (`codegen_docbook.py`), and xdg-desktop-portal passes `portal`, not
-/// `dbus`.
-fn gdbus_docbook_args(cmdline: &str) -> Option<(String, String, Vec<String>)> {
+/// The output directory, document prefix, document extension and input
+/// xmls of a `gdbus-codegen --generate-{docbook,rst,md}` command, or None
+/// for any other command. An input is a `.xml` argument that is not a flag,
+/// as spelled. The prefix is the flag's value: `gdbus-codegen` names each
+/// file `<prefix>-<interface>.<ext>` (`codegen_docbook.py`, `codegen_rst.py`,
+/// `codegen_md.py`), and xdg-desktop-portal passes `portal`, not `dbus`.
+/// meson declares `<prefix>-<input-stem>` for all three, `.xml` stem
+/// included, so an rst or md edge's declared names are never written.
+fn gdbus_docbook_args(cmdline: &str) -> Option<(String, String, &'static str, Vec<String>)> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
     let is_gdbus = toks.iter().any(|t| {
         Path::new(t)
@@ -8529,12 +8531,18 @@ fn gdbus_docbook_args(cmdline: &str) -> Option<(String, String, Vec<String>)> {
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("gdbus-codegen"))
     });
-    let has_docbook_flag = toks
-        .iter()
-        .any(|t| *t == "--generate-docbook" || t.starts_with("--generate-docbook="));
-    if !is_gdbus || !has_docbook_flag {
+    const KINDS: [(&str, &str); 3] = [
+        ("--generate-docbook", "xml"),
+        ("--generate-rst", "rst"),
+        ("--generate-md", "md"),
+    ];
+    let kind = KINDS.iter().find(|(flag, _)| {
+        toks.iter()
+            .any(|t| t == flag || t.strip_prefix(flag).is_some_and(|r| r.starts_with('=')))
+    });
+    let (Some(&(flag, ext)), true) = (kind, is_gdbus) else {
         return None;
-    }
+    };
     let mut out_dir = None;
     let mut prefix = None;
     let mut inputs = Vec::new();
@@ -8545,13 +8553,13 @@ fn gdbus_docbook_args(cmdline: &str) -> Option<(String, String, Vec<String>)> {
             "--output-directory" => {
                 out_dir = it.next().copied();
             }
-            "--generate-docbook" => {
+            t if t == flag => {
                 prefix = it.next().copied();
             }
             _ => {
                 if let Some(v) = t.strip_prefix("--output-directory=") {
                     out_dir = Some(v);
-                } else if let Some(v) = t.strip_prefix("--generate-docbook=") {
+                } else if let Some(v) = t.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
                     prefix = Some(v);
                 } else if t.ends_with(".xml") && !t.starts_with('-') {
                     inputs.push(t.trim_matches('"').to_string());
@@ -8561,7 +8569,7 @@ fn gdbus_docbook_args(cmdline: &str) -> Option<(String, String, Vec<String>)> {
     }
     let od = out_dir.map(|s| s.trim_matches('"')).unwrap_or(".");
     let prefix = prefix?.trim_matches('"');
-    Some((od.to_string(), prefix.to_string(), inputs))
+    Some((od.to_string(), prefix.to_string(), ext, inputs))
 }
 
 /// Declared docbook outputs of a `gdbus-codegen --generate-docbook` edge
@@ -8588,7 +8596,7 @@ pub fn gdbus_unwritten_outputs(
     build_dir: &Path,
     declared: &[PathBuf],
 ) -> Vec<PathBuf> {
-    let Some((od, prefix, inputs)) = gdbus_docbook_args(cmdline) else {
+    let Some((od, prefix, ext, inputs)) = gdbus_docbook_args(cmdline) else {
         return Vec::new();
     };
     // Each input xml names one declared docbook output:
@@ -8603,7 +8611,7 @@ pub fn gdbus_unwritten_outputs(
     // ONLY THE NAMES NO INTERFACE PRODUCES. An input whose single interface
     // carries its stem is written by the tool; stamping it anyway appended
     // `&& touch` to every docbook edge that builds today and moved its key.
-    let Some(written) = gdbus_docbook_written(&od, &prefix, &inputs, build_dir) else {
+    let Some(written) = gdbus_docbook_written(&od, &prefix, ext, &inputs, build_dir) else {
         return Vec::new();
     };
     declared
@@ -8634,17 +8642,17 @@ pub fn gdbus_docbook_interface_outputs(
     build_dir: &Path,
     declared: &[PathBuf],
 ) -> Vec<PathBuf> {
-    let Some((od, prefix, inputs)) = gdbus_docbook_args(cmdline) else {
+    let Some((od, prefix, ext, inputs)) = gdbus_docbook_args(cmdline) else {
         return Vec::new();
     };
-    gdbus_docbook_written(&od, &prefix, &inputs, build_dir)
+    gdbus_docbook_written(&od, &prefix, ext, &inputs, build_dir)
         .unwrap_or_default()
         .into_iter()
         .filter(|p| !declared.contains(p))
         .collect()
 }
 
-/// Every `<od>/<prefix>-<interface>.xml` the inputs' interfaces name, or None
+/// Every `<od>/<prefix>-<interface>.<ext>` the inputs' interfaces name, or None
 /// when any input cannot be read. An unreadable input is a GENERATED xml not
 /// yet on disk, and guessing would fail the wrong way: read as naming no
 /// interface, its stem would be stamped and an edge that builds today would
@@ -8652,6 +8660,7 @@ pub fn gdbus_docbook_interface_outputs(
 fn gdbus_docbook_written(
     od: &str,
     prefix: &str,
+    ext: &str,
     inputs: &[String],
     build_dir: &Path,
 ) -> Option<Vec<PathBuf>> {
@@ -8684,7 +8693,7 @@ fn gdbus_docbook_written(
             };
             let rel = lexical_join(
                 Path::new(""),
-                &Path::new(od).join(format!("{prefix}-{name}.xml")),
+                &Path::new(od).join(format!("{prefix}-{name}.{ext}")),
             );
             if !out.contains(&rel) {
                 out.push(rel);
@@ -23886,6 +23895,12 @@ mod vapigen_outputs_tests {
         );
         let pair_declared = [PathBuf::from("src/portal-org.freedesktop.portal.Pair.xml")];
         let pair_unwritten = gdbus_unwritten_outputs(&pair, &bd, &pair_declared);
+        // An rst edge: meson declares `<prefix>-<stem>.xml`, the tool writes
+        // `<prefix>-<interface>.rst`. The declared name is stamped and the
+        // written one declared.
+        let rst = cmd.replace("--generate-docbook portal", "--generate-rst portal");
+        let rst_unwritten = gdbus_unwritten_outputs(&rst, &bd, &declared);
+        let rst_extra = gdbus_docbook_interface_outputs(&rst, &bd, &declared);
         let _ = std::fs::remove_dir_all(&root);
         assert!(
             extra.is_empty(),
@@ -23907,6 +23922,18 @@ mod vapigen_outputs_tests {
             pair_unwritten,
             pair_declared.to_vec(),
             "the bare stem under the passed prefix is stamped"
+        );
+        assert_eq!(
+            rst_unwritten,
+            declared.to_vec(),
+            "rst: the .xml name is stamped"
+        );
+        assert_eq!(
+            rst_extra,
+            vec![PathBuf::from(
+                "src/portal-org.freedesktop.host.portal.Registry.rst"
+            )],
+            "rst: the written file is declared"
         );
     }
 
