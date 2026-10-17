@@ -4443,6 +4443,7 @@ fn build_task_derivation(
             // `to_upload` / `generated_not_yet_written` passes below treat
             // them as declared because they are in `virtual_paths` - the
             // miss becomes a declared input rather than a silent drop.
+            let mut interior_owner: HashMap<PathBuf, PathBuf> = HashMap::new();
             if let Some(consult) = consult {
                 for (build_path, df) in consult.iter() {
                     if !matches!(&df.derived_path, SingleDerivedPath::Built { .. }) {
@@ -4475,18 +4476,37 @@ fn build_task_derivation(
                         };
                         cand == abs || abs.starts_with(&cand) || cand.starts_with(&abs)
                     }) {
-                        let mut stack = vec![abs.clone()];
-                        while let Some(d) = stack.pop() {
+                        // THE TREE IS NOT ON THIS DISK in local mode: walk
+                        // its REALISED store object. Realise is memoized per
+                        // process, so each tree costs one round trip.
+                        let root = local::build_derived_files(
+                            rpc_client,
+                            &task.store_dir,
+                            std::slice::from_ref(df),
+                        )?
+                        .remove(build_path)
+                        .filter(|r| r.is_dir());
+                        let mut stack: Vec<(PathBuf, PathBuf)> =
+                            root.map(|r| (r, build_path.clone())).into_iter().collect();
+                        while let Some((d, rel_d)) = stack.pop() {
                             let Ok(entries) = fs::read_dir(&d) else {
                                 continue;
                             };
                             for e in entries.flatten() {
                                 let name = e.file_name();
                                 let f = d.join(&name);
-                                let rel = build_path.join(&name);
+                                let rel = rel_d.join(&name);
                                 if f.is_dir() {
-                                    stack.push(f);
+                                    stack.push((f, rel));
+                                    continue;
                                 }
+                                interior_owner.insert(rel.clone(), build_path.clone());
+                                // Both spellings: a relative `-I` probes the
+                                // relative key, an absolute one under the
+                                // exact mirror (gtk3's `-I/build/.../include`)
+                                // the absolute key.
+                                let abs_rel = task.build_dir.join(&rel);
+                                virtual_paths.entry(abs_rel.clone()).or_insert(abs_rel);
                                 virtual_paths
                                     .entry(rel.clone())
                                     .or_insert_with(|| rel.clone());
@@ -4555,8 +4575,19 @@ fn build_task_derivation(
             // declared inputs. `encoded_build_path` recovers the build
             // path from each one, which is what the entry's own build
             // path is matched against below.
+            let mut consult_offered = consult_offered;
+            for (interior, tree) in &interior_owner {
+                let hit =
+                    scanned.contains(&task.build_dir.join(interior)) || scanned.contains(interior);
+                if hit && !consult_offered.contains(tree) {
+                    consult_offered.push(tree.clone());
+                }
+            }
             for p in &consult_offered {
-                if !consult_entries_resolved(&scanned, p, &input_set) {
+                let interior_hit = interior_owner.iter().any(|(i, t)| {
+                    t == p && (scanned.contains(&task.build_dir.join(i)) || scanned.contains(i))
+                });
+                if !interior_hit && !consult_entries_resolved(&scanned, p, &input_set) {
                     continue;
                 }
                 let Some(df) = consult.as_ref().and_then(|c| c.get(p).cloned()) else {
