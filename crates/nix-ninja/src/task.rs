@@ -1958,6 +1958,12 @@ impl Runner {
             // at the end of it.
             let cmake_p_script = cmake_script_arg(&args).map(str::to_string);
             let cmake_p_defs = cmake_definitions(&args);
+            let gtkdoc_dirs = gtkdoc_dirs_to_carry(
+                &self.config.build_dir,
+                &self.config.store_dir,
+                &rewritten_cd_dir(&args),
+                &args,
+            );
             let tablegen = tablegen_invocation(&args);
             let xinclude_docs = xinclude_invocation(&args);
             let rst_docs = rst_invocation(&args);
@@ -2711,6 +2717,12 @@ impl Runner {
                         self.add_derived_file(files, input.clone());
                         input_set.insert(input.build_path.clone(), input);
                     }
+                }
+            }
+            for p in &gtkdoc_dirs {
+                for input in upload_referenced_dir(&self.rpc_client, &self.config.build_dir, p)? {
+                    self.add_derived_file(files, input.clone());
+                    input_set.insert(input.build_path.clone(), input);
                 }
             }
             if let Some(info) = &autogen_info {
@@ -7949,7 +7961,9 @@ pub fn gdbus_unwritten_outputs(
     // ONLY THE NAMES NO INTERFACE PRODUCES. An input whose single interface
     // carries its stem is written by the tool; stamping it anyway appended
     // `&& touch` to every docbook edge that builds today and moved its key.
-    let written = gdbus_docbook_written(&od, &inputs, build_dir);
+    let Some(written) = gdbus_docbook_written(&od, &inputs, build_dir) else {
+        return Vec::new();
+    };
     declared
         .iter()
         .filter(|p| {
@@ -7982,13 +7996,18 @@ pub fn gdbus_docbook_interface_outputs(
         return Vec::new();
     };
     gdbus_docbook_written(&od, &inputs, build_dir)
+        .unwrap_or_default()
         .into_iter()
         .filter(|p| !declared.contains(p))
         .collect()
 }
 
-/// Every `<od>/dbus-<interface>.xml` the inputs' interfaces name.
-fn gdbus_docbook_written(od: &str, inputs: &[String], build_dir: &Path) -> Vec<PathBuf> {
+/// Every `<od>/dbus-<interface>.xml` the inputs' interfaces name, or None
+/// when any input cannot be read. An unreadable input is a GENERATED xml not
+/// yet on disk, and guessing would fail the wrong way: read as naming no
+/// interface, its stem would be stamped and an edge that builds today would
+/// change its command. None leaves the edge's emission as it was.
+fn gdbus_docbook_written(od: &str, inputs: &[String], build_dir: &Path) -> Option<Vec<PathBuf>> {
     let mut out = Vec::new();
     for input in inputs {
         let path = if input.starts_with('/') {
@@ -7996,9 +8015,7 @@ fn gdbus_docbook_written(od: &str, inputs: &[String], build_dir: &Path) -> Vec<P
         } else {
             build_dir.join(input)
         };
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
+        let text = fs::read_to_string(&path).ok()?;
         let mut body = String::with_capacity(text.len());
         let mut rest = text.as_str();
         while let Some(i) = rest.find("<!--") {
@@ -8027,7 +8044,7 @@ fn gdbus_docbook_written(od: &str, inputs: &[String], build_dir: &Path) -> Vec<P
             }
         }
     }
-    out
+    Some(out)
 }
 
 fn undeclared_outputs(
@@ -11624,6 +11641,62 @@ pub fn cmake_autogen_referenced_files(text: &str) -> Vec<String> {
     out
 }
 
+/// Source directories a `meson --internal gtkdoc` run reads that no edge
+/// declares: its doc directory `<sourcedir>/<subdir>` (meson's gtkdochelper
+/// copies the `--mainfile` and `<module>-sections.txt`/`-overrides.txt` from
+/// there, and the main file xi:includes its neighbours) and each
+/// `--headerdirs` entry gtkdoc-scan reads. flatpak 1.18.4's gtkdoc edge died
+/// `FileNotFoundError: .../doc/reference/libflatpak-docs.xml`. Values are the
+/// REWRITTEN spellings, resolved against the command's directory. A directory
+/// inside the build dir is left out: its generated headers arrive as derived
+/// inputs, and uploading it would capture whatever is on disk at drive time.
+/// Only existing directories in this project's tree, never the store.
+fn gtkdoc_dirs_to_carry(
+    build_dir: &Path,
+    store_dir: &StoreDir,
+    cd_dir: &Path,
+    args: &[String],
+) -> Vec<PathBuf> {
+    if !args
+        .windows(2)
+        .any(|w| w[0] == "--internal" && w[1] == "gtkdoc")
+    {
+        return Vec::new();
+    }
+    let value = |flag: &str| {
+        args.iter()
+            .find_map(|a| a.strip_prefix(flag).and_then(|v| v.strip_prefix('=')))
+            .map(str::to_string)
+    };
+    let abs = |v: &str| {
+        if v.starts_with('/') {
+            lexical_join(Path::new(""), Path::new(v))
+        } else {
+            lexical_join(build_dir, &rebase_post_cd(cd_dir, v))
+        }
+    };
+    let mut dirs = Vec::new();
+    if let (Some(src), Some(sub)) = (value("--sourcedir"), value("--subdir")) {
+        dirs.push(abs(&src).join(sub));
+    }
+    if let Some(h) = value("--headerdirs") {
+        dirs.extend(h.split("@@").filter(|d| !d.is_empty()).map(abs));
+    }
+    let mut out = Vec::new();
+    for d in dirs {
+        if d.starts_with(store_dir)
+            || d.starts_with(build_dir)
+            || !same_project_tree(build_dir, &d)
+            || !d.is_dir()
+            || out.contains(&d)
+        {
+            continue;
+        }
+        out.push(d);
+    }
+    out
+}
+
 /// The directory a command runs in, relative to the build dir, read from the
 /// leading `cd <dir> &&` of the REWRITTEN argv (`rewrite_cmdline` has already
 /// made an in-tree target relative); empty when there is none.
@@ -12143,8 +12216,8 @@ mod cmake_script_reference_tests {
         cmake_definitions, cmake_dotted_stamp_outputs, cmake_p_references,
         cmake_p_stamp_edge_writes, cmake_script_arg, cmake_script_included_modules,
         cmake_script_included_paths, cmake_script_referenced_paths, expand_cmake_vars,
-        lexical_join, referenced_file_rel, rewrite_cmdline, rewritten_cd_dir, undeclared_outputs,
-        StoreDir,
+        gtkdoc_dirs_to_carry, lexical_join, referenced_file_rel, rewrite_cmdline, rewritten_cd_dir,
+        undeclared_outputs, StoreDir,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
@@ -12785,6 +12858,46 @@ endforeach()
         assert_eq!(got_rw, want);
         assert!(via_undeclared.contains(&want[0]), "{via_undeclared:?}");
         assert!(!control.contains(&want[0]), "{control:?}");
+    }
+
+    /// flatpak 1.18.4's gtkdoc edge died `FileNotFoundError:
+    /// .../doc/reference/libflatpak-docs.xml`: meson's gtkdochelper copies the
+    /// main file from `<sourcedir>/<subdir>` and no edge declared it. The
+    /// command is the real one through every flag the reader parses, run
+    /// through `rewrite_cmdline` as `new_task` receives it. Controls: the
+    /// build-tree header dir is not carried, a source dir that does not exist
+    /// is not carried, and another `meson --internal` subcommand carries
+    /// nothing.
+    #[test]
+    fn a_gtkdoc_edge_carries_its_doc_dir_and_source_header_dirs() {
+        let root = std::env::temp_dir().join(format!("nn-gtkdoc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, build) = (
+            root.join("flatpak-1.18.4"),
+            root.join("flatpak-1.18.4/build"),
+        );
+        touch(&src.join("doc/reference/libflatpak-docs.xml"), "");
+        touch(&src.join("common/flatpak.h"), "");
+        touch(&build.join("common/flatpak-enum-types.h"), "");
+        let s = src.display();
+        let cmdline = format!(
+            "/nix/store/wks9ln3yjvpymilzgw8yjj18p1n69qyb-meson-1.12.1/bin/meson --internal gtkdoc \
+             --sourcedir={s} --builddir={s}/build --subdir=doc/reference \
+             --headerdirs={s}/build/common@@{s}/common@@{s}/absent \
+             --mainfile=libflatpak-docs.xml --modulename=flatpak --moduleversion= --mode=auto"
+        );
+        let store = StoreDir::new(Path::new("/nix/store")).unwrap();
+        let a = shell_words::split(&rewrite_cmdline(&cmdline, &build)).unwrap();
+        let got = gtkdoc_dirs_to_carry(&build, &store, &rewritten_cd_dir(&a), &a);
+        let other = shell_words::split(&rewrite_cmdline(
+            &format!("/nix/store/x-meson/bin/meson --internal exe --sourcedir={s} --subdir=common"),
+            &build,
+        ))
+        .unwrap();
+        let none = gtkdoc_dirs_to_carry(&build, &store, &rewritten_cd_dir(&other), &other);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got, vec![src.join("doc/reference"), src.join("common")]);
+        assert!(none.is_empty(), "{none:?}");
     }
 }
 
@@ -22397,9 +22510,12 @@ mod vapigen_outputs_tests {
     /// (2026-10-17): meson's `gnome.gdbus_codegen(docbook: 'dbus')`
     /// declares one docbook output per input xml, each named
     /// `<output-directory>/dbus-<input-stem>.xml`. The command's argv is
-    /// verbatim from the failing task drv.
+    /// verbatim from the failing task drv. Its inputs are not on disk here,
+    /// so the edge must keep the emission it had: which names are unwritten
+    /// is read from the inputs' interfaces, and the stamped case is
+    /// `a_docbook_edge_stamps_only_what_no_interface_writes_and_declares_the_rest`.
     #[test]
-    fn a_gdbus_docbook_edge_stamps_the_declared_names_it_may_not_write() {
+    fn a_gdbus_docbook_edge_with_unreadable_inputs_keeps_its_emission() {
         let bd = Path::new("/build/flatpak-1.18.4");
         let cmd = "/nix/store/7y3yxnzk3yy1x8njrsa3m8804b1h1hz7-glib-2.88.3-dev/bin/gdbus-codegen \
                    --c-generate-autocleanup all --c-namespace doc \
@@ -22417,16 +22533,10 @@ mod vapigen_outputs_tests {
             PathBuf::from("doc/reference/dbus-org.freedesktop.portal.Documents.xml"),
             PathBuf::from("doc/reference/dbus-org.freedesktop.portal.Flatpak.xml"),
         ];
-        // Every declared docbook spelling is a candidate: the tool writes
-        // it for a single-interface input and not for a multi-interface
-        // one, so a bare-stem declared name may or may not exist when the
-        // check runs. The command must stamp all of them; `touch` on a
-        // file the tool already wrote is a no-op.
         let unwritten = gdbus_unwritten_outputs(cmd, bd, &declared);
-        assert_eq!(
-            unwritten,
-            declared.to_vec(),
-            "every declared docbook spelling must be stamped; got {unwritten:?}"
+        assert!(
+            unwritten.is_empty(),
+            "unreadable inputs must not be guessed at; got {unwritten:?}"
         );
         // A command without `--generate-docbook` stamps nothing: the
         // ordinary `gdbus-codegen` run has no docbook half.
@@ -22528,6 +22638,19 @@ mod vapigen_outputs_tests {
             gdbus_unwritten_outputs(&cmd_for(&green), &root, &declared_for(&green));
         let green_extra =
             gdbus_docbook_interface_outputs(&cmd_for(&green), &root, &declared_for(&green));
+        // The derivation half: the same names reach `undeclared_outputs`.
+        let via_undeclared = super::undeclared_outputs(&declared, Some(&cmd), &root);
+        // A generated input not on disk yet: the edge keeps its emission,
+        // no stamp and no extra output, rather than a guess.
+        let mut with_missing = all.clone();
+        with_missing.push("org.example.Generated");
+        let missing_unwritten =
+            gdbus_unwritten_outputs(&cmd_for(&with_missing), &root, &declared_for(&with_missing));
+        let missing_extra = gdbus_docbook_interface_outputs(
+            &cmd_for(&with_missing),
+            &root,
+            &declared_for(&with_missing),
+        );
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(
             unwritten,
@@ -22546,6 +22669,14 @@ mod vapigen_outputs_tests {
         .map(|n| PathBuf::from(format!("doc/reference/dbus-{n}.xml")))
         .collect();
         assert_eq!(extra, want);
+        for w in &want {
+            assert!(
+                via_undeclared.contains(w),
+                "{w:?} not in {via_undeclared:?}"
+            );
+        }
+        assert!(missing_unwritten.is_empty(), "{missing_unwritten:?}");
+        assert!(missing_extra.is_empty(), "{missing_extra:?}");
         assert!(green_unwritten.is_empty(), "{green_unwritten:?}");
         assert!(green_extra.is_empty(), "{green_extra:?}");
     }
