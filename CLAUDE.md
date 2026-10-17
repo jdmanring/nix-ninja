@@ -582,7 +582,11 @@ is also `max-jobs`, so machine-wide it is the square); `cores` sets the
 driver's `-j` (`resolved_jobs`) AND threads per build. Size through Saxum's
 governor, never literals. Realise latency is the daemon's single SQLite
 mutex: answer throughput by closure and realise counts per task, never
-cores; a `-j` sweep on a busy machine measures the daemon. Read a daemon
+cores; a `-j` sweep on a busy machine measures the daemon. `build_paths`
+realises DERIVED FILES only (a task's own outputs), never shared store
+inputs, and its `realised` memo is per process: a cold per-TU driver sends
+one first-time realise plus its drv and text uploads, none cacheable, so a
+persisted realise memo is refuted (queue, 2026-10-16). Read a daemon
 window as worker CPU DELTA (`daemon-gap-cpu-probe.sh`, also counts
 crashes), never load average. `DaemonStalled` is NO ANSWER, not busyness:
 crashed workers produce it in milliseconds
