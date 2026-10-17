@@ -1280,6 +1280,7 @@ impl Runner {
                             &config.build_dir,
                             &paths,
                         ))
+                        .chain(gtkdoc_html_dir(c, &config.build_dir))
                         .collect();
                     undeclared_dirs = external_project_extract_dirs(c, &config.build_dir)
                         .into_iter()
@@ -8099,6 +8100,11 @@ fn undeclared_outputs(
                 v.push(vapi);
             }
         }
+        if let Some(html) = gtkdoc_html_dir(c, build_dir) {
+            if !v.contains(&html) && !declared.contains(&html) {
+                v.push(html);
+            }
+        }
         for w in gdbus_docbook_interface_outputs(c, build_dir, declared) {
             if !v.contains(&w) {
                 v.push(w);
@@ -11760,6 +11766,38 @@ fn gtkdoc_make_dirs(build_dir: &Path, cmdline: &str) -> Vec<String> {
     out
 }
 
+/// The `html` directory a `meson --internal gtkdoc` run writes under
+/// `<builddir>/<subdir>`, relative to the build dir. No edge declares it, and
+/// meson's install step copies it from the build tree (gtkdochelper's
+/// `install_gtkdoc`), where real ninja leaves it and a task does not.
+/// Declared as a directory output so it is stored and placed.
+fn gtkdoc_html_dir(cmdline: &str, build_dir: &Path) -> Option<PathBuf> {
+    let args = shell_words::split(cmdline).ok()?;
+    if !args
+        .windows(2)
+        .any(|w| w[0] == "--internal" && w[1] == "gtkdoc")
+    {
+        return None;
+    }
+    let value = |flag: &str| {
+        args.iter()
+            .find_map(|a| a.strip_prefix(flag).and_then(|v| v.strip_prefix('=')))
+    };
+    let (bdir, sub) = (value("--builddir")?, value("--subdir")?);
+    let cd = rewritten_cd_dir(&args);
+    let bdir = if bdir.starts_with('/') {
+        lexical_join(Path::new(""), Path::new(bdir))
+    } else {
+        lexical_join(build_dir, &rebase_post_cd(&cd, bdir))
+    };
+    let html = lexical_join(&bdir, Path::new(sub)).join("html");
+    let rel = html.strip_prefix(build_dir).ok()?.to_path_buf();
+    rel.components()
+        .next()
+        .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
+        .then_some(rel)
+}
+
 /// The directory a command runs in, relative to the build dir, read from the
 /// leading `cd <dir> &&` of the REWRITTEN argv (`rewrite_cmdline` has already
 /// made an in-tree target relative); empty when there is none.
@@ -12279,8 +12317,8 @@ mod cmake_script_reference_tests {
         cmake_definitions, cmake_dotted_stamp_outputs, cmake_p_references,
         cmake_p_stamp_edge_writes, cmake_script_arg, cmake_script_included_modules,
         cmake_script_included_paths, cmake_script_referenced_paths, expand_cmake_vars,
-        gtkdoc_dirs_to_carry, gtkdoc_make_dirs, lexical_join, referenced_file_rel, rewrite_cmdline,
-        rewritten_cd_dir, undeclared_outputs, StoreDir,
+        gtkdoc_dirs_to_carry, gtkdoc_html_dir, gtkdoc_make_dirs, lexical_join, referenced_file_rel,
+        rewrite_cmdline, rewritten_cd_dir, undeclared_outputs, StoreDir,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
@@ -12965,6 +13003,10 @@ endforeach()
         .unwrap();
         let none = gtkdoc_dirs_to_carry(&build, &store, &rewritten_cd_dir(&other), &other);
         let made = gtkdoc_make_dirs(&build, &cmdline);
+        let html = gtkdoc_html_dir(&cmdline, &build);
+        let html_rw = gtkdoc_html_dir(&rewrite_cmdline(&cmdline, &build), &build);
+        let decl = vec![PathBuf::from("doc/reference/flatpak-decl.txt")];
+        let via_undeclared = undeclared_outputs(&decl, Some(&cmdline), &build);
         let made_other = gtkdoc_make_dirs(
             &build,
             &format!("/nix/store/x-meson/bin/meson --internal exe '--cflags=-I{s}/build/common'"),
@@ -12988,6 +13030,19 @@ endforeach()
             vec!["common".to_string(), "subprojects/libglnx".to_string()]
         );
         assert!(made_other.is_empty(), "{made_other:?}");
+        // meson's install step copies `<builddir>/<subdir>/html`, so the
+        // edge declares it, read from either spelling of the command.
+        assert_eq!(html, Some(PathBuf::from("doc/reference/html")));
+        assert_eq!(html_rw, html);
+        assert!(
+            via_undeclared.contains(&PathBuf::from("doc/reference/html")),
+            "{via_undeclared:?}"
+        );
+        assert!(gtkdoc_html_dir(
+            &format!("meson --internal exe --builddir={s}/build --subdir=x"),
+            &build
+        )
+        .is_none());
     }
 }
 
