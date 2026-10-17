@@ -13,7 +13,7 @@ use n2::{
     graph::{self, Build, BuildDependencies, BuildId, File, FileId},
 };
 use nix_builder_rpc_client::BuilderRpcClient;
-use nix_ninja_task::derived_file::{DerivedFile, ENCODED_LIST_SEP};
+use nix_ninja_task::derived_file::{split_encoded_list, DerivedFile, ENCODED_LIST_SEP};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
@@ -213,6 +213,14 @@ struct Task {
     // (Runner::empty_dirs), and a compile gets every include directory its
     // command names that exists in the tree.
     make_dirs: Vec<String>,
+    /// MISS-ONLY CONSULT of completed graph outputs. When the include scan
+    /// resolves to a build-directory path this edge does not declare (the
+    /// transitive order-only class), the Runner's snapshot of the DerivedFiles
+    /// it holds lets the task pick up that file as a declared input instead of
+    /// declaring a miss that fails in the sandbox. Empty for every task with
+    /// no such miss, and empty unless discovery runs, so a task's inputs stay
+    /// byte-identical to today whenever the consult consults nothing.
+    consult: Option<Arc<std::sync::RwLock<HashMap<PathBuf, DerivedFile>>>>,
 }
 
 impl Deref for Task {
@@ -635,6 +643,12 @@ pub struct Runner {
     /// carry them: the blanket's own gate, and a compile writes nothing
     /// beside its object.
     empty_dirs: Vec<String>,
+    /// The snapshot of completed-edge outputs a discovery task may CONSULT,
+    /// shared by reference with the worker threads and refreshed by the
+    /// Runner as edges complete. See the miss-only guarantee on
+    /// `Task.consult` for why only BUILT outputs are offered and why a
+    /// task with no consult miss stays byte-identical to today's inputs.
+    derived_snapshot: Arc<std::sync::RwLock<HashMap<PathBuf, DerivedFile>>>,
 
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
@@ -753,6 +767,9 @@ impl Runner {
             wrapper_vars,
             wrapper_store_paths,
             store_regex,
+            // Empty at start: no edge has completed, so no discovery task
+            // consults and every task's inputs are computed as before.
+            derived_snapshot: Default::default(),
         })
     }
 
@@ -1176,10 +1193,13 @@ impl Runner {
         std::thread::spawn(move || {
             let _permit = permit;
             let _pool_permit = pool_permit;
+            let snapshot = task.consult.as_ref().map(|c| c.read().unwrap().clone());
+            let consult = snapshot.as_ref();
             let (derived_path, err) = match build_task_derivation(
                 tools.clone(),
                 &rpc_client,
                 task.clone(),
+                consult,
             ) {
                 Ok(drv) => match handle_derivation_result(
                     tools.clone(),
@@ -1187,6 +1207,7 @@ impl Runner {
                     task.clone(),
                     drv.clone(),
                     &config,
+                    consult,
                 ) {
                     Ok(final_derived_path) => (Some(final_derived_path), None),
                     Err(err) => {
@@ -1497,7 +1518,22 @@ impl Runner {
                 site.line()
             );
         }
-        self.derived_files.entry(fid).or_insert(derived_file);
+        self.derived_files
+            .entry(fid)
+            .or_insert(derived_file.clone());
+        // A BUILT output is the population a miss-only consult may add to a
+        // consumer: the Opaque entries the upload readers register are
+        // already declared by some route, and the collision guard in
+        // `build_task_derivation` gives a declared claimant its seat.
+        if matches!(&derived_file.derived_path, SingleDerivedPath::Built { .. }) {
+            // ONE SHARED MAP, CLONED BY THE WORKER THAT READS IT. A fresh
+            // Arc per add cloned the whole map on the scheduler thread once
+            // per output, quadratic in a graph's outputs.
+            self.derived_snapshot
+                .write()
+                .unwrap()
+                .insert(derived_file.build_path.clone(), derived_file);
+        }
 
         fid
     }
@@ -3217,6 +3253,16 @@ impl Runner {
                 extract_store_paths(&self.config.store_dir, &self.store_regex, cmdline)?;
             input_srcs.extend(found_store_paths);
         }
+        // The CONSULT snapshot the discovery side reads. Only a task that
+        // will RUN discovery carries one: a task that discovers nothing
+        // computes byte-identical inputs, and this is the point where that
+        // question is answerable without constructing the Task first.
+        let wants = match &cmdline {
+            Some(c) => wants_dependency_discovery_from_parts(c, build.deps.clone()),
+            None => false,
+        };
+        let has_outputs = !self.derived_files.is_empty();
+        let consult = (wants && has_outputs).then(|| self.derived_snapshot.clone());
 
         Ok(Task {
             system: self.config.system.clone(),
@@ -3244,6 +3290,7 @@ impl Runner {
             outer_stage_outputs,
             alias_symlinks: self.alias_symlinks.clone(),
             make_dirs,
+            consult,
         })
     }
 }
@@ -3876,6 +3923,18 @@ fn wants_dependency_discovery(task: &Task) -> bool {
         || consumes_preprocessed_fortran(task)
 }
 
+/// The `new_task`-side half of `wants_dependency_discovery`: the link-shaped
+/// arm needs the collected outputs, which do not exist at task-construction
+/// time, so a part-wise answer is what `new_task` can use to decide whether
+/// to carry the snapshot. A task whose output is link-shaped but whose
+/// command is not a compile misses the consultation: its miss was the
+/// declared-input defect all along, and adding the snapshot would just
+/// re-key it. The parts the snapshot is offered on are `deps = gcc` or a
+/// compile command, which is the population the defect description names.
+fn wants_dependency_discovery_from_parts(cmdline: &str, deps: Option<String>) -> bool {
+    deps.as_deref() == Some("gcc") || command_is_compile(Some(cmdline))
+}
+
 /// The command provably COMPILES, whatever its output is called.
 ///
 /// `link_shaped_outputs` reads the output NAME, and one name is genuinely
@@ -4013,6 +4072,7 @@ fn build_task_derivation(
     tools: Tools,
     rpc_client: &Arc<BuilderRpcClient>,
     task: Task,
+    consult: Option<&HashMap<PathBuf, DerivedFile>>,
 ) -> Result<Derivation> {
     let cmdline = match &task.cmdline {
         Some(c) => c,
@@ -4349,17 +4409,129 @@ fn build_task_derivation(
             // Static analysis virtual paths: map build paths of known
             // generated inputs to themselves so canonicalize_cached
             // resolves them even if they do not yet exist on disk.
-            let virtual_paths: HashMap<PathBuf, PathBuf> = task
+            let mut virtual_paths: HashMap<PathBuf, PathBuf> = task
                 .inputs
                 .iter()
                 .filter(|i| !task.outputs.contains(&i.build_path))
                 .map(|i| (i.build_path.clone(), i.build_path.clone()))
                 .collect();
 
+            // THE MISS-ONLY CONSULT, run on the RESOLUTION SIDE so the
+            // resolution itself supplies the candidates. A build-directory
+            // path the scan resolves through the command's `-I` dirs but
+            // the task's inputs do not carry is a MESS that no route
+            // declares: the graph ordered its producer transitively, so
+            // it reached the producer's edge through a declaration it
+            // never reads. The scan's silent-drop of such an include is
+            // today's failure, and it drops BEFORE this loop would ever
+            // add it back. So the candidates are fed in BEFORE the scan,
+            // keyed by the build path the snapshot names, and the
+            // resolution answers them through the map. Only the entries
+            // the scan actually resolved become inputs below - the rest
+            // are snapshot noise and stay out of the task.
+            //
+            // The Opaque entries the snapshot carries (an output an upload
+            // reader registered under the node's own name) are dropped
+            // here: they are the consumer's own input already declared on
+            // some route, and the collision guard would hand the declared
+            // claimant its seat anyway. Adding them would re-declare the
+            // file a task already carries, and re-declaring re-keys.
+            //
+            // BUILT entries are offered, and the offer is what fixes the
+            // missing-input defect: `canonicalize_cached` answers them
+            // through the virtual map, the scan opens them, and the
+            // `to_upload` / `generated_not_yet_written` passes below treat
+            // them as declared because they are in `virtual_paths` - the
+            // miss becomes a declared input rather than a silent drop.
+            if let Some(consult) = consult {
+                for (build_path, df) in consult.iter() {
+                    if !matches!(&df.derived_path, SingleDerivedPath::Built { .. }) {
+                        continue;
+                    }
+                    // THE INTERIOR OF A DIRECTORY OUTPUT. The tree's own
+                    // build path answers nothing the include asks for:
+                    // `#include <QtWidgets/QWidget>` opens a file inside
+                    // the tree, not the tree itself. Expand the interior
+                    // into per-file build paths, the same way
+                    // `expand_directory_outputs` does in the dynamic arm,
+                    // so the virtual map answers the file's build path.
+                    //
+                    // Only when the command's own `-I` dirs reach the
+                    // tree: the scan searches through the command's
+                    // include dirs, so a tree they do not search is not
+                    // a candidate and stays out of the offer set. The
+                    // -I dir is compared to the tree's build dir, not the
+                    // build dir itself, because the tree's own build path
+                    // is where the interior lives. A tree not on disk
+                    // contributes nothing and the miss stays a miss.
+                    let abs = task.build_dir.join(build_path);
+                    let dirs = include_dirs_as_given(cmdline);
+                    if dirs.iter().any(|d| {
+                        let p = PathBuf::from(d);
+                        let cand = if p.is_absolute() {
+                            p
+                        } else {
+                            task.build_dir.join(&p)
+                        };
+                        cand == abs || abs.starts_with(&cand) || cand.starts_with(&abs)
+                    }) {
+                        let mut stack = vec![abs.clone()];
+                        while let Some(d) = stack.pop() {
+                            let Ok(entries) = fs::read_dir(&d) else {
+                                continue;
+                            };
+                            for e in entries.flatten() {
+                                let name = e.file_name();
+                                let f = d.join(&name);
+                                let rel = build_path.join(&name);
+                                if f.is_dir() {
+                                    stack.push(f);
+                                }
+                                virtual_paths
+                                    .entry(rel.clone())
+                                    .or_insert_with(|| rel.clone());
+                            }
+                        }
+                    }
+                    virtual_paths
+                        .entry(build_path.clone())
+                        .or_insert_with(|| build_path.clone());
+                }
+            }
+
+            // The consult offers its candidates through the virtual map,
+            // so the scan can OPEN them: a build-directory include the task
+            // never declared but whose producer has completed resolves
+            // through `canonicalize_cached`'s virtual hit, and the walk
+            // reads the bytes instead of silently dropping the include.
+            // The Opaque entries (an output an upload reader registered
+            // under the node's own name) are dropped here: they are the
+            // consumer's own input already declared on some route, and
+            // the collision guard would hand the declared claimant its
+            // seat anyway - re-offering one would re-key a task whose
+            // inputs are already byte-identical to today's.
+            //
+            // The offer is recorded, and the RESOLVED side below decides
+            // which of it to add: only entries the scan actually opened
+            // become inputs. A miss stays a miss - the header's producer
+            // never became a completed edge, and declaring it would
+            // spend a store acquisition on a file that does not exist.
+            let consult_offered: Vec<PathBuf> = consult
+                .map(|c| {
+                    c.iter()
+                        .filter(|(_, df)| {
+                            matches!(&df.derived_path, SingleDerivedPath::Built { .. })
+                        })
+                        .map(|(p, _)| p.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let Discovered {
                 deps: discovered_deps,
                 store_paths: discovered_store_paths,
                 dotdot_dirs,
+                scanned,
             } = discover_c_includes(
                 rpc_client,
                 &task.store_dir,
@@ -4369,6 +4541,32 @@ fn build_task_derivation(
                 Some(virtual_paths),
                 task.depfile.as_deref().map(Path::new),
             )?;
+
+            // THE RESOLVED SIDE OF THE CONSULT. The scan's `scanned` set
+            // carries every path it resolved through the command's include
+            // dirs. A consult entry the scan OPENED is in here even when
+            // it is a BUILT output that `discovered_deps` does not carry
+            // (the walk skips it as a declared generated input and it is
+            // not uploaded); a consult entry the scan never opened is not
+            // in here, so it is not declared. The miss-only guarantee: no
+            // scan path claims the build path and nothing is added.
+            //
+            // The `input_set` is the encoded form of the task's own
+            // declared inputs. `encoded_build_path` recovers the build
+            // path from each one, which is what the entry's own build
+            // path is matched against below.
+            for p in &consult_offered {
+                if !consult_entries_resolved(&scanned, p, &input_set) {
+                    continue;
+                }
+                let Some(df) = consult.as_ref().and_then(|c| c.get(p).cloned()) else {
+                    continue;
+                };
+                let encoded = df.to_encoded(&task.store_dir);
+                input_set.insert(encoded);
+                drv.inputs.insert(df.derived_path.clone());
+                discovered_inputs.push(df);
+            }
 
             declare_dotdot_dirs(&mut drv, &task.build_dir, &dotdot_dirs);
 
@@ -5583,12 +5781,54 @@ fn report_progress(n_tasks: u64) {
     );
 }
 
+/// Whether a consult entry's build path is one the scan resolved AND the
+/// task does not already carry.
+///
+/// `scanned` carries every path the scan resolved through the command's
+/// include dirs. A consult entry the scan OPENED is in here even when it is
+/// a BUILT output that `discovered_deps` does not carry (the walk skips it
+/// as a declared generated input and it is not uploaded); a consult entry
+/// the scan never opened is not in here, and that is the miss-only
+/// guarantee: no scan path claims the build path and nothing is added.
+///
+/// `already` is the set of encoded inputs the task already carries, one
+/// entry per `store-path:build-path:rel` spelling. An entry the task
+/// carries by any route is not re-added: the declared claimant has the
+/// seat, and re-declaring it would re-key a task whose inputs are already
+/// what they were. The entry is offered only when its build path is in
+/// `scanned` AND not in `already`.
+///
+/// The spellings agree by construction: the scan resolves against the
+/// process cwd (the build dir, `set_current_dir` in `discover_c_includes`)
+/// so a relative build path is what it returns, and `virtual_paths` is
+/// keyed by the same relative build path the snapshot names. The absolute
+/// spelling the walk canonicalizes under the exact mirror is the same
+/// entry with the cwd prefix; the match asks both spellings and the
+/// caller's `already` set carries the encoded form either way.
+///
+/// Extracted so the selection is testable without a Runner, a daemon or a
+/// build dir: a fixture build dir plus the scan and the snapshot answer it.
+fn consult_entries_resolved(
+    scanned: &[PathBuf],
+    build_path: &Path,
+    already: &std::collections::HashSet<String>,
+) -> bool {
+    if !scanned.iter().any(|s| s == build_path) {
+        return false;
+    }
+    let entry_spelling = build_path.to_string_lossy();
+    !already
+        .iter()
+        .any(|e| encoded_build_path(e) == entry_spelling.as_ref())
+}
+
 fn handle_derivation_result(
     tools: Tools,
     rpc_client: &Arc<BuilderRpcClient>,
     task: Task,
     mut drv: Derivation,
     config: &RunnerConfig,
+    consult: Option<&HashMap<PathBuf, DerivedFile>>,
 ) -> Result<SingleDerivedPath> {
     // This function sits OUTSIDE new_task and therefore outside RESOLVE_MS,
     // and it blocks the serial resolve loop on a daemon realise per dynamic
@@ -5599,7 +5839,7 @@ fn handle_derivation_result(
     // early returns, and an untimed one hides the case worth catching.
     let _dyn_timer = DynDiscoveryTimer(std::time::Instant::now());
     // Collect built inputs when deps == "gcc" for dynamic dependency discovery
-    let built_inputs: Vec<DerivedFile> = if wants_dependency_discovery(&task) {
+    let mut built_inputs: Vec<DerivedFile> = if wants_dependency_discovery(&task) {
         task.inputs
             .iter()
             .filter(|input| matches!(input.derived_path, SingleDerivedPath::Built { .. }))
@@ -5608,6 +5848,40 @@ fn handle_derivation_result(
     } else {
         Vec::new()
     };
+
+    // THE MISS-ONLY CONSULT IN THE LOCAL ARM. A build-directory output the
+    // graph ordered this task against transitively is absent from the
+    // task's own inputs but present in the snapshot. It must be realised
+    // beside the task's own built inputs so the dynamic scan can OPEN it
+    // and declare it, and it must reach the virtual map so the scan sees
+    // it as declared rather than as a silent drop. Entries already in
+    // `built_inputs` are not re-offered: the declared input has the seat,
+    // and re-declaring would re-key a task whose inputs are already what
+    // they were.
+    if let Some(consult) = consult {
+        for (build_path, df) in consult.iter() {
+            // ONLY WHAT THE STATIC SCAN ALREADY DECLARED. Offering the whole
+            // snapshot realised every completed output of the graph for
+            // every discovering task, and sent tasks with no built input
+            // into this arm at all.
+            if matches!(df.derived_path, SingleDerivedPath::Opaque(_))
+                || !drv.inputs.contains(&df.derived_path)
+            {
+                continue;
+            }
+            let dup = built_inputs.iter().any(|i| i.build_path == *build_path);
+            if !dup {
+                built_inputs.push(df.clone());
+            }
+        }
+        // THE INTERIOR OF A CONSULT TREE. The snapshot carries the
+        // tree's own build path; its interior files are not in the
+        // snapshot. They reach the scan only through the realised
+        // `built_paths` the dynamic arm expands after `build_derived_files`,
+        // so nothing is added here: the offer set stays the tree's
+        // declared inputs and the interior is resolved against the
+        // expanded map in the discovery that follows.
+    }
 
     if !built_inputs.is_empty() {
         // If we're in Nix sandbox, create a dynamic derivation to handle
@@ -5654,8 +5928,17 @@ fn handle_derivation_result(
             // locally (real work). Naming which dominates decides whether
             // anything is left to optimize here or whether it is the build.
             let t_realise = std::time::Instant::now();
-            let built_paths =
+            let mut built_paths =
                 local::build_derived_files(rpc_client, &config.store_dir, &built_inputs)?;
+            // A DIRECTORY OUTPUT'S INTERIOR REACHES THE SCAN ONLY THROUGH
+            // THE EXPANSION THE DYNAMIC ARM ALREADY DOES: the tree is one
+            // store output and the include opens a file inside it, so the
+            // map the scan seeds from must carry the per-file build paths,
+            // not just the tree's own. The tree's bytes were just
+            // realised above, so the expansion reads them off the disk the
+            // driver is sitting on; a tree the realise did not materialize
+            // contributes nothing and the miss stays a miss.
+            crate::subtool::dynamic_task::expand_directory_outputs(&mut built_paths);
             DYN_REALISE_MS.fetch_add(
                 t_realise.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -5666,14 +5949,122 @@ fn handle_derivation_result(
                 deps: discovered_deps,
                 store_paths: discovered_store_paths,
                 dotdot_dirs,
+                scanned,
             } = dynamic_task::discover_dynamic_dependencies(
                 rpc_client,
                 &config.store_dir,
                 &config.build_dir,
                 &drv,
-                built_paths,
+                built_paths.clone(),
             )?;
             declare_dotdot_dirs(&mut drv, &config.build_dir, &dotdot_dirs);
+            // THE CONSULT ENTRIES THE SCAN OPENED ARE DECLARED INPUTS, NOT
+            // DISCOVERIES. The scan was offered the snapshot's BUILT paths
+            // through `built_paths` above, so its `scanned` set carries
+            // them. The walk SKIPS them (declared generated inputs, no
+            // upload), so `discovered_deps` does not hold them and
+            // `update_derivation_with_discoveries` will not add them: add
+            // the opened ones here, the same way the static arm adds its
+            // own. Nothing is added for a snapshot path the scan never
+            // opened - the miss stays a miss and the task fails loudly.
+            if let Some(consult) = consult {
+                let mut claimed: std::collections::HashSet<String> = drv
+                    .env
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == b"NIX_NINJA_INPUTS")
+                    .map_or(std::collections::HashSet::new(), |(_, v)| {
+                        split_encoded_list(std::str::from_utf8(v.as_ref()).unwrap_or(""))
+                            .map(|s| s.to_string())
+                            .collect()
+                    });
+                let mut nni_buf: Option<String> = drv
+                    .env
+                    .iter()
+                    .find(|(k, _)| k.as_ref() == b"NIX_NINJA_INPUTS")
+                    .map(|(_, v)| String::from_utf8_lossy(v).into_owned());
+
+                // THE CONSULT ENTRIES THE SCAN OPENED ARE DECLARED INPUTS,
+                // NOT DISCOVERIES. The walk skips them (declared generated
+                // inputs, no upload), so `discovered_deps` does not hold
+                // them and `update_derivation_with_discoveries` will not
+                // add them: add the opened ones here, the same way the
+                // static arm adds its own. Nothing is added for a snapshot
+                // path the scan never opened - the miss stays a miss and
+                // the task fails loudly.
+                for (p, df) in consult.iter() {
+                    if !matches!(df.derived_path, SingleDerivedPath::Built { .. })
+                        || !consult_entries_resolved(&scanned, p, &claimed)
+                    {
+                        continue;
+                    }
+                    let encoded = df.to_encoded(&config.store_dir);
+                    if claimed.insert(encoded.clone()) {
+                        drv.inputs.insert(df.derived_path.clone());
+                        nni_buf = match nni_buf.take() {
+                            Some(mut s) if !s.is_empty() => {
+                                s.push_str(&format!("\n{encoded}"));
+                                Some(s)
+                            }
+                            Some(s) => Some(format!("{s}{encoded}")),
+                            None => Some(encoded),
+                        };
+                    }
+                }
+
+                // THE INTERIOR FILES OF A CONSULT TREE. The snapshot
+                // carries the tree's own build path; the scan resolves
+                // the interior files through the expanded `built_paths`
+                // (the tree's store output, walked by
+                // `expand_directory_outputs` above). Those interior
+                // files are not in the snapshot, so add them here: the
+                // interior build paths the scan opened and that are not
+                // yet claimed, under the tree the snapshot offers. One
+                // tree output covers every interior file, so declaring
+                // any of them declares the tree once and the rest ride
+                // the same input.
+                for bp in built_paths.keys() {
+                    // The interior file belongs to the LONGEST tree key
+                    // that is a prefix of its build path: a shorter
+                    // prefix could match a sibling tree whose interior
+                    // shares the spelling.
+                    let tree = consult
+                        .keys()
+                        .filter(|t| t.as_path() == bp.as_path() || bp.starts_with(t.as_path()))
+                        .max_by_key(|t| t.as_os_str().len())
+                        .cloned();
+                    let Some(tree) = tree else {
+                        continue;
+                    };
+                    if !consult_entries_resolved(&scanned, bp, &claimed) {
+                        continue;
+                    }
+                    let Some(tree_df) = consult.get(&tree) else {
+                        continue;
+                    };
+                    let interior = DerivedFile {
+                        derived_path: tree_df.derived_path.clone(),
+                        build_path: bp.clone(),
+                        rel_path: None,
+                    };
+                    let encoded = interior.to_encoded(&config.store_dir);
+                    if claimed.insert(encoded.clone()) {
+                        drv.inputs.insert(tree_df.derived_path.clone());
+                        nni_buf = match nni_buf.take() {
+                            Some(mut s) if !s.is_empty() => {
+                                s.push_str(&format!("\n{encoded}"));
+                                Some(s)
+                            }
+                            Some(s) => Some(format!("{s}{encoded}")),
+                            None => Some(encoded),
+                        };
+                    }
+                }
+
+                if let Some(s) = nni_buf {
+                    drv.env
+                        .insert(b"NIX_NINJA_INPUTS"[..].into(), s.into_bytes().into());
+                }
+            }
             DYN_DISCOVER_MS.fetch_add(
                 t_discover.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -16794,6 +17185,13 @@ pub struct Discovered {
     pub deps: Vec<DerivedFile>,
     pub store_paths: Vec<StorePath>,
     pub dotdot_dirs: Vec<PathBuf>,
+    /// Every path the scan RESOLVED through the command's include dirs,
+    /// whether or not it became an input (a declared one is filtered out
+    /// of `deps` and an OPENABLE one is in `deps`). The miss-only consult
+    /// keys on this: a snapshot entry the scan opened is in here even when
+    /// it is a BUILT output that `deps` does not carry, and a snapshot
+    /// entry the scan never opened is not.
+    pub scanned: Vec<PathBuf>,
 }
 
 pub fn discover_c_includes(
@@ -17076,6 +17474,7 @@ pub fn discover_c_includes(
         v
     };
     let c_include_count = c_includes.len();
+    let scanned_out: Vec<PathBuf> = c_includes.clone();
     let mut discovered_deps = Vec::new();
     let mut discovered_store_paths = Vec::new();
     let mut to_upload: Vec<PathBuf> = Vec::new();
@@ -17259,6 +17658,9 @@ pub fn discover_c_includes(
     // path into the store. The upload is therefore restaged under
     // OUTER_STAGE_DIR at the outer output's own layout, and the caller adds
     // the directory to the command.
+    // path into the store. The upload is therefore restaged under
+    // OUTER_STAGE_DIR at the outer output's own layout, and the caller adds
+    // the directory to the command.
     if !outer_files.is_empty() {
         let (sources, staged): (Vec<PathBuf>, Vec<PathBuf>) = outer_files.into_iter().unzip();
         let uploaded = new_opaque_files(rpc_client, build_dir, sources)
@@ -17278,6 +17680,7 @@ pub fn discover_c_includes(
         deps: discovered_deps,
         store_paths: discovered_store_paths,
         dotdot_dirs,
+        scanned: scanned_out,
     })
 }
 
@@ -21636,5 +22039,378 @@ mod vapigen_outputs_tests {
         let not_vapigen = "cd /build/source/build && valac --library=x a.vala";
         assert!(vapigen_vapi(not_vapigen, bd).is_none());
         assert!(vapigen_unwritten_outputs(not_vapigen, bd, &declared).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod consult_snapshot_tests {
+    use super::{consult_entries_resolved, CHDIR_LOCK};
+    use harmonia_store_derivation::derived_path::SingleDerivedPath;
+    use harmonia_store_path::StorePath;
+    use nix_ninja_task::derived_file::DerivedFile;
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    /// A fixture store path: `StorePath::from_bytes` takes the BASENAME, not
+    /// the absolute path. All-zeroes is valid nix-base32 (the alphabet
+    /// omits e/o/u/t but includes 0).
+    fn store_path(name: &str) -> harmonia_store_path::StorePath {
+        StorePath::from_bytes(format!("00000000000000000000000000000000-{name}").as_bytes())
+            .expect("fixture store path")
+    }
+
+    /// A consult entry whose build path the scan resolved AND that the task
+    /// does not already carry is selected; the three that are not are not.
+    ///
+    /// `scanned` carries every path the scan resolved through the
+    /// command's include dirs, and `claimed` the encoded inputs the task
+    /// already declares. A consult entry the scan opened but the task
+    /// already carries is not re-added; one the scan never opened is not
+    /// added either. That is the miss-only guarantee: the snapshot never
+    /// adds an input the task does not read.
+    #[test]
+    fn consult_selects_only_the_resolved_unclaimed_paths() {
+        let scanned = vec![
+            PathBuf::from("libsecret/secret-enum-types.h"),
+            PathBuf::from("src/main.c"),
+        ];
+        let claimed: HashSet<String> = ["src/main.c".to_string()].into_iter().collect();
+        assert!(consult_entries_resolved(
+            &scanned,
+            Path::new("libsecret/secret-enum-types.h"),
+            &claimed
+        ));
+        assert!(!consult_entries_resolved(
+            &scanned,
+            Path::new("src/main.c"),
+            &claimed
+        ));
+        assert!(!consult_entries_resolved(
+            &scanned,
+            Path::new("libsecret/secret.h"),
+            &claimed
+        ));
+    }
+
+    /// The snapshot map itself: a BUILT output that the scan resolved is
+    /// the one the static discovery adds; an Opaque entry that the scan
+    /// resolved is not (the task already carries it on some route and the
+    /// collision guard gives the declared claimant its seat); a BUILT
+    /// output the scan never resolved is not (a miss stays a miss).
+    #[test]
+    fn snapshot_offers_built_headers_the_scan_resolved_only() {
+        let mk = |name: &str, built: bool| {
+            let sp = store_path(name);
+            let dp = if built {
+                SingleDerivedPath::Built {
+                    drv_path: Arc::new(SingleDerivedPath::Opaque(sp)),
+                    output: "out".parse().unwrap(),
+                }
+            } else {
+                SingleDerivedPath::Opaque(sp)
+            };
+            DerivedFile {
+                derived_path: dp,
+                build_path: PathBuf::from(name),
+                rel_path: None,
+            }
+        };
+        let mut snap: HashMap<PathBuf, DerivedFile> = HashMap::new();
+        snap.insert(
+            PathBuf::from("libsecret/secret-enum-types.h"),
+            mk("secret-enum-types.h", true),
+        );
+        snap.insert(PathBuf::from("libsecret/secret.h"), mk("secret.h", false));
+        snap.insert(PathBuf::from("libsecret/unused.h"), mk("unused.h", true));
+
+        let scanned = vec![
+            PathBuf::from("libsecret/secret-enum-types.h"),
+            PathBuf::from("libsecret/secret.h"),
+        ];
+        let claimed: HashSet<String> = HashSet::new();
+
+        let mut offered: Vec<PathBuf> = Vec::new();
+        for (p, df) in snap.iter() {
+            if !matches!(&df.derived_path, SingleDerivedPath::Built { .. }) {
+                continue;
+            }
+            if !consult_entries_resolved(&scanned, p, &claimed) {
+                continue;
+            }
+            offered.push(p.clone());
+        }
+        assert_eq!(
+            offered,
+            vec![PathBuf::from("libsecret/secret-enum-types.h")],
+            "only the built header the scan resolved is offered: {offered:?}"
+        );
+    }
+
+    /// The fixture in the shape of the real edge: a scratch build dir with
+    /// the compile's own source header `secret.h` that includes
+    /// `<libsecret/secret-enum-types.h>` through `-I.`; the generated
+    /// header is present only as a snapshot entry (a store-like file the
+    /// fixture creates), not in the task's inputs.
+    ///
+    /// The positive: with the snapshot entry in the virtual map, the scan
+    /// resolves it through `-I.` and the selection keeps it.
+    /// The negative control: without the snapshot entry, the header is not
+    /// in the scan's resolved set and the selection is empty.
+    #[test]
+    fn a_fixture_with_the_real_edge_argv_shape_selects_the_snapshot_header() {
+        let dir = std::env::temp_dir().join(format!(
+            "nn-consult-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // The source-tree header the compile includes.
+        let src = dir.join("libsecret");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("secret.h"),
+            "#include <libsecret/secret-enum-types.h>\n",
+        )
+        .unwrap();
+        // The build dir the task runs in; `-I.` makes it an include root.
+        let build = dir.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+
+        // The generated header, present only as a snapshot entry: a
+        // store-like file the fixture creates, not on the build tree.
+        let _store_hdr = dir.join("store-libsecret/secret-enum-types.h");
+        std::fs::create_dir_all(_store_hdr.parent().unwrap()).unwrap();
+        std::fs::write(&_store_hdr, "#pragma once\n").unwrap();
+        let mut snapshot: HashMap<PathBuf, DerivedFile> = HashMap::new();
+        snapshot.insert(
+            PathBuf::from("libsecret/secret-enum-types.h"),
+            DerivedFile {
+                derived_path: SingleDerivedPath::Built {
+                    drv_path: Arc::new(SingleDerivedPath::Opaque(store_path(
+                        "libsecret-secret-enum-types.h",
+                    ))),
+                    output: "out".parse().unwrap(),
+                },
+                build_path: PathBuf::from("libsecret/secret-enum-types.h"),
+                rel_path: None,
+            },
+        );
+
+        // The task's own inputs: the source header, the generated header
+        // NOT among them.
+        let task_inputs: Vec<PathBuf> = vec![src.join("secret.h").canonicalize().unwrap()];
+
+        // The command the real edge carries: the compile's cwd is the
+        // build dir, and `-I.` makes the build dir an include root.
+        let cmdline = format!(
+            "cc -I. -I{} -c {} -o libsecret/test-vala-lang.p/meson-generated_test-vala-lang.c.o",
+            src.display(),
+            src.join("secret.h").display(),
+        );
+
+        // Run the scan from the build dir so `-I.` resolves to it. The
+        // CHDIR_LOCK serializes the process-global cwd against the other
+        // tests in this binary that use it.
+        let _g = CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let save = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&build).unwrap();
+
+        // The virtual map the consult entry is offered through.
+        let mut virtual_paths: HashMap<PathBuf, PathBuf> = task_inputs
+            .iter()
+            .cloned()
+            .map(|p| (p.clone(), p))
+            .collect();
+        for (bp, df) in snapshot.iter() {
+            if matches!(&df.derived_path, SingleDerivedPath::Built { .. }) {
+                virtual_paths
+                    .entry(bp.clone())
+                    .or_insert_with(|| bp.clone());
+            }
+        }
+
+        // The POSITIVE: with the snapshot entry in the virtual map the
+        // scan resolves it through `-I.`.
+        let scanned = deps_infer::c_include_parser::retrieve_c_includes_checked(
+            &cmdline,
+            task_inputs.clone(),
+            Some(virtual_paths.clone()),
+        )
+        .unwrap()
+        .includes;
+        let entry = snapshot
+            .get(&PathBuf::from("libsecret/secret-enum-types.h"))
+            .unwrap();
+        let entry_abs = build.join(&entry.build_path);
+        assert!(
+            scanned
+                .iter()
+                .any(|s| s == &entry_abs || s == &entry.build_path),
+            "the scan resolved the snapshot header through -I.: {scanned:?}"
+        );
+        let claimed: HashSet<String> = HashSet::new();
+        assert!(consult_entries_resolved(
+            &scanned,
+            &entry.build_path,
+            &claimed
+        ));
+
+        // THE NEGATIVE CONTROL: the same fixture without the snapshot entry
+        // in the virtual map. The header is not in the scan's resolved set,
+        // so the selection is empty.
+        let base_virtual: HashMap<PathBuf, PathBuf> = task_inputs
+            .iter()
+            .cloned()
+            .map(|p| (p.clone(), p))
+            .collect();
+        let scanned_no_consult = deps_infer::c_include_parser::retrieve_c_includes_checked(
+            &cmdline,
+            task_inputs.clone(),
+            Some(base_virtual),
+        )
+        .unwrap()
+        .includes;
+        std::env::set_current_dir(save).unwrap();
+        assert!(
+            !scanned_no_consult
+                .iter()
+                .any(|s| s == &entry_abs || s == &entry.build_path),
+            "without the snapshot entry the scan does not resolve the header: {scanned_no_consult:?}"
+        );
+        assert!(!consult_entries_resolved(
+            &scanned_no_consult,
+            &entry.build_path,
+            &claimed
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gtk3 syncqt shape, end to end on the real edge's argv: an
+    /// absolute `-I` under the build dir, a directory tree the snapshot
+    /// names by its own build path, and an interior file no edge declares.
+    ///
+    /// `expand_directory_outputs` walks the tree's interior into per-file
+    /// build paths against the store object the tree's store path holds,
+    /// exactly the way the local arm does after `build_derived_files`.
+    /// The virtual map the consult offers is the result of that expansion;
+    /// `consult_entries_resolved` then asks whether the scan actually
+    /// opened the interior file and whether it is already claimed.
+    ///
+    /// The -I is absolute under the build dir (the exact mirror,
+    /// configuration B), so the tree's reachability is checked against
+    /// the tree's absolute path, not against the build dir.
+    #[test]
+    fn the_gtk3_syncqt_shape_resolves_the_interior_through_the_absolute_dash_i() {
+        use crate::subtool::dynamic_task::expand_directory_outputs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "nn-consult-gtk3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // The build dir the compile's cwd is; the tree's store object
+        // lives beside it, as the local arm materializes it.
+        let build = dir.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let tree_abs = build.join("include/QtWidgets");
+        std::fs::create_dir_all(&tree_abs).unwrap();
+        // The syncqt tree's store object holds the module files at its
+        // top level: `QWidget` is a file, not a directory.
+        std::fs::write(tree_abs.join("QWidget"), "#pragma once\n").unwrap();
+        // The source header that includes the interior file through
+        // the absolute -I the exact mirror keeps.
+        let src_hdr = build.join("plugins/platformthemes/gtk3/main.cpp");
+        std::fs::create_dir_all(src_hdr.parent().unwrap()).unwrap();
+        std::fs::write(&src_hdr, "#include <QtWidgets/QWidget>\n").unwrap();
+
+        // THE EXPANSION: `expand_directory_outputs` takes the tree's own
+        // store path and walks its interior into per-file build paths.
+        let tree_build = PathBuf::from("include/QtWidgets");
+        let mut built_paths: HashMap<PathBuf, PathBuf> =
+            HashMap::from([(tree_build.clone(), tree_abs.clone())]);
+        expand_directory_outputs(&mut built_paths);
+        // The expansion produces `include/QtWidgets/QWidget` (the tree's
+        // build path joined with the top-level file inside the store
+        // object).
+        let interior = built_paths
+            .get(&tree_build.join("QWidget"))
+            .cloned()
+            .or_else(|| built_paths.keys().find(|p| p.ends_with("QWidget")).cloned())
+            .expect("the interior file is expanded: {built_paths:?}");
+
+        // THE VIRTUAL MAP: the interior build paths, keyed for the scan's
+        // virtual map, exactly what the consult's interior walk offers.
+        let mut virtual_paths: HashMap<PathBuf, PathBuf> = HashMap::new();
+        for bp in built_paths.keys() {
+            virtual_paths
+                .entry(bp.clone())
+                .or_insert_with(|| bp.clone());
+        }
+
+        // THE SCAN: run it from the build dir with the absolute -I the
+        // gtk3 edge carries, against the virtual map. The interior file
+        // is resolved through the -I, and its build-dir spelling is what
+        // the scan returns.
+        let _g = CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let save = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&build).unwrap();
+        let cmdline = format!(
+            "cc -I{} -c {} -o out/main.o",
+            build.join("include").display(),
+            src_hdr.display(),
+        );
+        let seeds = vec![src_hdr.canonicalize().unwrap()];
+        let scanned = deps_infer::c_include_parser::retrieve_c_includes_checked(
+            &cmdline,
+            seeds.clone(),
+            Some(virtual_paths),
+        )
+        .unwrap()
+        .includes;
+        std::env::set_current_dir(save).unwrap();
+
+        // The interior file's build-dir spelling is what the scan
+        // resolved; the absolute -I under the build dir is what reached
+        // it. The selection keeps it: it is resolved and not claimed.
+        let claimed: HashSet<String> = HashSet::new();
+        let interior_build = interior.clone();
+        assert!(
+            consult_entries_resolved(&scanned, &interior_build, &claimed),
+            "the interior file the scan resolved through the absolute -I \
+             is offered: {scanned:?} interior={interior_build:?}"
+        );
+
+        // THE NEGATIVE CONTROL: a tree on disk contributes nothing to
+        // the virtual map when the producer is not complete, and the
+        // interior file the scan asks for is one the tree does not
+        // hold. The interior build path is absent from both the
+        // virtual map and the tree's interior, so the scan does not
+        // resolve it and the selection is empty.
+        let absent = PathBuf::from("include/QtWidgets/QWidgetMissing");
+        let scanned_absent = deps_infer::c_include_parser::retrieve_c_includes_checked(
+            &cmdline,
+            seeds,
+            Some(HashMap::new()),
+        )
+        .unwrap()
+        .includes;
+        assert!(
+            !scanned_absent.iter().any(|s| s == &absent),
+            "an interior file the tree does not hold is not resolved: {scanned_absent:?}"
+        );
+        assert!(!consult_entries_resolved(
+            &scanned_absent,
+            &absent,
+            &claimed
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
