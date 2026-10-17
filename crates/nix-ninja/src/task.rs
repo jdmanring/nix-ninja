@@ -18152,8 +18152,83 @@ pub struct Discovered {
     pub dotdot_dirs: Vec<PathBuf>,
 }
 
-/// The first unresolved include spelling the producer index answers, or
-/// None. Pure: reads the filesystem through `scan_directives` and
+/// The candidates the compiler's own preprocessor confirms. The scanner does
+/// not evaluate `#if`, so a spelling in a branch the build never takes is a
+/// candidate too: qtbase's drive deferred 279 compiles on
+/// `QtGui/private/qspi_struct_marshallers_p.h` and 84 on a QtCore private
+/// header, compiles that build today. One `-M` run with the command's own
+/// flags answers which are live: when it fails on a missing header, that
+/// spelling is the live miss (the compiler stops at the first; a re-run finds
+/// the next); when it succeeds, the candidates its depfile lists are live and
+/// present on disk, still owed as inputs. Any other failure confirms nothing,
+/// which is the emission of before.
+fn preprocessor_confirmed(cmdline: &str, candidates: Vec<DeferMiss>) -> Vec<DeferMiss> {
+    match preprocessor_deps(cmdline) {
+        Err(stderr) => candidates
+            .into_iter()
+            .filter(|c| stderr.contains(&format!("{}: No such file", c.header)))
+            .take(1)
+            .collect(),
+        Ok(deps) => candidates
+            .into_iter()
+            .filter(|c| deps.iter().any(|p| p.ends_with(&c.header)))
+            .collect(),
+    }
+}
+
+/// The compile command's own preprocessor dependencies, `-M` (system headers
+/// included), or its stderr when it fails. NOT deps-infer's
+/// `retrieve_c_includes`: that runs `-MM`, under which gcc treats a missing
+/// ANGLE header as a system header, exits 0 and lists nothing, so
+/// `<QtWidgets/QWidget>` read as a dead branch; and deps-infer is in the task
+/// binary's fileset, so changing it would re-key every banked compile.
+fn preprocessor_deps(cmdline: &str) -> std::result::Result<Vec<PathBuf>, String> {
+    let words = shell_words::split(cmdline).map_err(|e| e.to_string())?;
+    let (program, rest) = words.split_first().ok_or("empty command")?;
+    let mut args: Vec<&str> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(w) = it.next() {
+        match w.as_str() {
+            "-o" | "-MF" | "-MT" | "-MQ" => {
+                it.next();
+            }
+            "-c" | "-MD" | "-MMD" | "-MP" => {}
+            _ => args.push(w),
+        }
+    }
+    let dep = std::env::temp_dir().join(
+        format!(
+            "nix-ninja-defer-{}-{:?}.d",
+            std::process::id(),
+            std::thread::current().id()
+        )
+        .replace(['(', ')', ' '], ""),
+    );
+    let out = std::process::Command::new(program)
+        .args(&args)
+        .arg("-M")
+        .arg("-MF")
+        .arg(&dep)
+        .output()
+        .map_err(|e| e.to_string());
+    let read = std::fs::read(&dep);
+    let _ = std::fs::remove_file(&dep);
+    let out = out?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    let mut buf = read.map_err(|e| e.to_string())?;
+    buf.push(0);
+    let mut scanner = n2::scanner::Scanner::new(&buf);
+    let parsed = n2::depfile::parse(&mut scanner).map_err(|e| format!("{e:?}"))?;
+    Ok(parsed
+        .iter()
+        .flat_map(|(_, values)| values.iter().map(PathBuf::from))
+        .collect())
+}
+
+/// Every unresolved include spelling the producer index answers, one per
+/// spelling. Pure: reads the filesystem through `scan_directives` and
 /// `canonicalize_cached`, never the daemon, so the tests drive it over
 /// fixture trees. The one caller is the miss-detection in
 /// `discover_c_includes` below.
@@ -18176,7 +18251,8 @@ fn find_unresolved_miss(
     build_dir: &Path,
     virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
     carried_trees: &[PathBuf],
-) -> Option<DeferMiss> {
+) -> Vec<DeferMiss> {
+    let mut out: Vec<DeferMiss> = Vec::new();
     let dirs = include_dirs_as_given(cmdline);
     let mut seen: rustc_hash::FxHashSet<String> = Default::default();
     // EACH CANDIDATE IN THE COMPILER'S SEARCH ORDER, three questions in turn:
@@ -18245,10 +18321,11 @@ fn find_unresolved_miss(
                     break;
                 }
                 if let Some(fid) = idx.hit_at(base, name, build_dir) {
-                    return Some(DeferMiss {
+                    out.push(DeferMiss {
                         fids: vec![fid],
                         header: name.display().to_string(),
                     });
+                    break;
                 }
                 if on_disk(&cand) {
                     break;
@@ -18256,7 +18333,7 @@ fn find_unresolved_miss(
             }
         }
     }
-    None
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18579,14 +18656,23 @@ pub fn discover_c_includes(
                 walk.push(p.clone());
             }
         }
-        find_unresolved_miss(
+        let candidates = find_unresolved_miss(
             idx,
             &walk,
             cmdline,
             build_dir,
             virtual_declared.as_ref(),
             carried_trees,
-        )
+        );
+        if candidates.is_empty() {
+            return None;
+        }
+        let live = preprocessor_confirmed(cmdline, candidates);
+        let header = live.first()?.header.clone();
+        let mut fids: Vec<FileId> = live.into_iter().flat_map(|m| m.fids).collect();
+        fids.sort_by_key(n2::densemap::Index::index);
+        fids.dedup();
+        Some(DeferMiss { fids, header })
     });
     let c_include_count = c_includes.len();
     let mut discovered_deps = Vec::new();
@@ -23352,6 +23438,20 @@ mod vapigen_outputs_tests {
 #[cfg(test)]
 mod unresolved_include_defer_tests {
     use super::{find_unresolved_miss, producer_index_of, DeferMiss, ProducerIndex};
+
+    /// The first candidate the detector returns, the form these tests assert.
+    fn first_miss(
+        idx: &ProducerIndex,
+        files: &[PathBuf],
+        cmdline: &str,
+        build_dir: &Path,
+        vp: Option<&HashMap<PathBuf, PathBuf>>,
+        carried: &[PathBuf],
+    ) -> Option<DeferMiss> {
+        find_unresolved_miss(idx, files, cmdline, build_dir, vp, carried)
+            .into_iter()
+            .next()
+    }
     use deps_infer::c_include_parser;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -23423,7 +23523,7 @@ mod unresolved_include_defer_tests {
         std::env::set_current_dir(d.join("build")).unwrap();
         let (idx, rep) = qt_widgets_index();
         let build = d.join("build");
-        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None, &[]);
+        let got = first_miss(&idx, &[tu], &cmd, &build, None, &[]);
         std::env::set_current_dir(prev).unwrap();
         let miss = got.expect("the unordered tree header must defer");
         assert_eq!(miss.fids, vec![rep]);
@@ -23456,7 +23556,7 @@ mod unresolved_include_defer_tests {
         );
         std::env::set_current_dir(&build).unwrap();
         let (idx, _) = qt_widgets_index();
-        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None, &[]);
+        let got = first_miss(&idx, &[tu], &cmd, &build, None, &[]);
         std::env::set_current_dir(prev).unwrap();
         assert!(got.is_none(), "the shadowed header resolves, so no miss");
     }
@@ -23483,7 +23583,7 @@ mod unresolved_include_defer_tests {
         let (idx, _) = qt_widgets_index();
         // No `stdio.h` producer is indexed. Whether or not the host header
         // resolves, the index answers nothing: the ordinary failure stands.
-        let got = find_unresolved_miss(&idx, &[tu], &cmd, &build, None, &[]);
+        let got = first_miss(&idx, &[tu], &cmd, &build, None, &[]);
         std::env::set_current_dir(prev).unwrap();
         assert!(got.is_none());
     }
@@ -23525,7 +23625,7 @@ mod unresolved_include_defer_tests {
         };
         idx.files
             .insert("libsecret/secret-enum-types.h".to_string(), fid);
-        let got = find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None, &[]);
+        let got = first_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None, &[]);
         std::env::set_current_dir(prev).unwrap();
         let miss = got.expect("the unordered generated header must defer");
         assert_eq!(miss.fids, vec![fid]);
@@ -23574,7 +23674,7 @@ mod unresolved_include_defer_tests {
         let mut vp: HashMap<PathBuf, PathBuf> = HashMap::new();
         let rel = PathBuf::from("libsecret/secret-enum-types.h");
         vp.insert(rel.clone(), rel);
-        let got = find_unresolved_miss(
+        let got = first_miss(
             &idx,
             std::slice::from_ref(&tu),
             &cmd,
@@ -23707,8 +23807,8 @@ mod unresolved_include_defer_tests {
         );
         std::env::set_current_dir(&build).unwrap();
         let (idx, rep) = qt_widgets_index();
-        let memory = find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None, &[]);
-        let real = find_unresolved_miss(&idx, &[tu2], &cmd, &build, None, &[]);
+        let memory = first_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None, &[]);
+        let real = first_miss(&idx, &[tu2], &cmd, &build, None, &[]);
         std::env::set_current_dir(prev).unwrap();
         assert!(
             memory.is_none(),
@@ -23755,7 +23855,7 @@ mod unresolved_include_defer_tests {
             pch.display()
         );
         std::env::set_current_dir(&build).unwrap();
-        let got = find_unresolved_miss(&idx, &[pch], &cmd, &build, Some(&vp), &[]);
+        let got = first_miss(&idx, &[pch], &cmd, &build, Some(&vp), &[]);
         std::env::set_current_dir(prev).unwrap();
         assert!(got.is_none(), "a header the task holds must not defer");
     }
@@ -23819,7 +23919,7 @@ mod unresolved_include_defer_tests {
         );
         let idx = super::producer_index_of(&g);
         std::env::set_current_dir(&build).unwrap();
-        let carried = find_unresolved_miss(
+        let carried = first_miss(
             &idx,
             std::slice::from_ref(&tu),
             &cmd,
@@ -23827,7 +23927,7 @@ mod unresolved_include_defer_tests {
             None,
             &[PathBuf::from("include/QtCore")],
         );
-        let bare = find_unresolved_miss(&idx, &[tu], &cmd, &build, None, &[]);
+        let bare = first_miss(&idx, &[tu], &cmd, &build, None, &[]);
         std::env::set_current_dir(prev).unwrap();
         assert!(carried.is_none(), "a carried tree supplies the header");
         assert!(bare.is_some(), "without the tree it is the miss");
@@ -23849,19 +23949,67 @@ mod unresolved_include_defer_tests {
         std::fs::write(build.join("include/QtWidgets/QWidget"), "").unwrap();
         std::env::set_current_dir(&build).unwrap();
         let (idx, rep) = qt_widgets_index();
-        let on_disk =
-            find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None, &[]);
+        let on_disk = first_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None, &[]);
         let mut vp = HashMap::new();
         vp.insert(
             PathBuf::from("include/QtWidgets/QWidget"),
             build.join("include/QtWidgets/QWidget"),
         );
-        let held = find_unresolved_miss(&idx, &[tu], &cmd, &build, Some(&vp), &[]);
+        let held = first_miss(&idx, &[tu], &cmd, &build, Some(&vp), &[]);
         std::env::set_current_dir(prev).unwrap();
         assert_eq!(
             on_disk.expect("a disk copy is not the task's").fids,
             vec![rep]
         );
         assert!(held.is_none(), "a held header resolves");
+    }
+
+    /// The preprocessor separates a live miss from an `#if` branch the build
+    /// never takes, which the scanner cannot: qtbase's QtGui private header
+    /// that deferred 279 compiles is the dead shape. Two runs of the real
+    /// compiler: with `live.h` absent the failure names it and only it is
+    /// confirmed; with it present its depfile lists it and the dead spelling
+    /// stays unconfirmed either way.
+    #[test]
+    fn the_preprocessor_confirms_the_live_miss_and_not_the_dead_branch() {
+        if std::process::Command::new("gcc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP: no gcc on PATH; this test needs the real preprocessor");
+            return;
+        }
+        let _g = super::CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        let d = super::Scratch::new(format!("nn-defer-cpp-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("inc")).unwrap();
+        std::fs::write(
+            d.join("tu.c"),
+            "#if 0\n#include <dead/dead.h>\n#endif\n#include <live/live.h>\nint x;\n",
+        )
+        .unwrap();
+        std::env::set_current_dir(d.join(".")).unwrap();
+        let cmd = "gcc -Iinc -c tu.c -o tu.o";
+        let cands = || {
+            vec![
+                DeferMiss {
+                    fids: vec![],
+                    header: "dead/dead.h".into(),
+                },
+                DeferMiss {
+                    fids: vec![],
+                    header: "live/live.h".into(),
+                },
+            ]
+        };
+        let absent = super::preprocessor_confirmed(cmd, cands());
+        std::fs::create_dir_all(d.join("inc/live")).unwrap();
+        std::fs::write(d.join("inc/live/live.h"), "").unwrap();
+        let present = super::preprocessor_confirmed(cmd, cands());
+        std::env::set_current_dir(prev).unwrap();
+        let names = |v: Vec<DeferMiss>| v.into_iter().map(|m| m.header).collect::<Vec<_>>();
+        assert_eq!(names(absent), vec!["live/live.h".to_string()]);
+        assert_eq!(names(present), vec!["live/live.h".to_string()]);
     }
 }
