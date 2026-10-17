@@ -28,9 +28,16 @@ pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
     let (build_dir, built_paths) = prepare_build_environment(store_dir)?;
 
     // Stage 2: Discover dynamic dependencies
-    let discovered =
-        discover_dynamic_dependencies(&rpc_client, store_dir, &build_dir, &drv, built_paths, None)?
-            .0;
+    let discovered = discover_dynamic_dependencies(
+        &rpc_client,
+        store_dir,
+        &build_dir,
+        &drv,
+        built_paths,
+        None,
+        &[],
+    )?
+    .0;
 
     // A `..` spelling discovered HERE has to reach the final derivation:
     // this subtool emits the derivation, it does not run the command, so
@@ -262,6 +269,7 @@ pub fn discover_dynamic_dependencies(
     drv: &Derivation,
     built_paths: HashMap<PathBuf, PathBuf>,
     producer: Option<&crate::task::ProducerIndex>,
+    carried_trees: &[PathBuf],
 ) -> Result<(crate::task::Discovered, Option<crate::task::DeferMiss>)> {
     let cmdline_bytes = drv
         .args
@@ -284,8 +292,9 @@ pub fn discover_dynamic_dependencies(
         // persistent build dir path only.
         None,
         producer,
-        // The realised view: built trees are expanded in `built_paths`.
-        &[],
+        // A header absent from a tree the task carries is not a miss the
+        // tree's producer could answer: it already ran.
+        carried_trees,
     )
 }
 

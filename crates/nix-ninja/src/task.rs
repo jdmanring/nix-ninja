@@ -378,6 +378,22 @@ pub fn producer_index_of(graph: &graph::Graph) -> ProducerIndex {
     }
 }
 
+/// The module trees (`include/<Module>`) among a task's inputs: a spelling
+/// inside one is held by the task. A MODULE tree only, the shape a spelling
+/// names (`<QtCore/...>`); an autogen tree holds moc output, and counting it
+/// vouched for every spelling through `-I<T>_autogen/include`, qtbase gtk3's
+/// first include dir, so `QtWidgets/QWidget` never became a candidate.
+fn carried_module_trees(inputs: &[DerivedFile]) -> Vec<PathBuf> {
+    inputs
+        .iter()
+        .filter_map(|i| {
+            let bp = i.build_path.to_string_lossy();
+            let bp = bp.strip_suffix("/.nn-tree").unwrap_or(&bp);
+            (is_tree_path(Path::new(bp)) && bp.starts_with("include/")).then(|| PathBuf::from(bp))
+        })
+        .collect()
+}
+
 /// One task's answer to its unresolved include: the sorted, deduplicated
 /// FileIds to add as implicit inputs - the producer's file node and the
 /// tree's representative - and the header's own spelling so the refusal
@@ -4694,22 +4710,7 @@ fn build_task_derivation(
                 task.is_gcc_task
                     .then_some(task.producer_index.as_deref())
                     .flatten(),
-                &task
-                    .inputs
-                    .iter()
-                    .filter_map(|i| {
-                        let bp = i.build_path.to_string_lossy();
-                        let bp = bp.strip_suffix("/.nn-tree").unwrap_or(&bp);
-                        // A MODULE tree only (`include/<Module>`): it is the
-                        // shape a spelling names (`<QtCore/...>`). An autogen
-                        // tree holds moc output, and counting it vouched for
-                        // every spelling through `-I<T>_autogen/include`,
-                        // qtbase gtk3's FIRST include dir, so
-                        // `QtWidgets/QWidget` never became a candidate.
-                        (is_tree_path(Path::new(bp)) && bp.starts_with("include/"))
-                            .then(|| PathBuf::from(bp))
-                    })
-                    .collect::<Vec<_>>(),
+                &carried_module_trees(&task.inputs),
             )?;
             // A miss the producer index answers ends the emission here,
             // before the derivation is written; the spawn site turns it
@@ -6026,6 +6027,7 @@ fn handle_derivation_result(
                 task.is_gcc_task
                     .then_some(task.producer_index.as_deref())
                     .flatten(),
+                &carried_module_trees(&task.inputs),
             )?;
             // THE COMPLETE VIEW DECIDES. Only here are the built inputs
             // realised and their trees expanded, so only here is an
@@ -18166,11 +18168,15 @@ pub struct Discovered {
 /// header, compiles that build today. One `-M -MG` run with the command's
 /// own flags answers which are live: the depfile lists a live include at its
 /// resolved path or, missing, under its spelling, and never one in a branch
-/// the build does not take. A failed run confirms nothing, the emission of
-/// before.
+/// the build does not take. A failed run is unknown and leaves the
+/// candidates as the scanner found them.
 fn preprocessor_confirmed(cmdline: &str, candidates: Vec<DeferMiss>) -> Vec<DeferMiss> {
     match preprocessor_deps(cmdline) {
-        Err(_) => Vec::new(),
+        // A run that fails is UNKNOWN, not refuted: the driver's disk lacks
+        // the trees a task carries, so a Qt header's `#if QT_CONFIG(x)`
+        // fails to parse there. The scanner's candidates, already filtered
+        // by the carried module trees, stand.
+        Err(_) => candidates,
         Ok(deps) => candidates
             .into_iter()
             .filter(|c| deps.iter().any(|p| p.ends_with(&c.header)))
@@ -24054,5 +24060,45 @@ mod unresolved_include_defer_tests {
         let names = |v: Vec<DeferMiss>| v.into_iter().map(|m| m.header).collect::<Vec<_>>();
         assert_eq!(names(absent), vec!["live/live.h".to_string()]);
         assert_eq!(names(present), vec!["live/live.h".to_string()]);
+    }
+
+    /// A preprocessor run that fails is unknown, not a refutation: qtbase
+    /// gtk3's died on `#if QT_CONFIG(...)` because the driver's disk lacks
+    /// the trees the task carries, and confirming nothing dropped the real
+    /// miss. The candidates stand.
+    #[test]
+    fn a_failed_preprocessor_run_keeps_the_candidates() {
+        let c = vec![DeferMiss {
+            fids: vec![],
+            header: "QtWidgets/QWidget".into(),
+        }];
+        let got = super::preprocessor_confirmed("/nonexistent/cc -c x.c -o x.o", c);
+        assert_eq!(got.len(), 1);
+    }
+
+    /// Only module trees hold a spelling; an autogen tree, qtbase gtk3's
+    /// first include dir, does not.
+    #[test]
+    fn only_module_trees_are_carried() {
+        let df = |p: &str| super::DerivedFile {
+            derived_path: super::SingleDerivedPath::Opaque(
+                "00000000000000000000000000000000-x".parse().unwrap(),
+            ),
+            build_path: PathBuf::from(p),
+            rel_path: None,
+        };
+        let got = super::carried_module_trees(&[
+            df("include/QtGui"),
+            df("src/plugins/platformthemes/gtk3/QGtk3ThemePlugin_autogen"),
+            df("include/QtCore/.nn-tree"),
+            df("src/gui/qguiapplication.cpp"),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("include/QtGui"),
+                PathBuf::from("include/QtCore")
+            ]
+        );
     }
 }
