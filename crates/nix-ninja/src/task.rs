@@ -19542,6 +19542,31 @@ pattern = "DEPRECATED"
         assert_eq!(config, PathBuf::from("doc/libgweather.toml"));
         assert_eq!(dirs, vec![PathBuf::from("/build/libgweather-4.6.0/doc")]);
 
+        // libsoup 3.6.6's edge (kept tree `nix-22736-4212444523`): an `env`
+        // prologue and the `--config=` spelling.
+        let soup: Vec<String> = [
+            "env",
+            "PKG_CONFIG_PATH=/build/libsoup-3.6.6/build/meson-uninstalled",
+            "/nix/store/x-gi-docgen-2026.1/bin/gi-docgen",
+            "generate",
+            "--quiet",
+            "--add-include-path=/build/libsoup-3.6.6/build/docs/reference/../../libsoup",
+            "--config=docs/reference/libsoup.toml",
+            "--output-dir=docs/reference/libsoup-3.0",
+            "--no-namespace-dir",
+            "--content-dir=/build/libsoup-3.6.6/docs/reference",
+            "libsoup/Soup-3.0.gir",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (config, dirs) = gi_docgen_invocation(&soup).expect("env prologue, --config=");
+        assert_eq!(config, PathBuf::from("docs/reference/libsoup.toml"));
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("/build/libsoup-3.6.6/docs/reference")]
+        );
+
         let cp: Vec<String> = ["cp", "doc/libgweather.toml", "x.toml"]
             .iter()
             .map(|s| s.to_string())
