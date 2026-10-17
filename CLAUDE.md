@@ -609,9 +609,11 @@ fixes.
 - A zero is the instrument until proven otherwise: capture status and
   output, anchor globs, `find | head` is not a sample, a package-prefixed
   grep cannot see a task's log, an optional prefix defeats a `^` anchor, a
-  `tail` discards the phase you would count. Never glob `/nix/store` into
-  an exec (`ls /nix/store/*-ninja-build.drv | wc -l` overruns ARG_MAX and
-  reads ZERO); list and filter in a loop, or `find`.
+  `tail` discards the phase you would count. Never glob `/nix/store` at
+  all: into an exec it overruns ARG_MAX and reads ZERO, and the shell's
+  expansion alone reached 77 GB RSS over 650k entries and stalled a live
+  round (2026-10-17). Gates use `store_find` (a streamed `find -maxdepth
+  1`, first hit); say so in every subagent brief.
 - Any claim supported by the absence of matching lines is a count. A
   success path that prints nothing cannot be counted from a log; use a
   counter.
