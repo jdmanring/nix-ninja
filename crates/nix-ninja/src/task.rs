@@ -8592,7 +8592,7 @@ fn gdbus_docbook_args(cmdline: &str) -> Option<(String, String, &'static str, Ve
     Some((od.to_string(), prefix.to_string(), ext, inputs))
 }
 
-/// Declared docbook outputs of a `gdbus-codegen --generate-docbook` edge
+/// Declared document outputs of a `gdbus-codegen` docbook, rst or md edge
 /// that the tool does not write, so the command can stamp them the way
 /// real ninja's shared tree simply never misses them. Empty for every
 /// other edge.
@@ -8609,8 +8609,10 @@ fn gdbus_docbook_args(cmdline: &str) -> Option<(String, String, &'static str, Ve
 /// harmless for a single-interface input the tool did write: `touch` on an
 /// existing file is a no-op.
 ///
-/// GATED on `gdbus-codegen` and `--generate-docbook`: an ordinary run and
-/// every other command yield nothing, and no other edge's emission moves.
+/// GATED on `gdbus-codegen` and one of `--generate-docbook`,
+/// `--generate-rst` or `--generate-md` (read by `gdbus_docbook_args`): an
+/// ordinary run and every other command yield nothing, and no other edge's
+/// emission moves.
 pub fn gdbus_unwritten_outputs(
     cmdline: &str,
     build_dir: &Path,
