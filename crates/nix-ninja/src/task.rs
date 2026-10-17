@@ -1942,6 +1942,7 @@ impl Runner {
             let xinclude_docs = xinclude_invocation(&args);
             let rst_docs = rst_invocation(&args);
             let gresource = gresource_invocation(&args);
+            let gi_docgen = gi_docgen_invocation(&args);
             let msgfmt_dirs = msgfmt_invocation(&args);
             let swig_i = swig_invocation(&args);
             let gir_filelists = gir_filelist_invocation(&args);
@@ -2488,6 +2489,16 @@ impl Runner {
             if let Some((docs, dirs)) = &gresource {
                 let root = self.config.build_dir.join(&cd_dir);
                 for p in gresource_referenced_files(&root, docs, dirs) {
+                    referenced.push(p.to_string_lossy().into_owned());
+                }
+            }
+            // A GI-DOCGEN MANIFEST NAMES ITS CONTENT FILES INSIDE THE TOML,
+            // resolved against `--content-dir`. meson stages the gir, the
+            // TOML and the pages it lists as `depend_files`, and none of the
+            // images or the urlmap.
+            if let Some((config, dirs)) = &gi_docgen {
+                let root = self.config.build_dir.join(&cd_dir);
+                for p in gi_docgen_referenced_files(&root, config, dirs) {
                     referenced.push(p.to_string_lossy().into_owned());
                 }
             }
@@ -10637,6 +10648,119 @@ fn gresource_file_names(text: &str) -> Vec<String> {
             out.push(name.to_string());
         }
         rest = &after_tag[end + 7..];
+    }
+    out
+}
+
+/// `gi-docgen generate` opens, besides the gir and the TOML it is handed,
+/// every file the TOML's `[extra]` table names: `content_files`,
+/// `content_images` and `urlmap_file`, each resolved against the
+/// `--content-dir` list in order and against the cwd when none is given
+/// (`utils.find_extra_content_file`). MEASURED 2026-10-17 on libgweather
+/// 4.6.0 (task `zdrin8s7`): meson's edge declared the TOML and the two
+/// markdown pages and the run died `Content file libgweather-logo.svg not
+/// found in any content directory`. Keyed on the tool AND the `generate`
+/// subcommand: `gi-docgen check` reads the gir alone.
+fn gi_docgen_invocation(args: &[String]) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let tool = args
+        .iter()
+        .position(|a| a.rsplit('/').next() == Some("gi-docgen"))?;
+    if args.get(tool + 1).map(String::as_str) != Some("generate") {
+        return None;
+    }
+    let mut config = None;
+    let mut dirs = Vec::new();
+    let mut it = args[tool + 2..].iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--config=") {
+            config = Some(PathBuf::from(v));
+        } else if a == "--config" {
+            config = it.next().map(PathBuf::from);
+        } else if let Some(v) = a.strip_prefix("--content-dir=") {
+            dirs.push(PathBuf::from(v));
+        } else if a == "--content-dir" {
+            if let Some(v) = it.next() {
+                dirs.push(PathBuf::from(v));
+            }
+        }
+    }
+    config.map(|c| (c, dirs))
+}
+
+/// Every file a gi-docgen TOML names under `[extra]`, offered under every
+/// content directory; the caller's existence check decides, exactly as the
+/// tool's own first-match search does. Same family and discipline as
+/// `gresource_referenced_files`.
+fn gi_docgen_referenced_files(root: &Path, config: &Path, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let cfg = if config.is_absolute() {
+        config.to_path_buf()
+    } else {
+        root.join(config)
+    };
+    let Ok(text) = std::fs::read_to_string(&cfg) else {
+        return Vec::new();
+    };
+    let bases: Vec<PathBuf> = if dirs.is_empty() {
+        vec![root.to_path_buf()]
+    } else {
+        dirs.iter()
+            .map(|d| {
+                if d.is_absolute() {
+                    d.clone()
+                } else {
+                    root.join(d)
+                }
+            })
+            .collect()
+    };
+    let mut out = Vec::new();
+    for name in gi_docgen_extra_names(&text) {
+        for base in &bases {
+            out.push(base.join(&name));
+        }
+    }
+    out
+}
+
+/// The quoted strings of `content_files`, `content_images` and
+/// `urlmap_file` in the `[extra]` table, in file order. `logo_url` under
+/// `[library]` is a URL the template emits, never a file the tool opens.
+///
+/// ponytail: a section-scoped string extraction, not a TOML parser. The
+/// three keys are a string or a string array in every gi-docgen manifest
+/// (gi-docgen's `config.py` reads them with `.get`); a nested table under
+/// `[extra]`, a literal `'...'` string or a `#` inside a quoted name would
+/// need the `toml` crate.
+fn gi_docgen_extra_names(text: &str) -> Vec<String> {
+    const KEYS: [&str; 3] = ["content_files", "content_images", "urlmap_file"];
+    let quoted = |s: &str, out: &mut Vec<String>| {
+        for (i, seg) in s.split('"').enumerate() {
+            if i % 2 == 1 {
+                out.push(seg.to_string());
+            }
+        }
+    };
+    let mut out = Vec::new();
+    let mut in_extra = false;
+    let mut array_open = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && !array_open {
+            in_extra = t == "[extra]";
+            continue;
+        }
+        if !in_extra {
+            continue;
+        }
+        if array_open {
+            quoted(t, &mut out);
+            array_open = !t.contains(']');
+        } else if let Some((k, v)) = t.split_once('=') {
+            if KEYS.contains(&k.trim()) {
+                quoted(v, &mut out);
+                array_open = v.contains('[') && !v.contains(']');
+            }
+        }
     }
     out
 }
@@ -19350,6 +19474,111 @@ mod gresource_tests {
             &[]
         )
         .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gi_docgen_tests {
+    use super::{gi_docgen_extra_names, gi_docgen_invocation, gi_docgen_referenced_files};
+    use std::path::PathBuf;
+
+    /// libgweather 4.6.0's own manifest. `logo_url` is a URL under
+    /// `[library]` and must not be read as a file; the three `[extra]` keys
+    /// are, in file order, across a multi-line array.
+    #[test]
+    fn the_extra_table_names_are_read_and_nothing_else_is() {
+        let text = r#"[library]
+namespace = "GWeather"
+logo_url = "libgweather-logo.svg"
+dependencies = [ "GObject-2.0", "Gio-2.0" ]
+
+  [dependencies."GObject-2.0"]
+  name = "GObject"
+
+[extra]
+urlmap_file = "urlmap.js"
+content_files = [
+  "adding-locations.md",
+  "migrating-3to4.md",
+]
+content_images = [
+  "libgweather-logo.svg",
+]
+
+[[object]]
+pattern = "DEPRECATED"
+"#;
+        assert_eq!(
+            gi_docgen_extra_names(text),
+            vec![
+                "urlmap.js".to_string(),
+                "adding-locations.md".to_string(),
+                "migrating-3to4.md".to_string(),
+                "libgweather-logo.svg".to_string(),
+            ]
+        );
+    }
+
+    /// The real edge's argv (task `zdrin8s7`), and the two negatives: another
+    /// program naming the TOML, and the `check` subcommand.
+    #[test]
+    fn only_a_generate_run_opens_the_manifest() {
+        let args: Vec<String> = [
+            "/nix/store/x-gi-docgen-2026.1/bin/gi-docgen",
+            "generate",
+            "--quiet",
+            "--fatal-warnings",
+            "--config",
+            "doc/libgweather.toml",
+            "--output-dir=doc/libgweather-4.0",
+            "--no-namespace-dir",
+            "--content-dir=/build/libgweather-4.6.0/doc",
+            "libgweather/GWeather-4.0.gir",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (config, dirs) = gi_docgen_invocation(&args).expect("the tool is named");
+        assert_eq!(config, PathBuf::from("doc/libgweather.toml"));
+        assert_eq!(dirs, vec![PathBuf::from("/build/libgweather-4.6.0/doc")]);
+
+        let cp: Vec<String> = ["cp", "doc/libgweather.toml", "x.toml"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(gi_docgen_invocation(&cp).is_none());
+        let mut check = args.clone();
+        check[1] = "check".to_string();
+        assert!(gi_docgen_invocation(&check).is_none());
+    }
+
+    /// Every name under every content dir; the cwd (root) only when no
+    /// `--content-dir` is given, which is the tool's default.
+    #[test]
+    fn a_named_file_is_offered_under_every_content_directory() {
+        let root = std::env::temp_dir().join(format!("nn-gidoc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("doc")).expect("mkdir");
+        std::fs::write(
+            root.join("doc/x.toml"),
+            "[extra]\ncontent_images = [\"logo.svg\"]\n",
+        )
+        .expect("write");
+        let got = gi_docgen_referenced_files(
+            &root,
+            &PathBuf::from("doc/x.toml"),
+            &[PathBuf::from("/build/p/doc"), PathBuf::from("src/doc")],
+        );
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/build/p/doc/logo.svg"),
+                root.join("src/doc/logo.svg"),
+            ]
+        );
+        let none = gi_docgen_referenced_files(&root, &PathBuf::from("doc/x.toml"), &[]);
+        assert_eq!(none, vec![root.join("logo.svg")]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
