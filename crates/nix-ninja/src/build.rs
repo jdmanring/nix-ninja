@@ -622,16 +622,20 @@ impl<'a> Scheduler<'a> {
         new: &[n2::graph::FileId],
     ) -> Result<()> {
         if new.is_empty() {
-            // NOTHING NEW TO ADD IS A FAILURE, NOT A NO-OP. The task did not
-            // emit, so returning here left the edge Running forever: the run
-            // loop then found nothing ready and nothing running and stopped
-            // with the target unbuilt. It happens when the re-run misses
-            // again although the producer's output is already an input, so
-            // that output does not supply the header after all.
-            anyhow::bail!(
-                "header {} is still unresolved with its producer's output already an input",
+            // NOTHING NEW TO ADD: the re-run missed again with the producer's
+            // output already an input, so that output does not supply the
+            // header (a dead `#if` spelling inside a module tree). The task
+            // did not emit, so returning here would leave the edge Running
+            // forever. Build it once more with no index, exactly as without
+            // deferral: never worse than before the feature.
+            self.runner.suppress_defer(consumer);
+            self.build_states.set(consumer, BuildState::Want);
+            self.build_states.set(consumer, BuildState::Ready);
+            eprintln!(
+                "nix-ninja: deferral on {} added nothing; building the edge without it",
                 defer.header
             );
+            return Ok(());
         }
         // The cycle guard answers the question before any graph edit: a
         // producer that transitively reaches the consumer means the

@@ -814,7 +814,13 @@ pub struct Runner {
     /// `Option`: a run with no produced graph entries is `None`, and the
     /// byte-identity case (a task with no miss) pays a single `None`
     /// check and emits exactly what it did without the field.
-    producer_index: Option<ProducerIndex>,
+    producer_index: Option<Arc<ProducerIndex>>,
+    /// Edges whose deferral came back empty: the re-run still missed with
+    /// the producer's output already an input, so that output does not
+    /// supply the header (a spelling in a dead `#if` branch inside a module
+    /// tree, for one). Such an edge is built once more with no index,
+    /// exactly as it would be without deferral.
+    no_defer: HashSet<BuildId>,
 
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
@@ -916,6 +922,7 @@ impl Runner {
             alias_symlinks: Vec::new(),
             empty_dirs: Vec::new(),
             producer_index: None,
+            no_defer: HashSet::new(),
             phony_aliases: HashMap::new(),
             stamp_inputs: HashMap::new(),
             stamp_input_files: HashMap::new(),
@@ -996,7 +1003,12 @@ impl Runner {
             })
             .collect();
         let index = ProducerIndex { files, trees };
-        self.producer_index = Some(index);
+        self.producer_index = Some(Arc::new(index));
+    }
+
+    /// Build `bid` once more with no producer index (see `no_defer`).
+    pub fn suppress_defer(&mut self, bid: BuildId) {
+        self.no_defer.insert(bid);
     }
 
     pub fn read_build_dir(&mut self, graph: &mut graph::Graph) -> Result<()> {
@@ -1334,7 +1346,10 @@ impl Runner {
         // is always on because its cost is two atomics per task.
         use std::sync::atomic::Ordering;
         let t0 = std::time::Instant::now();
-        let task = self.new_task(files, build)?;
+        let mut task = self.new_task(files, build)?;
+        if self.no_defer.contains(&bid) {
+            task.producer_index = None;
+        }
         let resolve_ms = t0.elapsed().as_millis() as u64;
         RESOLVE_MS.fetch_add(resolve_ms, Ordering::Relaxed);
         let n_tasks = TASKS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3510,10 +3525,10 @@ impl Runner {
                 .map(|r| (r.path.clone(), r.content.clone()))
                 .or(extra_rspfile),
             depfile: build.depfile.clone(),
-            producer_index: self
-                .producer_index
-                .as_ref()
-                .map(|idx| Arc::new(idx.clone())),
+            // SHARED, NOT COPIED: a deep clone per task made the index cost
+            // grow with tasks times graph size (qtbase's drive peak went
+            // from 977 to 1751 MiB).
+            producer_index: self.producer_index.clone(),
             verbose: self.config.verbose,
             files: build_files,
             inputs,
@@ -18144,8 +18159,27 @@ fn find_unresolved_miss(
 ) -> Option<DeferMiss> {
     let dirs = include_dirs_as_given(cmdline);
     let mut seen: rustc_hash::FxHashSet<String> = Default::default();
+    // A CANDIDATE INSIDE THE BUILD DIR IS ALSO ASKED IN ITS RELATIVE FORM,
+    // which is how the virtual map is keyed: an absolute `-I<build>/include`
+    // or an absolute spelling (a PCH header's `#include "<build>/include/
+    // QtCore/QtCore"`) otherwise reads as absent for every generated file not
+    // yet on disk, and qtbase's DBus PCH, which builds today, deferred on it.
+    let resolves = |cand: PathBuf| -> bool {
+        let cand = lexical_join(Path::new(""), &cand);
+        let rel = cand.strip_prefix(build_dir).ok().map(Path::to_path_buf);
+        rel.into_iter().chain(std::iter::once(cand)).any(|c| {
+            c_include_parser::canonicalize_cached(c, virtual_paths).is_ok_and(|o| o.is_some())
+        })
+    };
     for file in files {
-        let Ok(scan) = c_include_parser::scan_directives(file) else {
+        // Read through the virtual map: a generated header the task holds is
+        // a realised store copy, while its includer directory is the spelled
+        // build path.
+        let read = virtual_paths
+            .and_then(|v| v.get(file))
+            .cloned()
+            .unwrap_or_else(|| file.clone());
+        let Ok(scan) = c_include_parser::scan_directives(&read) else {
             continue;
         };
         let includer_dir = file.parent().unwrap_or(file);
@@ -18160,18 +18194,8 @@ fn find_unresolved_miss(
             // `canonicalize_cached` answers `Ok(None)` for absence, so
             // only `Some` is a resolution; `is_ok` alone would read every
             // missing header as found and no miss would ever fire.
-            let resolved = c_include_parser::canonicalize_cached(
-                includer_dir.join(name.clone()),
-                virtual_paths,
-            )
-            .is_ok_and(|o| o.is_some())
-                || dirs.iter().any(|i| {
-                    c_include_parser::canonicalize_cached(
-                        Path::new(i).join(name.clone()),
-                        virtual_paths,
-                    )
-                    .is_ok_and(|o| o.is_some())
-                });
+            let resolved = resolves(includer_dir.join(name))
+                || dirs.iter().any(|i| resolves(Path::new(i).join(name)));
             if !resolved {
                 let key = n2::canon::to_owned_canon_path(
                     normalize_build_path_lexical(name)
@@ -18189,13 +18213,8 @@ fn find_unresolved_miss(
             }
         }
         for name in angled {
-            let resolved = dirs.iter().any(|i| {
-                c_include_parser::canonicalize_cached(
-                    Path::new(i).join(name.clone()),
-                    virtual_paths,
-                )
-                .is_ok_and(|o| o.is_some())
-            });
+            let resolved = resolves(PathBuf::from(name)) && name.is_absolute()
+                || dirs.iter().any(|i| resolves(Path::new(i).join(name)));
             if !resolved {
                 let key = n2::canon::to_owned_canon_path(
                     normalize_build_path_lexical(name)
@@ -18523,8 +18542,19 @@ pub fn discover_c_includes(
     // `canonicalize_cached` read the filesystem alone, and the rpc client
     // the upload needs never enters. The one call site is here; the tests
     // drive that function over fixture trees.
+    // EVERY FILE THE SCAN OPENED, not the seeds alone: both real misses sit
+    // in a header the translation unit reaches transitively (libsecret's
+    // secret.h:24, qtbase's qgtk3interface_p.h:25), and a seeds-only walk
+    // never saw them. Store paths are left out: a system header cannot spell
+    // a header this project generates.
     let defer_miss = producer.as_ref().and_then(|idx| {
-        find_unresolved_miss(idx, &files, cmdline, build_dir, virtual_declared.as_ref())
+        let mut walk: Vec<PathBuf> = files.clone();
+        for p in &c_includes {
+            if !p.starts_with(store_dir.to_path()) && !walk.contains(p) {
+                walk.push(p.clone());
+            }
+        }
+        find_unresolved_miss(idx, &walk, cmdline, build_dir, virtual_declared.as_ref())
     });
     let c_include_count = c_includes.len();
     let mut discovered_deps = Vec::new();
