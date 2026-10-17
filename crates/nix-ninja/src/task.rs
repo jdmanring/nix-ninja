@@ -1985,21 +1985,11 @@ impl Runner {
             // an argument that was relative to begin with needs the other
             // direction, because it names a file under the cd target and
             // the upload path resolves against the build root.
-            let (cd_depth, cd_dir) = if args.len() >= 3
-                && args[0] == "cd"
-                && args[2] == "&&"
-                && !args[1].starts_with('/')
-            {
-                (
-                    Path::new(&args[1])
-                        .components()
-                        .filter(|c| matches!(c, std::path::Component::Normal(_)))
-                        .count(),
-                    PathBuf::from(&args[1]),
-                )
-            } else {
-                (0, PathBuf::new())
-            };
+            let cd_dir = rewritten_cd_dir(&args);
+            let cd_depth = cd_dir
+                .components()
+                .filter(|c| matches!(c, std::path::Component::Normal(_)))
+                .count();
             // THE DIRECTORY THE COMMAND ACTUALLY RUNS IN, READ FROM THE
             // ORIGINAL COMMAND LINE. `args` above comes from
             // `rewrite_cmdline`, WHICH DROPS A `cd` PROLOGUE WHOSE TARGET IS
@@ -2654,12 +2644,9 @@ impl Runner {
                 // what every other candidate here already does. The fixture
                 // that missed this cd'd to the build root, where depth is
                 // zero and the unrebased spelling happens to resolve.
-                let script_path = if script.starts_with('/') {
-                    PathBuf::from(script)
-                } else {
-                    self.config.build_dir.join(rebase_post_cd(&cd_dir, script))
-                };
-                if let Ok(text) = std::fs::read_to_string(&script_path) {
+                if let Some((text, refs)) =
+                    cmake_p_references(&self.config.build_dir, &cd_dir, script, &cmake_p_defs)
+                {
                     gtest_discovery |= runs_gtest_discovery(cmdline, Some(&text));
                     // THE SCRIPT ITSELF IS AN INPUT, and nothing else declares
                     // it when configure wrote it: CMake's ExternalProject
@@ -2670,14 +2657,7 @@ impl Runner {
                     // zero inputs and cmake died `Not a file`. Pushed as
                     // spelled; the filters below drop a store or foreign
                     // path and keep one inside this tree.
-                    referenced.push(script.clone());
-                    referenced.extend(cmake_script_referenced_paths(&text, &cmake_p_defs));
-                    referenced.extend(cmake_script_included_modules(&script_path, &text));
-                    referenced.extend(cmake_script_included_paths(
-                        &script_path,
-                        &text,
-                        &cmake_p_defs,
-                    ));
+                    referenced.extend(refs);
                 }
             }
             // A `cmake -E cmake_autogen` PLAN NAMES ITS OWN SOURCES, and no edge
@@ -2763,21 +2743,14 @@ impl Runner {
             {
                 {
                     for cand in referenced {
-                        let rel = if cand.starts_with('/') {
-                            let p = Path::new(&cand);
-                            if p.starts_with(&self.config.store_dir)
-                                || !same_project_tree(&self.config.build_dir, p)
-                            {
-                                continue;
-                            }
-                            relative_from(p, &self.config.build_dir)
-                        } else {
-                            Some(rebase_post_cd(&cd_dir, &cand))
-                        };
-                        let Some(rel) = rel else { continue };
-                        if !self.config.build_dir.join(&rel).is_file() {
+                        let Some(rel) = referenced_file_rel(
+                            &self.config.build_dir,
+                            &self.config.store_dir,
+                            &cd_dir,
+                            &cand,
+                        ) else {
                             continue;
-                        }
+                        };
                         for input in
                             upload_referenced_file(&self.rpc_client, &self.config.build_dir, rel)?
                         {
@@ -11451,6 +11424,67 @@ pub fn cmake_autogen_referenced_files(text: &str) -> Vec<String> {
     out
 }
 
+/// The directory a command runs in, relative to the build dir, read from the
+/// leading `cd <dir> &&` of the REWRITTEN argv (`rewrite_cmdline` has already
+/// made an in-tree target relative); empty when there is none.
+fn rewritten_cd_dir(args: &[String]) -> PathBuf {
+    if args.len() >= 3 && args[0] == "cd" && args[2] == "&&" && !args[1].starts_with('/') {
+        PathBuf::from(&args[1])
+    } else {
+        PathBuf::new()
+    }
+}
+
+/// What a `cmake -P` run reads: the script itself as spelled, the paths its
+/// `set()` calls and `foreach` bodies compose, its module includes and its
+/// composed includes. None when the script cannot be read. `script` and the
+/// definitions are the REWRITTEN spellings, so a relative path here is
+/// relative to the command's own directory, `build_dir.join(cd_dir)`.
+fn cmake_p_references(
+    build_dir: &Path,
+    cd_dir: &Path,
+    script: &str,
+    definitions: &HashMap<String, String>,
+) -> Option<(String, Vec<String>)> {
+    let script_path = if script.starts_with('/') {
+        PathBuf::from(script)
+    } else {
+        build_dir.join(rebase_post_cd(cd_dir, script))
+    };
+    let text = std::fs::read_to_string(&script_path).ok()?;
+    let mut refs = vec![script.to_string()];
+    refs.extend(cmake_script_referenced_paths(&text, definitions));
+    refs.extend(cmake_script_included_modules(&script_path, &text));
+    refs.extend(cmake_script_included_paths(
+        &script_path,
+        &text,
+        definitions,
+        &build_dir.join(cd_dir),
+    ));
+    Some((text, refs))
+}
+
+/// A reader's candidate as a build-dir-relative path to a FILE that exists,
+/// or None: an absolute candidate must be inside this project's tree and not
+/// in the store, a relative one is relative to the command's directory.
+fn referenced_file_rel(
+    build_dir: &Path,
+    store_dir: &StoreDir,
+    cd_dir: &Path,
+    cand: &str,
+) -> Option<PathBuf> {
+    let rel = if cand.starts_with('/') {
+        let p = Path::new(cand);
+        if p.starts_with(store_dir) || !same_project_tree(build_dir, p) {
+            return None;
+        }
+        relative_from(p, build_dir)?
+    } else {
+        rebase_post_cd(cd_dir, cand)
+    };
+    build_dir.join(&rel).is_file().then_some(rel)
+}
+
 fn cmake_script_arg(args: &[String]) -> Option<&str> {
     args.iter()
         .position(|a| a == "-P")
@@ -11559,7 +11593,13 @@ fn cmake_script_foreach_paths(text: &str, vars: &HashMap<String, String>) -> Vec
                 let Some(value) = expand_cmake_vars(&raw, &v) else {
                     continue;
                 };
-                if value.starts_with('/') {
+                // RELATIVE TOO: production hands this the REWRITTEN argv, in
+                // which `rewrite_cmdline` has made `CURRENT_SOURCE_DIR` a climb
+                // from the command's own directory (`../../../../client/X11/man`),
+                // so an absolute-only test kept nothing on the real edge while
+                // its fixture, fed the original argv, passed. The caller
+                // rebases a relative candidate against that directory.
+                if value.contains('/') {
                     let n = lexical_join(Path::new(""), Path::new(&value));
                     let n = n.to_string_lossy().into_owned();
                     if !out.contains(&n) {
@@ -11647,10 +11687,11 @@ fn cmake_script_included_paths(
     script: &Path,
     text: &str,
     definitions: &HashMap<String, String>,
+    cwd: &Path,
 ) -> Vec<String> {
     let mut vars = definitions.clone();
     let mut out = Vec::new();
-    included_paths_walk(script, text, &mut vars, &mut out, 0);
+    included_paths_walk(script, text, &mut vars, &mut out, 0, cwd);
     out
 }
 
@@ -11660,6 +11701,7 @@ fn included_paths_walk(
     vars: &mut HashMap<String, String>,
     out: &mut Vec<String>,
     depth: usize,
+    cwd: &Path,
 ) {
     let dir = file.parent().map(|d| d.to_string_lossy().into_owned());
     let saved = vars.get("CMAKE_CURRENT_LIST_DIR").cloned();
@@ -11690,9 +11732,19 @@ fn included_paths_walk(
         out.push(path.clone());
         // A regular file only: a composed path can name a device or fifo,
         // and reading one would hang the driver.
-        if depth < 4 && path.starts_with('/') && Path::new(&path).is_file() {
-            if let Ok(child) = std::fs::read_to_string(&path) {
-                included_paths_walk(Path::new(&path), &child, vars, out, depth + 1);
+        // A RELATIVE include is read against the directory the command runs
+        // in, which is where cmake resolves it: `rewrite_cmdline` turns
+        // opencv's `-DCMAKE_HELPER_SCRIPT=/build/source/build/...info.cmake`
+        // into a bare name, and an absolute-only walk never read the helper
+        // whose `set(OpenCV_SOURCE_DIR ...)` composes the next include.
+        let on_disk = if path.starts_with('/') {
+            PathBuf::from(&path)
+        } else {
+            cwd.join(&path)
+        };
+        if depth < 4 && on_disk.is_file() {
+            if let Ok(child) = std::fs::read_to_string(&on_disk) {
+                included_paths_walk(Path::new(&path), &child, vars, out, depth + 1, cwd);
             }
         }
     }
@@ -11873,31 +11925,15 @@ fn sibling_dirs_of(dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod cmake_script_reference_tests {
     use super::{
-        cmake_definitions, cmake_script_arg, cmake_script_included_modules,
+        cmake_definitions, cmake_p_references, cmake_script_arg, cmake_script_included_modules,
         cmake_script_included_paths, cmake_script_referenced_paths, expand_cmake_vars,
+        lexical_join, referenced_file_rel, rewrite_cmdline, rewritten_cd_dir, StoreDir,
     };
-    use std::collections::HashMap;
-    use std::path::Path;
+    use std::collections::{BTreeSet, HashMap};
+    use std::path::{Path, PathBuf};
 
-    fn args(s: &str) -> Vec<String> {
-        s.split_whitespace().map(String::from).collect()
-    }
-
-    /// FREERDP'S OWN SHAPE: the manpage edge's argv from task `gpy1sk9l`
-    /// (KDE round 2026-10-17) and freerdp 3.32.1's `GenerateManpages.cmake`
-    /// verbatim. The section `.in` files sit in a sibling tree the elements
-    /// climb into, named by no argument.
-    #[test]
-    fn a_foreach_over_a_split_definition_recovers_each_section() {
-        // THE SDL3 MANPAGES OF THE SAME FREERDP RELEASE: the edge's argv
-        // from task `gpy1sk9l` (KDE round 2026-10-17) and the release's
-        // `GenerateManpages.cmake` verbatim. `client/SDL/SDL3/man` owns
-        // two of the eight section `.in` files, the rest climb into
-        // sibling `man` trees; a DEP whose `.in` sits beside the edge's
-        // own directory is the spelling no `-D` argument names.
-        let cmdline = r#"cd /build/source/build/client/SDL/SDL3/man && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -Dtemplate="sdl3-freerdp.1" -DMANPAGE_NAME="sdl-freerdp" -Dmanpage="sdl-freerdp.1" -DMAN_TODAY="1980-01-01" -DCURRENT_SOURCE_DIR="/build/source/client/SDL/SDL3/man" -DCURRENT_BINARY_DIR="/build/source/build/client/SDL/SDL3/man" -Dtarget="sdl3-freerdp" -Dsection="1" -Ddependencies="../../../common/man/freerdp-global-options.1 ../../../common/man/freerdp-global-envvar.1 sdl3-freerdp-envvar.1 ../../common/man/sdl-freerdp-config.1 ../../../common/man/freerdp-global-config.1 ../../common/man/sdl-global-config.1 ../../common/man/sdl-freerdp-examples.1 ../../../common/man/freerdp-global-links.1" -DVENDOR=FreeRDP -DPRODUCT=FreeRDP -DVENDOR_PRODUCT=freerdp -DSYSCONF_DIR=/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-freerdp-3.32.1/etc/FreeRDP -DSDL_WIKI_BASE_URL=https://wiki.libsdl.org/SDL3 -P "/build/source/cmake/GenerateManpages.cmake""#;
-        let a = shell_words::split(cmdline).unwrap();
-        let script = r#"get_filename_component(GENERATE_MANPAGES_SCRIPT_DIR "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
+    /// freerdp 3.32.1's `cmake/GenerateManpages.cmake`, verbatim.
+    const FREERDP_MANPAGE_SCRIPT: &str = r#"get_filename_component(GENERATE_MANPAGES_SCRIPT_DIR "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
 list(APPEND CMAKE_MODULE_PATH ${GENERATE_MANPAGES_SCRIPT_DIR})
 
 set(SRC "${CURRENT_SOURCE_DIR}/${target}.${section}.in")
@@ -11944,6 +11980,48 @@ foreach(DEP IN LISTS DEPS)
   file(APPEND ${CURRENT_BINARY_DIR}/${manpage} "${CONTENTS}")
 endforeach()
 "#;
+
+    /// The reader chain `new_task` runs on a `cmake -P` edge, from the ORIGINAL
+    /// command line: `rewrite_cmdline`, the split, the command's directory,
+    /// `cmake_p_references`, then `referenced_file_rel`. Returns the
+    /// build-dir-relative files the task would be handed, normalized.
+    fn staged_by_cmake_p(cmdline: &str, build: &Path) -> BTreeSet<PathBuf> {
+        let a = shell_words::split(&rewrite_cmdline(cmdline, build)).unwrap();
+        let cd = rewritten_cd_dir(&a);
+        let script = cmake_script_arg(&a).expect("a -P script");
+        let (_, refs) = cmake_p_references(build, &cd, script, &cmake_definitions(&a))
+            .expect("the script is readable");
+        let store = StoreDir::new(Path::new("/nix/store")).unwrap();
+        refs.iter()
+            .filter_map(|r| referenced_file_rel(build, &store, &cd, r))
+            .map(|r| lexical_join(Path::new(""), &r))
+            .collect()
+    }
+
+    fn touch(p: &Path, body: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    /// FREERDP'S OWN SHAPE: the manpage edge's argv from task `gpy1sk9l`
+    /// (KDE round 2026-10-17) and freerdp 3.32.1's `GenerateManpages.cmake`
+    /// verbatim. The section `.in` files sit in a sibling tree the elements
+    /// climb into, named by no argument.
+    #[test]
+    fn a_foreach_over_a_split_definition_recovers_each_section() {
+        // THE SDL3 MANPAGES OF THE SAME FREERDP RELEASE: the edge's argv
+        // from task `gpy1sk9l` (KDE round 2026-10-17) and the release's
+        // `GenerateManpages.cmake` verbatim. `client/SDL/SDL3/man` owns
+        // two of the eight section `.in` files, the rest climb into
+        // sibling `man` trees; a DEP whose `.in` sits beside the edge's
+        // own directory is the spelling no `-D` argument names.
+        let cmdline = r#"cd /build/source/build/client/SDL/SDL3/man && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -Dtemplate="sdl3-freerdp.1" -DMANPAGE_NAME="sdl-freerdp" -Dmanpage="sdl-freerdp.1" -DMAN_TODAY="1980-01-01" -DCURRENT_SOURCE_DIR="/build/source/client/SDL/SDL3/man" -DCURRENT_BINARY_DIR="/build/source/build/client/SDL/SDL3/man" -Dtarget="sdl3-freerdp" -Dsection="1" -Ddependencies="../../../common/man/freerdp-global-options.1 ../../../common/man/freerdp-global-envvar.1 sdl3-freerdp-envvar.1 ../../common/man/sdl-freerdp-config.1 ../../../common/man/freerdp-global-config.1 ../../common/man/sdl-global-config.1 ../../common/man/sdl-freerdp-examples.1 ../../../common/man/freerdp-global-links.1" -DVENDOR=FreeRDP -DPRODUCT=FreeRDP -DVENDOR_PRODUCT=freerdp -DSYSCONF_DIR=/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-freerdp-3.32.1/etc/FreeRDP -DSDL_WIKI_BASE_URL=https://wiki.libsdl.org/SDL3 -P "/build/source/cmake/GenerateManpages.cmake""#;
+        let a = shell_words::split(cmdline).unwrap();
+        let script = FREERDP_MANPAGE_SCRIPT;
         let got = cmake_script_referenced_paths(script, &cmake_definitions(&a));
         for want in [
             "/build/source/client/common/man/freerdp-global-envvar.1.in",
@@ -12192,7 +12270,7 @@ endforeach()
             helper.display(),
             script.display()
         )));
-        let got = cmake_script_included_paths(&script, text, &defs);
+        let got = cmake_script_included_paths(&script, text, &defs, &build);
         let _ = std::fs::remove_dir_all(&root);
         let want: Vec<String> = [helper.clone(), src.join("cmake/OpenCVUtils.cmake")]
             .iter()
@@ -12256,7 +12334,7 @@ endforeach()
             helper.display(),
             script.display()
         )));
-        let got = cmake_script_included_paths(&script, text, &defs);
+        let got = cmake_script_included_paths(&script, text, &defs, &build);
         // The helper and the module both ride the recovery.
         for want in [
             helper.to_string_lossy().into_owned(),
@@ -12304,7 +12382,7 @@ endforeach()
             helper.display(),
             script.display()
         )));
-        let got = cmake_script_included_paths(&script, text, &defs);
+        let got = cmake_script_included_paths(&script, text, &defs, &build);
         let _ = std::fs::remove_dir_all(&root);
         // The helper itself is still reached: it is named by a definition.
         assert!(
@@ -12319,6 +12397,106 @@ endforeach()
                 .all(|g| g != &module.to_string_lossy().into_owned()),
             "the uncomposable module was recovered; got {got:?}"
         );
+    }
+
+    /// THE REAL EDGE, NOT ITS ARGV: freerdp's manpage task (`z0lihmjr`, KDE
+    /// round r8) still died `Missing manpage section` with the foreach reader
+    /// mounted, because production reads the REWRITTEN command, in which
+    /// `CURRENT_SOURCE_DIR` is a climb from `client/X11/man`, and the reader
+    /// kept only absolute values. This runs the original command line through
+    /// the same chain `new_task` does, against a tree shaped like the sandbox.
+    #[test]
+    fn the_manpage_edge_stages_every_section_through_the_rewritten_argv() {
+        let root = std::env::temp_dir().join(format!("nn-manpage-rw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, build) = (root.join("source"), root.join("source/build"));
+        std::fs::create_dir_all(build.join("client/X11/man")).unwrap();
+        touch(
+            &src.join("cmake/GenerateManpages.cmake"),
+            FREERDP_MANPAGE_SCRIPT,
+        );
+        let x11 = [
+            "xfreerdp",
+            "xfreerdp-shortcuts",
+            "xfreerdp-examples",
+            "xfreerdp-global-config",
+        ];
+        let common = ["options", "envvar", "config", "links"];
+        for n in x11 {
+            touch(&src.join(format!("client/X11/man/{n}.1.in")), "");
+        }
+        for n in common {
+            touch(
+                &src.join(format!("client/common/man/freerdp-global-{n}.1.in")),
+                "",
+            );
+        }
+        let cmdline = format!(
+            r#"cd {b}/client/X11/man && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -Dtemplate="xfreerdp.1" -DMANPAGE_NAME="xfreerdp" -Dmanpage="xfreerdp.1" -DMAN_TODAY="1980-01-01" -DCURRENT_SOURCE_DIR="{s}/client/X11/man" -DCURRENT_BINARY_DIR="{b}/client/X11/man" -Dtarget="xfreerdp" -Dsection="1" -Ddependencies="../../common/man/freerdp-global-options.1 xfreerdp-shortcuts.1 ../../common/man/freerdp-global-envvar.1 ../../common/man/freerdp-global-config.1 xfreerdp-global-config.1 xfreerdp-examples.1 ../../common/man/freerdp-global-links.1" -DVENDOR=FreeRDP -DPRODUCT=FreeRDP -DVENDOR_PRODUCT=freerdp -DSYSCONF_DIR=/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-freerdp-3.32.1/etc/FreeRDP -P "{s}/cmake/GenerateManpages.cmake""#,
+            b = build.display(),
+            s = src.display()
+        );
+        let got = staged_by_cmake_p(&cmdline, &build);
+        // Negative control on the same edge: a section the release does not
+        // ship beside the X11 pages is a candidate the reader composes and
+        // the existence filter refuses.
+        let unshipped = PathBuf::from("../client/X11/man/xfreerdp-global-links.1.in");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut want: BTreeSet<PathBuf> =
+            x11.iter()
+                .map(|n| PathBuf::from(format!("../client/X11/man/{n}.1.in")))
+                .chain(common.iter().map(|n| {
+                    PathBuf::from(format!("../client/common/man/freerdp-global-{n}.1.in"))
+                }))
+                .collect();
+        want.insert(PathBuf::from("../cmake/GenerateManpages.cmake"));
+        assert_eq!(got, want);
+        assert!(!got.contains(&unshipped));
+    }
+
+    /// opencv 4.13.0's pkg-config edge (`w8yfcxbv`, KDE round r8): line 116
+    /// includes `${OpenCV_SOURCE_DIR}/cmake/OpenCVUtils.cmake`, a name the
+    /// helper included on line 115 sets. The rewritten argv names the helper
+    /// BARE, and the walk read only absolute includes, so the helper was
+    /// staged and never read. Same chain as `new_task`; the control is the
+    /// same edge with a helper that sets nothing.
+    #[test]
+    fn the_pkgconfig_edge_reads_the_helper_its_rewritten_argv_names_bare() {
+        let root = std::env::temp_dir().join(format!("nn-pkgconfig-rw-{}", std::process::id()));
+        for (sets, want_utils) in [(true, true), (false, false)] {
+            let _ = std::fs::remove_dir_all(&root);
+            let (src, build) = (root.join("source"), root.join("source/build"));
+            let helper = if sets {
+                format!("set(OpenCV_SOURCE_DIR \"{}\")\n", src.display())
+            } else {
+                "set(BUILD_SHARED_LIBS \"ON\")\n".to_string()
+            };
+            touch(&build.join("OpenCVGenPkgConfig.info.cmake"), &helper);
+            touch(
+                &src.join("cmake/OpenCVGenPkgconfig.cmake"),
+                "include(\"${CMAKE_HELPER_SCRIPT}\")\n\
+                 include(\"${OpenCV_SOURCE_DIR}/cmake/OpenCVUtils.cmake\")\n",
+            );
+            touch(&src.join("cmake/OpenCVUtils.cmake"), "");
+            let cmdline = format!(
+                "cd {b} && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake \
+                 -DCMAKE_HELPER_SCRIPT={b}/OpenCVGenPkgConfig.info.cmake \
+                 -P {s}/cmake/OpenCVGenPkgconfig.cmake",
+                b = build.display(),
+                s = src.display()
+            );
+            let got = staged_by_cmake_p(&cmdline, &build);
+            assert!(
+                got.contains(Path::new("OpenCVGenPkgConfig.info.cmake")),
+                "{got:?}"
+            );
+            assert_eq!(
+                got.contains(Path::new("../cmake/OpenCVUtils.cmake")),
+                want_utils,
+                "helper sets OpenCV_SOURCE_DIR: {sets}; staged {got:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
