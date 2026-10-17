@@ -298,17 +298,49 @@ impl ProducerIndex {
         dirs: &[String],
         build_dir: &Path,
     ) -> Option<FileId> {
-        if let Some(dir) = includer_dir {
-            if let Some(fid) = self.fid_of_path(&dir.join(name), build_dir) {
-                return Some(fid);
-            }
+        // A name no compiler would look up (a macro continuation the
+        // directive parser kept, a stray space) answers nothing.
+        let n = name.to_string_lossy();
+        if n.is_empty() || n.contains(char::is_whitespace) || n.contains('\\') {
+            return None;
         }
-        for d in dirs {
-            if let Some(fid) = self.fid_of_path(&Path::new(d).join(name), build_dir) {
+        let bases = includer_dir.into_iter().chain(dirs.iter().map(Path::new));
+        for base in bases {
+            let Some(fid) = self.fid_of_path(&base.join(name), build_dir) else {
+                continue;
+            };
+            // A TREE MATCH COUNTS ONLY FROM OUTSIDE THE TREE. qtbase passes
+            // module trees themselves as include dirs (`-I<build>/include/
+            // QtCore`), and every spelling those miss - `<memory>`, whose
+            // directory is the compiler's own - landed "inside" the tree and
+            // deferred hundreds of compiles that build today. The real case
+            // is `-I<build>/include` with `QtWidgets/QWidget`.
+            if self
+                .files
+                .contains_key(&self.key(&base.join(name), build_dir))
+                || !self.in_tree(base, build_dir)
+            {
                 return Some(fid);
             }
         }
         None
+    }
+
+    /// Whether `p` is a module tree directory or lies inside one.
+    fn in_tree(&self, p: &Path, build_dir: &Path) -> bool {
+        let k = self.key(p, build_dir);
+        self.trees
+            .iter()
+            .any(|(t, _)| k == *t || k.starts_with(&format!("{t}/")))
+    }
+
+    fn key(&self, p: &Path, build_dir: &Path) -> String {
+        let rel = p.strip_prefix(build_dir).unwrap_or(p);
+        n2::canon::to_owned_canon_path(
+            normalize_build_path_lexical(rel)
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 }
 
@@ -23641,5 +23673,83 @@ mod unresolved_include_defer_tests {
             c_include_parser::canonicalize_cached(Path::new("inc").join("real.h"), None).is_ok();
         std::env::set_current_dir(prev).unwrap();
         assert!(got, "the fixture header must resolve");
+    }
+
+    /// qtbase's drive: the compiler's own `<memory>` misses every `-I`, and
+    /// qtbase passes the module tree itself as one (`-I<build>/include/
+    /// QtWidgets`). `include/QtWidgets/memory` lies inside the tree, and the
+    /// first rule deferred hundreds of compiles that build today on it. A
+    /// tree match counts only from an include dir outside the tree; the
+    /// control in the same index is the real case, from `-I<build>/include`.
+    #[test]
+    fn a_system_header_missed_through_a_tree_include_dir_is_not_a_miss() {
+        let _g = super::CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        let d = super::Scratch::new(format!("nn-defer-memory-{}", std::process::id()));
+        let build = d.join("build");
+        std::fs::create_dir_all(build.join("include/QtWidgets")).unwrap();
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        let tu = d.join("src/main.cpp");
+        std::fs::write(&tu, "#include <memory>\nint main(){return 0;}\n").unwrap();
+        let tu2 = d.join("src/gtk.cpp");
+        std::fs::write(&tu2, "#include <QtWidgets/QWidget>\n").unwrap();
+        let cmd = format!(
+            "c++ -I{b}/include/QtWidgets -I{b}/include -c {} -o main.o",
+            tu.display(),
+            b = build.display()
+        );
+        std::env::set_current_dir(&build).unwrap();
+        let (idx, rep) = qt_widgets_index();
+        let memory = find_unresolved_miss(&idx, std::slice::from_ref(&tu), &cmd, &build, None);
+        let real = find_unresolved_miss(&idx, &[tu2], &cmd, &build, None);
+        std::env::set_current_dir(prev).unwrap();
+        assert!(
+            memory.is_none(),
+            "<memory> through a tree dir must not defer"
+        );
+        assert_eq!(real.expect("QtWidgets/QWidget defers").fids, vec![rep]);
+    }
+
+    /// qtbase's DBus PCH header includes the master header by ABSOLUTE
+    /// spelling, a file the task holds under its build-dir-relative key in
+    /// the virtual map. It resolves, so nothing defers; the first resolver
+    /// asked only the absolute form and deferred a compile that builds.
+    #[test]
+    fn an_absolute_spelling_the_virtual_map_holds_relatively_resolves() {
+        let _g = super::CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+        let d = super::Scratch::new(format!("nn-defer-abs-{}", std::process::id()));
+        let build = d.join("build");
+        std::fs::create_dir_all(build.join("src/dbus")).unwrap();
+        let pch = build.join("src/dbus/cmake_pch.hxx");
+        std::fs::write(
+            &pch,
+            format!("#include \"{}/include/QtCore/QtCore\"\n", build.display()),
+        )
+        .unwrap();
+        let held = d.join("held-QtCore");
+        std::fs::write(&held, "").unwrap();
+        let mut vp = HashMap::new();
+        vp.insert(PathBuf::from("include/QtCore/QtCore"), held);
+        let g = graph_of(
+            "rule syncqt\n  command = syncqt $out\n\
+             build include/QtCore/QtCoreVersion include/QtCore/QtCore: syncqt\n",
+        );
+        let mut idx = ProducerIndex {
+            files: Default::default(),
+            trees: Default::default(),
+        };
+        let master = g.files.lookup("include/QtCore/QtCore").unwrap();
+        idx.files
+            .insert("include/QtCore/QtCore".to_string(), master);
+        let cmd = format!(
+            "c++ -I{}/include -c {} -o x.o",
+            build.display(),
+            pch.display()
+        );
+        std::env::set_current_dir(&build).unwrap();
+        let got = find_unresolved_miss(&idx, &[pch], &cmd, &build, Some(&vp));
+        std::env::set_current_dir(prev).unwrap();
+        assert!(got.is_none(), "a header the task holds must not defer");
     }
 }
