@@ -3547,6 +3547,15 @@ impl Runner {
             }
         }
 
+        // A FILE THE COMMAND OVERWRITES IS NOT AN INPUT. gcr's gdbus header
+        // edge depends on the source edge and reruns the same command,
+        // which writes both; placed read-only, the `.c` failed the write.
+        // Only an input this edge does not itself declare is dropped.
+        if let Some(c) = build.cmdline.as_deref() {
+            for w in gdbus_c_code_writes(c, &outputs) {
+                input_set.remove(&w);
+            }
+        }
         let mut inputs: Vec<DerivedFile> = input_set.into_values().collect();
         // Normalize away `.` components and dedup exact repeats: the same
         // file can enter input_set under two spellings of one destination
@@ -6191,7 +6200,9 @@ fn handle_derivation_result(
             // unresolved spelling really unresolved (the static arm read
             // qtbase's Bootstrap compiles as missing QtCore headers they
             // build with, and never opened libsecret's valac-generated
-            // translation unit). Nothing is written before this point.
+            // translation unit). No derivation or output is written before
+            // this point; the discovery uploads above are content-addressed
+            // and reused by the rerun.
             if let Some(d) = defer {
                 return Err(anyhow::Error::new(Deferred(d)));
             }
@@ -8504,10 +8515,13 @@ pub fn cmake_dotted_stamp_outputs(declared: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The output directory and input xmls of a `gdbus-codegen
+/// The output directory, docbook prefix and input xmls of a `gdbus-codegen
 /// --generate-docbook` command, or None for any other command. An input is
-/// a `.xml` argument that is not a flag, as spelled.
-fn gdbus_docbook_args(cmdline: &str) -> Option<(String, Vec<String>)> {
+/// a `.xml` argument that is not a flag, as spelled. The prefix is the
+/// flag's value: `gdbus-codegen` names each file `<prefix>-<interface>.xml`
+/// (`codegen_docbook.py`), and xdg-desktop-portal passes `portal`, not
+/// `dbus`.
+fn gdbus_docbook_args(cmdline: &str) -> Option<(String, String, Vec<String>)> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
     let is_gdbus = toks.iter().any(|t| {
         Path::new(t)
@@ -8522,6 +8536,7 @@ fn gdbus_docbook_args(cmdline: &str) -> Option<(String, Vec<String>)> {
         return None;
     }
     let mut out_dir = None;
+    let mut prefix = None;
     let mut inputs = Vec::new();
     let mut it = toks.iter();
     while let Some(t) = it.next() {
@@ -8530,9 +8545,14 @@ fn gdbus_docbook_args(cmdline: &str) -> Option<(String, Vec<String>)> {
             "--output-directory" => {
                 out_dir = it.next().copied();
             }
+            "--generate-docbook" => {
+                prefix = it.next().copied();
+            }
             _ => {
                 if let Some(v) = t.strip_prefix("--output-directory=") {
                     out_dir = Some(v);
+                } else if let Some(v) = t.strip_prefix("--generate-docbook=") {
+                    prefix = Some(v);
                 } else if t.ends_with(".xml") && !t.starts_with('-') {
                     inputs.push(t.trim_matches('"').to_string());
                 }
@@ -8540,7 +8560,8 @@ fn gdbus_docbook_args(cmdline: &str) -> Option<(String, Vec<String>)> {
         }
     }
     let od = out_dir.map(|s| s.trim_matches('"')).unwrap_or(".");
-    Some((od.to_string(), inputs))
+    let prefix = prefix?.trim_matches('"');
+    Some((od.to_string(), prefix.to_string(), inputs))
 }
 
 /// Declared docbook outputs of a `gdbus-codegen --generate-docbook` edge
@@ -8567,22 +8588,22 @@ pub fn gdbus_unwritten_outputs(
     build_dir: &Path,
     declared: &[PathBuf],
 ) -> Vec<PathBuf> {
-    let Some((od, inputs)) = gdbus_docbook_args(cmdline) else {
+    let Some((od, prefix, inputs)) = gdbus_docbook_args(cmdline) else {
         return Vec::new();
     };
     // Each input xml names one declared docbook output:
-    // `<od>/dbus-<input-stem>`, the spelling meson declares.
+    // `<od>/<prefix>-<input-stem>`, the spelling meson declares.
     let candidates: Vec<String> = inputs
         .iter()
         .map(|input| {
             let stem = input.rsplit('/').next().unwrap_or("");
-            format!("{od}/dbus-{stem}")
+            format!("{od}/{prefix}-{stem}")
         })
         .collect();
     // ONLY THE NAMES NO INTERFACE PRODUCES. An input whose single interface
     // carries its stem is written by the tool; stamping it anyway appended
     // `&& touch` to every docbook edge that builds today and moved its key.
-    let Some(written) = gdbus_docbook_written(&od, &inputs, build_dir) else {
+    let Some(written) = gdbus_docbook_written(&od, &prefix, &inputs, build_dir) else {
         return Vec::new();
     };
     declared
@@ -8613,22 +8634,27 @@ pub fn gdbus_docbook_interface_outputs(
     build_dir: &Path,
     declared: &[PathBuf],
 ) -> Vec<PathBuf> {
-    let Some((od, inputs)) = gdbus_docbook_args(cmdline) else {
+    let Some((od, prefix, inputs)) = gdbus_docbook_args(cmdline) else {
         return Vec::new();
     };
-    gdbus_docbook_written(&od, &inputs, build_dir)
+    gdbus_docbook_written(&od, &prefix, &inputs, build_dir)
         .unwrap_or_default()
         .into_iter()
         .filter(|p| !declared.contains(p))
         .collect()
 }
 
-/// Every `<od>/dbus-<interface>.xml` the inputs' interfaces name, or None
+/// Every `<od>/<prefix>-<interface>.xml` the inputs' interfaces name, or None
 /// when any input cannot be read. An unreadable input is a GENERATED xml not
 /// yet on disk, and guessing would fail the wrong way: read as naming no
 /// interface, its stem would be stamped and an edge that builds today would
 /// change its command. None leaves the edge's emission as it was.
-fn gdbus_docbook_written(od: &str, inputs: &[String], build_dir: &Path) -> Option<Vec<PathBuf>> {
+fn gdbus_docbook_written(
+    od: &str,
+    prefix: &str,
+    inputs: &[String],
+    build_dir: &Path,
+) -> Option<Vec<PathBuf>> {
     let mut out = Vec::new();
     for input in inputs {
         let path = if input.starts_with('/') {
@@ -8658,7 +8684,7 @@ fn gdbus_docbook_written(od: &str, inputs: &[String], build_dir: &Path) -> Optio
             };
             let rel = lexical_join(
                 Path::new(""),
-                &Path::new(od).join(format!("dbus-{name}.xml")),
+                &Path::new(od).join(format!("{prefix}-{name}.xml")),
             );
             if !out.contains(&rel) {
                 out.push(rel);
@@ -8666,6 +8692,56 @@ fn gdbus_docbook_written(od: &str, inputs: &[String], build_dir: &Path) -> Optio
         }
     }
     Some(out)
+}
+
+/// The files a `gdbus-codegen --generate-c-code <base>` command writes,
+/// `<output-directory>/<base>.c` and `.h`, as build-dir-relative paths;
+/// empty for any other command. meson takes this form when it cannot
+/// detect glib's version ("assuming 2.54", gcr 4.4.0.1) and then emits TWO
+/// edges running the same command, one declaring the `.c` and one the
+/// `.h`, the header edge depending on the source edge. Real ninja's shared
+/// tree lets the second run overwrite the first one's `.c`; the task tree
+/// places that `.c` as a read-only input, so the header edge died on
+/// `PermissionError: 'gcr/gcr-dbus-generated.c'`. The `--body`/`--header`
+/// form writes one named file and yields nothing here. A file the edge
+/// itself declares is its output, not an overwritten input, and is kept.
+pub fn gdbus_c_code_writes(cmdline: &str, outputs: &[PathBuf]) -> Vec<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let is_gdbus = toks.iter().any(|t| {
+        Path::new(t)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("gdbus-codegen"))
+    });
+    if !is_gdbus {
+        return Vec::new();
+    }
+    let mut out_dir = None;
+    let mut base = None;
+    let mut it = toks.iter();
+    while let Some(t) = it.next() {
+        match *t {
+            "&&" | ";" | "|" => break,
+            "--output-directory" => out_dir = it.next().copied(),
+            "--generate-c-code" => base = it.next().copied(),
+            _ => {
+                if let Some(v) = t.strip_prefix("--output-directory=") {
+                    out_dir = Some(v);
+                } else if let Some(v) = t.strip_prefix("--generate-c-code=") {
+                    base = Some(v);
+                }
+            }
+        }
+    }
+    let Some(base) = base.map(|b| b.trim_matches('"')) else {
+        return Vec::new();
+    };
+    let od = Path::new(out_dir.map(|s| s.trim_matches('"')).unwrap_or("."));
+    ["c", "h"]
+        .iter()
+        .map(|ext| lexical_join(Path::new(""), &od.join(format!("{base}.{ext}"))))
+        .filter(|w| !outputs.contains(w))
+        .collect()
 }
 
 fn undeclared_outputs(
@@ -18544,8 +18620,8 @@ pub struct Discovered {
 /// header, compiles that build today. One `-M -MG` run with the command's
 /// own flags answers which are live: the depfile lists a live include at its
 /// resolved path or, missing, under its spelling, and never one in a branch
-/// the build does not take. A failed run is unknown and leaves the
-/// candidates as the scanner found them.
+/// the build does not take. A failed run confirms nothing: no candidate
+/// survives it, so the edge defers on nothing and emits as before.
 fn preprocessor_confirmed(
     cmdline: &str,
     build_dir: &Path,
@@ -23676,8 +23752,8 @@ mod script_bare_programs_tests {
 #[cfg(test)]
 mod vapigen_outputs_tests {
     use super::{
-        gdbus_docbook_interface_outputs, gdbus_unwritten_outputs, vapigen_unwritten_outputs,
-        vapigen_vapi,
+        gdbus_c_code_writes, gdbus_docbook_interface_outputs, gdbus_unwritten_outputs,
+        vapigen_unwritten_outputs, vapigen_vapi,
     };
     use std::path::{Path, PathBuf};
 
@@ -23757,6 +23833,117 @@ mod vapigen_outputs_tests {
         assert!(
             gdbus_unwritten_outputs(cmd, bd, &no_docbook_declared).is_empty(),
             "a non-docbook declared name must not be stamped"
+        );
+    }
+
+    /// xdg-desktop-portal 1.22.1's docbook edge (task `8sszzqpz`, argv
+    /// verbatim) passes `--generate-docbook portal`, so `gdbus-codegen`
+    /// writes `src/portal-<interface>.xml`, the name meson declares. Read as
+    /// `dbus`, the driver declared a `src/dbus-...` output nothing writes and
+    /// the task died in its written-output check. The input sits where the
+    /// edge reads it, `../data` from the build dir, with its one interface.
+    #[test]
+    fn a_docbook_edge_names_its_files_by_the_prefix_it_passes() {
+        let root = std::env::temp_dir().join(format!("nn-gdbus-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bd = root.join("source/build");
+        let data = root.join("source/data");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            data.join("org.freedesktop.host.portal.Registry.xml"),
+            "<node>\n  <interface name=\"org.freedesktop.host.portal.Registry\">\n  </interface>\n</node>\n",
+        )
+        .unwrap();
+        let cmd = "/nix/store/7y3yxnzk3yy1x8njrsa3m8804b1h1hz7-glib-2.88.3-dev/bin/gdbus-codegen \
+                   --c-generate-autocleanup all --interface-prefix org.freedesktop.host.portal \
+                   --c-namespace XdpDbusHost --output-directory src --generate-docbook portal \
+                   ../data/org.freedesktop.host.portal.Registry.xml";
+        let declared = [PathBuf::from(
+            "src/portal-org.freedesktop.host.portal.Registry.xml",
+        )];
+        let extra = gdbus_docbook_interface_outputs(cmd, &bd, &declared);
+        let unwritten = gdbus_unwritten_outputs(cmd, &bd, &declared);
+        // Control: the same input under `dbus` writes `src/dbus-...`, which
+        // this declared set lacks, so it is declared.
+        let dbus = cmd.replace("--generate-docbook portal", "--generate-docbook dbus");
+        let dbus_extra = gdbus_docbook_interface_outputs(&dbus, &bd, &declared);
+        // The `=` spelling carries its prefix too: an empty answer here
+        // would also be what an unparsed flag gives, so it rides the control.
+        let eq = cmd.replace("--generate-docbook portal", "--generate-docbook=dbus");
+        let eq_extra = gdbus_docbook_interface_outputs(&eq, &bd, &declared);
+        // An input with two interfaces under the same prefix: meson's
+        // bare-stem name is never written, so it is the one stamped.
+        std::fs::write(
+            data.join("org.freedesktop.portal.Pair.xml"),
+            "<node>\n  <interface name=\"org.freedesktop.portal.Pair.A\"/>\n  \
+             <interface name=\"org.freedesktop.portal.Pair.B\"/>\n</node>\n",
+        )
+        .unwrap();
+        let pair = cmd.replace(
+            "../data/org.freedesktop.host.portal.Registry.xml",
+            "../data/org.freedesktop.portal.Pair.xml",
+        );
+        let pair_declared = [PathBuf::from("src/portal-org.freedesktop.portal.Pair.xml")];
+        let pair_unwritten = gdbus_unwritten_outputs(&pair, &bd, &pair_declared);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            extra.is_empty(),
+            "nothing beyond meson's name; got {extra:?}"
+        );
+        assert!(
+            unwritten.is_empty(),
+            "the declared name is written; got {unwritten:?}"
+        );
+        assert_eq!(
+            dbus_extra,
+            vec![PathBuf::from(
+                "src/dbus-org.freedesktop.host.portal.Registry.xml"
+            )],
+            "the control must still read the interface"
+        );
+        assert_eq!(eq_extra, dbus_extra, "`=` spelling");
+        assert_eq!(
+            pair_unwritten,
+            pair_declared.to_vec(),
+            "the bare stem under the passed prefix is stamped"
+        );
+    }
+
+    /// gcr 4.4.0.1 (meson "assuming 2.54"): the source and header edges both
+    /// run `--output-directory gcr --generate-c-code gcr-dbus-generated`
+    /// (argv verbatim from task `ihmjzqg4`), which writes the `.c` and the
+    /// `.h`. The `--body`/`--header` form libsecret and flatpak take writes
+    /// one named file and must yield nothing, as must any other command.
+    #[test]
+    fn a_generate_c_code_run_writes_both_halves() {
+        let cmd = "/nix/store/7y3yxnzk3yy1x8njrsa3m8804b1h1hz7-glib-2.88.3-dev/bin/gdbus-codegen \
+                   --c-generate-autocleanup all --interface-prefix org.gnome.keyring.internal. \
+                   --c-namespace _GcrDbus --output-directory gcr --generate-c-code \
+                   gcr-dbus-generated ../gcr/org.gnome.keyring.Prompter.xml";
+        // The header edge declares the `.h`: only the `.c` is overwritten.
+        let header_edge = [PathBuf::from("gcr/gcr-dbus-generated.h")];
+        assert_eq!(
+            gdbus_c_code_writes(cmd, &header_edge),
+            vec![PathBuf::from("gcr/gcr-dbus-generated.c")]
+        );
+        assert_eq!(
+            gdbus_c_code_writes(cmd, &[]),
+            vec![
+                PathBuf::from("gcr/gcr-dbus-generated.c"),
+                PathBuf::from("gcr/gcr-dbus-generated.h"),
+            ]
+        );
+        let body = "/nix/store/x/bin/gdbus-codegen --c-generate-autocleanup all \
+                    --interface-prefix org.freedesktop.Secret. --c-namespace _SecretGen \
+                    --body --output libsecret/secret-dbus-generated.c \
+                    ../libsecret/org.freedesktop.Secrets.xml";
+        assert!(gdbus_c_code_writes(body, &[]).is_empty());
+        assert!(gdbus_c_code_writes("cc -c --generate-c-code x a.c", &[]).is_empty());
+        // Without `--output-directory` the base carries its own directory.
+        assert_eq!(
+            gdbus_c_code_writes("gdbus-codegen --generate-c-code=gcr/./g a.xml", &[]),
+            vec![PathBuf::from("gcr/g.c"), PathBuf::from("gcr/g.h")]
         );
     }
 
