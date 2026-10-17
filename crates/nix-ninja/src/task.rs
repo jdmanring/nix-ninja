@@ -18163,19 +18163,14 @@ pub struct Discovered {
 /// not evaluate `#if`, so a spelling in a branch the build never takes is a
 /// candidate too: qtbase's drive deferred 279 compiles on
 /// `QtGui/private/qspi_struct_marshallers_p.h` and 84 on a QtCore private
-/// header, compiles that build today. One `-M` run with the command's own
-/// flags answers which are live: when it fails on a missing header, that
-/// spelling is the live miss (the compiler stops at the first; a re-run finds
-/// the next); when it succeeds, the candidates its depfile lists are live and
-/// present on disk, still owed as inputs. Any other failure confirms nothing,
-/// which is the emission of before.
+/// header, compiles that build today. One `-M -MG` run with the command's
+/// own flags answers which are live: the depfile lists a live include at its
+/// resolved path or, missing, under its spelling, and never one in a branch
+/// the build does not take. A failed run confirms nothing, the emission of
+/// before.
 fn preprocessor_confirmed(cmdline: &str, candidates: Vec<DeferMiss>) -> Vec<DeferMiss> {
     match preprocessor_deps(cmdline) {
-        Err(stderr) => candidates
-            .into_iter()
-            .filter(|c| stderr.contains(&format!("{}: No such file", c.header)))
-            .take(1)
-            .collect(),
+        Err(_) => Vec::new(),
         Ok(deps) => candidates
             .into_iter()
             .filter(|c| deps.iter().any(|p| p.ends_with(&c.header)))
@@ -18183,8 +18178,11 @@ fn preprocessor_confirmed(cmdline: &str, candidates: Vec<DeferMiss>) -> Vec<Defe
     }
 }
 
-/// The compile command's own preprocessor dependencies, `-M` (system headers
-/// included), or its stderr when it fails. NOT deps-infer's
+/// The compile command's own preprocessor dependencies, `-M -MG`, or its
+/// stderr when it fails. `-MG` because the driver's disk is not the task's
+/// input view: without it the run stopped at the first header a carried
+/// tree supplies in the sandbox and the disk lacks (qtbase gtk3's
+/// `qpa/qplatformthemeplugin.h`), and confirmed nothing. NOT deps-infer's
 /// `retrieve_c_includes`: that runs `-MM`, under which gcc treats a missing
 /// ANGLE header as a system header, exits 0 and lists nothing, so
 /// `<QtWidgets/QWidget>` read as a dead branch; and deps-infer is in the task
@@ -18221,6 +18219,7 @@ fn preprocessor_deps(cmdline: &str) -> std::result::Result<Vec<PathBuf>, String>
         .args(&args)
         .env("NIX_BUILD_TOP", build_top)
         .arg("-M")
+        .arg("-MG")
         .arg("-MF")
         .arg(&dep)
         .output()
@@ -18681,7 +18680,34 @@ pub fn discover_c_includes(
         if candidates.is_empty() {
             return None;
         }
+        // NIX_NINJA_DEBUG_DEFER=1 names each candidate and what the
+        // preprocessor confirmed; off, nothing is printed.
+        let debug = std::env::var_os("NIX_NINJA_DEBUG_DEFER").is_some();
+        let names: Vec<String> = candidates.iter().map(|c| c.header.clone()).collect();
         let live = preprocessor_confirmed(cmdline, candidates);
+        if debug {
+            let why = match preprocessor_deps(cmdline) {
+                Ok(d) => format!(
+                    "-M ok, {} deps, matching {:?}",
+                    d.len(),
+                    d.iter()
+                        .filter(|p| names
+                            .iter()
+                            .any(|n| p.to_string_lossy().contains(n.as_str())))
+                        .take(3)
+                        .collect::<Vec<_>>()
+                ),
+                Err(e) => format!(
+                    "-M failed: {}",
+                    e.lines().take(3).collect::<Vec<_>>().join(" | ")
+                ),
+            };
+            eprintln!(
+                "nix-ninja: defer candidates {names:?} confirmed {:?} ({why}) for {}",
+                live.iter().map(|c| c.header.as_str()).collect::<Vec<_>>(),
+                cmdline.split_whitespace().last().unwrap_or("")
+            );
+        }
         let header = live.first()?.header.clone();
         let mut fids: Vec<FileId> = live.into_iter().flat_map(|m| m.fids).collect();
         fids.sort_by_key(n2::densemap::Index::index);
@@ -23981,9 +24007,9 @@ mod unresolved_include_defer_tests {
     /// The preprocessor separates a live miss from an `#if` branch the build
     /// never takes, which the scanner cannot: qtbase's QtGui private header
     /// that deferred 279 compiles is the dead shape. Two runs of the real
-    /// compiler: with `live.h` absent the failure names it and only it is
-    /// confirmed; with it present its depfile lists it and the dead spelling
-    /// stays unconfirmed either way.
+    /// compiler, live.h absent and then present: it is confirmed both times,
+    /// the dead spelling never, and an unrelated missing header ahead of it
+    /// does not stop the run.
     #[test]
     fn the_preprocessor_confirms_the_live_miss_and_not_the_dead_branch() {
         if std::process::Command::new("gcc")
@@ -24000,7 +24026,10 @@ mod unresolved_include_defer_tests {
         std::fs::create_dir_all(d.join("inc")).unwrap();
         std::fs::write(
             d.join("tu.c"),
-            "#if 0\n#include <dead/dead.h>\n#endif\n#include <live/live.h>\nint x;\n",
+            // An unrelated header the disk lacks comes FIRST, as qtbase gtk3's
+            // `qpa/qplatformthemeplugin.h` does: the run must not stop there.
+            "#include <carried/elsewhere.h>\n#if 0\n#include <dead/dead.h>\n#endif\n\
+             #include <live/live.h>\nint x;\n",
         )
         .unwrap();
         std::env::set_current_dir(d.join(".")).unwrap();
