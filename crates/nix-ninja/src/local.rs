@@ -145,6 +145,16 @@ fn place_realised(
         .map(|(df, store_path)| opaque_twin(df, store_path))
         .collect();
 
+    // What configure left where an output lands is kept before anything is
+    // written there, so a later pass can read it (configure_state). Never on
+    // the compiler route, which keeps no record.
+    if std::env::var_os("NIX_NINJA_NO_BUILD_DIR_SCAN").is_none() {
+        crate::configure_state::keep_originals(
+            prefix,
+            opaque_files.iter().map(|d| d.build_path.as_path()),
+        );
+    }
+
     // PLACEHOLDER -> REAL OUTER PATH, by COPY, and NEVER exposed as the
     // placeholder first. A task output that names an outer output path
     // carries the placeholder (task.rs outer_rewrite_map); the build tree
@@ -1086,7 +1096,9 @@ fn repair_compressed(data: &[u8], restore: &[(String, String)]) -> std::io::Resu
         std::process::id(),
         REPAIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    std::fs::create_dir_all(&dir)?;
+    // A fresh directory of this process's own: refused if the name exists,
+    // so nothing placed there in advance (a link) is written through.
+    std::fs::create_dir(&dir)?;
     let run = |args: &[&std::ffi::OsStr]| -> std::io::Result<()> {
         let out = std::process::Command::new(&objcopy).args(args).output()?;
         if out.status.success() {

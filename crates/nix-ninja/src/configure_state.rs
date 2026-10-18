@@ -19,9 +19,12 @@
 //! build) moves the journaled paths aside before it reads the directory and
 //! puts them back once it has placed its own outputs (`Rewind`). Only the
 //! driver's own placements move: a file a hook or the build system wrote
-//! between phases stays where it is, and a configure file placement
-//! overwrote stays too. A changed build.ninja is a re-configure: no record
-//! answers for it and the walk records afresh.
+//! between phases stays where it is. A PATH CONFIGURE LEFT THAT PLACEMENT
+//! REPLACED (a 0-byte placeholder a generator's output lands on, qtbase's
+//! `qt6core_metatypes.json`) is snapshotted before placement replaces it
+//! (`keep_originals`), and a later pass reads configure's version for its
+//! duration. A changed build.ninja is a re-configure: no record answers for
+//! it and the walk records afresh.
 
 use harmonia_store_derivation::derived_path::SingleDerivedPath;
 use nix_ninja_task::derived_file::DerivedFile;
@@ -75,6 +78,148 @@ pub struct ConfigureState {
     pub files: HashSet<String>,
     /// The directories that were empty.
     pub empty_dirs: HashSet<String>,
+}
+
+/// A later pass's record of the files configure left, set by the walk
+/// (`answer_listings_from`) and asked by every other listing of a build-tree
+/// directory (`left_by_configure`). Unset on a first pass, so nothing a
+/// first pass emits depends on it.
+static LISTED: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+
+/// Makes this process's listings of build-tree directories answer from
+/// configure's record: called by a later pass's walk.
+pub fn answer_listings_from(files: HashSet<String>) {
+    *LISTED.lock().unwrap() = Some(files);
+}
+
+/// Whether a later pass reads `path`, found by listing a directory: a file
+/// under the build dir that configure did not leave is something written
+/// between phases (a check run's log, bytecode, a hook's output; an earlier
+/// pass's placement is set aside) and the first pass never saw it. A path
+/// outside the build dir, or any path on a first pass, is read.
+/// DEFER(a later pass re-keys on a file written between phases that an
+/// argv or response-file token names directly): only directory listings ask.
+pub fn left_by_configure(build_dir: &Path, path: &Path) -> bool {
+    left_by(LISTED.lock().unwrap().as_ref(), build_dir, path)
+}
+
+fn left_by(files: Option<&HashSet<String>>, build_dir: &Path, path: &Path) -> bool {
+    let Some(files) = files else {
+        return true;
+    };
+    let abs = build_dir.join(path);
+    match abs.strip_prefix(build_dir) {
+        Ok(rel) if confined(&rel.to_string_lossy()) => files.contains(&*rel.to_string_lossy()),
+        _ => true,
+    }
+}
+
+/// Where placement keeps what configure left at a path before replacing it.
+fn originals(state: &Path) -> PathBuf {
+    state.join("originals")
+}
+
+/// Copies `src` to `dest` keeping what an upload hashes: a file's bytes and
+/// mode (the executable bit is in the NAR), a symlink's link text (the
+/// upload is named from the canonical path as well as the asked one).
+fn copy_entry(src: &Path, dest: &Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    if meta.file_type().is_symlink() {
+        std::os::unix::fs::symlink(std::fs::read_link(src)?, dest)
+    } else {
+        std::fs::copy(src, dest).map(|_| ())
+    }
+}
+
+/// Whether `a` and `b` would upload alike: two symlinks with one link text,
+/// or two files with the same bytes and executable bit.
+fn same_entry(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) else {
+        return false;
+    };
+    if ma.file_type().is_symlink() || mb.file_type().is_symlink() {
+        return ma.file_type().is_symlink()
+            && mb.file_type().is_symlink()
+            && std::fs::read_link(a).ok() == std::fs::read_link(b).ok();
+    }
+    ma.is_file()
+        && mb.is_file()
+        && ma.len() == mb.len()
+        && (ma.mode() & 0o111 != 0) == (mb.mode() & 0o111 != 0)
+        && std::fs::read(a).ok() == std::fs::read(b).ok()
+}
+
+/// Snapshots what configure left at each of `placed` (relative build paths)
+/// before placement replaces it, once per path: the file or symlink at the
+/// path, and every one below it when the path is a directory configure
+/// left. Called before anything is written; no record (the compiler route,
+/// a first walk that never ran) means nothing to keep.
+pub fn keep_originals<'a>(build_dir: &Path, placed: impl IntoIterator<Item = &'a Path>) {
+    let state = state_dir(build_dir);
+    if let Some(r) = load_in(&state, build_dir) {
+        keep_originals_in(&state, build_dir, &r, placed);
+    }
+}
+
+fn keep_originals_in<'a>(
+    state: &Path,
+    build_dir: &Path,
+    r: &ConfigureState,
+    placed: impl IntoIterator<Item = &'a Path>,
+) {
+    let orig = originals(state);
+    let mut failed: Option<(PathBuf, std::io::Error)> = None;
+    let mut keep = |rel: &Path| {
+        if !r.files.contains(&*rel.to_string_lossy()) {
+            return;
+        }
+        let (src, dest) = (build_dir.join(rel), orig.join(rel));
+        if std::fs::symlink_metadata(&dest).is_ok() {
+            return;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&src) else {
+            return;
+        };
+        if !meta.is_file() && !meta.file_type().is_symlink() {
+            return;
+        }
+        let res = dest
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| copy_entry(&src, &dest, &meta));
+        if let Err(e) = res {
+            failed.get_or_insert((rel.to_path_buf(), e));
+        }
+    };
+    for rel in placed {
+        if !confined(&rel.to_string_lossy()) {
+            continue;
+        }
+        let abs = build_dir.join(rel);
+        match std::fs::symlink_metadata(&abs) {
+            Ok(m) if m.is_dir() => {
+                for e in walkdir::WalkDir::new(&abs)
+                    .min_depth(1)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let (false, Ok(below)) =
+                        (e.file_type().is_dir(), e.path().strip_prefix(build_dir))
+                    {
+                        keep(below);
+                    }
+                }
+            }
+            Ok(_) => keep(rel),
+            Err(_) => {}
+        }
+    }
+    if let Some((rel, e)) = failed {
+        eprintln!(
+            "nix-ninja: could not keep configure's copy of every path placement replaces \
+             (first: {}: {e}); a later pass reads the placed one there",
+            rel.display()
+        );
+    }
 }
 
 /// What identifies one configure: build.ninja's length and mtime.
@@ -216,6 +361,13 @@ pub fn journal_placed<'a>(
 ) {
     let state = state_dir(build_dir);
     let _lock = if held { None } else { lock_blocking(&state) };
+    if !held && _lock.is_none() {
+        eprintln!(
+            "nix-ninja: could not lock {} to journal this run's placement; journaling \
+             unlocked",
+            state.display()
+        );
+    }
     journal_in(&state, build_dir, placed)
 }
 
@@ -285,6 +437,31 @@ fn journal_in<'a>(state: &Path, build_dir: &Path, placed: impl IntoIterator<Item
             add(rel, &meta);
         }
     }
+    // EVERY PATH PLACEMENT REPLACED, with the stamp of what is there now;
+    // one holding exactly configure's version is no change (a generator
+    // that rewrote identical bytes) and is not journaled.
+    let orig = originals(state);
+    for e in walkdir::WalkDir::new(&orig)
+        .min_depth(1)
+        .into_iter()
+        .flatten()
+    {
+        let Ok(rel) = e.path().strip_prefix(&orig) else {
+            continue;
+        };
+        let key = rel.to_string_lossy().into_owned();
+        if e.file_type().is_dir() || !confined(&key) || key.contains('\n') {
+            continue;
+        }
+        let now = build_dir.join(rel);
+        entries.remove(&('O', key.clone()));
+        if same_entry(&now, e.path()) {
+            continue;
+        }
+        if let Ok(m) = std::fs::symlink_metadata(&now) {
+            entries.insert(('O', key.clone()), format!("O {} {key}", stamp(&m)));
+        }
+    }
     let lines: Vec<String> = entries.into_values().collect();
     if let Err(e) = write_lines(&path, build_dir, &lines, false) {
         eprintln!(
@@ -294,15 +471,31 @@ fn journal_in<'a>(state: &Path, build_dir: &Path, placed: impl IntoIterator<Item
     }
 }
 
-/// One journal line: its kind, its path, and for a file its stamp.
+/// Whether `rel` stays inside the build dir: plain names only, no root, no
+/// `..`, no `.`. Every path read back from the journal is checked, so a
+/// damaged journal cannot move a file outside the tree.
+fn confined(rel: &str) -> bool {
+    !rel.is_empty()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// One journal line: its kind, its path, and for a file its stamp. A path
+/// that would leave the build dir is not a journal line.
 fn parse_journal(line: &str) -> Option<(char, &str, Option<&str>)> {
+    let parsed = parse_journal_unchecked(line)?;
+    confined(parsed.1).then_some(parsed)
+}
+
+fn parse_journal_unchecked(line: &str) -> Option<(char, &str, Option<&str>)> {
     match line.split_once(' ')? {
         ("D", rel) => Some(('D', rel, None)),
-        ("F", rest) => {
+        (k @ ("F" | "O" | "R"), rest) => {
             let (mtime, rest) = rest.split_once(' ')?;
             let (size, rel) = rest.split_once(' ')?;
             let st = &line[2..2 + mtime.len() + 1 + size.len()];
-            Some(('F', rel, Some(st)))
+            Some((k.chars().next()?, rel, Some(st)))
         }
         _ => None,
     }
@@ -317,6 +510,13 @@ pub struct Rewind {
     removed_dirs: Vec<PathBuf>,
     /// Where `removed_dirs` is kept for a re-exec or a run that never ends.
     removed_file: PathBuf,
+    /// Configure's versions put back over placed paths, with the stamp each
+    /// was put back with: one still carrying it gives way to the placed one.
+    restored: Vec<(PathBuf, String)>,
+    /// Where `restored` is kept, as `removed_file` keeps `removed_dirs`.
+    restored_file: PathBuf,
+    /// Configure's versions of the paths placement replaced.
+    originals: PathBuf,
     /// `finish` already put everything back.
     done: bool,
     /// Held exclusively for the rewind's life: a second driver in the same
@@ -333,13 +533,24 @@ impl Rewind {
     }
 
     fn begin_in(state: &Path, build_dir: &Path, trusted: bool) -> Option<Self> {
-        std::fs::create_dir_all(state).ok()?;
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(state.join("lock"))
-            .ok()?;
+        let lock = std::fs::create_dir_all(state).and_then(|_| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(state.join("lock"))
+        });
+        let lock = match lock {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "nix-ninja: no rewind state at {} ({e}); this pass reads the \
+                     directory as it stands",
+                    state.display()
+                );
+                return None;
+            }
+        };
         if lock.try_lock().is_err() {
             eprintln!(
                 "nix-ninja: another driver holds this build directory's rewind; this one \
@@ -352,6 +563,16 @@ impl Rewind {
             aside: state.join("aside"),
             removed_dirs: read_removed(state),
             removed_file: state.join("removed-dirs"),
+            restored: std::fs::read_to_string(state.join("restored"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| match parse_journal(l)? {
+                    ('R', rel, Some(st)) => Some((PathBuf::from(rel), st.to_string())),
+                    _ => None,
+                })
+                .collect(),
+            restored_file: state.join("restored"),
+            originals: originals(state),
             done: false,
             _lock: Some(lock),
         };
@@ -373,6 +594,7 @@ impl Rewind {
         let mut changed = 0usize;
         let mut failed: Option<(PathBuf, std::io::Error)> = None;
         let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut replaced: Vec<(&str, &str)> = Vec::new();
         for line in &journal {
             match parse_journal(line) {
                 Some(('F', rel, placed_stamp)) => {
@@ -399,6 +621,7 @@ impl Rewind {
                     }
                 }
                 Some(('D', rel, _)) => dirs.push(PathBuf::from(rel)),
+                Some(('O', rel, Some(st))) => replaced.push((rel, st)),
                 _ => {}
             }
         }
@@ -409,17 +632,63 @@ impl Rewind {
                 rewind.removed_dirs.push(rel);
             }
         }
+        // A PATH CONFIGURE LEFT GETS CONFIGURE'S VERSION BACK, after the
+        // directories (one placed where configure left a file is gone by now).
+        for (rel, placed_stamp) in replaced {
+            let (src, dest) = (build_dir.join(rel), rewind.aside.join(rel));
+            let res = match std::fs::symlink_metadata(&src) {
+                Err(_) => Ok(()),
+                Ok(m) if !m.is_dir() && placed_stamp == stamp(&m) => dest
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|_| std::fs::rename(&src, &dest)),
+                Ok(_) => {
+                    changed += 1;
+                    continue;
+                }
+            };
+            let orig = rewind.originals.join(rel);
+            let res = res.and_then(|_| {
+                let meta = std::fs::symlink_metadata(&orig)?;
+                src.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+                copy_entry(&orig, &src, &meta)?;
+                std::fs::symlink_metadata(&src)
+            });
+            match res {
+                Ok(m) => {
+                    rewind.restored.push((PathBuf::from(rel), stamp(&m)));
+                    moved += 1;
+                }
+                Err(e) => {
+                    failed.get_or_insert((PathBuf::from(rel), e));
+                }
+            }
+        }
         let list: String = rewind
             .removed_dirs
             .iter()
             .map(|d| format!("{}\n", d.display()))
             .collect();
-        let _ = std::fs::write(&rewind.removed_file, list);
+        let restored: String = rewind
+            .restored
+            .iter()
+            .map(|(rel, st)| format!("R {st} {}\n", rel.display()))
+            .collect();
+        if let Err(e) = std::fs::write(&rewind.removed_file, list)
+            .and_then(|_| std::fs::write(&rewind.restored_file, restored))
+        {
+            eprintln!(
+                "nix-ninja: could not record what this pass set aside ({e}); a run that \
+                 dies before it ends leaves it aside"
+            );
+        }
         eprintln!(
             "nix-ninja: an earlier pass placed outputs in this build directory; {moved} \
              file(s) and {} directory(ies) it placed are set aside until this pass has \
-             placed its own; {changed} changed since placement stay",
-            rewind.removed_dirs.len()
+             placed its own, {} of them in place of configure's version; {changed} \
+             changed since placement stay",
+            rewind.removed_dirs.len(),
+            rewind.restored.len()
         );
         if let Some((rel, e)) = failed {
             eprintln!(
@@ -435,6 +704,13 @@ impl Rewind {
     /// this pass placed again stays as placed), and recreates the
     /// directories set aside with them.
     fn restore(&mut self) -> std::io::Result<()> {
+        for (rel, put_back) in self.restored.drain(..) {
+            let dest = self.build_dir.join(&rel);
+            if std::fs::symlink_metadata(&dest).is_ok_and(|m| stamp(&m) == put_back) {
+                let _ = std::fs::remove_file(&dest);
+            }
+        }
+        let _ = std::fs::remove_file(&self.restored_file);
         for rel in self.removed_dirs.drain(..) {
             let _ = std::fs::create_dir_all(self.build_dir.join(rel));
         }
@@ -450,6 +726,9 @@ impl Rewind {
             let Ok(rel) = e.path().strip_prefix(&self.aside) else {
                 continue;
             };
+            if !confined(&rel.to_string_lossy()) {
+                continue;
+            }
             if e.file_type().is_dir() {
                 let _ = std::fs::create_dir_all(self.build_dir.join(rel));
                 let _ = std::fs::remove_dir(e.path());
@@ -502,7 +781,10 @@ impl Drop for Rewind {
 
 #[cfg(test)]
 mod tests {
-    use super::{journal_in, load_in, placed_paths, save_in, state_dir_in, ConfigureState, Rewind};
+    use super::{
+        journal_in, keep_originals_in, load_in, placed_paths, save_in, state_dir_in,
+        ConfigureState, Rewind,
+    };
     use harmonia_store_derivation::derived_path::SingleDerivedPath;
     use harmonia_store_path::StoreDir;
     use nix_ninja_task::derived_file::DerivedFile;
@@ -691,5 +973,173 @@ mod tests {
         );
         assert!(bd.join("include/Foo/a.h").exists());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A PATH CONFIGURE LEFT THAT PLACEMENT REPLACED READS AS CONFIGURE LEFT
+    /// IT on a later pass, and as placed once the pass ends. qtbase's shape:
+    /// configure writes a 0-byte `qt6core_metatypes.json`, the moc edge's
+    /// output lands on it, and the install pass uploaded the placed copy
+    /// where the build pass had uploaded the placeholder, re-keying syncqt
+    /// and every compile behind it. Beside it: a file replaced inside a
+    /// directory configure left, a symlink replaced by a file and a file by
+    /// a directory (the type comes back), an executable replaced by a plain
+    /// file (the mode comes back), a file rewritten with identical bytes
+    /// (left alone), and a path the later pass places again (its placement
+    /// stands).
+    #[test]
+    fn a_path_configure_left_reads_as_configure_left_it_on_a_later_pass() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let d = scratch("originals");
+        let bd = d.join("build");
+        let state = d.join("state");
+        let json = "src/corelib/qt6core_metatypes.json";
+        write(&bd.join("build.ninja"), "default all\n");
+        write(&bd.join(json), "");
+        write(&bd.join("include/Foo/cfg.h"), "configure");
+        write(&bd.join("lib/libx.so.1"), "elf");
+        std::os::unix::fs::symlink("libx.so.1", bd.join("lib/libx.so")).unwrap();
+        write(&bd.join("tool"), "#!/bin/sh\n");
+        std::fs::set_permissions(bd.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        write(&bd.join("same.h"), "same");
+        write(&bd.join("tree"), "configure tree");
+        write(&bd.join("again.h"), "configure again");
+        let record = ConfigureState {
+            dirs: ["src", "src/corelib", "include", "include/Foo", "lib"]
+                .map(String::from)
+                .into(),
+            files: [
+                "build.ninja",
+                json,
+                "include/Foo/cfg.h",
+                "lib/libx.so.1",
+                "lib/libx.so",
+                "tool",
+                "same.h",
+                "tree",
+                "again.h",
+            ]
+            .map(String::from)
+            .into(),
+            empty_dirs: Default::default(),
+        };
+        save_in(&state, &bd, &record);
+        let placed = [
+            json,
+            "include/Foo",
+            "lib/libx.so",
+            "tool",
+            "same.h",
+            "tree",
+            "again.h",
+        ]
+        .map(PathBuf::from);
+        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path));
+
+        // Placement.
+        write(&bd.join(json), &"m".repeat(385));
+        write(&bd.join("include/Foo/cfg.h"), "placed");
+        write(&bd.join("include/Foo/new.h"), "placed");
+        std::fs::remove_file(bd.join("lib/libx.so")).unwrap();
+        write(&bd.join("lib/libx.so"), "placed elf");
+        std::fs::remove_file(bd.join("tool")).unwrap();
+        write(&bd.join("tool"), "placed tool");
+        write(&bd.join("same.h"), "same");
+        std::fs::remove_file(bd.join("tree")).unwrap();
+        write(&bd.join("tree/a.h"), "placed");
+        write(&bd.join("again.h"), "placed again");
+        let same_ino = std::fs::metadata(bd.join("same.h")).unwrap().ino();
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
+        let journal = std::fs::read_to_string(state.join("placed.v1")).unwrap();
+        assert!(
+            !journal.lines().any(|l| l.ends_with(" same.h")),
+            "identical bytes are no change:\n{journal}"
+        );
+
+        let rewind = Rewind::begin_in(&state, &bd, false).expect("a journal to act on");
+        let read = |rel: &str| std::fs::read_to_string(bd.join(rel)).unwrap();
+        assert_eq!(
+            read(json),
+            "",
+            "configure's placeholder, not the placed json"
+        );
+        assert_eq!(read("include/Foo/cfg.h"), "configure");
+        assert!(!bd.join("include/Foo/new.h").exists());
+        assert_eq!(
+            std::fs::read_link(bd.join("lib/libx.so")).unwrap(),
+            Path::new("libx.so.1"),
+            "configure's symlink comes back as a symlink"
+        );
+        assert_eq!(read("tool"), "#!/bin/sh\n");
+        assert_ne!(
+            std::fs::metadata(bd.join("tool")).unwrap().mode() & 0o111,
+            0,
+            "with its executable bit"
+        );
+        assert!(
+            bd.join("tree").is_file(),
+            "a file again where a directory was placed"
+        );
+        assert_eq!(read("tree"), "configure tree");
+        assert_eq!(
+            std::fs::metadata(bd.join("same.h")).unwrap().ino(),
+            same_ino,
+            "an identical file is not moved"
+        );
+        assert_eq!(read("again.h"), "configure again");
+        // The pass places one path again; the rest come back at the end.
+        std::fs::remove_file(bd.join("again.h")).unwrap();
+        write(&bd.join("again.h"), "placed by the later pass");
+        rewind.finish().expect("everything comes back");
+        assert_eq!(read(json), "m".repeat(385));
+        assert_eq!(read("include/Foo/cfg.h"), "placed");
+        assert_eq!(read("include/Foo/new.h"), "placed");
+        assert!(!bd.join("lib/libx.so").is_symlink());
+        assert_eq!(read("lib/libx.so"), "placed elf");
+        assert_eq!(read("tool"), "placed tool");
+        assert_eq!(read("tree/a.h"), "placed");
+        assert_eq!(read("again.h"), "placed by the later pass");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A later pass's directory listing reads only what configure left
+    /// under the build dir, whatever the spelling; outside it, and on a first
+    /// pass, it reads everything.
+    #[test]
+    fn a_later_listing_reads_only_what_configure_left() {
+        let bd = Path::new("/build/pkg/build");
+        let files: std::collections::HashSet<String> = ["meta/d/meta.json".to_string()].into();
+        for (path, read) in [
+            ("meta/d/meta.json", true),
+            ("./meta/d/meta.json", true),
+            ("/build/pkg/build/meta/d/meta.json", true),
+            ("meta/d/w123.tmp", false),
+            ("/build/pkg/build/meta/d/w123.tmp", false),
+            ("../src/x.h", true),
+            ("/nix/store/x-y/z.h", true),
+        ] {
+            assert_eq!(
+                super::left_by(Some(&files), bd, Path::new(path)),
+                read,
+                "{path}"
+            );
+        }
+        assert!(super::left_by(None, bd, Path::new("meta/d/w123.tmp")));
+    }
+
+    /// A damaged journal cannot move a file outside the build dir: a line
+    /// whose path climbs out, is absolute or is empty is no journal line.
+    #[test]
+    fn a_journal_path_outside_the_build_dir_is_not_read() {
+        use super::parse_journal;
+        assert!(parse_journal("F 1.2 3 include/a.h").is_some());
+        for bad in [
+            "F 1.2 3 ../../etc/passwd",
+            "F 1.2 3 /etc/passwd",
+            "D ..",
+            "D ./x",
+            "D ",
+        ] {
+            assert!(parse_journal(bad).is_none(), "{bad}");
+        }
     }
 }

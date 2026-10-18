@@ -574,44 +574,29 @@ pub fn run() -> Result<()> {
             }
         }
 
-        // Placement succeeded (every failure above returned): journal it, so
-        // a later pass can set it aside (configure_state). Never on the
-        // compiler route, where many drivers share the tree.
-        if std::env::var_os("NIX_NINJA_NO_BUILD_DIR_SCAN").is_none() {
-            crate::configure_state::journal_placed(
-                &build_dir,
-                crate::configure_state::placed_paths(
-                    all_outputs.values().chain(derived_files.iter()),
-                    &depfiles,
-                ),
-                rewind.is_some(),
-            );
-        }
-
-        // NINJA'S STATE, AFTER THE DEPFILES IT IS BUILT FROM. Only for the
-        // default manifest: real ninja in this directory reads build.ninja, so
-        // entries from another file (the compiler drop-in's one-edge file)
-        // describe a graph nothing consults. Best effort: a failure leaves
-        // real ninja reading the tree as dirty, which is what it read before.
-        let edges = crate::ninja_state::take_collected();
         let default_manifest = cli
             .build_filename
             .components()
             .filter(|c| !matches!(c, std::path::Component::CurDir))
             .collect::<PathBuf>()
             == Path::new("build.ninja");
-        if let (true, false, Some(start)) = (default_manifest, edges.is_empty(), start) {
-            match crate::ninja_state::write(&build_dir, &edges, start) {
-                Ok(n) => eprintln!(
-                    "nix-ninja: recorded {n}/{} edge(s) in .ninja_log and .ninja_deps",
-                    edges.len()
-                ),
-                Err(e) => eprintln!(
-                    "nix-ninja: could not write .ninja_log/.ninja_deps ({e}); real \
-                     ninja will report work to do for this tree"
-                ),
-            }
-        }
+        // Placement succeeded (every failure above returned). Never journaled
+        // on the compiler route, where many drivers share the tree.
+        let journal = std::env::var_os("NIX_NINJA_NO_BUILD_DIR_SCAN")
+            .is_none()
+            .then(|| {
+                crate::configure_state::placed_paths(
+                    all_outputs.values().chain(derived_files.iter()),
+                    &depfiles,
+                )
+            });
+        record_placement(
+            &build_dir,
+            &crate::ninja_state::take_collected(),
+            start.filter(|_| default_manifest),
+            journal,
+            rewind.is_some(),
+        );
     }
     // Everything set aside comes back before the run reports success, and a
     // file that cannot fails it.
@@ -621,6 +606,43 @@ pub fn run() -> Result<()> {
             .context("putting back what this pass set aside")?;
     }
     Ok(())
+}
+
+/// What a successful placement leaves for later runs, IN THIS ORDER.
+///
+/// NINJA'S STATE FIRST, after the depfiles it is built from, and only for the
+/// default manifest (`start` is None otherwise): real ninja in this directory
+/// reads build.ninja, so entries from another file (the compiler drop-in's
+/// one-edge file) describe a graph nothing consults. Best effort: a failure
+/// leaves real ninja reading the tree as dirty, which is what it read before.
+///
+/// THE PLACEMENT JOURNAL LAST (configure_state), because `ninja_state::write`
+/// re-stamps every recorded output's mtime and a later pass sets aside only
+/// a file whose stamp matches the journal: journaled first, every recorded
+/// output reads as changed since placement and stays visible to that pass.
+/// `held` says the caller's `Rewind` holds the build dir's lock.
+fn record_placement(
+    build_dir: &Path,
+    edges: &[crate::ninja_state::Edge],
+    start: Option<std::time::SystemTime>,
+    journal: Option<Vec<&Path>>,
+    held: bool,
+) {
+    if let (false, Some(start)) = (edges.is_empty(), start) {
+        match crate::ninja_state::write(build_dir, edges, start) {
+            Ok(n) => eprintln!(
+                "nix-ninja: recorded {n}/{} edge(s) in .ninja_log and .ninja_deps",
+                edges.len()
+            ),
+            Err(e) => eprintln!(
+                "nix-ninja: could not write .ninja_log/.ninja_deps ({e}); real \
+                 ninja will report work to do for this tree"
+            ),
+        }
+    }
+    if let Some(placed) = journal {
+        crate::configure_state::journal_placed(build_dir, placed, held);
+    }
 }
 
 /// builder-rpc-v0 requires the submitted path's name to match the caller's
@@ -951,5 +973,74 @@ mod ignored_flag_tests {
         assert_eq!(cli.load_average, 4.5);
         // default stays 0.0 so warn_ignored_flags says nothing unprompted
         assert_eq!(Cli::parse_from(["nix-ninja"]).load_average, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod record_placement_tests {
+    use super::record_placement;
+    use crate::configure_state::{save, ConfigureState, Rewind};
+    use crate::ninja_state::{mark_start, Edge};
+    use std::path::{Path, PathBuf};
+
+    /// A placed output ninja's state records is still set aside by the next
+    /// pass: the journal holds the stamp `ninja_state::write` leaves, not
+    /// the one placement wrote.
+    #[test]
+    fn a_recorded_output_is_set_aside_by_the_next_pass() {
+        let d = std::env::temp_dir().join(format!("nn-recplace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let bd = d.join("build");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(bd.join("build.ninja"), "default all\n").unwrap();
+        save(
+            &bd,
+            &ConfigureState {
+                files: ["build.ninja".to_string()].into(),
+                ..Default::default()
+            },
+        );
+        let start = mark_start(&bd).expect("a start stamp");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(bd.join("gen.h"), "placed").unwrap();
+        // The control: the restamp must change something, or this test
+        // passes with the journal written first.
+        let placed_mtime = std::fs::metadata(bd.join("gen.h"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_ne!(placed_mtime, start, "placement must postdate the start");
+
+        let edges = [Edge {
+            outputs: vec![PathBuf::from("gen.h")],
+            command: "gen".into(),
+            depfile: None,
+            deps_gcc: false,
+        }];
+        record_placement(
+            &bd,
+            &edges,
+            Some(start),
+            Some(vec![Path::new("gen.h")]),
+            false,
+        );
+        assert_eq!(
+            std::fs::metadata(bd.join("gen.h"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            start,
+            "ninja's state recorded the output"
+        );
+
+        let rewind = Rewind::begin(&bd, false).expect("a journal to act on");
+        assert!(
+            !bd.join("gen.h").exists(),
+            "the recorded output is set aside"
+        );
+        rewind.finish().expect("everything comes back");
+        assert!(bd.join("gen.h").exists());
+        let _ = std::fs::remove_dir_all(crate::configure_state::state_dir(&bd));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

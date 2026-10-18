@@ -1183,128 +1183,14 @@ impl Runner {
             .filter_map(|id| graph.builds[id].depfile.clone())
             .collect();
         let files = &mut graph.files;
-        // The first pass records what configure left; see configure_state.
-        // A LATER PASS ANSWERS FROM WHAT CONFIGURE LEFT: an upload, an alias
-        // or an empty directory configure did not leave is something a
-        // hook, a test run (ctest's Testing/) or placement wrote since, and
-        // the first pass never saw it. The files stay on disk.
         let recorded = crate::configure_state::load(&self.config.build_dir);
-        let left = |rel: &str| recorded.as_ref().is_none_or(|r| r.files.contains(rel));
-        let mut seen = crate::configure_state::ConfigureState::default();
-        for entry in WalkDir::new(&self.config.build_dir)
-            .into_iter()
-            .filter_entry(|e| {
-                // Skip directories that start with "meson-" as they contain
-                // non-deterministic internal data from meson
-                !crate::configure_state::walk_skips(&e.file_name().to_string_lossy())
-            })
-        {
-            // A file that vanishes between listing and reading is a build
-            // in progress, not an error: skip it rather than failing the
-            // whole driver on a temp file (libtool's `.loT`, alsa-lib).
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e)
-                    if e.io_error()
-                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    continue
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let disposition = build_dir_disposition(
-                &self.config.build_dir,
-                entry.file_type().is_symlink(),
-                entry.file_type().is_file(),
-                entry.path(),
-            );
-            let rel = entry
-                .path()
-                .strip_prefix(&self.config.build_dir)
-                .map(|r| r.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if !rel.is_empty() {
-                if entry.file_type().is_dir() {
-                    seen.dirs.insert(rel.clone());
-                } else {
-                    seen.files.insert(rel.clone());
-                }
-            }
-            let produced = matches!(disposition, BuildDirDisposition::Upload)
-                && (depfiles.contains(rel.as_str())
-                    || files
-                        .lookup(&rel)
-                        .is_some_and(|f| files.by_id[f].input.is_some()));
-            if std::env::var_os("NIX_NINJA_DIAG").is_some() {
-                let d = match &disposition {
-                    BuildDirDisposition::Alias(l, t) => format!("alias {l} -> {t}"),
-                    BuildDirDisposition::AliasAndUpload(l, t) => {
-                        format!("alias+upload {l} -> {t}")
-                    }
-                    BuildDirDisposition::Skip => "skip".into(),
-                    BuildDirDisposition::Upload if produced => "produced, not uploaded".into(),
-                    BuildDirDisposition::Upload => "upload".into(),
-                };
-                eprintln!(
-                    "nix-ninja: DIAG walk {} symlink={} file={} -> {d}",
-                    entry.path().display(),
-                    entry.file_type().is_symlink(),
-                    entry.file_type().is_file()
-                );
-            }
-            let path = match disposition {
-                BuildDirDisposition::Alias(..) | BuildDirDisposition::AliasAndUpload(..)
-                    if !left(&rel) =>
-                {
-                    continue
-                }
-                BuildDirDisposition::Upload if !left(&rel) => continue,
-                BuildDirDisposition::Alias(link, target) => {
-                    self.alias_symlinks.push((link, target));
-                    continue;
-                }
-                BuildDirDisposition::AliasAndUpload(link, target) => {
-                    self.alias_symlinks.push((link, target));
-                    entry.into_path()
-                }
-                BuildDirDisposition::Skip => {
-                    let empty = match &recorded {
-                        Some(r) => r.empty_dirs.contains(&rel),
-                        None => {
-                            entry.file_type().is_dir()
-                                && std::fs::read_dir(entry.path())
-                                    .is_ok_and(|mut d| d.next().is_none())
-                        }
-                    };
-                    if empty && !rel.is_empty() {
-                        seen.empty_dirs.insert(rel.clone());
-                        self.empty_dirs.push(rel);
-                    }
-                    continue;
-                }
-                BuildDirDisposition::Upload => entry.into_path(),
-            };
-            // A FILE THE GRAPH PRODUCES IS NOT THIS WALK'S TO NAME, and
-            // not its to upload either. The walk runs before any task is
-            // created and `add_derived_file` keeps the first registration,
-            // so an output that already exists on disk (placed by an
-            // earlier driver pass in the same build directory and
-            // refreshed into a real file) was registered under the
-            // graph's own node as an opaque upload, the edge that produces
-            // it could never claim the node, and co-output expansion
-            // carried that upload's store path to the output's aliases:
-            // placed as links to a plain file, refreshed into copies,
-            // installed as three identical files (onetbb, configuration B,
-            // 2026-09-04). Keeping the upload in the walk's map, out of
-            // the node, still paid one store add per placed product per
-            // pass, consumed only by an edge naming its own output, which
-            // the choke point below drops anyway; and the map's LENGTH
-            // gates the blanket, so a tree grown by an earlier pass could
-            // switch the blanket off for every later task. The producing
-            // edge keeps the node and the walk pays nothing for it.
-            if produced {
-                continue;
-            }
+        let plan = plan_build_dir_walk(&self.config.build_dir, recorded.as_ref(), |rel| {
+            depfiles.contains(rel)
+                || files
+                    .lookup(rel)
+                    .is_some_and(|f| files.by_id[f].input.is_some())
+        })?;
+        for path in plan.uploads {
             let derived_file =
                 match new_opaque_file(&self.rpc_client, &self.config.build_dir, path.clone()) {
                     Ok(d) => d,
@@ -1319,6 +1205,8 @@ impl Runner {
             let fid = self.add_derived_file(files, derived_file.clone());
             self.build_dir_inputs.insert(fid, derived_file);
         }
+        self.alias_symlinks.extend(plan.aliases);
+        self.empty_dirs.extend(plan.empty_dirs);
         // Deterministic order: the encoded env value must be a function
         // of the SET, not of readdir order, or every run re-keys every
         // task derivation.
@@ -1327,8 +1215,11 @@ impl Runner {
         self.empty_dirs.sort();
         self.empty_dirs.dedup();
         match recorded {
-            Some(r) => self.configure_dirs = Some(r.dirs),
-            None => crate::configure_state::save(&self.config.build_dir, &seen),
+            Some(r) => {
+                crate::configure_state::answer_listings_from(r.files);
+                self.configure_dirs = Some(r.dirs);
+            }
+            None => crate::configure_state::save(&self.config.build_dir, &plan.seen),
         }
         Ok(())
     }
@@ -3994,13 +3885,233 @@ fn named_dirs_to_create(
     include_dirs_named(cmdline, build_dir)
         .into_iter()
         .filter(|n| confined_relative_dir(build_dir, Path::new(n)))
-        .filter(|n| match configure_dirs {
-            // A later pass: under the build dir, where placement and hooks
-            // write, configure's record answers; outside it the disk does.
-            Some(dirs) if !n.starts_with("..") => dirs.contains(n),
-            _ => build_dir.join(n).is_dir(),
+        .filter(|n| {
+            let path = Path::new(n);
+            match configure_dirs {
+                // A later pass: under the build dir, where placement and hooks
+                // write, configure's record answers, asked for the walk's
+                // spelling (`-I.` is the build dir itself, `./gen` is `gen`);
+                // a climb out of it is answered by the disk.
+                Some(dirs)
+                    if !path
+                        .components()
+                        .any(|c| c == std::path::Component::ParentDir) =>
+                {
+                    let key: PathBuf = path
+                        .components()
+                        .filter(|c| *c != std::path::Component::CurDir)
+                        .collect();
+                    key.as_os_str().is_empty() || dirs.contains(&*key.to_string_lossy())
+                }
+                _ => build_dir.join(n).is_dir(),
+            }
         })
         .collect()
+}
+
+/// What the build-dir walk takes, before any upload: the files to upload
+/// (walk order), configure-time aliases, empty directories, and what the
+/// walk saw, which the first pass records (configure_state).
+#[derive(Default)]
+pub struct BuildDirWalk {
+    pub uploads: Vec<PathBuf>,
+    pub aliases: Vec<(String, String)>,
+    pub empty_dirs: Vec<String>,
+    pub seen: crate::configure_state::ConfigureState,
+}
+
+/// Walks `build_dir` and decides what `read_build_dir` takes from it.
+/// `is_produced(rel)` says an edge produces the file (a node with an input
+/// edge, or a declared depfile). The first pass (no `recorded`) answers from
+/// the disk.
+/// A LATER PASS ANSWERS FROM WHAT CONFIGURE LEFT: an upload, an alias or an
+/// empty directory configure did not leave is something a hook, a test run
+/// (ctest's Testing/) or placement wrote since, and the first pass never saw
+/// it. The files stay on disk.
+pub fn plan_build_dir_walk(
+    build_dir: &Path,
+    recorded: Option<&crate::configure_state::ConfigureState>,
+    is_produced: impl Fn(&str) -> bool,
+) -> Result<BuildDirWalk> {
+    let left = |rel: &str| recorded.is_none_or(|r| r.files.contains(rel));
+    let mut plan = BuildDirWalk::default();
+    for entry in WalkDir::new(build_dir).into_iter().filter_entry(|e| {
+        // Skip directories that start with "meson-" as they contain
+        // non-deterministic internal data from meson
+        !crate::configure_state::walk_skips(&e.file_name().to_string_lossy())
+    }) {
+        // A file that vanishes between listing and reading is a build
+        // in progress, not an error: skip it rather than failing the
+        // whole driver on a temp file (libtool's `.loT`, alsa-lib).
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e)
+                if e.io_error()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let disposition = build_dir_disposition(
+            build_dir,
+            entry.file_type().is_symlink(),
+            entry.file_type().is_file(),
+            entry.path(),
+        );
+        let rel = entry
+            .path()
+            .strip_prefix(build_dir)
+            .map(|r| r.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !rel.is_empty() {
+            if entry.file_type().is_dir() {
+                plan.seen.dirs.insert(rel.clone());
+            } else {
+                plan.seen.files.insert(rel.clone());
+            }
+        }
+        let produced = matches!(disposition, BuildDirDisposition::Upload) && is_produced(&rel);
+        if std::env::var_os("NIX_NINJA_DIAG").is_some() {
+            let d = match &disposition {
+                BuildDirDisposition::Alias(l, t) => format!("alias {l} -> {t}"),
+                BuildDirDisposition::AliasAndUpload(l, t) => {
+                    format!("alias+upload {l} -> {t}")
+                }
+                BuildDirDisposition::Skip => "skip".into(),
+                BuildDirDisposition::Upload if produced => "produced, not uploaded".into(),
+                BuildDirDisposition::Upload => "upload".into(),
+            };
+            eprintln!(
+                "nix-ninja: DIAG walk {} symlink={} file={} -> {d}",
+                entry.path().display(),
+                entry.file_type().is_symlink(),
+                entry.file_type().is_file()
+            );
+        }
+        let path = match disposition {
+            BuildDirDisposition::Alias(..) | BuildDirDisposition::AliasAndUpload(..)
+                if !left(&rel) =>
+            {
+                continue
+            }
+            BuildDirDisposition::Upload if !left(&rel) => continue,
+            BuildDirDisposition::Alias(link, target) => {
+                plan.aliases.push((link, target));
+                continue;
+            }
+            BuildDirDisposition::AliasAndUpload(link, target) => {
+                plan.aliases.push((link, target));
+                entry.into_path()
+            }
+            BuildDirDisposition::Skip => {
+                let empty = match recorded {
+                    Some(r) => r.empty_dirs.contains(&rel),
+                    None => {
+                        entry.file_type().is_dir()
+                            && std::fs::read_dir(entry.path()).is_ok_and(|mut d| d.next().is_none())
+                    }
+                };
+                if empty && !rel.is_empty() {
+                    plan.seen.empty_dirs.insert(rel.clone());
+                    plan.empty_dirs.push(rel);
+                }
+                continue;
+            }
+            BuildDirDisposition::Upload => entry.into_path(),
+        };
+        // A FILE THE GRAPH PRODUCES IS NOT THIS WALK'S TO NAME, and
+        // not its to upload either. The walk runs before any task is
+        // created and `add_derived_file` keeps the first registration,
+        // so an output that already exists on disk (placed by an
+        // earlier driver pass in the same build directory and
+        // refreshed into a real file) was registered under the
+        // graph's own node as an opaque upload, the edge that produces
+        // it could never claim the node, and co-output expansion
+        // carried that upload's store path to the output's aliases:
+        // placed as links to a plain file, refreshed into copies,
+        // installed as three identical files (onetbb, configuration B,
+        // 2026-09-04). Keeping the upload in the walk's map, out of
+        // the node, still paid one store add per placed product per
+        // pass, consumed only by an edge naming its own output, which
+        // the choke point below drops anyway; and the map's LENGTH
+        // gates the blanket, so a tree grown by an earlier pass could
+        // switch the blanket off for every later task. The producing
+        // edge keeps the node and the walk pays nothing for it.
+        if !produced {
+            plan.uploads.push(path);
+        }
+    }
+    Ok(plan)
+}
+
+#[cfg(test)]
+mod plan_build_dir_walk_tests {
+    //! What the build-dir walk takes on the first pass (the disk) and on a
+    //! later one (configure's record), with the record the first pass saves.
+    use super::{plan_build_dir_walk, Scratch};
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    fn rels(bd: &Path, v: &[std::path::PathBuf]) -> BTreeSet<String> {
+        v.iter()
+            .map(|p| p.strip_prefix(bd).unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_later_pass_takes_only_what_configure_left() {
+        let d = Scratch::new(format!("nn-walkplan-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(bd.join("emptyconf")).unwrap();
+        std::fs::create_dir_all(bd.join(".nix-ninja-state/0123")).unwrap();
+        std::fs::write(bd.join(".nix-ninja-state/0123/placed.v1"), "x").unwrap();
+        std::fs::write(bd.join("build.ninja"), "default all\n").unwrap();
+        std::fs::write(bd.join("conf.h"), "cfg").unwrap();
+        std::fs::write(bd.join("prod.json"), "").unwrap();
+        let produced = |rel: &str| rel == "prod.json";
+
+        let first = plan_build_dir_walk(&bd, None, produced).unwrap();
+        assert_eq!(
+            rels(&bd, &first.uploads),
+            ["build.ninja", "conf.h"].map(String::from).into(),
+            "a produced file is not uploaded, the state dir is not walked"
+        );
+        assert_eq!(first.empty_dirs, vec!["emptyconf"]);
+        assert!(
+            first.seen.files.contains("prod.json") && first.seen.dirs.contains("emptyconf"),
+            "the record holds what configure left"
+        );
+        assert!(
+            !first
+                .seen
+                .dirs
+                .iter()
+                .any(|d| d.starts_with(".nix-ninja-state")),
+            "and not the driver's state"
+        );
+
+        // What a pass places afterwards: a file, a library with its soname
+        // link, an empty directory, and a file in configure's empty one.
+        std::fs::create_dir_all(bd.join("gen")).unwrap();
+        std::fs::write(bd.join("gen/out.h"), "placed").unwrap();
+        std::fs::write(bd.join("libfoo.so.1"), "elf").unwrap();
+        std::os::unix::fs::symlink("libfoo.so.1", bd.join("libfoo.so")).unwrap();
+        std::fs::create_dir_all(bd.join("emptyplaced")).unwrap();
+        std::fs::write(bd.join("emptyconf/hook.log"), "hook").unwrap();
+
+        let disk = plan_build_dir_walk(&bd, None, produced).unwrap();
+        assert!(
+            disk.aliases.iter().any(|(l, _)| l == "libfoo.so")
+                && rels(&bd, &disk.uploads).contains("gen/out.h")
+                && disk.empty_dirs == vec!["emptyplaced"],
+            "the disk alone would take what was placed"
+        );
+        let later = plan_build_dir_walk(&bd, Some(&first.seen), produced).unwrap();
+        assert_eq!(rels(&bd, &later.uploads), rels(&bd, &first.uploads));
+        assert!(later.aliases.is_empty(), "took {:?}", later.aliases);
+        assert_eq!(later.empty_dirs, first.empty_dirs);
+    }
 }
 
 #[cfg(test)]
@@ -4041,6 +4152,16 @@ mod named_dirs_to_create_tests {
             vec!["gen"]
         );
         assert_eq!(named_dirs_to_create(cmd, &bd, None), vec!["gen", "gen/sub"]);
+        // Meson's root-dir compile: `-I.` is the build dir itself, which the
+        // record never names, and `./gen` is the record's `gen`. Both passes
+        // carry both.
+        let meson = "g++ -Ihello.p -I. -I./gen -I.. -c a.cc -o a.o";
+        std::fs::create_dir_all(bd.join("hello.p")).unwrap();
+        let configure: std::collections::HashSet<String> =
+            ["gen".to_string(), "hello.p".to_string()].into();
+        let first = named_dirs_to_create(meson, &bd, None);
+        assert!(first.contains(&".".to_string()), "carried {first:?}");
+        assert_eq!(named_dirs_to_create(meson, &bd, Some(&configure)), first);
     }
 
     /// THE EXISTENCE GUARD. A directory no part of the tree holds is a typo
@@ -7026,17 +7147,30 @@ fn store_hash(path: &str) -> Option<&[u8]> {
         .map(|(h, _)| h.as_bytes())
 }
 
-/// Swaps every run of a placeholder's HASH that survives, whole or in
-/// pieces, for the same characters of the real path's hash, at the same
+/// Swaps every occurrence of a placeholder's HASH that survives, whole or
+/// in pieces, for the real path's hash, character for character at the same
 /// offsets within the hash. `rewrite_bytes` swaps whole paths only, and a
 /// placeholder also lands split (a compiler's immediate stores: llvm-config
 /// carried `hjbdq8s5j5dkn2a110sy8` then `10sy8zlhfcs4lxsx`) or with escapes
 /// around it (a troff man page spells the dashes `\-`). The hash is the
-/// only part that differs between placeholder and real path, so a run of it
-/// found where `placeholder_residue` finds it is swapped character for
-/// character; runs shorter than `RESIDUE_WINDOW` are neither found nor
-/// residue. A pair whose hashes differ in length is skipped.
+/// only part that differs between placeholder and real path.
+///
+/// A RUN IS SWAPPED ONLY WITH THE REST OF ITS OCCURRENCE. Runs are found by
+/// `RESIDUE_WINDOW` windows, and a piece shorter than that is invisible: gcc
+/// `-mgeneral-regs-only` stores `/nix/store/hjbdq8s5...-pkg` as 8-byte
+/// immediates, so the hash lands as pieces of 5, 8, 8, 8 and 3 characters.
+/// Swapping the three long ones left `hjbdq` and `xsx` behind, no window
+/// matched any more, and the file was placed naming a path that does not
+/// exist. The runs of one occurrence (increasing hash offsets, each within
+/// `NEAR` bytes of the last) must cover the whole hash; a gap is looked for
+/// nearby, a head piece after the `/` that ends the store dir and a tail
+/// piece before the `-` (or troff's `\`) after the hash. An occurrence not
+/// accounted for is left alone, so the residue scan still finds its runs
+/// and placement refuses the file. A pair whose hashes differ in length is
+/// skipped.
 pub fn repair_residue(data: &[u8], restore: &[(String, String)]) -> Option<Vec<u8>> {
+    const NEAR: usize = 64;
+    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
     let mut out = data.to_vec();
     let mut changed = false;
     for (placeholder, real) in restore {
@@ -7050,19 +7184,83 @@ pub fn repair_residue(data: &[u8], restore: &[(String, String)]) -> Option<Vec<u
         for k in 0..=hp.len() - RESIDUE_WINDOW {
             at.entry(&hp[k..k + RESIDUE_WINDOW]).or_insert(k);
         }
+        // (file offset, hash offset, length) of every run, in file order.
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
         let mut i = 0;
-        while i + RESIDUE_WINDOW <= out.len() {
-            let Some(&k) = at.get(&out[i..i + RESIDUE_WINDOW]) else {
+        while i + RESIDUE_WINDOW <= data.len() {
+            let Some(&k) = at.get(&data[i..i + RESIDUE_WINDOW]) else {
                 i += 1;
                 continue;
             };
             let mut j = 0;
-            while k + j < hp.len() && i + j < out.len() && out[i + j] == hp[k + j] {
+            while k + j < hp.len() && i + j < data.len() && data[i + j] == hp[k + j] {
                 j += 1;
             }
-            out[i..i + j].copy_from_slice(&hr[k..k + j]);
-            changed = true;
+            runs.push((i, k, j));
             i += j;
+        }
+        let mut occurrences: Vec<Vec<(usize, usize, usize)>> = Vec::new();
+        for r in runs {
+            match occurrences.last_mut() {
+                Some(o)
+                    if o.last()
+                        .is_some_and(|l| r.1 > l.1 && r.0 <= l.0 + l.2 + NEAR) =>
+                {
+                    o.push(r)
+                }
+                _ => occurrences.push(vec![r]),
+            }
+        }
+        for o in occurrences {
+            // Every piece to swap, as (file offset, hash offset, length).
+            let mut pieces = o.clone();
+            let (first, last) = (o[0], o[o.len() - 1]);
+            let mut whole = true;
+            if first.1 > 0 {
+                let lo = first.0.saturating_sub(NEAR);
+                let head = &hp[..first.1];
+                let hit = (lo..first.0.saturating_sub(head.len()) + 1)
+                    .rev()
+                    .find(|&p| p > 0 && data[p - 1] == b'/' && data[p..].starts_with(head));
+                match hit {
+                    Some(p) => pieces.push((p, 0, head.len())),
+                    None => whole = false,
+                }
+            }
+            let mut reached = 0;
+            for w in o.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                reached = reached.max(a.1 + a.2);
+                if reached < b.1 {
+                    let gap = &hp[reached..b.1];
+                    match find(data.get(a.0 + a.2..b.0).unwrap_or_default(), gap) {
+                        Some(p) => pieces.push((a.0 + a.2 + p, reached, gap.len())),
+                        None => whole = false,
+                    }
+                }
+            }
+            let end = o.iter().map(|r| r.1 + r.2).max().unwrap_or(0);
+            if end < hp.len() {
+                let tail = &hp[end..];
+                let from = last.0 + last.2;
+                let window = data
+                    .get(from..(from + NEAR).min(data.len()))
+                    .unwrap_or_default();
+                let hit = window.windows(tail.len()).enumerate().position(|(p, w)| {
+                    w == tail && matches!(window.get(p + tail.len()), Some(b'-' | b'\\'))
+                });
+                match hit {
+                    Some(p) => pieces.push((from + p, end, tail.len())),
+                    None => whole = false,
+                }
+            }
+            if !whole {
+                continue;
+            }
+            for (f, k, n) in pieces {
+                out[f..f + n].copy_from_slice(&hr[k..k + n]);
+            }
+            changed = true;
         }
     }
     changed.then_some(out)
@@ -7253,6 +7451,74 @@ mod placeholder_residue_tests {
             "opcode bytes between pieces stay"
         );
         assert_eq!(&split[26..42], &real[16..]);
+    }
+
+    /// A HASH IN PIECES SHORTER THAN THE WINDOW IS REPAIRED WHOLE OR NOT AT
+    /// ALL. gcc `-mgeneral-regs-only` stores `/nix/store/<hash>-pkg` as
+    /// 8-byte immediates (pieces of 5, 8, 8, 8 and 3 hash characters) and
+    /// SSE as 16-byte constants (5, 16, 11); the short head and tail pieces
+    /// match no window. Each shape comes out naming the real hash in every
+    /// position with the bytes between pieces untouched. With the head piece
+    /// damaged the occurrence cannot be accounted for: nothing is swapped and
+    /// the residue scan still refuses the file, where swapping the long
+    /// pieces alone would leave no window to find and a wrong path placed.
+    #[test]
+    fn a_hash_in_short_pieces_is_repaired_whole_or_not_at_all() {
+        let restore = vec![(XDP_PH.to_string(), XDP_REAL.to_string())];
+        let want = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-pkg-";
+        let (op, gap) = (b"\x48\xb8".as_slice(), b"\x48\x89\x47\x08".as_slice());
+        let stores = |pieces: &[&str]| -> Vec<u8> {
+            pieces
+                .iter()
+                .flat_map(|p| [op, p.as_bytes(), gap].concat())
+                .collect()
+        };
+        let text = |bytes: &[u8], width: usize| -> String {
+            bytes
+                .chunks(op.len() + width + gap.len())
+                .map(|c| {
+                    assert_eq!(&c[..op.len()], op, "opcode bytes stay");
+                    assert_eq!(&c[op.len() + width..], gap, "bytes between pieces stay");
+                    String::from_utf8(c[op.len()..op.len() + width].to_vec()).unwrap()
+                })
+                .collect()
+        };
+        for (width, pieces) in [
+            (
+                8,
+                vec![
+                    "/nix/sto", "re/hjbdq", "8s5j5dkn", "2a110sy8", "zlhfcs4l", "xsx-pkg-",
+                ],
+            ),
+            (
+                16,
+                vec!["/nix/store/hjbdq", "8s5j5dkn2a110sy8", "zlhfcs4lxsx-pkg-"],
+            ),
+        ] {
+            let obj = stores(&pieces);
+            assert!(
+                placeholder_residue(&obj, &restore).is_some(),
+                "control: residue"
+            );
+            let fixed = repair_residue(&obj, &restore).expect("a repair");
+            assert_eq!(placeholder_residue(&fixed, &restore), None);
+            assert_eq!(text(&fixed, width), want, "{width}-byte pieces");
+        }
+        let damaged = stores(&[
+            "/nix/sto", "re/hjbXq", "8s5j5dkn", "2a110sy8", "zlhfcs4l", "xsx-pkg-",
+        ]);
+        assert_eq!(repair_residue(&damaged, &restore), None, "nothing swapped");
+        assert!(
+            placeholder_residue(&damaged, &restore).is_some(),
+            "and the file is still refused"
+        );
+        // A piece inside the hash stored as two 4-byte halves: no window
+        // and no contiguous gap, so the same.
+        let halves = stores(&[
+            "/nix/sto", "re/hjbdq", "8s5j5dkn", "2a11", "0sy8", "zlhfcs4l", "xsx-pkg-",
+        ]);
+        assert_eq!(repair_residue(&halves, &restore), None, "nothing swapped");
+        assert!(placeholder_residue(&halves, &restore).is_some());
     }
 
     /// THE SHAPE pkg-config 0.29.2 SHIPPED (2026-10-09): a placeholder that
@@ -15871,7 +16137,7 @@ fn walk_dir_capped_uncached(
             }
             if p.is_dir() {
                 stack.push(p);
-            } else if p.is_file() {
+            } else if p.is_file() && crate::configure_state::left_by_configure(build_dir, &p) {
                 if paths.len() >= cap {
                     return Ok(None);
                 }
