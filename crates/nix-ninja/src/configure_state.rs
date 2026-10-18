@@ -306,19 +306,23 @@ pub fn note_task(outputs: &[PathBuf], drv: &str, inputs: Vec<String>) {
     }
 }
 
-/// Placed files the rewind found changed since placement (a hook edited a
-/// generated file between phases). Placement may write the reused output
-/// over the edit before the pass ends, so the exit comparison cannot see
-/// it; every reused edge that read one is counted stale.
-static CHANGED_SINCE_PLACEMENT: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
-    std::sync::Mutex::new(None);
+/// Placed paths the rewind found changed since placement (a hook edited,
+/// rewrote, touched or removed a generated file between phases), each with
+/// the hash of what the hook left there (None: nothing). Placement may write
+/// the reused output over the edit before the pass ends, so the exit
+/// comparison cannot see it; a reused edge that read one where the hook
+/// left other content than the pass leaves is counted stale.
+static CHANGED_SINCE_PLACEMENT: std::sync::Mutex<
+    Option<std::collections::HashMap<String, Option<String>>>,
+> = std::sync::Mutex::new(None);
 
-fn note_changed_since_placement(rel: &str) {
+fn note_changed_since_placement(build_dir: &Path, rel: &str) {
+    let h = tree_hash(&build_dir.join(rel));
     CHANGED_SINCE_PLACEMENT
         .lock()
         .unwrap()
         .get_or_insert_with(Default::default)
-        .insert(rel.to_string());
+        .insert(rel.to_string(), h);
 }
 
 /// What the tree file or directory at `rel` holds now, hashed once per
@@ -350,9 +354,11 @@ fn tree_hash(path: &Path) -> Option<String> {
     if path.is_file() {
         file(path, &mut h)?;
     } else if path.is_dir() {
+        // The driver's own state is no input's, and changes every pass.
         let mut entries: Vec<_> = walkdir::WalkDir::new(path)
             .min_depth(1)
             .into_iter()
+            .filter_entry(|e| !is_state_dir(&e.file_name().to_string_lossy()))
             .filter_map(Result::ok)
             .filter(|e| e.file_type().is_file() || e.file_type().is_symlink())
             .collect();
@@ -370,6 +376,9 @@ fn tree_hash(path: &Path) -> Option<String> {
     }
     Some(format!("{:016x}", h.finish()))
 }
+
+/// The hash recorded for an input no exit has held yet.
+const UNKNOWN: &str = "-";
 
 type InputRecord = (
     Vec<(String, String)>,
@@ -468,9 +477,7 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
                 // As the tree holds it at this pass's exit: hooks run between
                 // passes, not during one, and this is the file as the task
                 // was given it, whatever the driver rewrote in its upload.
-                let Some(h) = now_hash(&pass.build_dir, p) else {
-                    continue;
-                };
+                let h = now_hash(&pass.build_dir, p).unwrap_or_else(|| UNKNOWN.to_string());
                 let next = files.len();
                 let i = *index.entry((p.clone(), h.clone())).or_insert(next);
                 if i == next {
@@ -479,6 +486,28 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
                 ix.push(i);
             }
             edges.insert(k.clone(), ix);
+        }
+        // AN INPUT FILE ABSENT AT ITS WRITER'S EXIT (a generated header a
+        // pass that placed only its targets left in the store) takes the
+        // content the first exit that holds it holds: placement's, which is
+        // what the task was given. Not a directory: a placed tree holds
+        // whatever was written into it between phases as well, which no
+        // task was given; its files are inputs of their own.
+        for ix in edges.values_mut() {
+            for i in ix.iter_mut() {
+                let (p, h) = &files[*i];
+                if h != UNKNOWN || !pass.build_dir.join(p).is_file() {
+                    continue;
+                }
+                if let Some(now) = now_hash(&pass.build_dir, p) {
+                    let next = files.len();
+                    let j = *index.entry((p.clone(), now.clone())).or_insert(next);
+                    if j == next {
+                        files.push((p.clone(), now));
+                    }
+                    *i = j;
+                }
+            }
         }
         let file_lines: Vec<String> = files
             .iter()
@@ -518,18 +547,42 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
     // sees it. Compared here, at exit, as the record was taken: placement
     // has put this pass's outputs back and the rewind has finished, so
     // both sides see the tree as a pass leaves it.
-    let edited = CHANGED_SINCE_PLACEMENT
+    // A HOOK'S EDIT PLACEMENT WROTE OVER (what the hook left differs from
+    // what the pass leaves) counts for every input it is, is inside (a
+    // directory input) or is behind (a link input), matched by resolved
+    // path. One that left the same bytes, or that this pass left standing,
+    // is the tree the exit comparison reads, so an edge derived after it is
+    // not counted on the pass after.
+    let canon = |r: &str| std::fs::canonicalize(pass.build_dir.join(r)).ok();
+    let overwritten: Vec<PathBuf> = CHANGED_SINCE_PLACEMENT
         .lock()
         .unwrap()
         .clone()
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .iter()
+        .filter(|(e, h)| **h != now_hash(&pass.build_dir, e))
+        .filter_map(|(e, _)| canon(e))
+        .collect();
+    let overwritten_under: std::collections::HashSet<usize> = if overwritten.is_empty() {
+        Default::default()
+    } else {
+        (0..pass.files.len())
+            .filter(|&i| {
+                canon(&pass.files[i].0)
+                    .is_some_and(|c| overwritten.iter().any(|e| e.starts_with(&c)))
+            })
+            .collect()
+    };
     let mut stale: std::collections::BTreeSet<String> = pass
         .reused_edges
         .iter()
         .filter(|(k, _)| {
             pass.edge_inputs.get(k).into_iter().flatten().any(|&i| {
                 let (p, then) = &pass.files[i];
-                edited.contains(p) || now_hash(&pass.build_dir, p).as_ref() != Some(then)
+                // Unknown until an exit holds it: nothing to compare yet.
+                then != UNKNOWN
+                    && (overwritten_under.contains(&i)
+                        || now_hash(&pass.build_dir, p).as_ref() != Some(then))
             })
         })
         .map(|(_, d)| d.clone())
@@ -1362,11 +1415,32 @@ impl Rewind {
         let mut changed = 0usize;
         let mut dirs: Vec<PathBuf> = Vec::new();
         let mut replaced: Vec<(&str, &str)> = Vec::new();
+        // What earlier passes' edges read at each path, for an edit that
+        // kept the stamp (`cp -p`, `touch -r`). Only a file whose inode
+        // changed after the journal was written is read again: one placed
+        // and left alone since is placement's.
+        let journal_written = std::fs::metadata(&journal_path)
+            .ok()
+            .map(|m| (m.mtime(), m.mtime_nsec()));
+        let recorded: std::collections::HashMap<String, Vec<String>> = PASS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| {
+                let mut m: std::collections::HashMap<String, Vec<String>> = Default::default();
+                for (path, h) in p.files.iter().filter(|(_, h)| h != UNKNOWN) {
+                    m.entry(path.clone()).or_default().push(h.clone());
+                }
+                m
+            })
+            .unwrap_or_default();
         for line in &journal {
             match parse_journal(line) {
                 Some(('F', rel, placed_stamp)) => {
                     let (src, dest) = (build_dir.join(rel), rewind.aside.join(rel));
+                    // A hook removed it; placement may put it back.
                     let Ok(meta) = std::fs::symlink_metadata(&src) else {
+                        note_changed_since_placement(build_dir, rel);
                         continue;
                     };
                     // A FILE CHANGED SINCE PLACEMENT IS NOT PLACEMENT'S ANY
@@ -1374,8 +1448,16 @@ impl Rewind {
                     // directory): it stays visible, as it was before.
                     if placed_stamp != Some(stamp(&meta).as_str()) {
                         changed += 1;
-                        note_changed_since_placement(rel);
+                        note_changed_since_placement(build_dir, rel);
                         continue;
+                    }
+                    if journal_written.is_some_and(|j| (meta.ctime(), meta.ctime_nsec()) > j)
+                        && recorded.get(rel).is_some_and(|hs| {
+                            let h = tree_hash(&src);
+                            !hs.iter().any(|r| h.as_ref() == Some(r))
+                        })
+                    {
+                        note_changed_since_placement(build_dir, rel);
                     }
                     dest.parent()
                         .map_or(Ok(()), std::fs::create_dir_all)
@@ -1424,7 +1506,17 @@ impl Rewind {
                 }
             }
             match std::fs::symlink_metadata(&src) {
-                Err(_) => {}
+                // A hook removed it (a placed directory emptied and removed
+                // above is not one).
+                Err(_) => {
+                    if !rewind
+                        .removed_dirs
+                        .iter()
+                        .any(|d| Path::new(rel).starts_with(d))
+                    {
+                        note_changed_since_placement(build_dir, rel);
+                    }
+                }
                 Ok(m) if !m.is_dir() && placed_stamp == stamp(&m) => {
                     dest.parent()
                         .map_or(Ok(()), std::fs::create_dir_all)
@@ -1433,7 +1525,7 @@ impl Rewind {
                 }
                 Ok(_) => {
                     changed += 1;
-                    note_changed_since_placement(rel);
+                    note_changed_since_placement(build_dir, rel);
                     continue;
                 }
             }
@@ -2444,81 +2536,311 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// One edge of a driven pass: its output, its task derivation, and the
+    /// tree files it reads when derived fresh.
+    type Edge<'a> = (&'a str, &'a str, &'a [&'a str]);
+
+    /// A PASS AS THE DRIVER RUNS ONE: `begin_pass`, configure's record kept
+    /// on the first pass and the rewind on a later one, each edge reused
+    /// where recorded and noted fresh where not, placement writing `place`
+    /// (configure's copies kept first, then journaled; `<dir>` places a
+    /// directory), the rewind finished,
+    /// and the report taken at exit.
+    fn drive_pass(
+        bd: &Path,
+        record: &ConfigureState,
+        edges: &[Edge],
+        place: &[(&str, &str)],
+    ) -> Option<String> {
+        let state = super::state_dir(bd);
+        super::EMITTED.lock().unwrap().clear();
+        super::EMITTED_INPUTS.lock().unwrap().clear();
+        *super::NOW.lock().unwrap() = None;
+        *super::CHANGED_SINCE_PLACEMENT.lock().unwrap() = None;
+        super::begin_pass(bd, true, "v").unwrap();
+        let first = load_in(&state, bd).unwrap().is_none();
+        if first {
+            save_in(&state, bd, record).expect("saved");
+        }
+        let rewind = if first {
+            None
+        } else {
+            begin_result(&state, bd).expect("no failure")
+        };
+        for (o, drv, inputs) in edges {
+            let out = [PathBuf::from(o)];
+            if super::reuse(&out, |_| true).is_none() {
+                super::note_task(&out, drv, inputs.iter().map(|s| s.to_string()).collect());
+            }
+        }
+        let placed: Vec<&Path> = place.iter().map(|(p, _)| Path::new(*p)).collect();
+        keep_originals_in(&state, bd, record, placed.iter().copied()).expect("kept");
+        for (p, v) in place {
+            let at = bd.join(p);
+            // A directory, placed where configure may have left a file.
+            if *v == "<dir>" {
+                if at.is_file() {
+                    std::fs::remove_file(&at).unwrap();
+                }
+                std::fs::create_dir_all(&at).unwrap();
+            } else {
+                write(&at, v);
+            }
+        }
+        journal_in(&state, bd, placed.iter().copied()).expect("journaled");
+        if let Some(r) = rewind {
+            r.finish().expect("put back");
+        }
+        super::pass_report().unwrap()
+    }
+
+    /// A fresh build dir for `drive_pass`, its state dir gone.
+    fn pass_dir(tag: &str) -> (PathBuf, PathBuf) {
+        let d = scratch(tag);
+        let bd = d.join("build");
+        write(&bd.join("build.ninja"), "default all\n");
+        let _ = std::fs::remove_dir_all(super::state_dir(&bd));
+        (d, bd)
+    }
+
+    fn end_passes(d: &Path, bd: &Path) {
+        *super::PASS.lock().unwrap() = None;
+        super::STRICT.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(super::state_dir(bd));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
     /// STALE IS COUNTED AGAINST WHAT EACH EDGE READ, at exit, as the record
     /// was taken: a source a hook changed or removed counts, and so does a
     /// file inside a directory input; an edge a later pass derived after
     /// the change read the new content and does not count on the pass
-    /// after; a placed output placed again does not count, but one the
-    /// rewind found edited since placement does, though placement wrote the
-    /// reused output back over the edit.
+    /// after; a placed output the rewind found edited counts, though
+    /// placement wrote the reused output back over the edit, and not once
+    /// placed again.
     #[test]
     fn stale_counts_what_each_edge_read() {
         let _g = super::PASS_TEST_LOCK.lock().unwrap();
-        let d = scratch("stale");
-        let bd = d.join("build");
-        write(&bd.join("build.ninja"), "default all\n");
-        let state = super::state_dir(&bd);
-        let _ = std::fs::remove_dir_all(&state);
-        let out = |n: &str| vec![PathBuf::from(n)];
-        let reset = || {
-            super::EMITTED.lock().unwrap().clear();
-            super::EMITTED_INPUTS.lock().unwrap().clear();
-            *super::NOW.lock().unwrap() = None;
-            *super::CHANGED_SINCE_PLACEMENT.lock().unwrap() = None;
-        };
+        let (d, bd) = pass_dir("stale");
+        let r = ConfigureState::default();
         write(&bd.join("h.h"), "v1");
         write(&bd.join("data/x.txt"), "one");
-        write(&bd.join("conf.h"), "placed over configure's");
         write(&bd.join("gone.h"), "source");
-        write(&bd.join("gen.h"), "a pass-1 output");
-        reset();
-        super::begin_pass(&bd, true, "v").unwrap();
-        let edges = [
-            ("a.o", "aaa", "h.h"),
-            ("d.o", "ddd", "data"),
-            ("e.o", "eee", "conf.h"),
-            ("f.o", "fff", "gone.h"),
-            ("g.o", "ggg", "gen.h"),
+        let edges: [Edge; 4] = [
+            ("a.o", "/nix/store/aaa-x.drv", &["h.h"]),
+            ("d.o", "/nix/store/ddd-x.drv", &["data"]),
+            ("f.o", "/nix/store/fff-x.drv", &["gone.h"]),
+            ("g.o", "/nix/store/ggg-x.drv", &["gen.h"]),
         ];
-        for (o, d, input) in edges {
-            super::note_task(
-                &out(o),
-                &format!("/nix/store/{d}-x.drv"),
-                vec![input.into()],
-            );
-        }
-        super::pass_report().unwrap();
-        save_in(&state, &bd, &ConfigureState::default()).expect("saved");
+        let gen = [("gen.h", "a pass-1 output")];
+        assert_eq!(drive_pass(&bd, &r, &edges, &gen), None, "pass 1");
         // Between phases: a hook changes a source and a file in a directory
         // input, removes a source, and edits a generated file.
         write(&bd.join("h.h"), "v2");
         write(&bd.join("data/x.txt"), "two");
         std::fs::remove_file(bd.join("gone.h")).unwrap();
-        // Pass 2: the rewind finds gen.h edited since placement; placement
-        // writes the reused output back by exit. c.o is derived fresh.
-        reset();
-        super::begin_pass(&bd, true, "v").unwrap();
-        super::note_changed_since_placement("gen.h");
-        for (o, _, _) in edges {
-            assert!(super::reuse(&out(o), |_| true).is_some());
-        }
-        super::note_task(&out("c.o"), "/nix/store/ccc-c.drv", vec!["h.h".into()]);
-        let line = super::pass_report().unwrap().unwrap();
+        write(&bd.join("gen.h"), "a hook's edit of it");
+        // Pass 2 places gen.h back over the edit; c.o is derived fresh.
+        let mut two = edges.to_vec();
+        two.push(("c.o", "/nix/store/ccc-x.drv", &["h.h"]));
+        let line = drive_pass(&bd, &r, &two, &gen).unwrap();
         assert!(line.contains(", 4 stale: "), "{line}");
-        assert!(!line.contains("eee-x.drv"), "{line}");
         // Pass 3, nothing changed since.
-        reset();
-        super::begin_pass(&bd, true, "v").unwrap();
-        for o in ["a.o", "c.o", "d.o", "e.o", "f.o", "g.o"] {
-            assert!(super::reuse(&out(o), |_| true).is_some());
-        }
-        let line = super::pass_report().unwrap().unwrap();
+        let line = drive_pass(&bd, &r, &two, &gen).unwrap();
         assert!(line.contains(", 3 stale: "), "{line}");
-        assert!(!line.contains("ccc-c.drv"), "{line}");
-        *super::PASS.lock().unwrap() = None;
-        super::STRICT.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _ = std::fs::remove_dir_all(&state);
-        let _ = std::fs::remove_dir_all(&d);
+        assert!(
+            !line.contains("ccc-x.drv") && !line.contains("ggg-x.drv"),
+            "{line}"
+        );
+        end_passes(&d, &bd);
+    }
+
+    /// A HOOK'S EDIT THE PASS LEAVES STANDING is the tree the exit reads:
+    /// the edge reused over it counts on every pass, an edge derived after
+    /// it on none (the rewind notes the edit again on every pass).
+    #[test]
+    fn an_edit_left_standing_counts_only_what_was_written_before_it() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let (d, bd) = pass_dir("standing");
+        let r = ConfigureState::default();
+        let e: Edge = ("e.o", "/nix/store/eee-e.drv", &["gen.h"]);
+        let e2: Edge = ("e2.o", "/nix/store/fff-e2.drv", &["gen.h"]);
+        drive_pass(&bd, &r, &[e], &[("gen.h", "a pass-1 output")]);
+        write(&bd.join("gen.h"), "a hook's edit of it");
+        let line = drive_pass(&bd, &r, &[e, e2], &[]).unwrap();
+        assert!(
+            line.contains(", 1 stale: ; stale: /nix/store/eee-e.drv;"),
+            "{line}"
+        );
+        let line = drive_pass(&bd, &r, &[e, e2], &[]).unwrap();
+        assert!(
+            line.contains(", 1 stale: ; stale: /nix/store/eee-e.drv;"),
+            "{line}"
+        );
+        end_passes(&d, &bd);
+    }
+
+    /// A HOOK'S EDIT PLACEMENT WROTE OVER counts for an input it is inside
+    /// (a directory) or behind (a link), and for a removal placement undid;
+    /// bytes rewritten unchanged, or only touched, count for nothing.
+    #[test]
+    fn an_overwritten_edit_counts_for_every_input_that_holds_it() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let r = ConfigureState::default();
+        // The hook's act, the inputs read (one edge each), the placed
+        // path, a link to it, and how many edges count stale.
+        type Case<'a> = (&'a str, &'a [&'a str], &'a str, Option<&'a str>, usize);
+        let cases: [Case; 6] = [
+            ("dir", &["pkg", "pkg/m.py"], "pkg/m.py", None, 2),
+            ("link", &["lib.so"], "lib.so.1", Some("lib.so"), 1),
+            ("plain", &["g.h"], "g.h", None, 1),
+            ("removed", &["g.h"], "g.h", None, 1),
+            ("same", &["g.h"], "g.h", None, 0),
+            ("touched", &["g.h"], "g.h", None, 0),
+        ];
+        for (tag, inputs, placed, link, want) in cases {
+            let (d, bd) = pass_dir(&format!("overwritten-{tag}"));
+            if let Some(l) = link {
+                std::os::unix::fs::symlink(placed, bd.join(l)).unwrap();
+            }
+            let drvs: Vec<String> = (0..inputs.len())
+                .map(|n| format!("/nix/store/x{n}-x.drv"))
+                .collect();
+            let edges: Vec<Edge> = inputs
+                .iter()
+                .zip(&drvs)
+                .map(|(i, drv)| (*i, drv.as_str(), std::slice::from_ref(i)))
+                .collect();
+            let place = [(placed, "a pass-1 output")];
+            drive_pass(&bd, &r, &edges, &place);
+            let p = bd.join(placed);
+            let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+            match tag {
+                "removed" => std::fs::remove_file(&p).unwrap(),
+                "same" => {
+                    write(&p, "a pass-1 output");
+                    std::fs::File::options()
+                        .write(true)
+                        .open(&p)
+                        .and_then(|f| f.set_modified(later))
+                        .unwrap();
+                }
+                "touched" => std::fs::File::options()
+                    .write(true)
+                    .open(&p)
+                    .and_then(|f| f.set_modified(later))
+                    .unwrap(),
+                _ => write(&p, "a hook's edit of it"),
+            }
+            let line = drive_pass(&bd, &r, &edges, &place).unwrap();
+            assert!(line.contains(&format!(", {want} stale: ")), "{tag}: {line}");
+            end_passes(&d, &bd);
+        }
+    }
+
+    /// AN INPUT ABSENT AT ITS WRITER'S EXIT (a pass placed only its
+    /// targets) counts nothing while absent and nothing when a later pass
+    /// first places it, and from then on a hook's edit to it counts.
+    #[test]
+    fn an_input_absent_at_its_writers_exit_counts_once_placed() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let (d, bd) = pass_dir("absent-at-exit");
+        let r = ConfigureState::default();
+        let edges: [Edge; 1] = [("x.o", "/nix/store/xxx-x.drv", &["gen.h"])];
+        let gen = [("gen.h", "a pass-1 output")];
+        drive_pass(&bd, &r, &edges, &[]);
+        let line = drive_pass(&bd, &r, &edges, &[]).unwrap();
+        assert!(line.contains(", 0 stale: "), "still absent: {line}");
+        let line = drive_pass(&bd, &r, &edges, &gen).unwrap();
+        assert!(line.contains(", 0 stale: "), "first placed: {line}");
+        write(&bd.join("gen.h"), "a hook's edit of it");
+        let line = drive_pass(&bd, &r, &edges, &gen).unwrap();
+        assert!(line.contains(", 1 stale: "), "edited: {line}");
+        // A directory input absent at its writer's exit stays unknown: a
+        // file written into the placed tree between phases counts nothing.
+        let edges: [Edge; 1] = [("y.o", "/nix/store/yyy-y.drv", &["inc"])];
+        drive_pass(&bd, &r, &edges, &[]);
+        let tree = [("inc", "<dir>"), ("inc/a.h", "a header")];
+        drive_pass(&bd, &r, &edges, &tree);
+        write(&bd.join("inc/check.log"), "written between phases");
+        let line = drive_pass(&bd, &r, &edges, &tree).unwrap();
+        assert!(line.contains(", 0 stale: "), "tree: {line}");
+        end_passes(&d, &bd);
+    }
+
+    /// AN EDIT THAT KEPT THE STAMP (`cp -p`, `touch -r`): the file is read
+    /// again where its inode changed after the journal was written, and
+    /// counts where its bytes are not what an edge read.
+    #[test]
+    fn an_edit_that_kept_the_stamp_counts() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let (d, bd) = pass_dir("kept-stamp");
+        let r = ConfigureState::default();
+        let edges: [Edge; 1] = [("x.o", "/nix/store/xxx-x.drv", &["g.h"])];
+        let place = [("g.h", "AAAA")];
+        drive_pass(&bd, &r, &edges, &place);
+        let p = bd.join("g.h");
+        let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+        // Past the journal's mtime on a coarse clock.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(&p, "BBBB");
+        std::fs::File::options()
+            .write(true)
+            .open(&p)
+            .and_then(|f| f.set_modified(mtime))
+            .unwrap();
+        let line = drive_pass(&bd, &r, &edges, &place).unwrap();
+        assert!(line.contains(", 1 stale: "), "{line}");
+        end_passes(&d, &bd);
+    }
+
+    /// A PATH PLACED OVER CONFIGURE'S FILE (an `O` line): a hook's edit
+    /// placement wrote back over counts, and once placed again, with
+    /// configure's version put back and replaced on every pass, nothing does.
+    #[test]
+    fn an_edit_over_configures_file_counts() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let (d, bd) = pass_dir("over-configure");
+        write(&bd.join("conf.h"), "configure's");
+        let r = record_of(&["conf.h".to_string()].into());
+        let edges: [Edge; 1] = [("x.o", "/nix/store/xxx-x.drv", &["conf.h"])];
+        let place = [("conf.h", "placed over configure's")];
+        drive_pass(&bd, &r, &edges, &place);
+        let journal = std::fs::read_to_string(super::state_dir(&bd).join("placed.v1")).unwrap();
+        assert!(journal.lines().any(|l| l.starts_with("O ")), "{journal}");
+        write(&bd.join("conf.h"), "a hook's edit of it");
+        let line = drive_pass(&bd, &r, &edges, &place).unwrap();
+        assert!(line.contains(", 1 stale: "), "{line}");
+        let line = drive_pass(&bd, &r, &edges, &place).unwrap();
+        assert!(line.contains(", 0 stale: "), "{line}");
+        // A removal placement undid counts too.
+        std::fs::remove_file(bd.join("conf.h")).unwrap();
+        let line = drive_pass(&bd, &r, &edges, &place).unwrap();
+        assert!(line.contains(", 1 stale: "), "{line}");
+        end_passes(&d, &bd);
+    }
+
+    /// A DIRECTORY PLACED WHERE CONFIGURE LEFT A FILE is emptied and
+    /// removed by the rewind, which is no hook's removal: a pass that does
+    /// not place it again counts nothing for its reader.
+    #[test]
+    fn a_placed_directory_the_rewind_removed_is_no_removal() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let (d, bd) = pass_dir("dir-over-file");
+        write(&bd.join("out"), "configure's file");
+        let r = record_of(&["out".to_string()].into());
+        let edges: [Edge; 1] = [("x.o", "/nix/store/xxx-x.drv", &["out"])];
+        drive_pass(&bd, &r, &edges, &[("out", "<dir>"), ("out/a", "placed")]);
+        let journal = std::fs::read_to_string(super::state_dir(&bd).join("placed.v1")).unwrap();
+        assert!(
+            journal
+                .lines()
+                .any(|l| l.starts_with("O ") && l.ends_with(" out")),
+            "{journal}"
+        );
+        let line = drive_pass(&bd, &r, &edges, &[]).unwrap();
+        assert!(line.contains(", 0 stale: "), "{line}");
+        assert!(bd.join("out/a").is_file(), "the directory came back");
+        end_passes(&d, &bd);
     }
 
     /// A TREE HASH SEES WHAT AN UPLOAD KEEPS: a script's executable bit,
@@ -2542,6 +2864,10 @@ mod tests {
             before,
             "a link retargeted"
         );
+        // The driver's own state under a directory input is not the input's.
+        let before = super::tree_hash(&d.join("dir"));
+        write(&d.join("dir/.nix-ninja-state/x"), "pass 2");
+        assert_eq!(super::tree_hash(&d.join("dir")), before, "state");
         let _ = std::fs::remove_dir_all(&d);
     }
 
