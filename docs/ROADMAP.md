@@ -716,13 +716,14 @@ configure left (a 0-byte `qt6core_metatypes.json` that syncqt's
 `-binaryDir` directory upload carries), and files written into the tree
 between phases.
 
-Where it stands: `5de3682`, `da700bd`, `79e1d51` and `998b14f` (driver
-only, priced free on the corpus's five shapes) record what configure left,
+Where it stands: `5de3682` through the current revision (driver only,
+priced free on the corpus's five shapes) record what configure left,
 journal what placement wrote, and make a later pass set that aside, put back
 configure's version of a path placement replaced, and answer the build-dir
 walk, include dirs and directory listings from configure's record. The
-placeholder residue that used to re-run the whole build is repaired in
-place. `local/gates/install-pass-reuse-repro.sh` builds nothing in passes 2
+placeholder residue that used to re-run the whole build is refused at
+placement; a repair of its pieces in place was tried and withdrawn when
+real compiler output placed files naming neither path. `local/gates/install-pass-reuse-repro.sh` builds nothing in passes 2
 and 3 on three fixture shapes, and fails with each of the three later
 mechanisms switched off. Done when a qtbase round builds only its configure
 probes in the build pass and nothing in the install pass. Not covered: a file

@@ -210,19 +210,16 @@ fn place_realised(
         };
         if !restore.is_empty() && target.is_file() {
             let data = std::fs::read(&target)?;
-            let mut rewritten = crate::task::rewrite_bytes(&data, &restore);
-            // A PLACEHOLDER THE WHOLE-PATH SWAP COULD NOT REACH IS REPAIRED
-            // HERE, NOT BY BUILDING AGAIN. The driver used to re-run itself
-            // with every task keyed to the real outer paths, which rebuilt
-            // the run a second time (a whole package on the ninja route).
-            // What is left is the placeholder's hash in pieces or behind
-            // escapes, or inside a compressed section; each is swapped in
-            // place. One still carrying it is NOT placed: a file carrying it
-            // is wrong in a way nothing downstream detects.
-            let after = rewritten.as_deref().unwrap_or(&data);
-            if crate::task::placeholder_residue(after, &restore).is_some() {
-                rewritten = repair(after, &restore).or(rewritten);
-            }
+            let rewritten = crate::task::rewrite_bytes(&data, &restore);
+            // A PLACEHOLDER THE WHOLE-PATH SWAP COULD NOT REACH IS REFUSED,
+            // neither guessed at nor built again. The driver used to re-run
+            // itself with every task keyed to the real outer paths, which
+            // rebuilt the run a second time (a whole package on the ninja
+            // route), and then to swap the hash's surviving pieces in place,
+            // which compiler output proved cannot be done from the bytes
+            // alone (a piece's edge matches its neighbour by chance). A file
+            // still carrying it is NOT placed: it is wrong in a way nothing
+            // downstream detects.
             let after = rewritten.as_deref().unwrap_or(&data);
             if let Some(p) = crate::task::placeholder_residue(after, &restore) {
                 residue.push((df.build_path.clone(), p));
@@ -287,9 +284,9 @@ fn scrub_placed_runpaths(prefix: &Path, files: &[DerivedFile]) {
     }
 }
 
-/// Outputs left unplaced because neither the restore nor the repair could
-/// reach their placeholder (`task::placeholder_residue`). `cli::run` fails
-/// the run with it; nothing is built again. Only the placement in this file
+/// Outputs left unplaced because the restore could not reach their
+/// placeholder (`task::placeholder_residue`). `cli::run` fails the run with
+/// it; nothing is built again. Only the placement in this file
 /// scans, so an output placed by the dynamic or outer-stage paths is not
 /// covered.
 #[derive(Debug)]
@@ -1058,85 +1055,6 @@ pub fn copy_derived_files(
     Ok(copied)
 }
 
-/// `data` with a placeholder's surviving hash swapped for the real one:
-/// pieces and escaped spellings in the plain bytes (`repair_residue`), then,
-/// if a compressed ELF section still carries it, that section inflated,
-/// swapped and compressed again (`repair_compressed`). None when nothing
-/// changed.
-fn repair(data: &[u8], restore: &[(String, String)]) -> Option<Vec<u8>> {
-    let plain = crate::task::repair_residue(data, restore);
-    let now = plain.as_deref().unwrap_or(data);
-    let carries = crate::task::compressed_sections(now).iter().any(|sec| {
-        sec.as_ref()
-            .is_none_or(|sec| crate::task::placeholder_residue(sec, restore).is_some())
-    });
-    if !carries {
-        return plain;
-    }
-    match repair_compressed(now, restore) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            eprintln!(
-                "nix-ninja: could not repair a placeholder inside a compressed section \
-                 ({e}); the file is refused"
-            );
-            plain
-        }
-    }
-}
-
-/// An ELF file's compressed sections repaired: `objcopy` (from `$OBJCOPY`,
-/// else the build's PATH, as nixpkgs' strip phase finds it) inflates them,
-/// the hash is swapped in the plain bytes, and `objcopy` compresses them
-/// again as zlib (ELFCOMPRESS_ZLIB, the only type the residue scan reads).
-/// The section bytes differ from what the compiler would have written, and
-/// the contents are the same; the file is only ever a placed copy.
-fn repair_compressed(data: &[u8], restore: &[(String, String)]) -> std::io::Result<Vec<u8>> {
-    let objcopy = std::env::var_os("OBJCOPY").unwrap_or_else(|| "objcopy".into());
-    let dir = std::env::temp_dir().join(format!(
-        "nix-ninja-repair-{}-{}",
-        std::process::id(),
-        REPAIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    // A fresh directory of this process's own: refused if the name exists,
-    // so nothing placed there in advance (a link) is written through.
-    std::fs::create_dir(&dir)?;
-    let run = |args: &[&std::ffi::OsStr]| -> std::io::Result<()> {
-        let out = std::process::Command::new(&objcopy).args(args).output()?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "objcopy {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            )))
-        }
-    };
-    let result = (|| {
-        let (a, b, c) = (dir.join("in"), dir.join("plain"), dir.join("out"));
-        std::fs::write(&a, data)?;
-        run(&[
-            "--decompress-debug-sections".as_ref(),
-            a.as_os_str(),
-            b.as_os_str(),
-        ])?;
-        let plain = std::fs::read(&b)?;
-        let swapped = crate::task::repair_residue(&plain, restore).unwrap_or(plain);
-        std::fs::write(&b, swapped)?;
-        run(&[
-            "--compress-debug-sections=zlib".as_ref(),
-            b.as_os_str(),
-            c.as_os_str(),
-        ])?;
-        std::fs::read(&c)
-    })();
-    let _ = std::fs::remove_dir_all(&dir);
-    result
-}
-
-static REPAIR_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// A hidden sibling of `dest` to write before renaming into place.
 ///
 /// UNIQUE PER PROCESS AND PER CALL. The first version used `with_extension`,
@@ -1501,39 +1419,5 @@ mod placed_mtime_tests {
         let f = std::fs::File::options().write(true).open(p).unwrap();
         f.set_times(std::fs::FileTimes::new().set_modified(t))
             .unwrap();
-    }
-}
-
-#[cfg(test)]
-mod repair_tests {
-    use super::repair;
-
-    /// THE SHAPE pkg-config 0.29.2 SHIPPED and the residue re-exec used to
-    /// rebuild a run for: the placeholder only inside a zlib-compressed debug
-    /// section. The repair inflates, swaps and recompresses it, and the
-    /// residue scan, which reads compressed sections inflated, then finds
-    /// nothing. The control is the residue before the repair.
-    #[test]
-    fn a_placeholder_inside_a_compressed_section_is_repaired_in_place() {
-        let obj = crate::tests::zlib_debug_placeholder::object();
-        let restore = vec![(
-            "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-pkg-config-0.29.2".to_string(),
-            "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-pkg-config-0.29.2".to_string(),
-        )];
-        assert!(
-            crate::task::placeholder_residue(&obj, &restore).is_some(),
-            "control: the fixture carries the placeholder"
-        );
-        let fixed = repair(&obj, &restore).expect("a repair");
-        assert_eq!(crate::task::placeholder_residue(&fixed, &restore), None);
-        assert!(
-            crate::task::compressed_sections(&fixed)
-                .iter()
-                .flatten()
-                .any(|s| s
-                    .windows(32)
-                    .any(|w| w == b"32a39vx421j6s4zh3nh85a5r1jlgagqg")),
-            "the real hash is inside the recompressed section"
-        );
     }
 }

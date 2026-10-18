@@ -1216,8 +1216,8 @@ impl Runner {
         self.empty_dirs.dedup();
         match recorded {
             Some(r) => {
-                crate::configure_state::answer_listings_from(r.files);
-                self.configure_dirs = Some(r.dirs);
+                self.configure_dirs = Some(r.dirs.clone());
+                crate::configure_state::answer_listings_from(r);
             }
             None => crate::configure_state::save(&self.config.build_dir, &plan.seen),
         }
@@ -3896,11 +3896,13 @@ fn named_dirs_to_create(
             let Some(dirs) = configure_dirs else {
                 return build_dir.join(n).is_dir();
             };
+            use crate::configure_state::{landing, walk_skips, Landing};
             let left_link = |r: &str| dirs.contains(r) && build_dir.join(r).is_symlink();
-            match crate::configure_state::landed_rel(build_dir, Path::new(n), left_link) {
-                Some(rel) if !rel.split('/').any(crate::configure_state::walk_skips) => {
+            match landing(build_dir, Path::new(n), |r| dirs.contains(r), left_link) {
+                Landing::Inside(rel) if !rel.split('/').any(walk_skips) => {
                     rel.is_empty() || dirs.contains(&rel)
                 }
+                Landing::Absent => false,
                 _ => build_dir.join(n).is_dir(),
             }
         })
@@ -4131,7 +4133,76 @@ mod plan_build_dir_walk_tests {
 
 #[cfg(test)]
 mod named_dirs_to_create_tests {
-    use super::{named_dirs_to_create, Scratch};
+    use super::{named_dirs_to_create, plan_build_dir_walk, Scratch};
+
+    /// EVERY -I SPELLING ANSWERS ON A LATER PASS AS ON THE FIRST. Pass 1
+    /// asks the disk as configure left it; a later pass asks the record,
+    /// after a hook made directories between phases. Spellings of up to four
+    /// components over plain dirs, `.`, `..`, a relative link, an absolute
+    /// link, a link out of the tree, a link to the tree's parent and a
+    /// dangling link.
+    #[test]
+    fn every_include_spelling_answers_as_pass_one() {
+        let d = std::env::temp_dir().join(format!("nn-landed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let bd = d.join("build");
+        for p in ["build/gen", "build/real/inner", "ext/gen", "ext/inner"] {
+            std::fs::create_dir_all(d.join(p)).unwrap();
+        }
+        std::fs::write(bd.join("build.ninja"), "").unwrap();
+        let ln = |t: &str, l: &str| std::os::unix::fs::symlink(t, bd.join(l)).unwrap();
+        ln("real", "alias");
+        ln(&bd.join("real").to_string_lossy(), "abslink");
+        ln("../ext", "out");
+        ln("..", "up");
+        ln("nothing", "dangling");
+        ln("real/inner", "deep");
+        let words = [
+            "gen", "real", "alias", "abslink", "out", "up", "dangling", "deep", "inner", "sub",
+            "new", "..", ".", "build", "ext",
+        ];
+        let mut spellings: Vec<String> = Vec::new();
+        let mut cur: Vec<Vec<&str>> = vec![vec![]];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for s in &cur {
+                for w in words {
+                    let mut t = s.clone();
+                    t.push(w);
+                    spellings.push(t.join("/"));
+                    next.push(t);
+                }
+            }
+            cur = next;
+        }
+        let cmd = |s: &str| format!("cc -I{s} -c a.c -o a.o");
+        let first: Vec<Vec<String>> = spellings
+            .iter()
+            .map(|s| named_dirs_to_create(&cmd(s), &bd, None))
+            .collect();
+        let record = plan_build_dir_walk(&bd, None, |_| false).unwrap().seen;
+        // Between phases: a hook makes directories configure never left.
+        for p in ["real/sub", "gen/new", "new", "real/inner/sub", "sub"] {
+            std::fs::create_dir_all(bd.join(p)).unwrap();
+        }
+        let mut wrong = Vec::new();
+        for (s, f) in spellings.iter().zip(&first) {
+            let later = named_dirs_to_create(&cmd(s), &bd, Some(&record.dirs));
+            if &later != f {
+                wrong.push(format!("-I{s}: pass 1 {f:?}, later {later:?}"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        eprintln!("{} of {} spellings differ", wrong.len(), spellings.len());
+        for w in wrong.iter().take(25) {
+            eprintln!("  {w}");
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} spellings answer differently",
+            wrong.len()
+        );
+    }
 
     /// glib's gio shape, with the source-tree directory POPULATED as the
     /// package's is. Both spellings must be carried, and the emptiness of
@@ -7197,344 +7268,6 @@ fn store_hash(path: &str) -> Option<&[u8]> {
         .map(|(h, _)| h.as_bytes())
 }
 
-/// Swaps every occurrence of a placeholder's HASH that survives, whole or
-/// in pieces, for the real path's hash, character for character at the same
-/// offsets within the hash. `rewrite_bytes` swaps whole paths only, and a
-/// placeholder also lands split (a compiler's immediate stores: llvm-config
-/// carried `hjbdq8s5j5dkn2a110sy8` then `10sy8zlhfcs4lxsx`) or with escapes
-/// around it (a troff man page spells the dashes `\-`). The hash is the
-/// only part that differs between placeholder and real path.
-///
-/// A RUN IS SWAPPED ONLY WITH THE REST OF ITS OCCURRENCE. Runs are found by
-/// `RESIDUE_WINDOW` windows, and a piece shorter than that is invisible: gcc
-/// `-mgeneral-regs-only` stores `/nix/store/hjbdq8s5...-pkg` as 8-byte
-/// immediates, so the hash lands as pieces of 5, 8, 8, 8 and 3 characters.
-/// Swapping the three long ones left `hjbdq` and `xsx` behind, no window
-/// matched any more, and the file was placed naming a path that does not
-/// exist. The runs of one occurrence (increasing hash offsets, each within
-/// `NEAR` bytes of the last) must cover the whole hash; a gap is looked for
-/// nearby, a head piece after the `/` that ends the store dir and a tail
-/// piece before the `-` (or troff's `\`) after the hash.
-///
-/// WHEN WHICH BYTE IS WHICH IS NOT KNOWN, NOTHING IS SWAPPED. A short
-/// piece's bytes are the same as any other string's that shares a character
-/// with the hash (`/store/h` begins every store path whose hash starts
-/// `h`), and constants laid side by side let a piece's edge match its
-/// neighbour by chance. So a piece must join the chain of stores the runs
-/// belong to and must not run on into a whole hash (another path spelled
-/// out); every piece nearby must be one some occurrence takes, and none may
-/// be taken by two; one store holds the hash's start (none when a run
-/// does); no byte may be read two ways (as a hash character and as the
-/// placeholder's own store dir or name text, or as two hash characters);
-/// and a run followed straight on by one that does not continue it is
-/// refused with it. An occurrence not accounted for is left alone, so the
-/// residue scan still finds its runs and placement refuses the file. A pair
-/// whose hashes differ in length is skipped.
-/// DEFER(a placement refused with residue on stores emitted in descending
-/// order, or on two copies of one placeholder stored back to back): runs
-/// are grouped in file order with rising hash offsets, so a string stored
-/// last-store-first is refused, never repaired, and so is a pair of copies
-/// whose stores meet, since a piece between them is not known to be
-/// either's.
-pub fn repair_residue(data: &[u8], restore: &[(String, String)]) -> Option<Vec<u8>> {
-    const NEAR: usize = 64;
-    /// (file offset, hash offset, length).
-    type Piece = (usize, usize, usize);
-    let mut out = data.to_vec();
-    let mut changed = false;
-    for (placeholder, real) in restore {
-        let (Some(hp), Some(hr)) = (store_hash(placeholder), store_hash(real)) else {
-            continue;
-        };
-        if hp.len() != hr.len() || hp.len() < RESIDUE_WINDOW {
-            continue;
-        }
-        let mut at: rustc_hash::FxHashMap<&[u8], usize> = Default::default();
-        for k in 0..=hp.len() - RESIDUE_WINDOW {
-            at.entry(&hp[k..k + RESIDUE_WINDOW]).or_insert(k);
-        }
-        // (file offset, hash offset, length) of every run, in file order.
-        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
-        let mut i = 0;
-        while i + RESIDUE_WINDOW <= data.len() {
-            let Some(&k) = at.get(&data[i..i + RESIDUE_WINDOW]) else {
-                i += 1;
-                continue;
-            };
-            let mut j = 0;
-            while k + j < hp.len() && i + j < data.len() && data[i + j] == hp[k + j] {
-                j += 1;
-            }
-            runs.push((i, k, j));
-            i += j;
-        }
-        // A RUN THAT RAN ON INTO THE NEXT CONSTANT: constants laid side by
-        // side, a run reaching the end of one goes on matching while the next
-        // one's first byte equals the next hash character, and the run
-        // straight after it then starts at a hash offset that does not follow
-        // on. Which byte is which is not known; both are left to be refused.
-        let ran_on: rustc_hash::FxHashSet<usize> = runs
-            .windows(2)
-            .filter(|w| w[1].0 == w[0].0 + w[0].2 && w[1].1 != w[0].1 + w[0].2)
-            .flat_map(|w| [w[0].0, w[1].0])
-            .collect();
-        // A run joins the occurrence before it when it continues the hash
-        // (a later hash offset, within NEAR bytes) and that occurrence does
-        // not already reach the hash's end: a whole copy followed by a split
-        // one is two occurrences, each accounted for on its own.
-        let mut occurrences: Vec<Vec<(usize, usize, usize)>> = Vec::new();
-        for r in runs {
-            match occurrences.last_mut() {
-                Some(o)
-                    if o.last()
-                        .is_some_and(|l| r.1 > l.1 && r.0 <= l.0 + l.2 + NEAR)
-                        && o.iter().map(|x| x.1 + x.2).max() < Some(hp.len()) =>
-                {
-                    o.push(r)
-                }
-                _ => occurrences.push(vec![r]),
-            }
-        }
-        // Each occurrence searches for its head and tail only between its
-        // neighbours, nearest first, so a piece is never taken from another
-        // copy of the hash.
-        let bounds: Vec<(usize, usize)> = (0..occurrences.len())
-            .map(|n| {
-                let lo = n.checked_sub(1).map_or(0, |m| {
-                    occurrences[m].iter().map(|r| r.0 + r.2).max().unwrap_or(0)
-                });
-                let hi = occurrences.get(n + 1).map_or(data.len(), |o| o[0].0);
-                (lo, hi)
-            })
-            .collect();
-        // WHAT SURROUNDS THE HASH IN THE PLACEHOLDER: the store dir before
-        // it and `-name` after it. A store holding a short piece of the hash
-        // holds that context too (a store is RESIDUE_WINDOW bytes wide), so a
-        // piece is taken only where the context stands beside it. Every such
-        // piece around an occurrence is swapped, not only one that fills a
-        // gap: an overlapping store runs after the stores it overlaps.
-        let hstart = placeholder.rfind('/').map_or(0, |i| i + 1);
-        let before = &placeholder.as_bytes()[..hstart];
-        let after = &placeholder.as_bytes()[(hstart + hp.len()).min(placeholder.len())..];
-        let head_at = |p: usize, m: usize| {
-            let c = (RESIDUE_WINDOW - m).min(before.len());
-            p >= c
-                && data[p - c..p] == before[before.len() - c..]
-                && data[p..].starts_with(&hp[..m])
-        };
-        let tail_at = |p: usize, k: usize| {
-            let f = hp.len() - k;
-            let c = (RESIDUE_WINDOW - f).min(after.len());
-            data[p..].starts_with(&hp[k..]) && data[p + f..].starts_with(&after[..c])
-        };
-        // A STORE IS A FEW BYTES WITH OPCODES BESIDE THEM, so a piece that
-        // runs on into a whole hash of nix base32 characters is another store
-        // path spelled out whose hash begins or ends like this one, unless
-        // what it runs on into is the occurrence's own (constants laid side
-        // by side: the one before a tail constant is the hash itself).
-        let b32 = |b: &u8| b.is_ascii_digit() || (b.is_ascii_lowercase() && !b"eotu".contains(b));
-        // The placeholder's own text away from the hash (the store dir, the
-        // name), window by window: bytes that read as one of these are the
-        // store dir or the name, whatever a piece beside them claims.
-        let ph = placeholder.as_bytes();
-        let text: rustc_hash::FxHashSet<&[u8]> = (0..ph.len().saturating_sub(RESIDUE_WINDOW - 1))
-            .filter(|&s| s + RESIDUE_WINDOW <= hstart || s >= hstart + hp.len())
-            .map(|s| &ph[s..s + RESIDUE_WINDOW])
-            .collect();
-        let foreign = |r: std::ops::Range<usize>, own: &[Piece]| {
-            data.get(r.clone()).is_some_and(|w| w.iter().all(b32))
-                && !own.iter().any(|q| q.0 < r.end && r.start < q.0 + q.2)
-        };
-        // Every occurrence's verdict and pieces first: a piece two of them
-        // take is not known to be either's, and both are left to be refused.
-        let mut plans: Vec<(bool, Vec<Piece>, Vec<usize>)> = Vec::new();
-        for (o, (lo, hi)) in occurrences.into_iter().zip(bounds) {
-            // Every piece to swap, as (file offset, hash offset, length).
-            let mut pieces = o.clone();
-            let (first, last) = (o[0], o[o.len() - 1]);
-            let mut whole = true;
-            let end = o.iter().map(|r| r.1 + r.2).max().unwrap_or(0);
-            // HEAD AND TAIL PIECES AROUND THE OCCURRENCE, between its
-            // neighbours: a store overlapping the hash can be emitted after
-            // the runs it overlaps (and runs last), so neither side of the
-            // runs is the only place to look. Each is the longest at its
-            // place; the hash offsets the runs leave uncovered must be among
-            // them.
-            let short = 1..RESIDUE_WINDOW.min(hp.len());
-            let from = last.0 + last.2;
-            // (start, end) of each store holding a piece, with the piece.
-            let mut found: Vec<(usize, usize, Piece)> = Vec::new();
-            // Wider than one store's reach on purpose: a piece of this
-            // occurrence emitted several stores off, unjoined, refuses it.
-            let span =
-                lo.max(first.0.saturating_sub(4 * NEAR))..(from + 4 * NEAR).min(hi).min(data.len());
-            let mut context: Vec<(usize, usize)> = span
-                .clone()
-                .filter(|&p| {
-                    data.get(p..p + RESIDUE_WINDOW)
-                        .is_some_and(|w| text.contains(w))
-                })
-                .map(|p| (p, p + RESIDUE_WINDOW))
-                .collect();
-            for p in span {
-                if let Some(m) = short.clone().rev().find(|&m| head_at(p, m)) {
-                    if !foreign(p + m..p + hp.len(), &o) {
-                        let c = (RESIDUE_WINDOW - m).min(before.len());
-                        found.push((p - c, p + m, (p, 0, m)));
-                    }
-                }
-                if let Some(f) = short.clone().rev().find(|&f| tail_at(p, hp.len() - f)) {
-                    let k = hp.len() - f;
-                    if !(p >= k && foreign(p - k..p, &o)) {
-                        let c = (RESIDUE_WINDOW - f).min(after.len());
-                        found.push((p, p + f + c, (p, hp.len() - f, f)));
-                    }
-                }
-            }
-            // THE OCCURRENCE'S OWN STORES: a piece counts only where it joins
-            // the chain the runs belong to, within the widest gap the runs
-            // leave between them (at least a window) of a store already in
-            // it. A piece of some other string further off is not one of
-            // them, whatever its bytes.
-            let gap = o
-                .windows(2)
-                .map(|w| w[1].0 - (w[0].0 + w[0].2))
-                .max()
-                .unwrap_or(0)
-                .max(RESIDUE_WINDOW);
-            let mut chain: Vec<(usize, usize)> = o.iter().map(|r| (r.0, r.0 + r.2)).collect();
-            let (mut head, mut tail) = (0, hp.len());
-            loop {
-                let n = found.len();
-                found.retain(|&(a, b, piece)| {
-                    let joins = chain.iter().any(|&(x, y)| a <= y + gap && x <= b + gap);
-                    if joins {
-                        chain.push((a, b));
-                        pieces.push(piece);
-                        context.push((a, piece.0));
-                        context.push((piece.0 + piece.2, b));
-                        match piece {
-                            (_, 0, m) => head = head.max(m),
-                            (_, k, _) => tail = tail.min(k),
-                        }
-                    }
-                    !joins
-                });
-                if found.len() == n {
-                    break;
-                }
-            }
-            if head < first.1 || (end < hp.len() && tail > end) {
-                whole = false;
-            }
-            let unjoined: Vec<usize> = found.iter().map(|q| q.2 .0).collect();
-            // An inner piece must occur ONCE between its runs: a short one
-            // can also match an opcode byte, and swapping that rewrites code.
-            let mut inner: Vec<Piece> = Vec::new();
-            let mut reached = 0;
-            for w in o.windows(2) {
-                let (a, b) = (w[0], w[1]);
-                reached = reached.max(a.1 + a.2);
-                if reached < b.1 {
-                    let gap = &hp[reached..b.1];
-                    let between = data.get(a.0 + a.2..b.0).unwrap_or_default();
-                    let at: Vec<usize> = between
-                        .windows(gap.len())
-                        .enumerate()
-                        .filter(|(_, w)| *w == gap)
-                        .map(|(p, _)| p)
-                        .collect();
-                    match at[..] {
-                        [p] => {
-                            inner.push((a.0 + a.2 + p, reached, gap.len()));
-                            pieces.push((a.0 + a.2 + p, reached, gap.len()));
-                        }
-                        _ => whole = false,
-                    }
-                }
-            }
-            // EACH SHORT STORE MUST BE THE ONE ITS HASH CHARACTERS NEED. Its
-            // bytes are a store of any path whose hash starts (or ends) as
-            // this one does with the same name after (`/store/h`, `x-pkg-de`
-            // of a `-dev` sibling), so one is taken only where no run holds
-            // what it holds and no other short store holds it too.
-            let mut by_runs = vec![false; hp.len()];
-            for &(_, k, n) in o
-                .iter()
-                .chain(&pieces[o.len()..])
-                .filter(|q| q.2 >= RESIDUE_WINDOW || inner.contains(q))
-            {
-                by_runs[k..k + n].fill(true);
-            }
-            let shorts: Vec<Piece> = pieces[o.len()..]
-                .iter()
-                .filter(|q| q.2 < RESIDUE_WINDOW && !inner.contains(q))
-                .filter(|q| !o.iter().any(|r| r.0 <= q.0 && q.0 + q.2 <= r.0 + r.2))
-                .copied()
-                .collect();
-            let stores: Vec<Piece> = shorts
-                .iter()
-                .filter(|q| {
-                    !shorts
-                        .iter()
-                        .any(|w| w != *q && w.0 <= q.0 && q.0 + q.2 <= w.0 + w.2)
-                })
-                .copied()
-                .collect();
-            let mut held = vec![0usize; hp.len()];
-            for &(_, k, n) in &stores {
-                if by_runs[k..k + n].iter().all(|&b| b) {
-                    whole = false;
-                }
-                held[k..k + n].iter_mut().for_each(|h| *h += 1);
-            }
-            if (0..hp.len()).any(|k| !by_runs[k] && held[k] > 1) {
-                whole = false;
-            }
-            // EVERY BYTE READ ONE WAY: a byte one piece takes for the store dir
-            // or the name and another for a hash character, or two take for
-            // different hash characters, is not known to be either.
-            let mut read: rustc_hash::FxHashMap<usize, Option<usize>> = Default::default();
-            let claims = pieces
-                .iter()
-                .flat_map(|&(f, k, n)| (0..n).map(move |t| (f + t, Some(k + t))))
-                .chain(context.iter().flat_map(|&(a, b)| (a..b).map(|f| (f, None))));
-            for (f, as_read) in claims {
-                if *read.entry(f).or_insert(as_read) != as_read {
-                    whole = false;
-                }
-            }
-            if o.iter().any(|r| ran_on.contains(&r.0)) {
-                whole = false;
-            }
-            plans.push((whole, pieces, unjoined));
-        }
-        let mut takers: rustc_hash::FxHashMap<usize, usize> = Default::default();
-        for (_, pieces, _) in &plans {
-            let mine: rustc_hash::FxHashSet<usize> = pieces.iter().map(|q| q.0).collect();
-            for f in mine {
-                *takers.entry(f).or_default() += 1;
-            }
-        }
-        // A PIECE NEARBY THAT JOINS NO OCCURRENCE is not known to be another
-        // string's: one of an occurrence's own stores emitted further off
-        // would run without its swap.
-        for (whole, pieces, unjoined) in plans {
-            if !whole
-                || pieces.iter().any(|q| takers[&q.0] > 1)
-                || unjoined.iter().any(|f| !takers.contains_key(f))
-            {
-                continue;
-            }
-            for (f, k, n) in pieces {
-                out[f..f + n].copy_from_slice(&hr[k..k + n]);
-            }
-            changed = true;
-        }
-    }
-    changed.then_some(out)
-}
-
 /// The reverse map: placeholder -> real.
 pub fn outer_restore_map() -> Vec<(String, String)> {
     outer_rewrite_map()
@@ -7572,8 +7305,7 @@ const RESIDUE_WINDOW: usize = 8;
 /// config-0.29.2/lib` this way, 2026-10-09: raw scan zero, one `objcopy
 /// --decompress-debug-sections` and the placeholder stood out). Scan those
 /// sections INFLATED. Read-only: the scan answers "is a placeholder in
-/// here"; placement repairs what it finds (`repair_residue`, and for a
-/// compressed section `local::repair_compressed`).
+/// here"; placement refuses a file it finds one in.
 pub fn placeholder_residue(data: &[u8], restore: &[(String, String)]) -> Option<String> {
     if let Some(p) = placeholder_residue_plain(data, restore) {
         return Some(p);
@@ -7668,615 +7400,7 @@ pub(crate) fn compressed_sections(data: &[u8]) -> Vec<Option<Vec<u8>>> {
 
 #[cfg(test)]
 mod placeholder_residue_tests {
-    use super::{placeholder_residue, placeholder_residue_plain, repair_residue, rewrite_bytes};
-
-    const XDP_PH: &str = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-xdg-desktop-portal-1.22.1";
-    const XDP_REAL: &str = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-xdg-desktop-portal-1.22.1";
-
-    /// A pair whose name is `name`: what follows the hash in the file.
-    fn named(name: &str) -> Vec<(String, String)> {
-        vec![(
-            format!("/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-{name}"),
-            format!("/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-{name}"),
-        )]
-    }
-
-    /// THE SHAPES THE RE-EXEC USED TO REBUILD A RUN FOR, now repaired in
-    /// place: a man page that spells the path with troff escapes (no whole
-    /// path for `rewrite_bytes` to swap) and an immediate-store split
-    /// (llvm-config's two overlapping pieces). After the repair no residue
-    /// window remains and every hash character is the real one; bytes
-    /// around the pieces are untouched.
-    #[test]
-    fn split_and_escaped_placeholders_are_repaired_in_place() {
-        let restore = vec![(XDP_PH.to_string(), XDP_REAL.to_string())];
-        let man = b".B \\/nix\\/store\\/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx\\-xdg\\-desktop\\-portal\\-1.22.1/share".to_vec();
-        assert_eq!(
-            rewrite_bytes(&man, &restore),
-            None,
-            "control: no whole path to swap"
-        );
-        assert!(
-            placeholder_residue(&man, &restore).is_some(),
-            "control: residue"
-        );
-        let fixed = repair_residue(&man, &restore).unwrap();
-        assert_eq!(placeholder_residue(&fixed, &restore), None);
-        assert_eq!(
-            String::from_utf8(fixed).unwrap(),
-            String::from_utf8(man).unwrap().replace(
-                "hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx",
-                "32a39vx421j6s4zh3nh85a5r1jlgagqg"
-            )
-        );
-        let mut split = b"\x48\xb8hjbdq8s5j5dkn2a110sy8\xc7\x40\x0110sy8zlhfcs4lxsx\x00".to_vec();
-        let before = split.clone();
-        assert!(
-            placeholder_residue(&split, &restore).is_some(),
-            "control: residue"
-        );
-        split = repair_residue(&split, &restore).unwrap();
-        assert_eq!(placeholder_residue(&split, &restore), None);
-        assert_eq!(
-            &split[..2],
-            &before[..2],
-            "bytes before a piece are untouched"
-        );
-        let real = b"32a39vx421j6s4zh3nh85a5r1jlgagqg";
-        assert_eq!(&split[2..23], &real[..21]);
-        assert_eq!(
-            &split[23..26],
-            &before[23..26],
-            "opcode bytes between pieces stay"
-        );
-        assert_eq!(&split[26..42], &real[16..]);
-    }
-
-    /// A HASH IN PIECES SHORTER THAN THE WINDOW IS REPAIRED WHOLE OR NOT AT
-    /// ALL. gcc `-mgeneral-regs-only` stores `/nix/store/<hash>-pkg` as
-    /// 8-byte immediates (pieces of 5, 8, 8, 8 and 3 hash characters) and
-    /// SSE as 16-byte constants (5, 16, 11); the short head and tail pieces
-    /// match no window. Each shape comes out naming the real hash in every
-    /// position with the bytes between pieces untouched. With the head piece
-    /// damaged the occurrence cannot be accounted for: nothing is swapped and
-    /// the residue scan still refuses the file, where swapping the long
-    /// pieces alone would leave no window to find and a wrong path placed.
-    #[test]
-    fn a_hash_in_short_pieces_is_repaired_whole_or_not_at_all() {
-        let restore = named("pkg-1.0");
-        let want = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-pkg-";
-        let (op, gap) = (b"\x48\xb8".as_slice(), b"\x48\x89\x47\x08".as_slice());
-        let stores = |pieces: &[&str]| -> Vec<u8> {
-            pieces
-                .iter()
-                .flat_map(|p| [op, p.as_bytes(), gap].concat())
-                .collect()
-        };
-        let text = |bytes: &[u8], width: usize| -> String {
-            bytes
-                .chunks(op.len() + width + gap.len())
-                .map(|c| {
-                    assert_eq!(&c[..op.len()], op, "opcode bytes stay");
-                    assert_eq!(&c[op.len() + width..], gap, "bytes between pieces stay");
-                    String::from_utf8(c[op.len()..op.len() + width].to_vec()).unwrap()
-                })
-                .collect()
-        };
-        for (width, pieces) in [
-            (
-                8,
-                vec![
-                    "/nix/sto", "re/hjbdq", "8s5j5dkn", "2a110sy8", "zlhfcs4l", "xsx-pkg-",
-                ],
-            ),
-            (
-                16,
-                vec!["/nix/store/hjbdq", "8s5j5dkn2a110sy8", "zlhfcs4lxsx-pkg-"],
-            ),
-        ] {
-            let obj = stores(&pieces);
-            assert!(
-                placeholder_residue(&obj, &restore).is_some(),
-                "control: residue"
-            );
-            let fixed = repair_residue(&obj, &restore).expect("a repair");
-            assert_eq!(placeholder_residue(&fixed, &restore), None);
-            assert_eq!(text(&fixed, width), want, "{width}-byte pieces");
-        }
-        let damaged = stores(&[
-            "/nix/sto", "re/hjbXq", "8s5j5dkn", "2a110sy8", "zlhfcs4l", "xsx-pkg-",
-        ]);
-        assert_eq!(repair_residue(&damaged, &restore), None, "nothing swapped");
-        assert!(
-            placeholder_residue(&damaged, &restore).is_some(),
-            "and the file is still refused"
-        );
-        // A piece inside the hash stored as two 4-byte halves: no window
-        // and no contiguous gap, so the same.
-        let halves = stores(&[
-            "/nix/sto", "re/hjbdq", "8s5j5dkn", "2a11", "0sy8", "zlhfcs4l", "xsx-pkg-",
-        ]);
-        assert_eq!(repair_residue(&halves, &restore), None, "nothing swapped");
-        assert!(placeholder_residue(&halves, &restore).is_some());
-    }
-
-    /// WHAT THE STORES WRITE, not what the bytes hold: an object built from
-    /// 8-byte immediate stores of `path` at `offsets` (each `movabs` plus a
-    /// store), and the path those stores leave in memory when run in order.
-    fn immediate_stores(path: &str, offsets: &[usize]) -> Vec<u8> {
-        offsets
-            .iter()
-            .flat_map(|&o| {
-                [
-                    b"\x48\xb8".as_slice(),
-                    &path.as_bytes()[o..o + 8],
-                    b"\x48\x89\x47".as_slice(),
-                    &[o as u8],
-                ]
-                .concat()
-            })
-            .collect()
-    }
-    fn run_stores(obj: &[u8], len: usize) -> String {
-        let mut mem = vec![b'?'; len];
-        for c in obj.chunks(14) {
-            let o = c[13] as usize;
-            mem[o..o + 8].copy_from_slice(&c[2..10]);
-        }
-        String::from_utf8(mem).unwrap()
-    }
-
-    /// A TAIL STORED OVERLAPPING THE STORE BEFORE IT, as gcc and clang emit
-    /// for a length that is not a multiple of 8 (45 bytes: stores at 32 and
-    /// 37), and a WHOLE COPY BESIDE A SPLIT ONE within 64 bytes. Both used to
-    /// come out naming a path that is neither placeholder nor real, with no
-    /// residue left to refuse.
-    #[test]
-    fn overlapping_and_neighbouring_occurrences_come_out_real() {
-        let restore = named("x");
-        let ph = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-x";
-        let real = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-x";
-        let obj = immediate_stores(ph, &[0, 8, 16, 24, 32, 37]);
-        assert_eq!(
-            run_stores(&obj, 45),
-            ph,
-            "control: the fixture stores the placeholder"
-        );
-        let fixed = repair_residue(&obj, &restore).expect("a repair");
-        assert_eq!(placeholder_residue(&fixed, &restore), None);
-        assert_eq!(run_stores(&fixed, 45), real, "overlapping tail");
-
-        let mut both = ph.as_bytes().to_vec();
-        let split = immediate_stores(ph, &[0, 8, 16, 24, 32, 37]);
-        both.extend_from_slice(&split);
-        let fixed = repair_residue(&both, &restore).expect("a repair");
-        assert_eq!(&fixed[..45], real.as_bytes(), "the whole copy");
-        assert_eq!(
-            run_stores(&fixed[45..], 45),
-            real,
-            "and the split one beside it"
-        );
-
-        // The split copy's own head damaged: its head is not borrowed from
-        // the whole copy before it, so its runs stay for the scan to refuse.
-        let damaged = "/nix/store/hjbXq8s5j5dkn2a110sy8zlhfcs4lxsx-x";
-        let mut both = ph.as_bytes().to_vec();
-        both.extend_from_slice(&immediate_stores(damaged, &[0, 8, 16, 24, 32, 37]));
-        let fixed = repair_residue(&both, &restore).expect("the whole copy is repaired");
-        assert_eq!(&fixed[..45], real.as_bytes());
-        assert!(
-            placeholder_residue(&fixed[45..], &restore).is_some(),
-            "the damaged copy is left to be refused"
-        );
-    }
-
-    /// SHORT STORES WHOSE CHARACTERS A RUN ALREADY HOLDS ARE NOT GUESSED. A
-    /// 48-byte path stored at 0, 8, 16, 24, 32, 35, 37 and 40: the runs
-    /// (hash offsets 5, 13, 21 and 24) reach the end, and the stores at 37
-    /// and 40 carry 6 and 3 placeholder characters with the name after them,
-    /// byte for byte what a `-dev` sibling's store whose hash ends the same
-    /// way leaves. Left unswapped they run after the runs and name a mixed
-    /// path; swapped, a sibling's would be rewritten. Refused.
-    #[test]
-    fn short_stores_a_run_already_covers_are_refused() {
-        let restore = named("abcd");
-        let ph = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-abcd";
-        let real = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-abcd";
-        let obj = immediate_stores(ph, &[0, 8, 16, 24, 32, 35, 37, 40]);
-        assert_eq!(
-            run_stores(&obj, 48),
-            ph,
-            "control: the fixture stores the placeholder"
-        );
-        let fixed = repair_residue(&obj, &restore).unwrap_or_else(|| obj.clone());
-        assert!(placeholder_residue(&fixed, &restore).is_some(), "refused");
-        // Without the overlapping stores the same path is repaired.
-        let obj = immediate_stores(ph, &[0, 8, 16, 24, 32, 40]);
-        let fixed = repair_residue(&obj, &restore).expect("a repair");
-        assert_eq!(run_stores(&fixed, 48), real);
-        // A SECOND store holding the hash's start, emitted after the runs
-        // (5..13, `store/hj`): byte for byte the store every other path
-        // whose hash starts `hj` can leave, so it is refused, not guessed.
-        let obj = immediate_stores(ph, &[0, 8, 16, 24, 32, 40, 5]);
-        assert_eq!(run_stores(&obj, 48), ph, "control");
-        let fixed = repair_residue(&obj, &restore).unwrap_or_else(|| obj.clone());
-        assert!(
-            placeholder_residue(&fixed, &restore).is_some(),
-            "late head store refused"
-        );
-        // A tail store emitted FIRST, beside the head store: 45 bytes stored
-        // at 8, 37, 16, 24 and 32 (the first 8 bytes stored elsewhere).
-        let restore = named("x");
-        let ph = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-x";
-        let real = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-x";
-        let obj = immediate_stores(ph, &[0, 8, 37, 16, 24, 32]);
-        assert_eq!(run_stores(&obj, 45), ph, "control");
-        let fixed = repair_residue(&obj, &restore).expect("a repair");
-        assert_eq!(run_stores(&fixed, 45), real, "early tail store");
-        // Further off, with a store holding no piece of the hash between it
-        // and the rest (37, then 0 to 32), it is not known to be one of
-        // them: refused, not guessed.
-        let obj = immediate_stores(ph, &[37, 0, 8, 16, 24, 32]);
-        assert_eq!(run_stores(&obj, 45), ph, "control");
-        let fixed = repair_residue(&obj, &restore).unwrap_or_else(|| obj.clone());
-        assert!(placeholder_residue(&fixed, &restore).is_some(), "refused");
-    }
-
-    /// ANOTHER STORE PATH BESIDE AN OCCURRENCE IS NOT A PIECE OF IT, though
-    /// its hash starts (or ends) with the placeholder's first (or last)
-    /// character and the store dir (or the name) stands beside it. A man
-    /// page naming `bash` on the next line had its hash's first character
-    /// swapped, naming a path that does not exist, and placement took it.
-    #[test]
-    fn a_neighbouring_store_path_is_left_as_it_is() {
-        let restore = named("pkg");
-        let real = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg";
-        let bash = "/nix/store/h0a1b2c3d4f5g6h7i8j9k0l1m2n3p4q5\\-bash/bin/sh";
-        let man = format!(".B /nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx\\-pkg/bin/x\n{bash}\n");
-        let fixed = repair_residue(man.as_bytes(), &restore).expect("a repair");
-        let fixed = String::from_utf8(fixed).unwrap();
-        assert!(fixed.contains(&format!("{real}\\-pkg")), "{fixed}");
-        assert!(fixed.contains(bash), "the neighbour is untouched: {fixed}");
-        // A split occurrence with a whole path spelled right after it.
-        let ph = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-pkg";
-        let mut obj = immediate_stores(ph, &[0, 8, 16, 24, 32, 39]);
-        obj.extend_from_slice(b"/nix/store/h0a1b2c3d4f5g6h7i8j9k0l1m2n3p4q5-bash");
-        let fixed = repair_residue(&obj, &restore).expect("a repair");
-        assert_eq!(run_stores(&fixed[..6 * 14], 47), format!("{real}-pkg"));
-        assert!(
-            fixed.ends_with(b"/nix/store/h0a1b2c3d4f5g6h7i8j9k0l1m2n3p4q5-bash"),
-            "the spelled path is untouched"
-        );
-        // Another string's store holding `/store/h`, beside the stores or
-        // further off: its bytes are a head store's, so the occurrence is
-        // refused and the other store untouched, whichever side it is on.
-        for gap in [0, 20] {
-            let other = immediate_stores("/nix/store/h0a1b2c3", &[4]);
-            let mut obj = immediate_stores(ph, &[0, 8, 16, 24, 32, 39]);
-            obj.extend_from_slice(&vec![0x90; gap]);
-            obj.extend_from_slice(&other);
-            let fixed = repair_residue(&obj, &restore).unwrap_or_else(|| obj.clone());
-            assert!(placeholder_residue(&fixed, &restore).is_some(), "refused");
-            assert!(fixed.ends_with(&other), "the other store is untouched");
-            let mut obj = other.clone();
-            obj.extend_from_slice(&vec![0x90; gap]);
-            obj.extend_from_slice(&immediate_stores(ph, &[16, 24, 32, 39, 0, 8]));
-            let fixed = repair_residue(&obj, &restore).unwrap_or_else(|| obj.clone());
-            assert!(fixed.starts_with(&other), "the other store is untouched");
-        }
-    }
-
-    /// A SIBLING OUTPUT WHOSE HASH ENDS AS THE PLACEHOLDER'S DOES: `-pkg-dev`
-    /// beside `-pkg`, its last hash character `x` and the name after it
-    /// matching the placeholder's tail. Beside a whole copy and beside a
-    /// split one, it is left as it is.
-    #[test]
-    fn a_sibling_output_ending_like_the_hash_is_left_as_it_is() {
-        let restore = named("pkg");
-        let real = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-pkg";
-        let dev = "/nix/store/a0a1b2c3d4f5g6h7i8j9k0l1m2n3p4qx-pkg-dev/lib";
-        let text = format!("{}:{dev}", restore[0].0);
-        let fixed = String::from_utf8(repair_residue(text.as_bytes(), &restore).unwrap()).unwrap();
-        assert_eq!(fixed, format!("{real}:{dev}"));
-        let mut obj = immediate_stores(&restore[0].0, &[0, 8, 16, 24, 32, 39]);
-        obj.extend_from_slice(dev.as_bytes());
-        let fixed = repair_residue(&obj, &restore).expect("a repair");
-        assert_eq!(run_stores(&fixed[..6 * 14], 47), real);
-        assert!(fixed.ends_with(dev.as_bytes()), "the sibling is untouched");
-    }
-
-    /// ONE OCCURRENCE'S PIECE DOES NOT ACCOUNT FOR ANOTHER'S. Two copies
-    /// stored one after the other, the second's own tail store far off:
-    /// the first copy's tail store sits beside the second's head store, and
-    /// taking it for the second's left the second naming a mixed path with
-    /// no residue to refuse. With a store holding no piece of the hash
-    /// between, it is too far to be taken at all; with the second's own
-    /// tail store out of reach (300 bytes off), the piece both take is
-    /// what refuses it.
-    #[test]
-    fn a_piece_is_not_borrowed_from_a_neighbouring_occurrence() {
-        let restore = named("x");
-        let ph = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-x";
-        for second in [
-            &[8, 16, 24, 32][..],
-            &[0, 8, 16, 24, 32],
-            &[16, 24, 32, 8, 0],
-        ] {
-            for far in [84, 300] {
-                let mut obj = immediate_stores(ph, &[0, 8, 16, 24, 32, 37]);
-                obj.extend_from_slice(&immediate_stores(ph, second));
-                obj.extend_from_slice(&vec![0x90; far]);
-                obj.extend_from_slice(&immediate_stores(ph, &[37]));
-                let fixed = repair_residue(&obj, &restore).unwrap_or_else(|| obj.clone());
-                assert!(
-                    placeholder_residue(&fixed, &restore).is_some(),
-                    "the second copy is refused ({second:?}, {far} bytes)"
-                );
-            }
-        }
-    }
-
-    /// GCC'S OWN PATTERN, EVERY ALIGNMENT: a string copied by 8-byte stores
-    /// at 0, 8, 16, ... and one overlapping store ending at its end, in that
-    /// order and reversed, with 0 to 23 bytes before the store path and names
-    /// of 1 to 30 characters. Every case either comes out naming the real
-    /// path or is left with residue for placement to refuse; none comes out
-    /// naming a path that is neither. The two shapes the review of c17626b
-    /// found (a 50-byte string stored at 40 and 42; a 49-byte one at 40 and
-    /// 41) are inside this sweep.
-    #[test]
-    fn gccs_store_pattern_is_repaired_or_refused_never_wrong() {
-        let (mut repaired, mut repaired_reversed) = (0, 0);
-        for pre in 0..24usize {
-            for nlen in 1..31usize {
-                let name: String = "abcdefghijklmnopqrstuvwxyz0123"
-                    .chars()
-                    .take(nlen)
-                    .collect();
-                let restore = named(&name);
-                let prefix = &"ABCDEFGHIJKLMNOPQRSTUVW"[..pre];
-                let ph = format!("{prefix}{}", restore[0].0);
-                let real = format!("{prefix}{}", restore[0].1);
-                let len = ph.len();
-                let mut offs: Vec<usize> = (0..len / 8).map(|i| i * 8).collect();
-                if len % 8 != 0 {
-                    offs.push(len - 8);
-                }
-                for rev in [false, true] {
-                    let mut o = offs.clone();
-                    if rev {
-                        o.reverse();
-                    }
-                    let obj = immediate_stores(&ph, &o);
-                    assert_eq!(run_stores(&obj, len), ph);
-                    let fixed = repair_residue(&obj, &restore).unwrap_or_else(|| obj.clone());
-                    let ran = run_stores(&fixed, len);
-                    if placeholder_residue(&fixed, &restore).is_none() {
-                        assert_eq!(ran, real, "pre {pre} name {nlen} reversed {rev}");
-                        repaired += 1;
-                        if rev {
-                            repaired_reversed += 1;
-                        }
-                    }
-                }
-            }
-        }
-        eprintln!(
-            "repaired {repaired} of {} layouts ({repaired_reversed} in reverse order); the rest refused",
-            24 * 30 * 2
-        );
-        assert!(repaired > 0, "the sweep repairs something");
-    }
-
-    /// Every order of a string's pieces the sweeps below try: as stored, in
-    /// reverse, every rotation and every swap of two neighbours.
-    fn orders(offs: &[usize]) -> Vec<Vec<usize>> {
-        let mut all = vec![offs.to_vec(), offs.iter().rev().copied().collect()];
-        for k in 1..offs.len() {
-            let mut o = offs.to_vec();
-            o.rotate_left(k);
-            all.push(o);
-        }
-        for k in 0..offs.len().saturating_sub(1) {
-            let mut o = offs.to_vec();
-            o.swap(k, k + 1);
-            all.push(o);
-        }
-        all
-    }
-
-    /// The placeholder for a name of `nlen` characters with `pre` bytes
-    /// before it, the real path, and the offsets of `width`-byte pieces at
-    /// 0, width, ... and one ending at the end.
-    fn layout(
-        pre: usize,
-        nlen: usize,
-        width: usize,
-    ) -> (Vec<(String, String)>, String, String, Vec<usize>) {
-        let name: String = "abcdefghijklmnopqrstuvwxyz0123"
-            .chars()
-            .take(nlen)
-            .collect();
-        let restore = named(&name);
-        let prefix = &"ABCDEFGHIJKLMNOPQRSTUVW"[..pre];
-        let ph = format!("{prefix}{}", restore[0].0);
-        let real = format!("{prefix}{}", restore[0].1);
-        let len = ph.len();
-        let mut offs: Vec<usize> = (0..len / width).map(|i| i * width).collect();
-        if len % width != 0 {
-            offs.push(len - width);
-        }
-        (restore, ph, real, offs)
-    }
-
-    /// CONSTANTS SIDE BY SIDE IN ANY ORDER (8- and 16-byte), as gcc's
-    /// default `-O2` SSE copy lays a string in `.rodata.cst16`: a run
-    /// reaching the end of one constant goes on matching while the next
-    /// one's first byte equals the next hash character, and a short piece's
-    /// edge can match the constant beside it the same way. None is placed
-    /// naming a path that is neither the placeholder nor the real one.
-    #[test]
-    fn constants_in_any_order_are_repaired_or_refused_never_wrong() {
-        let (mut repaired, mut total) = (0, 0);
-        let mut wrong: Vec<String> = Vec::new();
-        for width in [8usize, 16] {
-            for pre in 0..24usize {
-                for nlen in 1..31usize {
-                    let (restore, ph, real, offs) = layout(pre, nlen, width);
-                    let name = &restore[0].0[restore[0].0.len() - nlen..];
-                    // Beside another path's constants too (every third name):
-                    // one whose hash starts with `h`, and a `-dev` sibling
-                    // whose hash ends with `x`, cut where its hash ends.
-                    let bash = b"/nix/store/h0a1b2c3d4f5g6h7i8j9k0l1m2n3p4q5-bash-5.3/bin/s";
-                    let dev =
-                        format!("/nix/store/a0a1b2c3d4f5g6h7i8j9k0l1m2n3p4qx-{name}-dev/lib/");
-                    let dev = &dev.as_bytes()[42..];
-                    let others: Vec<&[u8]> = if nlen % 3 == 1 {
-                        vec![b"", &bash[..48], &dev[..width.min(dev.len())]]
-                    } else {
-                        vec![b""]
-                    };
-                    for other in others {
-                        for o in orders(&offs) {
-                            let consts: Vec<u8> = o
-                                .iter()
-                                .flat_map(|&s| ph.as_bytes()[s..s + width].to_vec())
-                                .collect();
-                            for before in [false, true] {
-                                if other.is_empty() && before {
-                                    continue;
-                                }
-                                let at = if before { other.len() } else { 0 };
-                                let obj = if before {
-                                    [other, &consts].concat()
-                                } else {
-                                    [consts.as_slice(), other].concat()
-                                };
-                                let run = |obj: &[u8]| {
-                                    let mut mem = vec![b'?'; ph.len()];
-                                    for (c, &s) in obj[at..at + consts.len()].chunks(width).zip(&o)
-                                    {
-                                        mem[s..s + width].copy_from_slice(c);
-                                    }
-                                    String::from_utf8(mem).unwrap()
-                                };
-                                total += 1;
-                                let fixed =
-                                    repair_residue(&obj, &restore).unwrap_or_else(|| obj.clone());
-                                let rest = if before {
-                                    &fixed[..at]
-                                } else {
-                                    &fixed[consts.len()..]
-                                };
-                                // A file left with residue is refused whole,
-                                // whatever else changed in it.
-                                if placeholder_residue(&fixed, &restore).is_some() {
-                                    continue;
-                                }
-                                match run(&fixed) {
-                                    _ if rest != other => wrong.push(format!(
-                                        "other changed: {width} {pre} {nlen} {o:?} {before}"
-                                    )),
-                                    r if r == real => repaired += 1,
-                                    r => wrong.push(format!("{width} {pre} {nlen} {o:?}: {r}")),
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        eprintln!("repaired {repaired} of {total} constant layouts; the rest refused");
-        assert_eq!(wrong, Vec::<String>::new(), "placed naming neither path");
-        assert!(repaired > 0, "the sweep repairs something");
-    }
-
-    /// IMMEDIATE STORES IN ANY ORDER, alone and beside another store path:
-    /// one spelled out whose hash starts as the placeholder's does, a
-    /// sibling output whose hash ends as it does, and another string's
-    /// store holding `/store/h`, before the stores and after them. Neither
-    /// the occurrence nor the other path is left naming a path that is
-    /// neither. Names step by 3 to keep the run short.
-    #[test]
-    fn stores_in_any_order_beside_other_paths_are_never_wrong() {
-        let (mut repaired, mut total) = (0, 0);
-        let mut wrong: Vec<String> = Vec::new();
-        for pre in 0..24usize {
-            for nlen in (1..31usize).step_by(3) {
-                let (restore, ph, real, offs) = layout(pre, nlen, 8);
-                let name = &restore[0].0[restore[0].0.len() - nlen..];
-                let others: [Vec<u8>; 5] = [
-                    Vec::new(),
-                    b"/nix/store/h0a1b2c3d4f5g6h7i8j9k0l1m2n3p4q5-bash-5.3/bin/sh".to_vec(),
-                    format!("/nix/store/a0a1b2c3d4f5g6h7i8j9k0l1m2n3p4qx-{name}-dev/lib")
-                        .into_bytes(),
-                    immediate_stores("/nix/store/h0a1b2c3", &[4]),
-                    immediate_stores(
-                        &format!("/nix/store/a0a1b2c3d4f5g6h7i8j9k0l1m2n3p4qx-{name}-dev/lib"),
-                        &[42],
-                    ),
-                ];
-                for other in &others {
-                    for o in orders(&offs) {
-                        let stores = immediate_stores(&ph, &o);
-                        for before in [false, true] {
-                            let obj = if before {
-                                [other.as_slice(), &stores].concat()
-                            } else {
-                                [stores.as_slice(), other].concat()
-                            };
-                            let at = if before { other.len() } else { 0 };
-                            total += 1;
-                            let fixed =
-                                repair_residue(&obj, &restore).unwrap_or_else(|| obj.clone());
-                            let (ours, rest) = if before {
-                                (&fixed[at..], &fixed[..at])
-                            } else {
-                                (&fixed[..stores.len()], &fixed[stores.len()..])
-                            };
-                            // A file left with residue is refused whole,
-                            // whatever else changed in it.
-                            if placeholder_residue(&fixed, &restore).is_some() {
-                                continue;
-                            }
-                            match run_stores(ours, ph.len()) {
-                                _ if rest != other.as_slice() => wrong.push(format!(
-                                    "other path changed: {pre} {nlen} {o:?} {before}"
-                                )),
-                                r if r == real => repaired += 1,
-                                r => wrong.push(format!("{pre} {nlen} {o:?} {before}: {r}")),
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        eprintln!("repaired {repaired} of {total} store layouts; the rest refused");
-        assert_eq!(wrong, Vec::<String>::new(), "placed naming neither path");
-        assert!(repaired > 0, "the sweep repairs something");
-    }
-
-    /// AN INNER PIECE THAT IS NOT UNIQUE BETWEEN ITS RUNS IS NOT GUESSED: a
-    /// 2-character piece can also match an opcode byte, so the occurrence is
-    /// left for the residue scan to refuse.
-    #[test]
-    fn an_ambiguous_inner_piece_is_not_guessed() {
-        let restore = vec![(XDP_PH.to_string(), XDP_REAL.to_string())];
-        // hash 0..13 whole after `/`, then `2a` twice (the second the real
-        // piece), then 15..32 whole before `-`.
-        let mut obj = b"/nix/store/hjbdq8s5j5dkn\x48".to_vec();
-        obj.extend_from_slice(b"2a\x90\x902a\x48110sy8zlhfcs4lxsx-x");
-        assert!(
-            placeholder_residue(&obj, &restore).is_some(),
-            "control: residue"
-        );
-        assert_eq!(repair_residue(&obj, &restore), None);
-        // With one `2a` the piece is found and the occurrence repaired.
-        let mut one = b"/nix/store/hjbdq8s5j5dkn\x48".to_vec();
-        one.extend_from_slice(b"\x90\x902a\x48110sy8zlhfcs4lxsx-x");
-        let fixed = repair_residue(&one, &restore).expect("a repair");
-        assert_eq!(placeholder_residue(&fixed, &restore), None);
-    }
+    use super::{placeholder_residue, placeholder_residue_plain, rewrite_bytes};
 
     /// THE SHAPE pkg-config 0.29.2 SHIPPED (2026-10-09): a placeholder that
     /// exists only inside a zlib-compressed debug section. The fixture is

@@ -597,7 +597,8 @@ pub fn run() -> Result<()> {
             start.filter(|_| default_manifest),
             journal,
             rewind.is_some(),
-        );
+        )
+        .context("recording this pass's placement")?;
     }
     // Everything set aside comes back before the run reports success, and a
     // file that cannot fails it.
@@ -628,7 +629,7 @@ fn record_placement(
     start: Option<std::time::SystemTime>,
     journal: Option<Vec<&Path>>,
     held: bool,
-) {
+) -> std::io::Result<()> {
     if let (false, Some(start)) = (edges.is_empty(), start) {
         match crate::ninja_state::write(build_dir, edges, start) {
             Ok(n) => eprintln!(
@@ -641,8 +642,9 @@ fn record_placement(
             ),
         }
     }
-    if let Some(placed) = journal {
-        crate::configure_state::journal_placed(build_dir, placed, held);
+    match journal {
+        Some(placed) => crate::configure_state::journal_placed(build_dir, placed, held),
+        None => Ok(()),
     }
 }
 
@@ -1024,7 +1026,8 @@ mod record_placement_tests {
             Some(start),
             Some(vec![Path::new("gen.h")]),
             false,
-        );
+        )
+        .expect("recorded");
         assert_eq!(
             std::fs::metadata(bd.join("gen.h"))
                 .unwrap()

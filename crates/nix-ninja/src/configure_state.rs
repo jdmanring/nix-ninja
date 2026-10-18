@@ -80,16 +80,16 @@ pub struct ConfigureState {
     pub empty_dirs: HashSet<String>,
 }
 
-/// A later pass's record of the files configure left, set by the walk
+/// A later pass's record of what configure left, set by the walk
 /// (`answer_listings_from`) and asked by every other listing of a build-tree
 /// directory (`left_by_configure`). Unset on a first pass, so nothing a
 /// first pass emits depends on it.
-static LISTED: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+static LISTED: std::sync::Mutex<Option<ConfigureState>> = std::sync::Mutex::new(None);
 
 /// Makes this process's listings of build-tree directories answer from
 /// configure's record: called by a later pass's walk.
-pub fn answer_listings_from(files: HashSet<String>) {
-    *LISTED.lock().unwrap() = Some(files);
+pub fn answer_listings_from(record: ConfigureState) {
+    *LISTED.lock().unwrap() = Some(record);
 }
 
 /// Whether a later pass reads `path`, found by listing a directory: a file
@@ -103,65 +103,114 @@ pub fn left_by_configure(build_dir: &Path, path: &Path) -> bool {
     left_by(LISTED.lock().unwrap().as_ref(), build_dir, path)
 }
 
-fn left_by(files: Option<&HashSet<String>>, build_dir: &Path, path: &Path) -> bool {
-    files.is_none_or(|files| left_in(files, build_dir, path))
+fn left_by(record: Option<&ConfigureState>, build_dir: &Path, path: &Path) -> bool {
+    record.is_none_or(|r| left_in(r, build_dir, path))
 }
 
-fn left_in(files: &HashSet<String>, build_dir: &Path, path: &Path) -> bool {
+fn left_in(r: &ConfigureState, build_dir: &Path, path: &Path) -> bool {
     // THE RECORD KNOWS ONLY WHAT THE WALK ENTERED: not a directory the walk
     // skips (`walk_skips`), not what lies below a symlink (recorded as a
     // file, so a recorded file with more of the path below it is one), and
     // nothing outside the build dir, which the listing reads.
-    match landed_rel(build_dir, path, |r| files.contains(r)) {
-        Some(rel) => rel.is_empty() || files.contains(&rel) || rel.split('/').any(walk_skips),
-        None => true,
+    match landing(
+        build_dir,
+        path,
+        |d| r.dirs.contains(d),
+        |l| r.files.contains(l),
+    ) {
+        Landing::Inside(rel) => {
+            rel.is_empty() || r.files.contains(&rel) || rel.split('/').any(walk_skips)
+        }
+        Landing::Outside => true,
+        Landing::Absent => false,
     }
 }
 
-/// Where `spelled` (relative to `build_dir`, or absolute) lands, as the walk
-/// spells it: `Some("")` for the build dir itself, None outside it. ONE
-/// ANSWER FOR EVERY PASS: `.` and `..` are taken lexically, as the kernel
-/// takes them in a tree of plain directories, but at a symlink configure
-/// left (`left_link`) with more of the spelling to follow, the kernel's
-/// answer is taken (a `..` after it climbs from the link's target), and the
-/// rest goes on from where the link lands. A link landing outside, or one
-/// that does not resolve, is None: there the disk answers, as on the first
-/// pass.
-pub fn landed_rel(
+/// Where a spelling lands, as `landing` answers it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Landing {
+    /// Under the build dir, as the walk spells it (`""` for the build dir).
+    Inside(String),
+    /// Outside it, or through a link that does not resolve: the disk
+    /// answers, as on the first pass.
+    Outside,
+    /// Nowhere on the first pass: a `..` after a name configure left no
+    /// directory at.
+    Absent,
+}
+
+/// Where `spelled` (relative to `build_dir`, or absolute) lands, ONE ANSWER
+/// FOR EVERY PASS. It climbs as the kernel does: from the build dir's real
+/// location, through every symlink configure left (`left_link`) with more
+/// of the spelling to follow (a `..` after one climbs from its target, and
+/// one leaving the tree is followed back in if the spelling returns), and
+/// `..` after a name is a climb only where configure left a directory
+/// (`left_dir`) there, since otherwise the first pass found nothing.
+pub fn landing(
     build_dir: &Path,
     spelled: &Path,
+    left_dir: impl Fn(&str) -> bool,
     left_link: impl Fn(&str) -> bool,
-) -> Option<String> {
-    let spelled = build_dir.join(spelled);
+) -> Landing {
+    let bd = std::fs::canonicalize(build_dir).unwrap_or_else(|_| build_dir.to_path_buf());
+    // An absolute spelling is climbed from the root, lexically outside the
+    // tree; under it, the tree's own spelling or its real location.
+    let inside = |p: &Path| -> Option<String> {
+        let r = p
+            .strip_prefix(&bd)
+            .or_else(|_| p.strip_prefix(build_dir))
+            .ok()?;
+        Some(normal_rel(r).unwrap_or_default())
+    };
     let comps: Vec<_> = spelled.components().collect();
-    let mut cur = PathBuf::new();
+    let mut cur = if spelled.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        bd.clone()
+    };
     let mut hops = 0;
     for (i, c) in comps.iter().enumerate() {
         match c {
             std::path::Component::ParentDir => {
                 cur.pop();
+                continue;
             }
-            std::path::Component::CurDir => {}
-            c => cur.push(c),
+            std::path::Component::Normal(n) => cur.push(n),
+            _ => continue,
         }
-        if i + 1 == comps.len() {
+        let more = &comps[i + 1..];
+        if more.is_empty() {
             break;
         }
-        let Some(rel) = cur.strip_prefix(build_dir).ok().and_then(normal_rel) else {
+        let up = more.first() == Some(&std::path::Component::ParentDir);
+        let Some(rel) = inside(&cur) else {
+            // Outside the tree nothing changes between phases: the disk
+            // answers what the kernel would.
+            if cur.is_symlink() {
+                hops += 1;
+                match std::fs::canonicalize(&cur) {
+                    Ok(t) if hops <= 40 => cur = t,
+                    _ => return Landing::Outside,
+                }
+            } else if up && !cur.is_dir() {
+                return Landing::Absent;
+            }
             continue;
         };
+        if rel.is_empty() {
+            continue;
+        }
         if left_link(&rel) {
             hops += 1;
-            let bd = std::fs::canonicalize(build_dir).ok()?;
-            let inside = std::fs::canonicalize(&cur).ok()?;
-            cur = build_dir.join(inside.strip_prefix(&bd).ok()?);
-            if hops > 8 {
-                return None;
+            match std::fs::canonicalize(&cur) {
+                Ok(t) if hops <= 40 => cur = t,
+                _ => return Landing::Outside,
             }
+        } else if up && !left_dir(&rel) {
+            return Landing::Absent;
         }
     }
-    let rel = cur.strip_prefix(build_dir).ok()?;
-    Some(normal_rel(rel).unwrap_or_default())
+    inside(&cur).map_or(Landing::Outside, Landing::Inside)
 }
 
 /// `rel` as the walk spells it (plain names joined by `/`, no `.`, no empty
@@ -455,14 +504,16 @@ fn stamp(meta: &std::fs::Metadata) -> String {
 /// build paths) that exists, every file below one that is a directory, and
 /// every ancestor directory configure did not leave; a file with the stamp
 /// it was placed with. Called only once placement has succeeded. `held`
-/// says the caller's `Rewind` already holds the build dir's lock.
+/// says the caller's `Rewind` already holds the build dir's lock. AN ERROR
+/// when the journal cannot be written: a later pass would read what this
+/// one placed.
 /// DEFER(a placed output outside the build dir carries a placeholder a later
 /// pass reads): paths with `..` or absolute spellings are not journaled.
 pub fn journal_placed<'a>(
     build_dir: &Path,
     placed: impl IntoIterator<Item = &'a Path>,
     held: bool,
-) {
+) -> std::io::Result<()> {
     let state = state_dir(build_dir);
     let _lock = if held { None } else { lock_blocking(&state) };
     if !held && _lock.is_none() {
@@ -487,9 +538,13 @@ fn lock_blocking(state: &Path) -> Option<std::fs::File> {
     Some(f)
 }
 
-fn journal_in<'a>(state: &Path, build_dir: &Path, placed: impl IntoIterator<Item = &'a Path>) {
+fn journal_in<'a>(
+    state: &Path,
+    build_dir: &Path,
+    placed: impl IntoIterator<Item = &'a Path>,
+) -> std::io::Result<()> {
     let Some(r) = load_in(state, build_dir) else {
-        return;
+        return Ok(());
     };
     let path = state.join("placed.v1");
     // Keyed by kind and path, so a later pass's placement replaces the stamp
@@ -583,12 +638,12 @@ fn journal_in<'a>(state: &Path, build_dir: &Path, placed: impl IntoIterator<Item
         }
     }
     let lines: Vec<String> = entries.into_values().collect();
-    if let Err(e) = write_lines(&path, build_dir, &lines, false) {
-        eprintln!(
-            "nix-ninja: could not journal this run's placement ({e}); a later pass \
-             reads what it placed"
-        );
-    }
+    write_lines(&path, build_dir, &lines, false).map_err(|e| {
+        std::io::Error::other(format!(
+            "could not journal this run's placement ({e}); a later pass would read \
+             what it placed"
+        ))
+    })
 }
 
 /// Whether `rel` stays inside the build dir: plain names only, no root, no
@@ -952,6 +1007,23 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    /// A record holding `files` and every directory above them.
+    fn record_of(files: &std::collections::HashSet<String>) -> ConfigureState {
+        let mut dirs = std::collections::HashSet::new();
+        for f in files {
+            let mut p = Path::new(f).parent();
+            while let Some(d) = p.filter(|d| !d.as_os_str().is_empty()) {
+                dirs.insert(d.to_string_lossy().into_owned());
+                p = d.parent();
+            }
+        }
+        ConfigureState {
+            files: files.clone(),
+            dirs,
+            ..Default::default()
+        }
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("nn-cfgstate-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -1096,7 +1168,7 @@ mod tests {
             "emptyout",
         ]
         .map(PathBuf::from);
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
         write(&bd.join("docs/index.html"), "hook");
         std::thread::sleep(std::time::Duration::from_millis(10));
         write(&bd.join("include/Foo/b.h"), "HOOK-EDITED");
@@ -1229,7 +1301,7 @@ mod tests {
         write(&bd.join("tree/a.h"), "placed");
         write(&bd.join("again.h"), "placed again");
         let same_ino = std::fs::metadata(bd.join("same.h")).unwrap().ino();
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
         let journal = std::fs::read_to_string(state.join("placed.v1")).unwrap();
         assert!(
             !journal.lines().any(|l| l.ends_with(" same.h")),
@@ -1304,7 +1376,7 @@ mod tests {
             ("/build/pkg/src/../build/meta/d/w123.tmp", false),
         ] {
             assert_eq!(
-                super::left_by(Some(&files), bd, Path::new(path)),
+                super::left_by(Some(&record_of(&files)), bd, Path::new(path)),
                 read,
                 "{path}"
             );
@@ -1315,16 +1387,20 @@ mod tests {
         // cannot answer and the listing reads.
         let files: std::collections::HashSet<String> = ["python".to_string()].into();
         assert!(super::left_by(
-            Some(&files),
+            Some(&record_of(&files)),
             bd,
             Path::new("python/pkg/a.py")
         ));
         assert!(super::left_by(
-            Some(&files),
+            Some(&record_of(&files)),
             bd,
             Path::new("meson-private/x.dat")
         ));
-        assert!(!super::left_by(Some(&files), bd, Path::new("pythonx/a.py")));
+        assert!(!super::left_by(
+            Some(&record_of(&files)),
+            bd,
+            Path::new("pythonx/a.py")
+        ));
         // Any spelling of a file configure left (CMake-joined dir arguments).
         let files: std::collections::HashSet<String> = ["meta/d/meta.json".to_string()].into();
         for spelled in [
@@ -1333,7 +1409,7 @@ mod tests {
             "meta/d/./meta.json",
         ] {
             assert!(
-                super::left_by(Some(&files), bd, Path::new(spelled)),
+                super::left_by(Some(&record_of(&files)), bd, Path::new(spelled)),
                 "{spelled}"
             );
         }
@@ -1351,8 +1427,16 @@ mod tests {
         std::os::unix::fs::symlink("real", bd.join("alias")).unwrap();
         let files: std::collections::HashSet<String> =
             ["real/a.h".to_string(), "alias".to_string()].into();
-        assert!(super::left_by(Some(&files), &bd, Path::new("alias/a.h")));
-        assert!(!super::left_by(Some(&files), &bd, Path::new("alias/w.tmp")));
+        assert!(super::left_by(
+            Some(&record_of(&files)),
+            &bd,
+            Path::new("alias/a.h")
+        ));
+        assert!(!super::left_by(
+            Some(&record_of(&files)),
+            &bd,
+            Path::new("alias/w.tmp")
+        ));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1378,12 +1462,12 @@ mod tests {
         let placed = [PathBuf::from("m.json")];
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("m.json"), "placed");
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
         let read = || std::fs::read_to_string(bd.join("m.json")).unwrap();
         for pass in [2, 3] {
             let rewind = begin(&state, &bd);
             assert_eq!(read(), "", "pass {pass} reads configure's version");
-            journal_in(&state, &bd, std::iter::empty());
+            journal_in(&state, &bd, std::iter::empty()).expect("journaled");
             rewind.finish().expect("everything comes back");
             assert_eq!(read(), "placed", "after pass {pass}");
         }
@@ -1475,7 +1559,7 @@ mod tests {
         let placed = [PathBuf::from(spelled)];
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("D/m.json"), "placed");
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
         (d, bd, state)
     }
 
@@ -1488,7 +1572,7 @@ mod tests {
         let read = || std::fs::read_to_string(bd.join("D/m.json")).unwrap();
         let rewind = begin(&state, &bd);
         assert_eq!(read(), "", "pass 2 reads configure's version");
-        journal_in(&state, &bd, [Path::new("D")]);
+        journal_in(&state, &bd, [Path::new("D")]).expect("journaled");
         rewind.finish().expect("everything comes back");
         let rewind = begin(&state, &bd);
         assert_eq!(read(), "", "and so does pass 3");
@@ -1530,6 +1614,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// A PLACEMENT THAT CANNOT BE JOURNALED STOPS THE RUN, as one that
+    /// cannot keep configure's copy does: unjournaled, the next pass would
+    /// read the placed file where pass 1 read configure's.
+    #[test]
+    fn an_unjournaled_placement_stops_the_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("journal-stuck");
+        let bd = d.join("build");
+        let state = d.join("state");
+        write(&bd.join("build.ninja"), "default all\n");
+        write(&bd.join("D/m.json"), "configure");
+        let record = ConfigureState {
+            files: ["build.ninja", "D/m.json"].map(String::from).into(),
+            dirs: ["D".to_string()].into(),
+            ..Default::default()
+        };
+        save_in(&state, &bd, &record);
+        let placed = [PathBuf::from("D/m.json")];
+        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
+        write(&bd.join("D/m.json"), "placed");
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let res = journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(res.is_err(), "the run stops");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// A PLACED FILE THAT CANNOT BE SET ASIDE STOPS THE PASS: reading it
     /// would read another tree than the first pass did.
     #[test]
@@ -1544,7 +1655,7 @@ mod tests {
         };
         save_in(&state, &bd, &record);
         write(&bd.join("gen.h"), "placed");
-        journal_in(&state, &bd, [Path::new("gen.h")]);
+        journal_in(&state, &bd, [Path::new("gen.h")]).expect("journaled");
         // Nothing can be made below a file.
         write(&state.join("aside"), "in the way");
         assert!(begin_result(&state, &bd).is_err());
@@ -1626,14 +1737,14 @@ mod tests {
         let placed = [PathBuf::from("m.json")];
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("m.json"), "placed");
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
         std::thread::sleep(std::time::Duration::from_millis(10));
         write(&bd.join("m.json"), "HOOK");
         let read = || std::fs::read_to_string(bd.join("m.json")).unwrap();
         for pass in [2, 3] {
             let rewind = begin(&state, &bd);
             assert_eq!(read(), "HOOK", "pass {pass}");
-            journal_in(&state, &bd, std::iter::empty());
+            journal_in(&state, &bd, std::iter::empty()).expect("journaled");
             rewind.finish().expect("everything comes back");
         }
         let _ = std::fs::remove_dir_all(&d);
@@ -1658,7 +1769,7 @@ mod tests {
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         std::fs::remove_file(bd.join("x")).unwrap();
         std::fs::create_dir(bd.join("x")).unwrap();
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
         let rewind = begin(&state, &bd);
         assert_eq!(std::fs::read_to_string(bd.join("x")).unwrap(), "configure");
         // A record written now (a lost configure.v1) leaves the originals.
@@ -1669,7 +1780,7 @@ mod tests {
             "originals kept"
         );
         std::fs::remove_file(state.join("aside/.keep")).unwrap();
-        journal_in(&state, &bd, std::iter::empty());
+        journal_in(&state, &bd, std::iter::empty()).expect("journaled");
         rewind.finish().expect("everything comes back");
         assert!(bd.join("x").is_dir(), "the placed directory is back");
         let _ = std::fs::remove_dir_all(&d);
