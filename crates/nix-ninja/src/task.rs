@@ -7170,7 +7170,6 @@ fn store_hash(path: &str) -> Option<&[u8]> {
 /// skipped.
 pub fn repair_residue(data: &[u8], restore: &[(String, String)]) -> Option<Vec<u8>> {
     const NEAR: usize = 64;
-    let find = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).position(|w| w == needle);
     let mut out = data.to_vec();
     let mut changed = false;
     for (placeholder, real) in restore {
@@ -7199,58 +7198,103 @@ pub fn repair_residue(data: &[u8], restore: &[(String, String)]) -> Option<Vec<u
             runs.push((i, k, j));
             i += j;
         }
+        // A run joins the occurrence before it when it continues the hash
+        // (a later hash offset, within NEAR bytes) and that occurrence does
+        // not already reach the hash's end: a whole copy followed by a split
+        // one is two occurrences, each accounted for on its own.
         let mut occurrences: Vec<Vec<(usize, usize, usize)>> = Vec::new();
         for r in runs {
             match occurrences.last_mut() {
                 Some(o)
                     if o.last()
-                        .is_some_and(|l| r.1 > l.1 && r.0 <= l.0 + l.2 + NEAR) =>
+                        .is_some_and(|l| r.1 > l.1 && r.0 <= l.0 + l.2 + NEAR)
+                        && o.iter().map(|x| x.1 + x.2).max() < Some(hp.len()) =>
                 {
                     o.push(r)
                 }
                 _ => occurrences.push(vec![r]),
             }
         }
-        for o in occurrences {
+        // Each occurrence searches for its head and tail only between its
+        // neighbours, nearest first, so a piece is never taken from another
+        // copy of the hash.
+        let bounds: Vec<(usize, usize)> = (0..occurrences.len())
+            .map(|n| {
+                let lo = n.checked_sub(1).map_or(0, |m| {
+                    occurrences[m].iter().map(|r| r.0 + r.2).max().unwrap_or(0)
+                });
+                let hi = occurrences.get(n + 1).map_or(data.len(), |o| o[0].0);
+                (lo, hi)
+            })
+            .collect();
+        for (o, (lo, hi)) in occurrences.into_iter().zip(bounds) {
             // Every piece to swap, as (file offset, hash offset, length).
             let mut pieces = o.clone();
             let (first, last) = (o[0], o[o.len() - 1]);
             let mut whole = true;
+            // The head piece: the nearest `/` before the first run, then the
+            // LONGEST piece there, since a store overlapping the first run
+            // carries more of the hash than the gap.
             if first.1 > 0 {
-                let lo = first.0.saturating_sub(NEAR);
-                let head = &hp[..first.1];
-                let hit = (lo..first.0.saturating_sub(head.len()) + 1)
-                    .rev()
-                    .find(|&p| p > 0 && data[p - 1] == b'/' && data[p..].starts_with(head));
+                let lo = lo.max(first.0.saturating_sub(NEAR));
+                let hit = (lo.max(1)..first.0).rev().find_map(|p| {
+                    if data[p - 1] != b'/' {
+                        return None;
+                    }
+                    (first.1..(first.1 + RESIDUE_WINDOW).min(hp.len()))
+                        .rev()
+                        .find(|&m| p + m <= first.0 && data[p..].starts_with(&hp[..m]))
+                        .map(|m| (p, m))
+                });
                 match hit {
-                    Some(p) => pieces.push((p, 0, head.len())),
+                    Some((p, m)) => pieces.push((p, 0, m)),
                     None => whole = false,
                 }
             }
+            // An inner piece must occur ONCE between its runs: a short one
+            // can also match an opcode byte, and swapping that rewrites code.
             let mut reached = 0;
             for w in o.windows(2) {
                 let (a, b) = (w[0], w[1]);
                 reached = reached.max(a.1 + a.2);
                 if reached < b.1 {
                     let gap = &hp[reached..b.1];
-                    match find(data.get(a.0 + a.2..b.0).unwrap_or_default(), gap) {
-                        Some(p) => pieces.push((a.0 + a.2 + p, reached, gap.len())),
-                        None => whole = false,
+                    let between = data.get(a.0 + a.2..b.0).unwrap_or_default();
+                    let at: Vec<usize> = between
+                        .windows(gap.len())
+                        .enumerate()
+                        .filter(|(_, w)| *w == gap)
+                        .map(|(p, _)| p)
+                        .collect();
+                    match at[..] {
+                        [p] => pieces.push((a.0 + a.2 + p, reached, gap.len())),
+                        _ => whole = false,
                     }
                 }
             }
+            // The tail piece, the LONGEST before the `-` (or troff's `\`):
+            // gcc and clang store a tail that is not a multiple of the store
+            // width OVERLAPPING the store before it (`s4lxsx-x` after
+            // `zlhfcs4l`), and that store runs last, so every hash byte in it
+            // is swapped.
             let end = o.iter().map(|r| r.1 + r.2).max().unwrap_or(0);
             if end < hp.len() {
-                let tail = &hp[end..];
                 let from = last.0 + last.2;
                 let window = data
-                    .get(from..(from + NEAR).min(data.len()))
+                    .get(from..(from + NEAR).min(hi).max(from))
                     .unwrap_or_default();
-                let hit = window.windows(tail.len()).enumerate().position(|(p, w)| {
-                    w == tail && matches!(window.get(p + tail.len()), Some(b'-' | b'\\'))
+                // Nearest first, and at each place the LONGEST piece.
+                let hit = (0..window.len()).find_map(|p| {
+                    (end.saturating_sub(RESIDUE_WINDOW - 1)..=end)
+                        .find(|&k| {
+                            let tail = &hp[k..];
+                            window[p..].starts_with(tail)
+                                && matches!(window.get(p + tail.len()), Some(b'-' | b'\\'))
+                        })
+                        .map(|k| (p, k))
                 });
                 match hit {
-                    Some(p) => pieces.push((from + p, end, tail.len())),
+                    Some((p, k)) => pieces.push((from + p, k, hp.len() - k)),
                     None => whole = false,
                 }
             }
@@ -7519,6 +7563,98 @@ mod placeholder_residue_tests {
         ]);
         assert_eq!(repair_residue(&halves, &restore), None, "nothing swapped");
         assert!(placeholder_residue(&halves, &restore).is_some());
+    }
+
+    /// WHAT THE STORES WRITE, not what the bytes hold: an object built from
+    /// 8-byte immediate stores of `path` at `offsets` (each `movabs` plus a
+    /// store), and the path those stores leave in memory when run in order.
+    fn immediate_stores(path: &str, offsets: &[usize]) -> Vec<u8> {
+        offsets
+            .iter()
+            .flat_map(|&o| {
+                [
+                    b"\x48\xb8".as_slice(),
+                    &path.as_bytes()[o..o + 8],
+                    b"\x48\x89\x47".as_slice(),
+                    &[o as u8],
+                ]
+                .concat()
+            })
+            .collect()
+    }
+    fn run_stores(obj: &[u8], len: usize) -> String {
+        let mut mem = vec![b'?'; len];
+        for c in obj.chunks(14) {
+            let o = c[13] as usize;
+            mem[o..o + 8].copy_from_slice(&c[2..10]);
+        }
+        String::from_utf8(mem).unwrap()
+    }
+
+    /// A TAIL STORED OVERLAPPING THE STORE BEFORE IT, as gcc and clang emit
+    /// for a length that is not a multiple of 8 (45 bytes: stores at 32 and
+    /// 37), and a WHOLE COPY BESIDE A SPLIT ONE within 64 bytes. Both used to
+    /// come out naming a path that is neither placeholder nor real, with no
+    /// residue left to refuse.
+    #[test]
+    fn overlapping_and_neighbouring_occurrences_come_out_real() {
+        let restore = vec![(XDP_PH.to_string(), XDP_REAL.to_string())];
+        let ph = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-x";
+        let real = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-x";
+        let obj = immediate_stores(ph, &[0, 8, 16, 24, 32, 37]);
+        assert_eq!(
+            run_stores(&obj, 45),
+            ph,
+            "control: the fixture stores the placeholder"
+        );
+        let fixed = repair_residue(&obj, &restore).expect("a repair");
+        assert_eq!(placeholder_residue(&fixed, &restore), None);
+        assert_eq!(run_stores(&fixed, 45), real, "overlapping tail");
+
+        let mut both = ph.as_bytes().to_vec();
+        let split = immediate_stores(ph, &[0, 8, 16, 24, 32, 37]);
+        both.extend_from_slice(&split);
+        let fixed = repair_residue(&both, &restore).expect("a repair");
+        assert_eq!(&fixed[..45], real.as_bytes(), "the whole copy");
+        assert_eq!(
+            run_stores(&fixed[45..], 45),
+            real,
+            "and the split one beside it"
+        );
+
+        // The split copy's own head damaged: its head is not borrowed from
+        // the whole copy before it, so its runs stay for the scan to refuse.
+        let damaged = "/nix/store/hjbXq8s5j5dkn2a110sy8zlhfcs4lxsx-x";
+        let mut both = ph.as_bytes().to_vec();
+        both.extend_from_slice(&immediate_stores(damaged, &[0, 8, 16, 24, 32, 37]));
+        let fixed = repair_residue(&both, &restore).expect("the whole copy is repaired");
+        assert_eq!(&fixed[..45], real.as_bytes());
+        assert!(
+            placeholder_residue(&fixed[45..], &restore).is_some(),
+            "the damaged copy is left to be refused"
+        );
+    }
+
+    /// AN INNER PIECE THAT IS NOT UNIQUE BETWEEN ITS RUNS IS NOT GUESSED: a
+    /// 2-character piece can also match an opcode byte, so the occurrence is
+    /// left for the residue scan to refuse.
+    #[test]
+    fn an_ambiguous_inner_piece_is_not_guessed() {
+        let restore = vec![(XDP_PH.to_string(), XDP_REAL.to_string())];
+        // hash 0..13 whole after `/`, then `2a` twice (the second the real
+        // piece), then 15..32 whole before `-`.
+        let mut obj = b"/nix/store/hjbdq8s5j5dkn\x48".to_vec();
+        obj.extend_from_slice(b"2a\x90\x902a\x48110sy8zlhfcs4lxsx-x");
+        assert!(
+            placeholder_residue(&obj, &restore).is_some(),
+            "control: residue"
+        );
+        assert_eq!(repair_residue(&obj, &restore), None);
+        // With one `2a` the piece is found and the occurrence repaired.
+        let mut one = b"/nix/store/hjbdq8s5j5dkn\x48".to_vec();
+        one.extend_from_slice(b"\x90\x902a\x48110sy8zlhfcs4lxsx-x");
+        let fixed = repair_residue(&one, &restore).expect("a repair");
+        assert_eq!(placeholder_residue(&fixed, &restore), None);
     }
 
     /// THE SHAPE pkg-config 0.29.2 SHIPPED (2026-10-09): a placeholder that

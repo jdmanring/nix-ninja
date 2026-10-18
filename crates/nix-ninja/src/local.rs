@@ -287,10 +287,11 @@ fn scrub_placed_runpaths(prefix: &Path, files: &[DerivedFile]) {
     }
 }
 
-/// Outputs left unplaced because a restore could not reach their placeholder
-/// (`task::placeholder_residue`). `cli::run` answers it by re-running with
-/// every task on the raw arm; only the placement in this file scans, so an
-/// output placed by the dynamic or outer-stage paths is not covered.
+/// Outputs left unplaced because neither the restore nor the repair could
+/// reach their placeholder (`task::placeholder_residue`). `cli::run` fails
+/// the run with it; nothing is built again. Only the placement in this file
+/// scans, so an output placed by the dynamic or outer-stage paths is not
+/// covered.
 #[derive(Debug)]
 pub struct PlaceholderResidue(pub Vec<(PathBuf, String)>);
 
