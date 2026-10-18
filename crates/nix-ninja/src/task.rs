@@ -1015,7 +1015,7 @@ pub struct Runner {
     empty_dirs: Vec<String>,
     /// The directories configure left, from the first pass's record; None
     /// on the first pass, which asks the disk (configure_state).
-    configure_dirs: Option<HashSet<String>>,
+    configure_record: Option<crate::configure_state::ConfigureState>,
     /// The producer index this discovery pass reads, set once from
     /// `build.rs` before the schedule starts. The Runner keeps it as
     /// `Option`: a run with no produced graph entries is `None`, and the
@@ -1128,7 +1128,7 @@ impl Runner {
             build_dir_inputs: HashMap::new(),
             alias_symlinks: Vec::new(),
             empty_dirs: Vec::new(),
-            configure_dirs: None,
+            configure_record: None,
             producer_index: None,
             no_defer: HashSet::new(),
             phony_aliases: HashMap::new(),
@@ -1183,7 +1183,7 @@ impl Runner {
             .filter_map(|id| graph.builds[id].depfile.clone())
             .collect();
         let files = &mut graph.files;
-        let recorded = crate::configure_state::load(&self.config.build_dir);
+        let recorded = crate::configure_state::load(&self.config.build_dir)?;
         let plan = plan_build_dir_walk(&self.config.build_dir, recorded.as_ref(), |rel| {
             depfiles.contains(rel)
                 || files
@@ -1216,10 +1216,14 @@ impl Runner {
         self.empty_dirs.dedup();
         match recorded {
             Some(r) => {
-                self.configure_dirs = Some(r.dirs.clone());
+                self.configure_record = Some(r.clone());
                 crate::configure_state::answer_listings_from(r);
+                crate::configure_state::note_pass(&self.config.build_dir, true);
             }
-            None => crate::configure_state::save(&self.config.build_dir, &plan.seen),
+            None => {
+                crate::configure_state::save(&self.config.build_dir, &plan.seen)?;
+                crate::configure_state::note_pass(&self.config.build_dir, false);
+            }
         }
         Ok(())
     }
@@ -3678,7 +3682,7 @@ impl Runner {
             cmdline
                 .as_deref()
                 .map(|c| {
-                    named_dirs_to_create(c, &self.config.build_dir, self.configure_dirs.as_ref())
+                    named_dirs_to_create(c, &self.config.build_dir, self.configure_record.as_ref())
                 })
                 .unwrap_or_default()
         } else {
@@ -3880,7 +3884,7 @@ fn include_dirs_named(cmdline: &str, build_dir: &Path) -> Vec<String> {
 fn named_dirs_to_create(
     cmdline: &str,
     build_dir: &Path,
-    configure_dirs: Option<&HashSet<String>>,
+    configure: Option<&crate::configure_state::ConfigureState>,
 ) -> Vec<String> {
     include_dirs_named(cmdline, build_dir)
         .into_iter()
@@ -3893,14 +3897,13 @@ fn named_dirs_to_create(
             // left is followed as the kernel follows it). Outside the build
             // dir, and in a directory the walk skips, nothing was recorded:
             // there the disk answers, as it did on the first pass.
-            let Some(dirs) = configure_dirs else {
+            let Some(r) = configure else {
                 return build_dir.join(n).is_dir();
             };
             use crate::configure_state::{landing, walk_skips, Landing};
-            let left_link = |r: &str| dirs.contains(r) && build_dir.join(r).is_symlink();
-            match landing(build_dir, Path::new(n), |r| dirs.contains(r), left_link) {
+            match landing(build_dir, Path::new(n), r) {
                 Landing::Inside(rel) if !rel.split('/').any(walk_skips) => {
-                    rel.is_empty() || dirs.contains(&rel)
+                    rel.is_empty() || r.dirs.contains(&rel)
                 }
                 Landing::Absent => false,
                 _ => build_dir.join(n).is_dir(),
@@ -3935,6 +3938,7 @@ pub fn plan_build_dir_walk(
 ) -> Result<BuildDirWalk> {
     let left = |rel: &str| recorded.is_none_or(|r| r.files.contains(rel));
     let mut plan = BuildDirWalk::default();
+    let real_bd = std::fs::canonicalize(build_dir).unwrap_or_else(|_| build_dir.to_path_buf());
     for entry in WalkDir::new(build_dir).into_iter().filter_entry(|e| {
         // Skip directories that start with "meson-" as they contain
         // non-deterministic internal data from meson
@@ -3974,6 +3978,12 @@ pub fn plan_build_dir_walk(
                 // record's dirs.
                 if entry.file_type().is_symlink() && entry.path().is_dir() {
                     plan.seen.dirs.insert(rel.clone());
+                }
+                if entry.file_type().is_symlink() {
+                    plan.seen.links.insert(
+                        rel.clone(),
+                        crate::configure_state::link_landing(&real_bd, entry.path()),
+                    );
                 }
             }
         }
@@ -4075,6 +4085,7 @@ mod plan_build_dir_walk_tests {
         std::fs::write(bd.join("build.ninja"), "default all\n").unwrap();
         std::fs::write(bd.join("conf.h"), "cfg").unwrap();
         std::fs::write(bd.join("prod.json"), "").unwrap();
+        std::fs::write(bd.join(crate::resolve_cache::NAR_FILE), "stamps").unwrap();
         let produced = |rel: &str| rel == "prod.json";
 
         std::fs::create_dir_all(d.join("inc")).unwrap();
@@ -4085,7 +4096,7 @@ mod plan_build_dir_walk_tests {
             "a link to a directory is recorded as both"
         );
         assert_eq!(
-            super::named_dirs_to_create("cc -Iinclink -c a.c -o a.o", &bd, Some(&first.seen.dirs)),
+            super::named_dirs_to_create("cc -Iinclink -c a.c -o a.o", &bd, Some(&first.seen)),
             vec!["inclink"],
             "and a later pass carries it as the first did"
         );
@@ -4095,6 +4106,14 @@ mod plan_build_dir_walk_tests {
             "a produced file is not uploaded, the state dir is not walked"
         );
         assert_eq!(first.empty_dirs, vec!["emptyconf"]);
+        assert!(
+            !first
+                .seen
+                .files
+                .iter()
+                .any(|f| f.ends_with(crate::resolve_cache::NAR_FILE)),
+            "the driver's stamp file is not configure's"
+        );
         assert!(
             first.seen.files.contains("prod.json") && first.seen.dirs.contains("emptyconf"),
             "the record holds what configure left"
@@ -4135,6 +4154,34 @@ mod plan_build_dir_walk_tests {
 mod named_dirs_to_create_tests {
     use super::{named_dirs_to_create, plan_build_dir_walk, Scratch};
 
+    /// A LINK A HOOK CHANGES BETWEEN PHASES is followed as configure left
+    /// it: replaced by a directory, retargeted, or a directory replaced by a
+    /// link, every spelling through it answers as on the first pass.
+    #[test]
+    fn a_link_changed_between_phases_is_followed_as_configure_left_it() {
+        let d = Scratch::new(format!("nn-mkdirs-relink-{}", std::process::id()));
+        let bd = d.join("build");
+        for p in ["real/inner", "gen/x"] {
+            std::fs::create_dir_all(bd.join(p)).unwrap();
+        }
+        std::os::unix::fs::symlink("real/inner", bd.join("deep")).unwrap();
+        std::os::unix::fs::symlink("real", bd.join("alias")).unwrap();
+        std::os::unix::fs::symlink("later", bd.join("dangle")).unwrap();
+        let cmd = "cc -Ideep/../inner -Ialias/inner -Ialias/x -Ireal/inner -Ireal/x \
+                   -Idangle/sub -Idangle/../gen -c a.c -o a.o";
+        let first = named_dirs_to_create(cmd, &bd, None);
+        let record = plan_build_dir_walk(&bd, None, |_| false).unwrap().seen;
+        std::fs::remove_file(bd.join("deep")).unwrap();
+        std::fs::create_dir_all(bd.join("deep")).unwrap();
+        std::fs::remove_file(bd.join("alias")).unwrap();
+        std::os::unix::fs::symlink("gen", bd.join("alias")).unwrap();
+        std::fs::rename(bd.join("real"), bd.join("moved")).unwrap();
+        std::os::unix::fs::symlink("gen", bd.join("real")).unwrap();
+        // The dangling link's target appears.
+        std::fs::create_dir_all(bd.join("later/sub")).unwrap();
+        assert_eq!(named_dirs_to_create(cmd, &bd, Some(&record)), first);
+    }
+
     /// A BUILD DIR REACHED THROUGH A SYMLINK climbs from where it really is,
     /// as the kernel does: `../build/sub` from `blink -> x/build` is the
     /// tree's own `sub`, which a hook made between phases.
@@ -4148,7 +4195,7 @@ mod named_dirs_to_create_tests {
         let first = named_dirs_to_create(cmd, &bd, None);
         let record = plan_build_dir_walk(&bd, None, |_| false).unwrap().seen;
         std::fs::create_dir_all(d.join("x/build/sub")).unwrap();
-        assert_eq!(named_dirs_to_create(cmd, &bd, Some(&record.dirs)), first);
+        assert_eq!(named_dirs_to_create(cmd, &bd, Some(&record)), first);
     }
 
     /// EVERY -I SPELLING ANSWERS ON A LATER PASS AS ON THE FIRST. Pass 1
@@ -4205,7 +4252,7 @@ mod named_dirs_to_create_tests {
         }
         let mut wrong = Vec::new();
         for (s, f) in spellings.iter().zip(&first) {
-            let later = named_dirs_to_create(&cmd(s), &bd, Some(&record.dirs));
+            let later = named_dirs_to_create(&cmd(s), &bd, Some(&record));
             if &later != f {
                 wrong.push(format!("-I{s}: pass 1 {f:?}, later {later:?}"));
             }
@@ -4240,6 +4287,23 @@ mod named_dirs_to_create_tests {
         assert_eq!(got, vec!["subprojects/gvdb", "../subprojects/gvdb"]);
     }
 
+    /// A record holding `dirs`, with the landing of each that is a link.
+    fn rec(bd: &std::path::Path, dirs: &[&str]) -> crate::configure_state::ConfigureState {
+        let real = std::fs::canonicalize(bd).unwrap();
+        crate::configure_state::ConfigureState {
+            dirs: dirs.iter().map(|d| d.to_string()).collect(),
+            links: dirs
+                .iter()
+                .filter(|d| bd.join(d).is_symlink())
+                .map(|d| {
+                    let l = crate::configure_state::link_landing(&real, &bd.join(d));
+                    (d.to_string(), l)
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
     /// A LATER PASS ASKS CONFIGURE'S RECORD, NOT THE DISK. `gen/sub` exists
     /// because something wrote there after configure (placement, a hook);
     /// carrying it would emit what the first pass did not. With no record
@@ -4250,7 +4314,7 @@ mod named_dirs_to_create_tests {
         let bd = d.join("build");
         std::fs::create_dir_all(bd.join("gen/sub")).unwrap();
         let cmd = "gcc -Igen -Igen/sub -c a.c -o a.o";
-        let configure: std::collections::HashSet<String> = ["gen".to_string()].into();
+        let configure = rec(&bd, &["gen"]);
         assert_eq!(
             named_dirs_to_create(cmd, &bd, Some(&configure)),
             vec!["gen"]
@@ -4261,8 +4325,7 @@ mod named_dirs_to_create_tests {
         // carry both.
         let meson = "g++ -Ihello.p -I. -I./gen -I.. -c a.cc -o a.o";
         std::fs::create_dir_all(bd.join("hello.p")).unwrap();
-        let configure: std::collections::HashSet<String> =
-            ["gen".to_string(), "hello.p".to_string()].into();
+        let configure = rec(&bd, &["gen", "hello.p"]);
         let first = named_dirs_to_create(meson, &bd, None);
         assert!(first.contains(&".".to_string()), "carried {first:?}");
         assert_eq!(named_dirs_to_create(meson, &bd, Some(&configure)), first);
@@ -4274,8 +4337,7 @@ mod named_dirs_to_create_tests {
         let build_name = bd.file_name().unwrap().to_string_lossy().into_owned();
         let cmd =
             format!("cc -Ilink/sub -I../{build_name}/gen -I../{build_name}/gen/sub -c a.c -o a.o");
-        let configure: std::collections::HashSet<String> =
-            ["gen".to_string(), "link".to_string()].into();
+        let configure = rec(&bd, &["gen", "link"]);
         assert_eq!(
             named_dirs_to_create(&cmd, &bd, Some(&configure)),
             vec!["link/sub".to_string(), format!("../{build_name}/gen")]
@@ -4285,8 +4347,7 @@ mod named_dirs_to_create_tests {
         // hook, a check run) is not carried through `alias`.
         std::fs::create_dir_all(bd.join("real")).unwrap();
         std::os::unix::fs::symlink("real", bd.join("alias")).unwrap();
-        let configure: std::collections::HashSet<String> =
-            ["gen", "link", "real", "alias"].map(String::from).into();
+        let configure = rec(&bd, &["gen", "link", "real", "alias"]);
         let cmd = "cc -Ialias/sub -Ialias -c a.c -o a.o";
         let first = named_dirs_to_create(cmd, &bd, None);
         assert_eq!(first, vec!["alias"]);
@@ -4301,6 +4362,13 @@ mod named_dirs_to_create_tests {
             named_dirs_to_create(cmd, &bd, Some(&configure)),
             Vec::<String>::new()
         );
+        // Below a directory the walk skips, the record knows nothing and
+        // the disk answers: `meson-private/..` is the build dir.
+        std::fs::create_dir_all(bd.join("meson-private")).unwrap();
+        let cmd = "cc -Imeson-private/../gen -c a.c -o a.o";
+        let first = named_dirs_to_create(cmd, &bd, None);
+        assert_eq!(first, vec!["meson-private/../gen"]);
+        assert_eq!(named_dirs_to_create(cmd, &bd, Some(&configure)), first);
     }
 
     /// THE EXISTENCE GUARD. A directory no part of the tree holds is a typo
@@ -6754,6 +6822,10 @@ fn handle_derivation_result(
 
             let t_addrv = std::time::Instant::now();
             let drv_path = rpc_client.add_drv_to_store(&config.store_dir, &drv)?;
+            crate::configure_state::note_task(
+                &task.outputs,
+                &config.store_dir.display(&drv_path).to_string(),
+            );
             DYN_ADDDRV_MS.fetch_add(
                 t_addrv.elapsed().as_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -6779,6 +6851,10 @@ fn handle_derivation_result(
         // populations, and pooling them would hide which one costs.
         let t_add = std::time::Instant::now();
         let drv_path = rpc_client.add_drv_to_store(&config.store_dir, &drv)?;
+        crate::configure_state::note_task(
+            &task.outputs,
+            &config.store_dir.display(&drv_path).to_string(),
+        );
         DYN_PLAIN_ADDDRV_MS.fetch_add(
             t_add.elapsed().as_millis() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -6879,14 +6955,8 @@ fn place_outer_stage_outputs(
 /// mode bit is a different output. The two look alike enough that a reader
 /// reconciling them would otherwise correct whichever they read second.
 ///
-/// THE RE-EXEC DOES NOT REACH HERE, so residue on this path is LOUD rather
-/// than recovered. `cli::run` decides to re-run with real outer paths from the
-/// error `symlink_derived_files` returns, and this runs inside the build, from
-/// `handle_derivation_result`, so the same error type aborts instead. That is
-/// the right way round for now: the whole-path swap above is what the plain
-/// copy was missing, and a SPLIT placeholder reaching an outer-stage output is
-/// unwitnessed. Route it to the re-exec when a package produces one, rather
-/// than building a second recovery path for a state nothing has reached.
+/// Residue on this path is refused, as at placement: the same error type
+/// aborts the run from `handle_derivation_result`, and nothing is rebuilt.
 fn copy_restoring(src: &Path, dst: &Path, restore: &[(String, String)]) -> Result<()> {
     if !restore.is_empty() {
         let data = std::fs::read(src)?;
@@ -7571,7 +7641,7 @@ mod placeholder_residue_tests {
             assert!(
                 err.downcast_ref::<crate::local::PlaceholderResidue>()
                     .is_some(),
-                "the re-exec decision reads this type, got {err:?}"
+                "the run's refusal reads this type, got {err:?}"
             );
             assert!(!dst.exists(), "a file carrying residue must not be placed");
         }

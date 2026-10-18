@@ -20,7 +20,10 @@ use std::process::ExitCode;
 /// single line long enough to hold it is the length that gets spliced when
 /// many drivers share one fd.
 fn main() -> ExitCode {
-    match cli::run() {
+    let run = cli::run();
+    let report = cli::report_pass();
+    let run = run.and(report);
+    match run {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("nix-ninja: ABORTED: {err}");

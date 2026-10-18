@@ -243,8 +243,8 @@ fn place_realised(
             symlink_files.push(df.clone());
         }
     }
-    // Residue outranks a placement error: it names the file no repair could
-    // reach, and returning the other error would lose the finding.
+    // Residue outranks a placement error: it names the file the restore
+    // could not reach, and returning the other error would lose the finding.
     let placed = create_symlinks(prefix, store_dir, symlink_files.clone(), true);
     if !residue.is_empty() {
         return Err(PlaceholderResidue(residue).into());

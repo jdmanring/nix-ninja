@@ -361,6 +361,18 @@ mod connection_ceiling_tests {
     }
 }
 
+/// What a pass reports at exit (`configure_state::pass_report`), printed
+/// whether the run succeeded or not; an error recording pass 1's tasks is
+/// returned.
+pub fn report_pass() -> Result<()> {
+    if let Some(line) = crate::configure_state::pass_report()
+        .context("recording the task derivations this pass wrote")?
+    {
+        eprintln!("{line}");
+    }
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     warn_ignored_flags(&cli);
@@ -462,15 +474,14 @@ pub fn run() -> Result<()> {
             &derived_files,
             &all_outputs,
         );
-        // A RESTORE NO REPAIR COULD REACH FAILS THE RUN; IT IS NEVER ANSWERED
-        // BY BUILDING AGAIN. Placement repairs split, escaped and compressed
-        // placeholders in place; re-running every task keyed to the real
-        // outer paths rebuilt the run a second time (the whole graph on the
-        // ninja route), so it is no longer done.
+        // A PLACEHOLDER THE RESTORE COULD NOT REACH FAILS THE RUN; IT IS
+        // NEVER ANSWERED BY BUILDING AGAIN. Re-running every task keyed to
+        // the real outer paths rebuilt the run a second time (the whole
+        // graph on the ninja route), so it is no longer done.
         if let Err(e) = placed {
             if e.downcast_ref::<local::PlaceholderResidue>().is_some() {
                 return Err(e.context(
-                    "an outer-output placeholder survived every repair; nothing was \
+                    "an outer-output placeholder survived the restore; nothing was \
                      rebuilt (the residue names the file)",
                 ));
             }
@@ -1002,7 +1013,8 @@ mod record_placement_tests {
                 files: ["build.ninja".to_string()].into(),
                 ..Default::default()
             },
-        );
+        )
+        .expect("saved");
         let start = mark_start(&bd).expect("a start stamp");
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(bd.join("gen.h"), "placed").unwrap();

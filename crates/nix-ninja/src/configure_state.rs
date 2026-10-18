@@ -47,9 +47,11 @@ pub fn walk_skips(name: &str) -> bool {
     name.starts_with("meson-") || is_state_dir(name)
 }
 
-/// The driver's own state directory, which no walk or upload may take.
+/// The driver's own state, which no walk or upload may take: this
+/// directory, and the NAR stamp file (`resolve_cache`) at `NIX_BUILD_TOP`,
+/// which changes between passes.
 pub fn is_state_dir(name: &str) -> bool {
-    name == STATE_DIR
+    name == STATE_DIR || name == crate::resolve_cache::NAR_FILE
 }
 
 /// This build dir's own state directory: under `NIX_BUILD_TOP` inside a
@@ -72,12 +74,29 @@ fn state_dir_in(top: Option<&Path>, build_dir: &Path) -> PathBuf {
         .join(format!("{:016x}", h.finish()))
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConfigureState {
     pub dirs: HashSet<String>,
     pub files: HashSet<String>,
     /// The directories that were empty.
     pub empty_dirs: HashSet<String>,
+    /// Where each symlink landed when the walk saw it (`link_landing`), so a
+    /// later pass follows the link configure left, not whatever a hook put
+    /// at its path since.
+    pub links: std::collections::HashMap<String, String>,
+}
+
+/// Where the symlink at `path` lands, as the record keeps it: `I:<rel>`
+/// inside the build dir (real location `bd`), `O:<path>` outside it, `X`
+/// for one that does not resolve.
+pub fn link_landing(bd: &Path, path: &Path) -> String {
+    match std::fs::canonicalize(path) {
+        Ok(t) => match t.strip_prefix(bd) {
+            Ok(r) => format!("I:{}", normal_rel(r).unwrap_or_default()),
+            Err(_) => format!("O:{}", t.display()),
+        },
+        Err(_) => "X".to_string(),
+    }
 }
 
 /// A later pass's record of what configure left, set by the walk
@@ -85,6 +104,82 @@ pub struct ConfigureState {
 /// directory (`left_by_configure`). Unset on a first pass, so nothing a
 /// first pass emits depends on it.
 static LISTED: std::sync::Mutex<Option<ConfigureState>> = std::sync::Mutex::new(None);
+
+/// The task derivations this process wrote, keyed by the outputs of the
+/// edge each is for.
+static EMITTED: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// The state dir the walk found this pass's record in or wrote it to, and
+/// whether it found one (a later pass).
+static PASS: std::sync::Mutex<Option<(PathBuf, PathBuf, bool)>> = std::sync::Mutex::new(None);
+
+/// Notes the task derivation written for an edge with `outputs`.
+pub fn note_task(outputs: &[PathBuf], drv: &str) {
+    let key = outputs
+        .iter()
+        .map(|o| o.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !key.contains(['\n', '\t']) {
+        EMITTED.lock().unwrap().insert(key, drv.to_string());
+    }
+}
+
+pub fn note_pass(build_dir: &Path, later: bool) {
+    *PASS.lock().unwrap() = Some((state_dir(build_dir), build_dir.to_path_buf(), later));
+}
+
+/// At exit. Pass 1 records the task derivations it wrote; A LATER PASS SAYS
+/// HOW MANY TASKS IT WROTE AT ANOTHER DERIVATION THAN PASS 1 DID for the
+/// same outputs (a re-key: each is built again unless already valid), and
+/// says it at zero too, so a round reads the line's absence as "not a later
+/// pass", never as "nothing to report". None when this process walked no
+/// build dir (the compiler route).
+pub fn pass_report() -> std::io::Result<Option<String>> {
+    let Some((state, build_dir, later)) = PASS.lock().unwrap().clone() else {
+        return Ok(None);
+    };
+    let emitted = EMITTED.lock().unwrap().clone();
+    let path = state.join("emitted.v1");
+    if !later {
+        let mut first: std::collections::BTreeMap<String, String> = read_lines(&path, &build_dir)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(k, d)| (k.to_string(), d.to_string()))
+            .collect();
+        first.extend(emitted);
+        let lines: Vec<String> = first.iter().map(|(k, d)| format!("{k}\t{d}")).collect();
+        write_lines(&path, &build_dir, &lines, false)?;
+        return Ok(None);
+    }
+    let Some(first) = read_lines(&path, &build_dir) else {
+        return Ok(Some(
+            "nix-ninja: later-pass rekeyed ? task(s): pass 1 recorded none".to_string(),
+        ));
+    };
+    let first: std::collections::HashMap<&str, &str> =
+        first.iter().filter_map(|l| l.split_once('\t')).collect();
+    let rekeyed: Vec<&String> = emitted
+        .iter()
+        .filter(|(k, d)| first.get(k.as_str()).is_some_and(|f| f != d))
+        .map(|(_, d)| d)
+        .collect();
+    let new = emitted
+        .keys()
+        .filter(|k| !first.contains_key(k.as_str()))
+        .count();
+    Ok(Some(format!(
+        "nix-ninja: later-pass rekeyed {} task(s), {new} pass 1 did not write: {}",
+        rekeyed.len(),
+        rekeyed
+            .iter()
+            .take(3)
+            .map(|d| d.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    )))
+}
 
 /// Makes this process's listings of build-tree directories answer from
 /// configure's record: called by a later pass's walk.
@@ -109,15 +204,9 @@ fn left_by(record: Option<&ConfigureState>, build_dir: &Path, path: &Path) -> bo
 
 fn left_in(r: &ConfigureState, build_dir: &Path, path: &Path) -> bool {
     // THE RECORD KNOWS ONLY WHAT THE WALK ENTERED: not a directory the walk
-    // skips (`walk_skips`), not what lies below a symlink (recorded as a
-    // file, so a recorded file with more of the path below it is one), and
-    // nothing outside the build dir, which the listing reads.
-    match landing(
-        build_dir,
-        path,
-        |d| r.dirs.contains(d),
-        |l| r.files.contains(l),
-    ) {
+    // skips (`walk_skips`), and nothing outside the build dir, which the
+    // listing reads.
+    match landing(build_dir, path, r) {
         Landing::Inside(rel) => {
             rel.is_empty() || r.files.contains(&rel) || rel.split('/').any(walk_skips)
         }
@@ -126,32 +215,43 @@ fn left_in(r: &ConfigureState, build_dir: &Path, path: &Path) -> bool {
     }
 }
 
+/// `rel`, a path placement writes, as the walk spells the file the write
+/// reaches: its directory resolved as the kernel resolves it now (through a
+/// link configure left, or one this pass placed), the name kept, so a
+/// placed link is itself and a file written through one is the file it
+/// reaches. None for one outside the tree.
+fn written_at(build_dir: &Path, rel: &Path) -> Option<String> {
+    let rel = normal_rel(rel)?;
+    let bd = std::fs::canonicalize(build_dir).ok()?;
+    let p = build_dir.join(&rel);
+    let dir = std::fs::canonicalize(p.parent()?).ok()?;
+    normal_rel(dir.join(p.file_name()?).strip_prefix(&bd).ok()?)
+}
+
 /// Where a spelling lands, as `landing` answers it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Landing {
     /// Under the build dir, as the walk spells it (`""` for the build dir).
     Inside(String),
-    /// Outside it, or through a link that does not resolve: the disk
-    /// answers, as on the first pass.
+    /// Outside it: the disk answers, as on the first pass.
     Outside,
     /// Nowhere on the first pass: a `..` after a name configure left no
-    /// directory at.
+    /// directory at, or more spelling after a link that did not resolve.
     Absent,
 }
 
-/// Where `spelled` (relative to `build_dir`, or absolute) lands, ONE ANSWER
-/// FOR EVERY PASS. It climbs as the kernel does: from the build dir's real
-/// location, through every symlink configure left (`left_link`) with more
-/// of the spelling to follow (a `..` after one climbs from its target, and
-/// one leaving the tree is followed back in if the spelling returns), and
-/// `..` after a name is a climb only where configure left a directory
-/// (`left_dir`) there, since otherwise the first pass found nothing.
-pub fn landing(
-    build_dir: &Path,
-    spelled: &Path,
-    left_dir: impl Fn(&str) -> bool,
-    left_link: impl Fn(&str) -> bool,
-) -> Landing {
+/// Where `spelled` (relative to `build_dir`, or absolute) lands on a later
+/// pass, ONE ANSWER FOR EVERY PASS: inside the tree it asks only configure's
+/// record `r`, never the disk, which hooks and placement change between
+/// phases. It climbs as the kernel did when configure left the tree: from
+/// the build dir's real location, through every symlink configure left
+/// with more of the spelling to follow, to where that link landed then (a
+/// `..` after one climbs from its target, and one leaving the tree is
+/// followed back in if the spelling returns), and `..` after a name is a
+/// climb only where configure left a directory there, since otherwise the
+/// first pass found nothing. Outside the tree, and below a directory the
+/// walk skips, nothing was recorded and the disk answers.
+pub fn landing(build_dir: &Path, spelled: &Path, r: &ConfigureState) -> Landing {
     let bd = std::fs::canonicalize(build_dir).unwrap_or_else(|_| build_dir.to_path_buf());
     // An absolute spelling is climbed from the root, lexically outside the
     // tree; under it, the tree's own spelling or its real location.
@@ -183,9 +283,28 @@ pub fn landing(
             break;
         }
         let up = more.first() == Some(&std::path::Component::ParentDir);
-        let Some(rel) = inside(&cur) else {
-            // Outside the tree nothing changes between phases: the disk
-            // answers what the kernel would.
+        let unrecorded = |rel: &str| rel.split('/').any(walk_skips);
+        let disk = match inside(&cur) {
+            None => true,
+            Some(rel) if rel.is_empty() => continue,
+            Some(rel) if unrecorded(&rel) => true,
+            Some(rel) => {
+                hops += 1;
+                match r.links.get(&rel).map(String::as_str) {
+                    Some(_) if hops > 40 => return Landing::Outside,
+                    Some(l) if l.starts_with("I:") => cur = bd.join(&l[2..]),
+                    Some(l) if l.starts_with("O:") => cur = PathBuf::from(&l[2..]),
+                    // A link that did not resolve when configure left it:
+                    // nothing was there on the first pass.
+                    Some(_) => return Landing::Absent,
+                    None if up && !r.dirs.contains(&rel) => return Landing::Absent,
+                    None => {}
+                }
+                false
+            }
+        };
+        if disk {
+            // Nothing recorded here: the disk answers what the kernel would.
             if cur.is_symlink() {
                 hops += 1;
                 match std::fs::canonicalize(&cur) {
@@ -195,19 +314,6 @@ pub fn landing(
             } else if up && !cur.is_dir() {
                 return Landing::Absent;
             }
-            continue;
-        };
-        if rel.is_empty() {
-            continue;
-        }
-        if left_link(&rel) {
-            hops += 1;
-            match std::fs::canonicalize(&cur) {
-                Ok(t) if hops <= 40 => cur = t,
-                _ => return Landing::Outside,
-            }
-        } else if up && !left_dir(&rel) {
-            return Landing::Absent;
         }
     }
     inside(&cur).map_or(Landing::Outside, Landing::Inside)
@@ -274,7 +380,7 @@ pub fn keep_originals<'a>(
     placed: impl IntoIterator<Item = &'a Path>,
 ) -> std::io::Result<()> {
     let state = state_dir(build_dir);
-    match load_in(&state, build_dir) {
+    match load_in(&state, build_dir)? {
         Some(r) => keep_originals_in(&state, build_dir, &r, placed),
         None => Ok(()),
     }
@@ -309,8 +415,9 @@ fn keep_originals_in<'a>(
         }
     };
     for rel in placed {
-        // As the journal spells it, so `./m.json` is kept as `m.json` is.
-        let Some(rel) = normal_rel(rel) else {
+        // As the walk spells the file the write reaches, so `./m.json` and
+        // a path through a link are kept as the journal keys them.
+        let Some(rel) = written_at(build_dir, rel) else {
             continue;
         };
         let rel = Path::new(&rel);
@@ -348,7 +455,7 @@ fn keep_originals_in<'a>(
 fn header(build_dir: &Path) -> Option<String> {
     let m = std::fs::metadata(build_dir.join("build.ninja")).ok()?;
     Some(format!(
-        "nix-ninja-configure-state v1 {} {}.{}",
+        "nix-ninja-configure-state v2 {} {}.{}",
         m.len(),
         m.mtime(),
         m.mtime_nsec()
@@ -373,7 +480,10 @@ fn write_lines(
     append: bool,
 ) -> std::io::Result<()> {
     let Some(head) = header(build_dir) else {
-        return Ok(());
+        return Err(std::io::Error::other(format!(
+            "no build.ninja in {} to key this configure's record on",
+            build_dir.display()
+        )));
     };
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p)?;
@@ -409,18 +519,28 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 
 /// The record the first walk wrote for this configure, or None: no record,
 /// an unreadable one, or one for another build.ninja.
-pub fn load(build_dir: &Path) -> Option<ConfigureState> {
+pub fn load(build_dir: &Path) -> std::io::Result<Option<ConfigureState>> {
     load_in(&state_dir(build_dir), build_dir)
 }
 
-fn load_in(state: &Path, build_dir: &Path) -> Option<ConfigureState> {
+fn load_in(state: &Path, build_dir: &Path) -> std::io::Result<Option<ConfigureState>> {
     let mut s = ConfigureState::default();
     let mut malformed = 0usize;
-    for line in read_lines(&state.join("configure.v1"), build_dir)? {
+    let Some(lines) = read_lines(&state.join("configure.v1"), build_dir) else {
+        return Ok(None);
+    };
+    for line in lines {
         match line.split_once(' ') {
             Some(("D", rel)) => s.dirs.insert(rel.to_string()),
             Some(("F", rel)) => s.files.insert(rel.to_string()),
             Some(("E", rel)) => s.empty_dirs.insert(rel.to_string()),
+            Some(("L", rest)) => match rest.split_once('\t') {
+                Some((l, t)) => s.links.insert(l.to_string(), t.to_string()).is_none(),
+                None => {
+                    malformed += 1;
+                    false
+                }
+            },
             _ => {
                 malformed += 1;
                 false
@@ -428,19 +548,24 @@ fn load_in(state: &Path, build_dir: &Path) -> Option<ConfigureState> {
         };
     }
     if malformed > 0 {
-        eprintln!("nix-ninja: {malformed} unreadable line(s) in the configure record skipped");
+        // A record missing lines would answer a later pass for a tree pass 1
+        // never saw.
+        return Err(std::io::Error::other(format!(
+            "{malformed} unreadable line(s) in the configure record at {}",
+            state.display()
+        )));
     }
-    Some(s)
+    Ok(Some(s))
 }
 
-/// Writes `s` as this configure's record. A failure is reported, not fatal:
-/// without a record a later pass reads the directory as it stands, as every
-/// pass did before.
-pub fn save(build_dir: &Path, s: &ConfigureState) {
+/// Writes `s` as this configure's record. AN ERROR when it cannot: without
+/// a record a later pass would read the directory as it stands, placed
+/// files and all.
+pub fn save(build_dir: &Path, s: &ConfigureState) -> std::io::Result<()> {
     save_in(&state_dir(build_dir), build_dir, s)
 }
 
-fn save_in(state: &Path, build_dir: &Path, s: &ConfigureState) {
+fn save_in(state: &Path, build_dir: &Path, s: &ConfigureState) -> std::io::Result<()> {
     // A name holding a newline cannot be one line; it is left out, so a
     // later pass treats it as something configure did not leave.
     let lines: Vec<String> = s
@@ -450,13 +575,19 @@ fn save_in(state: &Path, build_dir: &Path, s: &ConfigureState) {
         .chain(s.files.iter().map(|f| format!("F {f}")))
         .chain(s.empty_dirs.iter().map(|e| format!("E {e}")))
         .filter(|l| !l.contains('\n'))
+        .chain(
+            s.links
+                .iter()
+                .filter(|(l, t)| !l.contains(['\n', '\t']) && !t.contains('\n'))
+                .map(|(l, t)| format!("L {l}\t{t}")),
+        )
         .collect();
-    if let Err(e) = write_lines(&state.join("configure.v1"), build_dir, &lines, false) {
-        eprintln!(
-            "nix-ninja: could not record the configure-time build directory ({e}); \
-             a later pass reads the directory as it stands"
-        );
-    }
+    write_lines(&state.join("configure.v1"), build_dir, &lines, false).map_err(|e| {
+        std::io::Error::other(format!(
+            "could not record the configure-time build directory ({e}); a later \
+             pass would read the directory as it stands"
+        ))
+    })?;
     // A new record is a new configure: what an earlier one left at a path
     // placement replaced is not this configure's. Not while a pass holds
     // files or directories aside: its restore asks these copies what gives
@@ -466,16 +597,15 @@ fn save_in(state: &Path, build_dir: &Path, s: &ConfigureState) {
         .iter()
         .any(|n| std::fs::symlink_metadata(state.join(n)).is_ok())
     {
-        return;
+        return Ok(());
     }
-    if let Err(e) = std::fs::remove_dir_all(&orig) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!(
-                "nix-ninja: could not clear {} ({e}); a later pass may read an \
-                 earlier configure's file where placement replaced one",
-                orig.display()
-            );
-        }
+    match std::fs::remove_dir_all(&orig) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(std::io::Error::other(format!(
+            "could not clear {} ({e}); a later pass would read an earlier \
+             configure's file where placement replaced one",
+            orig.display()
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -517,11 +647,10 @@ pub fn journal_placed<'a>(
     let state = state_dir(build_dir);
     let _lock = if held { None } else { lock_blocking(&state) };
     if !held && _lock.is_none() {
-        eprintln!(
-            "nix-ninja: could not lock {} to journal this run's placement; journaling \
-             unlocked",
+        return Err(std::io::Error::other(format!(
+            "could not lock {} to journal this run's placement",
             state.display()
-        );
+        )));
     }
     journal_in(&state, build_dir, placed)
 }
@@ -543,7 +672,7 @@ fn journal_in<'a>(
     build_dir: &Path,
     placed: impl IntoIterator<Item = &'a Path>,
 ) -> std::io::Result<()> {
-    let Some(r) = load_in(state, build_dir) else {
+    let Some(r) = load_in(state, build_dir)? else {
         return Ok(());
     };
     let path = state.join("placed.v1");
@@ -570,7 +699,7 @@ fn journal_in<'a>(
     };
     let mut placed_keys: Vec<String> = Vec::new();
     for rel in placed {
-        let Some(key) = normal_rel(rel) else {
+        let Some(key) = written_at(build_dir, rel) else {
             continue;
         };
         let rel = Path::new(&key);
@@ -716,23 +845,16 @@ impl Rewind {
                 .write(true)
                 .open(state.join("lock"))
         });
-        let lock = match lock {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!(
-                    "nix-ninja: no rewind state at {} ({e}); this pass reads the \
-                     directory as it stands",
-                    state.display()
-                );
-                return Ok(None);
-            }
-        };
+        let lock = lock.map_err(|e| {
+            std::io::Error::other(format!("no rewind state at {} ({e})", state.display()))
+        })?;
+        // ANOTHER DRIVER IN THIS BUILD DIR is waited for, never read past:
+        // reading the directory as it stands would read its placements.
         if lock.try_lock().is_err() {
             eprintln!(
-                "nix-ninja: another driver holds this build directory's rewind; this one \
-                 reads the directory as it stands"
+                "nix-ninja: another driver holds this build directory's rewind; waiting for it"
             );
-            return Ok(None);
+            lock.lock()?;
         }
         let mut rewind = Rewind {
             build_dir: build_dir.to_path_buf(),
@@ -1066,13 +1188,18 @@ mod tests {
             dirs: ["CMakeFiles/foo.dir".to_string()].into(),
             files: ["build.ninja".to_string(), "config.h".to_string()].into(),
             empty_dirs: ["CMakeFiles/foo.dir".to_string()].into(),
+            links: [("alias".to_string(), "I:CMakeFiles".to_string())].into(),
         };
-        assert_eq!(load_in(&state, &d), None, "no record before the first pass");
-        save_in(&state, &d, &s);
-        assert_eq!(load_in(&state, &d), Some(s));
+        assert_eq!(
+            load_in(&state, &d).unwrap(),
+            None,
+            "no record before the first pass"
+        );
+        save_in(&state, &d, &s).expect("saved");
+        assert_eq!(load_in(&state, &d).unwrap(), Some(s));
         write(&d.join("build.ninja"), "default all app\n");
         assert_eq!(
-            load_in(&state, &d),
+            load_in(&state, &d).unwrap(),
             None,
             "a changed build.ninja is a new configure"
         );
@@ -1154,8 +1281,10 @@ mod tests {
                     .map(String::from)
                     .into(),
                 empty_dirs: ["CMakeFiles/foo.dir"].map(String::from).into(),
+                ..Default::default()
             },
-        );
+        )
+        .expect("saved");
         write(&bd.join("include/Foo/a.h"), "placed");
         write(&bd.join("include/Foo/b.h"), "placed");
         write(&bd.join("CMakeFiles/foo.dir/foo.c.o"), "placed");
@@ -1191,9 +1320,19 @@ mod tests {
         ] {
             assert!(bd.join(kept).exists(), "{kept} should stay");
         }
+        // A second driver in the same build dir waits for the rewind, never
+        // reading the directory past it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (s2, b2) = (state.clone(), bd.clone());
+        let second = std::thread::spawn(move || {
+            let r = Rewind::begin_in(&s2, &b2, true).map(|r| r.is_none());
+            tx.send(()).unwrap();
+            r
+        });
         assert!(
-            Rewind::begin_in(&state, &bd, false).unwrap().is_none(),
-            "a second driver in the same build dir leaves the rewind alone"
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a second driver waits"
         );
         assert!(
             !bd.join("include/Foo/a.h").exists(),
@@ -1202,6 +1341,7 @@ mod tests {
         // The pass places one output again; the rest come back at the end.
         write(&bd.join("gen/sub/y.h"), "new");
         rewind.finish().expect("everything comes back");
+        assert!(second.join().unwrap().unwrap(), "and goes on once it ends");
         assert_eq!(
             std::fs::read_to_string(bd.join("gen/sub/y.h")).unwrap(),
             "new"
@@ -1273,9 +1413,9 @@ mod tests {
             ]
             .map(String::from)
             .into(),
-            empty_dirs: Default::default(),
+            ..Default::default()
         };
-        save_in(&state, &bd, &record);
+        save_in(&state, &bd, &record).expect("saved");
         let placed = [
             json,
             "include/Foo",
@@ -1386,21 +1526,16 @@ mod tests {
         // what it reaches) and below a directory the walk skips, the record
         // cannot answer and the listing reads.
         let files: std::collections::HashSet<String> = ["python".to_string()].into();
+        let mut r = record_of(&files);
+        r.links
+            .insert("python".into(), "O:/elsewhere/python".into());
+        assert!(super::left_by(Some(&r), bd, Path::new("python/pkg/a.py")));
         assert!(super::left_by(
-            Some(&record_of(&files)),
-            bd,
-            Path::new("python/pkg/a.py")
-        ));
-        assert!(super::left_by(
-            Some(&record_of(&files)),
+            Some(&r),
             bd,
             Path::new("meson-private/x.dat")
         ));
-        assert!(!super::left_by(
-            Some(&record_of(&files)),
-            bd,
-            Path::new("pythonx/a.py")
-        ));
+        assert!(!super::left_by(Some(&r), bd, Path::new("pythonx/a.py")));
         // Any spelling of a file configure left (CMake-joined dir arguments).
         let files: std::collections::HashSet<String> = ["meta/d/meta.json".to_string()].into();
         for spelled in [
@@ -1427,16 +1562,16 @@ mod tests {
         std::os::unix::fs::symlink("real", bd.join("alias")).unwrap();
         let files: std::collections::HashSet<String> =
             ["real/a.h".to_string(), "alias".to_string()].into();
-        assert!(super::left_by(
-            Some(&record_of(&files)),
-            &bd,
-            Path::new("alias/a.h")
-        ));
-        assert!(!super::left_by(
-            Some(&record_of(&files)),
-            &bd,
-            Path::new("alias/w.tmp")
-        ));
+        let mut r = record_of(&files);
+        r.links.insert("alias".into(), "I:real".into());
+        assert!(super::left_by(Some(&r), &bd, Path::new("alias/a.h")));
+        assert!(!super::left_by(Some(&r), &bd, Path::new("alias/w.tmp")));
+        // A hook replaces the link with a directory holding the same name:
+        // the record's link still answers, as pass 1 read it.
+        std::fs::remove_file(bd.join("alias")).unwrap();
+        write(&bd.join("alias/a.h"), "hook");
+        assert!(super::left_by(Some(&r), &bd, Path::new("alias/a.h")));
+        assert!(!super::left_by(Some(&r), &bd, Path::new("alias/w.tmp")));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1458,7 +1593,7 @@ mod tests {
             files: ["build.ninja", "m.json"].map(String::from).into(),
             ..Default::default()
         };
-        save_in(&state, &bd, &record);
+        save_in(&state, &bd, &record).expect("saved");
         let placed = [PathBuf::from("m.json")];
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("m.json"), "placed");
@@ -1495,7 +1630,7 @@ mod tests {
 
         // A new configure: its own file at the path, a fresh record.
         write(&bd.join("m.json"), "configure B");
-        save_in(&state, &bd, &record);
+        save_in(&state, &bd, &record).expect("saved");
         assert!(
             !super::originals(&state).exists(),
             "the old originals are gone"
@@ -1555,7 +1690,7 @@ mod tests {
             dirs: ["D".to_string()].into(),
             ..Default::default()
         };
-        save_in(&state, &bd, &record);
+        save_in(&state, &bd, &record).expect("saved");
         let placed = [PathBuf::from(spelled)];
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("D/m.json"), "placed");
@@ -1614,6 +1749,126 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// PLACEMENT THROUGH A LINK CONFIGURE LEFT writes the file the link
+    /// reaches, so that file's copy is kept and its line journaled: through
+    /// a chain of links and through a link with an absolute target alike,
+    /// pass 2 reads configure's version where pass 1 did.
+    #[test]
+    fn placement_through_a_configure_link_keeps_the_file_it_reaches() {
+        for (tag, links) in [
+            (
+                "chain",
+                vec![
+                    ("alias2", "real".to_string()),
+                    ("alias", "alias2".to_string()),
+                ],
+            ),
+            ("absolute", vec![("alias", String::new())]),
+        ] {
+            let d = scratch(&format!("through-{tag}"));
+            let bd = d.join("build");
+            let state = d.join("state");
+            write(&bd.join("build.ninja"), "default all\n");
+            write(&bd.join("real/x.h"), "configure");
+            for (l, t) in &links {
+                let t = if t.is_empty() {
+                    bd.join("real").to_string_lossy().into_owned()
+                } else {
+                    t.clone()
+                };
+                std::os::unix::fs::symlink(t, bd.join(l)).unwrap();
+            }
+            let record = crate::task::plan_build_dir_walk(&bd, None, |_| false)
+                .unwrap()
+                .seen;
+            save_in(&state, &bd, &record).expect("saved");
+            let placed = [PathBuf::from("alias/x.h")];
+            keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path))
+                .expect("kept");
+            write(&bd.join("alias/x.h"), "placed");
+            journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
+            let rewind = begin(&state, &bd);
+            assert_eq!(
+                std::fs::read_to_string(bd.join("real/x.h")).unwrap(),
+                "configure",
+                "{tag}: pass 2 reads configure's version"
+            );
+            rewind.finish().expect("everything comes back");
+            assert_eq!(
+                std::fs::read_to_string(bd.join("real/x.h")).unwrap(),
+                "placed"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// NOTHING TO KEY A RECORD ON, OR A RECORD MISSING LINES, STOPS THE RUN:
+    /// with no build.ninja every pass would be a first pass, and a record
+    /// that dropped lines would answer for a tree pass 1 never saw. A state
+    /// dir that cannot be opened stops a later pass the same way.
+    #[test]
+    fn a_record_that_cannot_answer_for_pass_one_stops_the_run() {
+        let d = scratch("record-unkeyed");
+        let bd = d.join("build");
+        let state = d.join("state");
+        write(&bd.join("other.ninja"), "default all\n");
+        assert!(save_in(&state, &bd, &ConfigureState::default()).is_err());
+        write(&bd.join("build.ninja"), "default all\n");
+        save_in(&state, &bd, &ConfigureState::default()).expect("saved");
+        let rec = std::fs::read_to_string(state.join("configure.v1")).unwrap();
+        std::fs::write(state.join("configure.v1"), format!("{rec}Q what\n")).unwrap();
+        assert!(load_in(&state, &bd).is_err());
+        write(&d.join("notadir"), "a file");
+        assert!(Rewind::begin_in(&d.join("notadir/state"), &bd, false).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A LINK THIS PASS PLACED, written through: the journal keys the file
+    /// the write reached, so pass 2 sets aside both the link and that file,
+    /// not a path below a link it has already moved.
+    #[test]
+    fn a_file_placed_through_a_placed_link_is_set_aside_with_it() {
+        let d = scratch("placed-link");
+        let bd = d.join("build");
+        let state = d.join("state");
+        write(&bd.join("build.ninja"), "default all\n");
+        std::fs::create_dir_all(bd.join("lib64")).unwrap();
+        let record = crate::task::plan_build_dir_walk(&bd, None, |_| false)
+            .unwrap()
+            .seen;
+        save_in(&state, &bd, &record).expect("saved");
+        std::os::unix::fs::symlink("lib64", bd.join("lib")).unwrap();
+        write(&bd.join("lib/foo.so"), "placed");
+        let placed = [PathBuf::from("lib"), PathBuf::from("lib/foo.so")];
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
+        let rewind = begin(&state, &bd);
+        assert!(!bd.join("lib64/foo.so").exists(), "the file is set aside");
+        assert!(!bd.join("lib").is_symlink(), "and so is the link");
+        rewind.finish().expect("everything comes back");
+        assert_eq!(
+            std::fs::read_to_string(bd.join("lib/foo.so")).unwrap(),
+            "placed"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A RECORD THAT CANNOT BE WRITTEN STOPS THE FIRST PASS: without it a
+    /// later pass would read the tree as it stands, placed files and all.
+    #[test]
+    fn a_record_that_cannot_be_written_stops_the_first_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("record-stuck");
+        let bd = d.join("build");
+        let state = d.join("state");
+        write(&bd.join("build.ninja"), "default all\n");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let res = save_in(&state, &bd, &ConfigureState::default());
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(res.is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// A PLACEMENT THAT CANNOT BE JOURNALED STOPS THE RUN, as one that
     /// cannot keep configure's copy does: unjournaled, the next pass would
     /// read the placed file where pass 1 read configure's.
@@ -1630,7 +1885,7 @@ mod tests {
             dirs: ["D".to_string()].into(),
             ..Default::default()
         };
-        save_in(&state, &bd, &record);
+        save_in(&state, &bd, &record).expect("saved");
         let placed = [PathBuf::from("D/m.json")];
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("D/m.json"), "placed");
@@ -1653,7 +1908,7 @@ mod tests {
             files: ["build.ninja".to_string()].into(),
             ..Default::default()
         };
-        save_in(&state, &bd, &record);
+        save_in(&state, &bd, &record).expect("saved");
         write(&bd.join("gen.h"), "placed");
         journal_in(&state, &bd, [Path::new("gen.h")]).expect("journaled");
         // Nothing can be made below a file.
@@ -1676,7 +1931,7 @@ mod tests {
             files: ["build.ninja", "m.json"].map(String::from).into(),
             ..Default::default()
         };
-        save_in(&state, &bd, &record);
+        save_in(&state, &bd, &record).expect("saved");
         assert!(keep_originals_in(&state, &bd, &record, [Path::new("m.json")]).is_err());
         // A path configure did not leave has nothing to keep.
         assert!(keep_originals_in(&state, &bd, &record, [Path::new("new.h")]).is_ok());
@@ -1691,6 +1946,7 @@ mod tests {
         let d = scratch("removed-stuck");
         let bd = d.join("build");
         let state = d.join("state");
+        write(&bd.join("build.ninja"), "default all\n");
         // `a` is a file now, so `a/b` cannot be made.
         write(&bd.join("a"), "in the way");
         write(&super::originals(&state).join("x"), "configure's");
@@ -1711,7 +1967,7 @@ mod tests {
             [PathBuf::from("a/b")],
             "and the directory waits on the record"
         );
-        save_in(&state, &bd, &ConfigureState::default());
+        save_in(&state, &bd, &ConfigureState::default()).expect("saved");
         assert!(
             super::originals(&state).join("x").exists(),
             "the originals are kept while it waits"
@@ -1733,7 +1989,7 @@ mod tests {
             files: ["build.ninja", "m.json"].map(String::from).into(),
             ..Default::default()
         };
-        save_in(&state, &bd, &record);
+        save_in(&state, &bd, &record).expect("saved");
         let placed = [PathBuf::from("m.json")];
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("m.json"), "placed");
@@ -1764,7 +2020,7 @@ mod tests {
             files: ["build.ninja", "x"].map(String::from).into(),
             ..Default::default()
         };
-        save_in(&state, &bd, &record);
+        save_in(&state, &bd, &record).expect("saved");
         let placed = [PathBuf::from("x")];
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         std::fs::remove_file(bd.join("x")).unwrap();
@@ -1774,7 +2030,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(bd.join("x")).unwrap(), "configure");
         // A record written now (a lost configure.v1) leaves the originals.
         write(&state.join("aside/.keep"), "");
-        save_in(&state, &bd, &record);
+        save_in(&state, &bd, &record).expect("saved");
         assert!(
             super::originals(&state).join("x").exists(),
             "originals kept"
