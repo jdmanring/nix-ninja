@@ -207,6 +207,16 @@ fn cache_homes(
     }
 }
 
+/// Whether this invocation trusts state an earlier one left (the resolve
+/// memo's switch), from the environment alone, so it can be asked before
+/// `init`: off inside a nix build and under NIX_NINJA_RESOLVE_CACHE=0.
+pub fn earlier_runs_trusted() -> bool {
+    persistence_enabled(
+        std::env::var("NIX_NINJA_RESOLVE_CACHE").ok().as_deref(),
+        std::env::var_os("NIX_BUILD_TOP").is_some(),
+    )
+}
+
 fn persistence_enabled(setting: Option<&str>, in_nix_build: bool) -> bool {
     match setting {
         Some("0") => false,

@@ -1179,12 +1179,15 @@ impl Runner {
             .filter_map(|id| graph.builds[id].depfile.clone())
             .collect();
         let files = &mut graph.files;
+        // The first pass records what configure left; see configure_state.
+        let first = crate::configure_state::load(&self.config.build_dir).is_none();
+        let mut seen = crate::configure_state::ConfigureState::default();
         for entry in WalkDir::new(&self.config.build_dir)
             .into_iter()
             .filter_entry(|e| {
                 // Skip directories that start with "meson-" as they contain
                 // non-deterministic internal data from meson
-                !e.file_name().to_string_lossy().starts_with("meson-")
+                !crate::configure_state::walk_skips(&e.file_name().to_string_lossy())
             })
         {
             // A file that vanishes between listing and reading is a build
@@ -1211,6 +1214,13 @@ impl Runner {
                 .strip_prefix(&self.config.build_dir)
                 .map(|r| r.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            if !rel.is_empty() {
+                if entry.file_type().is_dir() {
+                    seen.dirs.insert(rel.clone());
+                } else {
+                    seen.files.insert(rel.clone());
+                }
+            }
             let produced = matches!(disposition, BuildDirDisposition::Upload)
                 && (depfiles.contains(rel.as_str())
                     || files
@@ -1233,7 +1243,18 @@ impl Runner {
                     entry.file_type().is_file()
                 );
             }
+            // A LINK AN EDGE PRODUCES IS NOT A CONFIGURE-TIME ALIAS: an
+            // earlier pass over this directory placed it (a soname link from
+            // CMAKE_SYMLINK_LIBRARY), and recording it writes it into
+            // NIX_NINJA_ALIASES of every task.
+            let produced_link = matches!(
+                disposition,
+                BuildDirDisposition::Alias(..) | BuildDirDisposition::AliasAndUpload(..)
+            ) && files
+                .lookup(&rel)
+                .is_some_and(|f| files.by_id[f].input.is_some());
             let path = match disposition {
+                _ if produced_link => continue,
                 BuildDirDisposition::Alias(link, target) => {
                     self.alias_symlinks.push((link, target));
                     continue;
@@ -1299,6 +1320,9 @@ impl Runner {
         self.alias_symlinks.dedup();
         self.empty_dirs.sort();
         self.empty_dirs.dedup();
+        if first {
+            crate::configure_state::save(&self.config.build_dir, &seen);
+        }
         Ok(())
     }
 
@@ -10145,6 +10169,19 @@ enum BuildDirDisposition {
     Skip,
 }
 
+/// A file this driver writes into the build dir itself: the resolve memo,
+/// the NAR stamps, the configure record and ninja's state files.
+pub fn is_driver_state(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        n == crate::resolve_cache::FILE_NAME
+            || n == crate::resolve_cache::NAR_FILE
+            || n == crate::configure_state::FILE_NAME
+            || n.starts_with(".ninja_log")
+            || n.starts_with(".ninja_deps")
+            || n.starts_with(".ninja_state_start")
+    })
+}
+
 /// EXTRACTED SO THE WIRING CAN BE PINNED. Reverting the symlink arm to the
 /// entry's own file type left the whole suite green, because every test
 /// covered `alias_symlink_entry` and nothing covered what the walk DOES with
@@ -10185,14 +10222,7 @@ fn build_dir_disposition(
     // a byte-identical command (class 27, configuration A).
     // ninja's two state files are written by the driver after a local build
     // (`ninja_state`) and change on every one, the same hazard.
-    let own_state = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-        n == crate::resolve_cache::FILE_NAME
-            || n == crate::resolve_cache::NAR_FILE
-            || n.starts_with(".ninja_log")
-            || n.starts_with(".ninja_deps")
-            || n.starts_with(".ninja_state_start")
-    });
-    if entry_is_file && !own_state {
+    if entry_is_file && !is_driver_state(path) {
         BuildDirDisposition::Upload
     } else {
         BuildDirDisposition::Skip

@@ -422,6 +422,22 @@ pub fn run() -> Result<()> {
         return subtool(&build_dir, &cli.store_dir, &tool, cli.targets.clone());
     }
 
+    // BEFORE ANYTHING READS THE BUILD DIR, and held until this pass has
+    // placed its outputs: a later pass resolves against the directory as
+    // the first pass found it (configure_state).
+    // NEVER ON THE COMPILER ROUTE: there thousands of drivers share one tree
+    // concurrently (NIX_NINJA_NO_BUILD_DIR_SCAN, no walk, so no record), and
+    // one moving files aside would pull them from under the others.
+    let _rewind =
+        if cli.is_output_derivation || std::env::var_os("NIX_NINJA_NO_BUILD_DIR_SCAN").is_some() {
+            None
+        } else {
+            crate::configure_state::Rewind::begin(
+                &build_dir,
+                crate::resolve_cache::earlier_runs_trusted(),
+                crate::task::is_driver_state,
+            )
+        };
     let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
         resolved_connections(&cli, crate::task::available_gib()),
     ))?);

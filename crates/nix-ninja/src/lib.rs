@@ -1,5 +1,6 @@
 mod build;
 pub mod cli;
+mod configure_state;
 mod dyndep;
 pub mod local;
 mod ninja_state;
