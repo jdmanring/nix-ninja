@@ -184,11 +184,13 @@ struct Task {
     // inputSrcs carries them - but seeds for the include scan, which is
     // otherwise seeded only from `inputs`. See new_task.
     store_srcs: Vec<PathBuf>,
-    // What a moc response-file walk found that `inputs` cannot hold: store
-    // paths its includes reached and the `..` directories they enter. Empty
-    // for every edge but a moc over a generated header; see moc_rsp_scan.
-    rsp_store_paths: Vec<StorePath>,
-    rsp_dotdot_dirs: Vec<PathBuf>,
+    // The include walk a moc over a generated header needs, as
+    // `moc_rsp_scan` planned it: (scan command, seeds). Run in the worker
+    // (`moc_walk`), where a seed can be realised. None for every other edge.
+    moc_scan: Option<(String, Vec<PathBuf>)>,
+    // RunnerConfig::emit_only: a query about the graph must not build, so
+    // the walk realises nothing under it.
+    emit_only: bool,
     outputs: Vec<PathBuf>,
     // Outputs this edge declares INSIDE the outer derivation's own output,
     // as (the path the graph declared, the staged build-relative path the
@@ -2378,8 +2380,7 @@ impl Runner {
         // cmdline rewrite it needs. Filled by the `@` branch below, applied
         // after the loop (the loop holds cmdline borrowed).
         let mut extra_rspfile: Option<(PathBuf, String)> = None;
-        let mut rsp_store_paths: Vec<StorePath> = Vec::new();
-        let mut rsp_dotdot_dirs: Vec<PathBuf> = Vec::new();
+        let mut moc_scan: Option<(String, Vec<PathBuf>)> = None;
         let mut arg_rewrites: Vec<(String, String)> = Vec::new();
         // Positions FROM THE END of the split argv that the `@` branch
         // respelled, so the same respelling can be applied to the ORIGINAL
@@ -2663,74 +2664,13 @@ impl Runner {
                                 }
                                 // A MOC OVER A GENERATED HEADER READS ITS INCLUDES
                                 // through the `-I` flags above, which the token
-                                // scan skips; see moc_rsp_scan. Walked by the
-                                // compile discovery, the generated header read
-                                // from its realised copy.
-                                if let Some((scan, seeds)) =
-                                    moc_rsp_scan(cmdline, &root_view, |p| {
-                                        files
-                                            .lookup(&p.to_string_lossy())
-                                            .is_some_and(|f| files.by_id[f].input.is_some())
-                                    })
-                                {
-                                    let store_dir = &self.config.store_dir;
-                                    let mut virtual_paths: HashMap<PathBuf, PathBuf> =
-                                        HashMap::new();
-                                    let mut unbuilt: Vec<DerivedFile> = Vec::new();
-                                    for (bp, df) in input_set.iter() {
-                                        match df.derived_path {
-                                            SingleDerivedPath::Opaque(_) => {
-                                                virtual_paths.insert(
-                                                    bp.clone(),
-                                                    df.absolute_path(store_dir),
-                                                );
-                                            }
-                                            SingleDerivedPath::Built { .. } => {
-                                                if seeds.contains(bp)
-                                                    && !self.config.is_output_derivation
-                                                {
-                                                    unbuilt.push(df.clone());
-                                                } else {
-                                                    virtual_paths.insert(bp.clone(), bp.clone());
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if !unbuilt.is_empty() {
-                                        virtual_paths.extend(local::build_derived_files(
-                                            &self.rpc_client,
-                                            store_dir,
-                                            &unbuilt,
-                                        )?);
-                                    }
-                                    let seed_count = seeds.len();
-                                    let (found, _) = discover_c_includes(
-                                        &self.rpc_client,
-                                        store_dir,
-                                        &self.config.build_dir,
-                                        &scan,
-                                        seeds,
-                                        Some(virtual_paths),
-                                        None,
-                                        None,
-                                        &[],
-                                        &|| None,
-                                    )?;
-                                    eprintln!(
-                                        "nix-ninja: moc {rsp_rel}: {} include(s) carried, \
-                                         {} store path(s), from {seed_count} seed(s)",
-                                        found.deps.len(),
-                                        found.store_paths.len(),
-                                    );
-                                    for input in found.deps {
-                                        self.add_derived_file(files, input.clone());
-                                        input_set.insert(input.build_path.clone(), input);
-                                    }
-                                    rsp_store_paths.extend(found.store_paths);
-                                    rsp_dotdot_dirs.extend(found.dotdot_dirs);
-                                    rsp_dotdot_dirs
-                                        .extend(include_dir_dotdots(&scan, &self.config.build_dir));
-                                }
+                                // scan skips; see moc_rsp_scan. Planned here,
+                                // walked in the worker (`moc_walk`).
+                                moc_scan = moc_rsp_scan(cmdline, &root_view, |p| {
+                                    files
+                                        .lookup(&p.to_string_lossy())
+                                        .is_some_and(|f| files.by_id[f].input.is_some())
+                                });
                                 // WHAT THE CONTENT SCAN ACTUALLY TOOK, once
                                 // per rspfile. syncqt's args file names the
                                 // module's source headers, and if none of
@@ -3868,8 +3808,8 @@ impl Runner {
             files: build_files,
             inputs,
             store_srcs,
-            rsp_store_paths,
-            rsp_dotdot_dirs,
+            moc_scan,
+            emit_only: self.config.emit_only,
             outputs,
             outer_stage_outputs,
             alias_symlinks: self.alias_symlinks.clone(),
@@ -4956,12 +4896,40 @@ fn build_task_derivation(
     // class, 2026-08-23). The scan over a non-source input is inert - a
     // file with no include directives contributes nothing - so the wider
     // gate can only over-declare, which is the pipeline's safe polarity.
-    declare_dotdot_dirs(&mut drv, &task.build_dir, &task.rsp_dotdot_dirs);
-    for store_path in &task.rsp_store_paths {
-        drv.inputs
-            .insert(SingleDerivedPath::Opaque(store_path.clone()));
-    }
     let mut discovered_inputs: Vec<DerivedFile> = Vec::new();
+    // A moc over a generated header: the walk `moc_rsp_scan` planned. A
+    // failure is named and the edge emits without it, so the task fails in
+    // its own sandbox rather than ending the run.
+    if let Some((scan, seeds)) = &task.moc_scan {
+        let rsp = task.rspfile.as_ref().map_or_else(
+            || "<no rspfile>".to_string(),
+            |(p, _)| p.display().to_string(),
+        );
+        match moc_walk(rpc_client, &task, scan, seeds) {
+            Ok(found) => {
+                eprintln!(
+                    "nix-ninja: moc {rsp}: {} include(s) carried, {} store path(s), \
+                     from {} seed(s)",
+                    found.deps.len(),
+                    found.store_paths.len(),
+                    seeds.len(),
+                );
+                let entered = include_dir_dotdots(scan, &task.build_dir);
+                apply_moc_walk(
+                    &mut drv,
+                    &task.build_dir,
+                    &task.store_dir,
+                    &mut input_set,
+                    &mut discovered_inputs,
+                    found,
+                    &entered,
+                );
+            }
+            Err(e) => {
+                eprintln!("nix-ninja: moc {rsp}: include walk failed, emitted without it: {e:#}")
+            }
+        }
+    }
     {
         let wants_discovery = wants_dependency_discovery(&task);
         if wants_discovery {
@@ -9339,10 +9307,13 @@ pub fn autogen_own_products<'a>(
 }
 
 /// The include walk a `moc @<params>` edge needs: a scan command carrying
-/// the response file's `-I`, `-D` and `-U` flags, and the files moc reads
-/// (the headers it is handed and any `--include` file). `root_view` is the
-/// response file rewritten root-relative. `None` unless the program is moc
-/// and some header it is handed is produced by another edge (`produced`).
+/// the response file's `-I` and `-D` flags (each shell-quoted, since a `-D`
+/// value may hold a quote), and the header-shaped files moc reads (the
+/// headers it is handed and any `--include` file). `root_view` is the
+/// response file with absolute in-tree paths rewritten root-relative.
+/// `None` unless the program is moc and some header it is handed is
+/// produced by another edge (`produced`); `--collect-json` reads JSON lists,
+/// not headers, and is left alone.
 ///
 /// kdsoap 2.2.0's `qt_wrap_cpp` edge runs moc over `wsdl_helloworld.h`,
 /// which kdwsdl2cpp generates and which includes
@@ -9364,9 +9335,12 @@ pub fn moc_rsp_scan(
     let mut seeds: Vec<PathBuf> = Vec::new();
     let mut toks = root_view.lines().map(str::trim).filter(|t| !t.is_empty());
     while let Some(t) = toks.next() {
-        if t.len() > 2 && ["-I", "-D", "-U"].iter().any(|f| t.starts_with(f)) {
+        if t == "--collect-json" {
+            return None;
+        }
+        if t.len() > 2 && (t.starts_with("-I") || t.starts_with("-D")) {
             scan.push(' ');
-            scan.push_str(t);
+            scan.push_str(&shell_words::quote(t));
         } else if t == "--include" {
             seeds.extend(toks.next().map(PathBuf::from));
         } else if matches!(
@@ -9378,7 +9352,101 @@ pub fn moc_rsp_scan(
             seeds.push(PathBuf::from(t));
         }
     }
+    seeds.retain(|s| nix_ninja_task::derived_file::header_like(s));
     seeds.iter().any(|s| produced(s)).then_some((scan, seeds))
+}
+
+/// The resolution map a moc walk reads: an Opaque input at its store copy,
+/// a Built input at its own build path (declared, not yet written), and the
+/// Built inputs among `seeds` returned apart for the caller to realise when
+/// `realise` holds (local mode, not a query). A seed left unrealised reads
+/// as absent and contributes nothing.
+pub fn moc_virtual_paths(
+    inputs: &[DerivedFile],
+    seeds: &[PathBuf],
+    store_dir: &StoreDir,
+    realise: bool,
+) -> (HashMap<PathBuf, PathBuf>, Vec<DerivedFile>) {
+    let mut map: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut unbuilt: Vec<DerivedFile> = Vec::new();
+    for df in inputs {
+        match df.derived_path {
+            SingleDerivedPath::Opaque(_) => {
+                map.insert(df.build_path.clone(), df.absolute_path(store_dir));
+            }
+            SingleDerivedPath::Built { .. } if realise && seeds.contains(&df.build_path) => {
+                unbuilt.push(df.clone());
+            }
+            SingleDerivedPath::Built { .. } => {
+                map.insert(df.build_path.clone(), df.build_path.clone());
+            }
+        }
+    }
+    (map, unbuilt)
+}
+
+/// Runs the walk `moc_rsp_scan` planned, in the worker: realises the Built
+/// seeds (local mode, not a query), keeps the seeds that resolve, and hands
+/// them to the compile discovery with the scan command.
+fn moc_walk(
+    rpc_client: &Arc<BuilderRpcClient>,
+    task: &Task,
+    scan: &str,
+    seeds: &[PathBuf],
+) -> Result<Discovered> {
+    let realise = task.local_mode && !task.emit_only;
+    let (mut map, unbuilt) = moc_virtual_paths(&task.inputs, seeds, &task.store_dir, realise);
+    if !unbuilt.is_empty() {
+        map.extend(local::build_derived_files(
+            rpc_client,
+            &task.store_dir,
+            &unbuilt,
+        )?);
+    }
+    let seeds: Vec<PathBuf> = seeds
+        .iter()
+        .filter(|s| map.contains_key(*s) || s.is_file())
+        .cloned()
+        .collect();
+    let (found, _) = discover_c_includes(
+        rpc_client,
+        &task.store_dir,
+        &task.build_dir,
+        scan,
+        seeds,
+        Some(map),
+        None,
+        None,
+        &[],
+        &|| None,
+    )?;
+    Ok(found)
+}
+
+/// Writes what a moc walk found into the derivation: each reached file an
+/// input once (by its encoding), each reached store path an input, and the
+/// directories its spellings and its `-I` flags enter (`entered`) into
+/// NIX_NINJA_MKDIRS.
+pub fn apply_moc_walk(
+    drv: &mut Derivation,
+    build_dir: &Path,
+    store_dir: &StoreDir,
+    input_set: &mut HashSet<String>,
+    discovered: &mut Vec<DerivedFile>,
+    found: Discovered,
+    entered: &[PathBuf],
+) {
+    declare_dotdot_dirs(drv, build_dir, &found.dotdot_dirs);
+    declare_dotdot_dirs(drv, build_dir, entered);
+    for sp in found.store_paths {
+        drv.inputs.insert(SingleDerivedPath::Opaque(sp));
+    }
+    for df in found.deps {
+        if input_set.insert(df.to_encoded(store_dir)) {
+            drv.inputs.insert(df.derived_path.clone());
+            discovered.push(df);
+        }
+    }
 }
 
 /// The directories a relative `-I` in `scan` has to ENTER, as absolute paths
@@ -9389,7 +9457,8 @@ pub fn moc_rsp_scan(
 /// are stepped over first.
 pub fn include_dir_dotdots(scan: &str, build_dir: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for dir in scan.split_whitespace().filter_map(|t| t.strip_prefix("-I")) {
+    let toks = shell_words::split(scan).unwrap_or_default();
+    for dir in toks.iter().filter_map(|t| t.strip_prefix("-I")) {
         let dir = Path::new(dir);
         if dir.is_absolute() {
             continue;
@@ -25444,6 +25513,9 @@ mod moc_rsp_scan_tests {
             vec![src.join("examples")],
             "`../examples/../src` must enter the source tree's examples/ and nothing else"
         );
+        // A dir the scan command had to quote is read back whole.
+        let paren = format!("moc {}", shell_words::quote("-I../ex(1)/../src"));
+        assert_eq!(include_dir_dotdots(&paren, &build), vec![src.join("ex(1)")]);
         // An absolute dir is not this tree's to create, `..` or not.
         assert!(include_dir_dotdots(
             "moc -I/nix/store/afi66ica100hgzl8ik05n5bkcvpyclry-boost-1.89.0-dev/x/../include",
@@ -25451,10 +25523,168 @@ mod moc_rsp_scan_tests {
         )
         .is_empty());
 
+        // A `-D` value holding a quote stays one parseable token.
+        let quoted = format!("{root_view}-DAUTHOR=\"O'Brien\"\n");
+        let (qscan, _) = moc_rsp_scan(&cmdline, &quoted, produced).unwrap();
+        let toks = shell_words::split(&qscan).expect("the scan command must parse");
+        assert!(toks.iter().any(|t| t == "-DAUTHOR=\"O'Brien\""), "{toks:?}");
+        // A token that is not header-shaped is not a seed (a `-M` value split
+        // over two lines, a directory).
+        let noisy = format!("{root_view}-M\nuri=org.kde.x\nexamples\n");
+        let (_, nseeds) = moc_rsp_scan(&cmdline, &noisy, produced).unwrap();
+        assert_eq!(nseeds, vec![header.clone()]);
+        // Metatype collection reads JSON lists, not headers.
+        let collect = format!("--collect-json\n{root_view}");
+        assert!(moc_rsp_scan(&cmdline, &collect, produced).is_none());
         // A moc edge over source headers only, and a program that is not moc.
         assert!(moc_rsp_scan(&cmdline, &root_view, |_| false).is_none());
         let syncqt = cmdline.replace("libexec/moc", "libexec/syncqt");
         assert!(moc_rsp_scan(&syncqt, &root_view, produced).is_none());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod moc_walk_tests {
+    use super::{apply_moc_walk, moc_virtual_paths, Discovered};
+    use harmonia_store_derivation::derivation::Derivation;
+    use harmonia_store_derivation::derived_path::SingleDerivedPath;
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::DerivedFile;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    fn store() -> StoreDir {
+        StoreDir::new(Path::new("/nix/store")).unwrap()
+    }
+    fn opaque(name: &str, build: &str) -> DerivedFile {
+        let sp = store()
+            .parse(&format!(
+                "/nix/store/7d34cd6g6q3jmldxb6z4q8pysy4sq1c8-{name}"
+            ))
+            .unwrap();
+        DerivedFile {
+            derived_path: SingleDerivedPath::Opaque(sp),
+            build_path: PathBuf::from(build),
+            rel_path: None,
+        }
+    }
+    fn built(build: &str) -> DerivedFile {
+        let drv = store()
+            .parse("/nix/store/2kv2vqgrga5y6m5fxz98878rg29yygkv-ninja-build.drv")
+            .unwrap();
+        DerivedFile {
+            derived_path: SingleDerivedPath::Built {
+                drv_path: Arc::new(SingleDerivedPath::Opaque(drv)),
+                output: "out".parse().unwrap(),
+            },
+            build_path: PathBuf::from(build),
+            rel_path: None,
+        }
+    }
+
+    /// The generated header is read from its realised copy, so a Built seed
+    /// is handed back for realising in local mode and only there; any other
+    /// Built input is declared at its own path, an Opaque one at its store
+    /// copy.
+    #[test]
+    fn a_built_seed_is_realised_only_where_a_build_is_allowed() {
+        let header = "examples/helloworld_server/wsdl_helloworld.h";
+        let inputs = vec![
+            built(header),
+            built("examples/other.h"),
+            opaque("kdsoap_version.h", "kdsoap_version.h"),
+        ];
+        let seeds = vec![PathBuf::from(header)];
+        let (map, unbuilt) = moc_virtual_paths(&inputs, &seeds, &store(), true);
+        assert_eq!(unbuilt.len(), 1);
+        assert_eq!(unbuilt[0].build_path, Path::new(header));
+        assert!(!map.contains_key(Path::new(header)));
+        assert_eq!(
+            map[Path::new("examples/other.h")],
+            Path::new("examples/other.h")
+        );
+        assert_eq!(
+            map[Path::new("kdsoap_version.h")],
+            Path::new("/nix/store/7d34cd6g6q3jmldxb6z4q8pysy4sq1c8-kdsoap_version.h")
+        );
+        // DRV mode or a `-t drv` query: nothing is built.
+        let (map, unbuilt) = moc_virtual_paths(&inputs, &seeds, &store(), false);
+        assert!(unbuilt.is_empty());
+        assert_eq!(map[Path::new(header)], Path::new(header));
+    }
+
+    /// What the walk found reaches the derivation: the reached file once,
+    /// the store path as an input, and the `-I` climb's directory in
+    /// NIX_NINJA_MKDIRS. An empty walk leaves the derivation unchanged.
+    #[test]
+    fn a_walk_lands_in_the_inputs_and_the_mkdirs() {
+        let build_dir = Path::new("/build/kdsoap-2.2.0/build");
+        let fresh = || {
+            Derivation::new(
+                "ninja-build".parse().unwrap(),
+                b"x86_64-linux".to_vec().into(),
+                b"/b".to_vec().into(),
+            )
+        };
+        let iface = opaque(
+            "KDSoapServerObjectInterface.h",
+            "../src/KDSoapServer/KDSoapServerObjectInterface.h",
+        );
+        let boost: harmonia_store_path::StorePath = store()
+            .parse("/nix/store/afi66ica100hgzl8ik05n5bkcvpyclry-boost-1.89.0-dev")
+            .unwrap();
+
+        let mut drv = fresh();
+        let mut set: HashSet<String> = HashSet::new();
+        let mut discovered: Vec<DerivedFile> = Vec::new();
+        let found = Discovered {
+            deps: vec![iface.clone(), iface.clone()],
+            store_paths: vec![boost.clone()],
+            dotdot_dirs: vec![],
+        };
+        let entered = [PathBuf::from("/build/kdsoap-2.2.0/examples")];
+        apply_moc_walk(
+            &mut drv,
+            build_dir,
+            &store(),
+            &mut set,
+            &mut discovered,
+            found,
+            &entered,
+        );
+        assert_eq!(discovered.len(), 1, "a file reached twice is one input");
+        assert!(drv.inputs.contains(&iface.derived_path));
+        assert!(drv.inputs.contains(&SingleDerivedPath::Opaque(boost)));
+        let mk = drv
+            .env
+            .iter()
+            .find(|(k, _)| k.as_ref() == b"NIX_NINJA_MKDIRS")
+            .map(|(_, v)| String::from_utf8_lossy(v).into_owned());
+        assert_eq!(mk.as_deref(), Some("../examples"));
+
+        // A file already among the inputs is not added again.
+        let mut drv2 = fresh();
+        let mut set2: HashSet<String> = [iface.to_encoded(&store())].into();
+        let mut d2: Vec<DerivedFile> = Vec::new();
+        let found2 = Discovered {
+            deps: vec![iface.clone()],
+            store_paths: vec![],
+            dotdot_dirs: vec![],
+        };
+        apply_moc_walk(
+            &mut drv2,
+            build_dir,
+            &store(),
+            &mut set2,
+            &mut d2,
+            found2,
+            &[],
+        );
+        assert!(d2.is_empty());
+        let empty = fresh();
+        assert_eq!(drv2.env, empty.env);
+        assert_eq!(drv2.inputs, empty.inputs);
     }
 }
