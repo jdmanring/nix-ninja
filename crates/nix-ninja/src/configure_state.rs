@@ -710,6 +710,15 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
     )))
 }
 
+/// Whether this process is a later pass (one that read earlier passes'
+/// task derivations).
+pub fn later_pass() -> bool {
+    PASS.lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|p| p.earlier.is_some())
+}
+
 /// Makes this process's listings of build-tree directories answer from
 /// configure's record: called by a later pass's walk.
 pub fn answer_listings_from(record: ConfigureState) {

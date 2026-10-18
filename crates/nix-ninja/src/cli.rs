@@ -401,6 +401,41 @@ pub fn report_pass() -> Result<()> {
     Ok(())
 }
 
+/// A postFixup check whose loop variable shadows `$out`:
+/// `empty=$(for out in $outputs; do find "${!out}" ...)`. Its first
+/// iteration asks `find` for the relative path `out`, absent, so fixup fails
+/// after every task is built. The other outputs are still checked, and the
+/// subshell leaves `$out` itself intact.
+pub fn shadows_out(post_fixup: &str) -> bool {
+    post_fixup.contains(r#"for out in $outputs; do find "${!out}""#)
+}
+
+/// Makes an empty `out` where fixup runs (`cwd`, the directory ninja was
+/// started in) when postFixup carries the shadowing check, so its first
+/// iteration finds nothing. Only after a later pass succeeds: no walk or
+/// listing of this build sees a path configure did not leave. An existing
+/// `out` is never touched.
+/// DEFER(next pin bump, when the fixed check from saxum 879e577 enters the target): delete
+pub fn make_shadowed_out(cwd: &Path) {
+    if std::env::var_os("NIX_BUILD_TOP").is_none()
+        || !std::env::var("postFixup").is_ok_and(|v| shadows_out(&v))
+        || !crate::configure_state::later_pass()
+    {
+        return;
+    }
+    let out = cwd.join("out");
+    if std::fs::symlink_metadata(&out).is_ok() {
+        return;
+    }
+    match std::fs::create_dir(&out) {
+        Ok(()) => eprintln!(
+            "nix-ninja: made an empty {} for postFixup's shadowed $out check",
+            out.display()
+        ),
+        Err(e) => eprintln!("nix-ninja: could not make {}: {e}", out.display()),
+    }
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     warn_ignored_flags(&cli);

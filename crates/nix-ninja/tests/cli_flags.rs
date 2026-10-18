@@ -71,3 +71,15 @@ fn dry_run_is_still_unimplemented() {
         "if -n now parses, implement the dry run and delete this test"
     );
 }
+
+/// The check as qtbase's postFixup ran it (the build's env-vars), and the
+/// fixed spelling, whose loop variable no longer shadows `$out`.
+#[test]
+fn only_the_shadowing_metatypes_check_gets_an_out() {
+    let broken = "empty=$(for out in $outputs; do find \"${!out}\" -name '*_metatypes.json' -size 0; done)\n";
+    let fixed =
+        "empty=$(for o in $outputs; do find \"${!o}\" -name '*_metatypes.json' -size 0; done)\n";
+    assert!(nix_ninja::cli::shadows_out(broken));
+    assert!(!nix_ninja::cli::shadows_out(fixed));
+    assert!(!nix_ninja::cli::shadows_out(""));
+}
