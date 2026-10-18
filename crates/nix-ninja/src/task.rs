@@ -1218,12 +1218,8 @@ impl Runner {
             Some(r) => {
                 self.configure_record = Some(r.clone());
                 crate::configure_state::answer_listings_from(r);
-                crate::configure_state::note_pass(&self.config.build_dir, true);
             }
-            None => {
-                crate::configure_state::save(&self.config.build_dir, &plan.seen)?;
-                crate::configure_state::note_pass(&self.config.build_dir, false);
-            }
+            None => crate::configure_state::save(&self.config.build_dir, &plan.seen)?,
         }
         Ok(())
     }
@@ -1527,7 +1523,31 @@ impl Runner {
             // writing anything; no derived path, no derived files, and the
             // scheduler makes the implicit-input edit and re-queues the edge.
             let mut defer_out: Option<DeferMiss> = None;
-            let (derived_path, err) = {
+            // A LATER PASS TAKES THE DERIVATION AN EARLIER PASS WROTE for an
+            // edge with these outputs, rather than deriving it again from a
+            // tree hooks and placement have changed since: the build is
+            // already done, and deriving it again is how a pass rebuilt it.
+            // Its outer-stage outputs are copied as a fresh one's are.
+            let reused = (!config.is_output_derivation)
+                .then(|| {
+                    crate::configure_state::reuse(&task.outputs, |d| {
+                        config.store_dir.parse::<StorePath>(d).is_ok() && Path::new(d).exists()
+                    })
+                })
+                .flatten()
+                .and_then(|d| config.store_dir.parse::<StorePath>(&d).ok());
+            let (derived_path, err) = if let Some(drv_path) = reused {
+                nix_builder_rpc_client::watch_built(
+                    config.store_dir.display(&drv_path).to_string(),
+                );
+                match place_outer_stage_outputs(&rpc_client, &config, &task, &drv_path) {
+                    Ok(()) => (Some(SingleDerivedPath::Opaque(drv_path)), None),
+                    Err(e) => (
+                        None,
+                        Some(e.context("placing a reused task's outer-stage outputs")),
+                    ),
+                }
+            } else {
                 match build_task_derivation(tools.clone(), &rpc_client, task.clone()) {
                     Ok(drv) => match handle_derivation_result(
                         tools.clone(),

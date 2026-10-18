@@ -13,7 +13,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use harmonia_protocol::daemon_wire::types2::{BuildMode, BuildResultInner};
+use harmonia_protocol::daemon_wire::types2::{BuildMode, BuildResultInner, SuccessStatus};
 use harmonia_protocol::store_path::StoreDir;
 use harmonia_protocol::types::{DaemonError, DaemonErrorKind, DaemonStore};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
@@ -756,6 +756,32 @@ fn merge_hits_and_misses<T>(
 /// its benefit; a hit count alone says nothing about what was avoided.
 static REALISE_ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static REALISE_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Derivations to report if the daemon builds or substitutes them (a later
+/// pass's reused tasks, whose outputs should already be valid), and those
+/// it did.
+static WATCHED: std::sync::Mutex<Option<(std::collections::HashSet<String>, Vec<String>)>> =
+    std::sync::Mutex::new(None);
+
+/// Reports `drv` in `built_watched` if a realise builds or substitutes it.
+pub fn watch_built(drv: String) {
+    WATCHED
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .0
+        .insert(drv);
+}
+
+/// The watched derivations a realise built or substituted.
+pub fn built_watched() -> Vec<String> {
+    WATCHED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|w| w.1.clone())
+        .unwrap_or_default()
+}
 
 static BUILD_PATHS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BUILD_PATHS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1834,6 +1860,18 @@ impl BuilderRpcClient {
             if let Some(success) = r.result.success() {
                 for (name, realisation) in &success.built_outputs {
                     out_pool.insert(name.clone(), realisation.out_path.clone());
+                }
+                if let (
+                    SuccessStatus::Built | SuccessStatus::Substituted,
+                    DerivedPath::Built { drv_path, .. },
+                ) = (success.status, &r.path)
+                {
+                    let shown = store_dir.display(drv_path.as_ref()).to_string();
+                    if let Some(w) = WATCHED.lock().unwrap().as_mut() {
+                        if w.0.contains(&shown) {
+                            w.1.push(shown);
+                        }
+                    }
                 }
             } else if let BuildResultInner::Failure(f) = &r.result.inner {
                 let who = match &r.path {

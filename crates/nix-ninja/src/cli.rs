@@ -361,6 +361,34 @@ mod connection_ceiling_tests {
     }
 }
 
+/// What of this run, besides the tree, shapes the derivations it writes:
+/// a later pass that differs here would reuse derivations it would not have
+/// written (`configure_state::begin_pass`).
+fn invocation(cli: &Cli) -> String {
+    let env: Vec<String> = [
+        "NIX_NINJA_ASSUME_LTO",
+        "NIX_NINJA_TASK_ABI",
+        "NIX_NINJA_TASK_BUILDER",
+        "NIX_NINJA_DRIVER_BUILDER",
+        "NIX_NINJA_IMPLICIT_INPUTS_LIMIT",
+        "NIX_NINJA_PASS_ENV",
+        "NIX_NINJA_RAW_OUTER_PATHS",
+        "NIX_NINJA_SYSTEM",
+        "NIX_NINJA_DRV",
+    ]
+    .iter()
+    .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
+    .collect();
+    format!(
+        "v={} x={} {}",
+        cli.verbose,
+        cli.expand_rspfile,
+        env.join(" ")
+    )
+    .trim_end()
+    .replace('\n', " ")
+}
+
 /// What a pass reports at exit (`configure_state::pass_report`), printed
 /// whether the run succeeded or not; an error recording pass 1's tasks is
 /// returned.
@@ -438,16 +466,26 @@ pub fn run() -> Result<()> {
     // NEVER ON THE COMPILER ROUTE: there thousands of drivers share one tree
     // concurrently (NIX_NINJA_NO_BUILD_DIR_SCAN, no walk, so no record), and
     // one moving files aside would pull them from under the others.
-    let rewind =
-        if cli.is_output_derivation || std::env::var_os("NIX_NINJA_NO_BUILD_DIR_SCAN").is_some() {
-            None
-        } else {
-            crate::configure_state::Rewind::begin(
-                &build_dir,
-                crate::resolve_cache::earlier_runs_trusted(),
-            )
-            .context("reading the build directory as the first pass found it")?
-        };
+    let scanned =
+        !cli.is_output_derivation && std::env::var_os("NIX_NINJA_NO_BUILD_DIR_SCAN").is_none();
+    if scanned {
+        crate::configure_state::use_manifest(&cli.build_filename);
+        crate::configure_state::begin_pass(
+            &build_dir,
+            !crate::resolve_cache::earlier_runs_trusted(),
+            &invocation(&cli),
+        )
+        .context("reading the tasks earlier passes wrote")?;
+    }
+    let rewind = if !scanned {
+        None
+    } else {
+        crate::configure_state::Rewind::begin(
+            &build_dir,
+            crate::resolve_cache::earlier_runs_trusted(),
+        )
+        .context("reading the build directory as the first pass found it")?
+    };
     let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
         resolved_connections(&cli, crate::task::available_gib()),
     ))?);

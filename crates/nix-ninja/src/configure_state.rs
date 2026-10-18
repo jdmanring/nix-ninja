@@ -109,75 +109,183 @@ static LISTED: std::sync::Mutex<Option<ConfigureState>> = std::sync::Mutex::new(
 /// edge each is for.
 static EMITTED: std::sync::Mutex<std::collections::BTreeMap<String, String>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
-/// The state dir the walk found this pass's record in or wrote it to, and
-/// whether it found one (a later pass).
-static PASS: std::sync::Mutex<Option<(PathBuf, PathBuf, bool)>> = std::sync::Mutex::new(None);
+/// This pass, decided at startup (`begin_pass`): the state dir, the build
+/// dir, and on a later pass the task derivations earlier passes wrote.
+static PASS: std::sync::Mutex<Option<Pass>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static PASS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Notes the task derivation written for an edge with `outputs`.
-pub fn note_task(outputs: &[PathBuf], drv: &str) {
+#[derive(Clone)]
+struct Pass {
+    state: PathBuf,
+    build_dir: PathBuf,
+    earlier: Option<std::collections::BTreeMap<String, String>>,
+    reused: usize,
+    fallback: Vec<String>,
+}
+
+fn task_key(outputs: &[PathBuf]) -> Option<String> {
     let key = outputs
         .iter()
         .map(|o| o.to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ");
-    if !key.contains(['\n', '\t']) {
+    (!key.contains(['\n', '\t'])).then_some(key)
+}
+
+/// Decides, before anything is read, whether this is a later pass (a record
+/// of configure exists) and loads the task derivations earlier passes
+/// wrote. AN ERROR on a later pass whose task record is missing or
+/// unreadable: deriving every edge again is what reuse exists to prevent.
+///
+/// ONLY WHERE EARLIER RUNS ARE NOT TRUSTED (`reuse_allowed`: inside a nix
+/// build, where passes are the phases of one build of one tree). Outside
+/// one, a later run follows an edit to a source, and reusing would place
+/// the output from before it.
+/// Never on the output-derivation route (configuration C, one pass, its
+/// own dynamic arm): the caller does not begin a pass there.
+/// `invocation` names what of this run shapes every derivation besides the
+/// tree (`-v`, the builder knobs): a later pass run otherwise would reuse
+/// derivations it would not have written, and stops instead.
+pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> std::io::Result<()> {
+    let state = state_dir(build_dir);
+    STRICT.store(reuse_allowed, std::sync::atomic::Ordering::Relaxed);
+    let later = reuse_allowed && read_lines(&state.join("configure.v1"), build_dir)?.is_some();
+    let inv = state.join("invocation.v1");
+    if reuse_allowed {
+        match read_lines(&inv, build_dir)? {
+            Some(first) if later && first != [invocation.to_string()] => {
+                return Err(std::io::Error::other(format!(
+                    "this pass runs as `{invocation}` and the first ran as `{}`: its \
+                     derivations would differ from the ones it reuses",
+                    first.join(" ")
+                )))
+            }
+            Some(_) => {}
+            None if later => {
+                return Err(std::io::Error::other(format!(
+                    "a later pass found no record of how the first ran in {}",
+                    state.display()
+                )))
+            }
+            None => write_lines(&inv, build_dir, &[invocation.to_string()], false)?,
+        }
+    }
+    let earlier = if later {
+        let lines = read_lines(&state.join("emitted.v1"), build_dir)?.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "a later pass found configure's record but no record of the tasks \
+                 earlier passes wrote in {}",
+                state.display()
+            ))
+        })?;
+        let mut m = std::collections::BTreeMap::new();
+        for l in lines {
+            let (k, d) = l.split_once('\t').ok_or_else(|| {
+                std::io::Error::other(format!("an unreadable task record line: {l}"))
+            })?;
+            m.insert(k.to_string(), d.to_string());
+        }
+        Some(m)
+    } else {
+        None
+    };
+    *PASS.lock().unwrap() = Some(Pass {
+        state,
+        build_dir: build_dir.to_path_buf(),
+        earlier,
+        reused: 0,
+        fallback: Vec::new(),
+    });
+    Ok(())
+}
+
+/// On a later pass, the task derivation an earlier pass wrote for the edge
+/// with `outputs`. `present` says whether it is still in the store; one
+/// that is not is counted as a fallback, and the edge is derived again.
+pub fn reuse(outputs: &[PathBuf], present: impl Fn(&str) -> bool) -> Option<String> {
+    let mut pass = PASS.lock().unwrap();
+    let pass = pass.as_mut()?;
+    let earlier = pass.earlier.as_ref()?;
+    // Outputs no record line can hold are derived on every pass: counted.
+    let Some(key) = task_key(outputs) else {
+        pass.fallback
+            .push(format!("<unrecordable outputs: {outputs:?}>"));
+        return None;
+    };
+    let drv = earlier.get(&key)?.clone();
+    if present(&drv) {
+        pass.reused += 1;
+        Some(drv)
+    } else {
+        pass.fallback.push(drv);
+        None
+    }
+}
+
+/// Notes the task derivation written for an edge with `outputs`.
+pub fn note_task(outputs: &[PathBuf], drv: &str) {
+    if let Some(key) = task_key(outputs) {
         EMITTED.lock().unwrap().insert(key, drv.to_string());
     }
 }
 
-pub fn note_pass(build_dir: &Path, later: bool) {
-    *PASS.lock().unwrap() = Some((state_dir(build_dir), build_dir.to_path_buf(), later));
-}
-
-/// At exit. Pass 1 records the task derivations it wrote; A LATER PASS SAYS
-/// HOW MANY TASKS IT WROTE AT ANOTHER DERIVATION THAN PASS 1 DID for the
-/// same outputs (a re-key: each is built again unless already valid), and
-/// says it at zero too, so a round reads the line's absence as "not a later
-/// pass", never as "nothing to report". None when this process walked no
-/// build dir (the compiler route).
+/// At exit, success or not. Every pass adds the tasks it derived to the
+/// record, an earlier pass's entry kept (first writer wins), under the
+/// build dir's lock. A LATER PASS SAYS WHAT IT REUSED AND WHAT IT DERIVED,
+/// zero included, so a round reads the line's absence as "not a later
+/// pass", never as "nothing to report": `F` is pass-1 work done again (a
+/// recorded task missing from the store, or one whose outputs had to be
+/// built or substituted). None when this process decided no pass (the
+/// compiler route, a subtool).
 pub fn pass_report() -> std::io::Result<Option<String>> {
-    let Some((state, build_dir, later)) = PASS.lock().unwrap().clone() else {
+    let Some(pass) = PASS.lock().unwrap().clone() else {
         return Ok(None);
     };
     let emitted = EMITTED.lock().unwrap().clone();
-    let path = state.join("emitted.v1");
-    if !later {
-        let mut first: std::collections::BTreeMap<String, String> = read_lines(&path, &build_dir)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|l| l.split_once('\t'))
-            .map(|(k, d)| (k.to_string(), d.to_string()))
-            .collect();
-        first.extend(emitted);
-        let lines: Vec<String> = first.iter().map(|(k, d)| format!("{k}\t{d}")).collect();
-        write_lines(&path, &build_dir, &lines, false)?;
-        return Ok(None);
-    }
-    let Some(first) = read_lines(&path, &build_dir) else {
-        return Ok(Some(
-            "nix-ninja: later-pass rekeyed ? task(s): pass 1 recorded none".to_string(),
-        ));
-    };
-    let first: std::collections::HashMap<&str, &str> =
-        first.iter().filter_map(|l| l.split_once('\t')).collect();
-    let rekeyed: Vec<&String> = emitted
+    let path = pass.state.join("emitted.v1");
+    let earlier = pass.earlier.clone().unwrap_or_default();
+    let fresh: Vec<&String> = emitted
         .iter()
-        .filter(|(k, d)| first.get(k.as_str()).is_some_and(|f| f != d))
+        .filter(|(k, _)| !earlier.contains_key(k.as_str()))
         .map(|(_, d)| d)
         .collect();
-    let new = emitted
-        .keys()
-        .filter(|k| !first.contains_key(k.as_str()))
-        .count();
+    {
+        let _lock = lock_blocking(&pass.state).ok_or_else(|| {
+            std::io::Error::other(format!("could not lock {}", pass.state.display()))
+        })?;
+        let mut all = std::collections::BTreeMap::new();
+        for l in read_lines(&path, &pass.build_dir)?.unwrap_or_default() {
+            let (k, d) = l.split_once('\t').ok_or_else(|| {
+                std::io::Error::other(format!("an unreadable task record line: {l}"))
+            })?;
+            all.insert(k.to_string(), d.to_string());
+        }
+        for (k, d) in &emitted {
+            all.entry(k.clone()).or_insert_with(|| d.clone());
+        }
+        let lines: Vec<String> = all.iter().map(|(k, d)| format!("{k}\t{d}")).collect();
+        write_lines(&path, &pass.build_dir, &lines, false)?;
+    }
+    if pass.earlier.is_none() {
+        return Ok(None);
+    }
+    let mut pass = pass;
+    pass.fallback
+        .extend(nix_builder_rpc_client::built_watched());
+    let shown: Vec<&str> = pass
+        .fallback
+        .iter()
+        .chain(fresh.iter().copied())
+        .take(3)
+        .map(String::as_str)
+        .collect();
     Ok(Some(format!(
-        "nix-ninja: later-pass rekeyed {} task(s), {new} pass 1 did not write: {}",
-        rekeyed.len(),
-        rekeyed
-            .iter()
-            .take(3)
-            .map(|d| d.as_str())
-            .collect::<Vec<_>>()
-            .join(" ")
+        "nix-ninja: later-pass reused {} task(s), derived {} fresh, {} fallback: {}",
+        pass.reused,
+        fresh.len(),
+        pass.fallback.len(),
+        shown.join(" ")
     )))
 }
 
@@ -219,13 +327,19 @@ fn left_in(r: &ConfigureState, build_dir: &Path, path: &Path) -> bool {
 /// reaches: its directory resolved as the kernel resolves it now (through a
 /// link configure left, or one this pass placed), the name kept, so a
 /// placed link is itself and a file written through one is the file it
-/// reaches. None for one outside the tree.
+/// reaches; as spelled where that leaves the tree. None for a spelling
+/// that leaves it.
 fn written_at(build_dir: &Path, rel: &Path) -> Option<String> {
     let rel = normal_rel(rel)?;
-    let bd = std::fs::canonicalize(build_dir).ok()?;
-    let p = build_dir.join(&rel);
-    let dir = std::fs::canonicalize(p.parent()?).ok()?;
-    normal_rel(dir.join(p.file_name()?).strip_prefix(&bd).ok()?)
+    let reached = || -> Option<String> {
+        let bd = std::fs::canonicalize(build_dir).ok()?;
+        let p = build_dir.join(&rel);
+        let dir = std::fs::canonicalize(p.parent()?).ok()?;
+        normal_rel(dir.join(p.file_name()?).strip_prefix(&bd).ok()?)
+    };
+    // A write that leaves the tree through a link is kept and journaled as
+    // spelled: the rewind reaches it through the same link.
+    Some(reached().unwrap_or(rel))
 }
 
 /// Where a spelling lands, as `landing` answers it.
@@ -289,8 +403,9 @@ pub fn landing(build_dir: &Path, spelled: &Path, r: &ConfigureState) -> Landing 
             Some(rel) if rel.is_empty() => continue,
             Some(rel) if unrecorded(&rel) => true,
             Some(rel) => {
-                hops += 1;
-                match r.links.get(&rel).map(String::as_str) {
+                let link = r.links.get(&rel).map(String::as_str);
+                hops += usize::from(link.is_some());
+                match link {
                     Some(_) if hops > 40 => return Landing::Outside,
                     Some(l) if l.starts_with("I:") => cur = bd.join(&l[2..]),
                     Some(l) if l.starts_with("O:") => cur = PathBuf::from(&l[2..]),
@@ -451,24 +566,74 @@ fn keep_originals_in<'a>(
     }
 }
 
-/// What identifies one configure: build.ninja's length and mtime.
-fn header(build_dir: &Path) -> Option<String> {
-    let m = std::fs::metadata(build_dir.join("build.ninja")).ok()?;
-    Some(format!(
-        "nix-ninja-configure-state v2 {} {}.{}",
-        m.len(),
-        m.mtime(),
-        m.mtime_nsec()
-    ))
+/// The manifest this process reads (`-f`), which keys every record.
+static MANIFEST: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Keys this process's records on `manifest` instead of build.ninja.
+pub fn use_manifest(manifest: &Path) {
+    let _ = MANIFEST.set(manifest.to_path_buf());
 }
 
-fn read_lines(path: &Path, build_dir: &Path) -> Option<Vec<String>> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// What identifies one configure: a hash of the manifest's CONTENT, so a
+/// touch (a configure re-run that writes the same file, an edit that
+/// restores it) is not a re-configure. Hashed once per length and mtime.
+fn header(build_dir: &Path) -> Option<String> {
+    use std::hash::{Hash as _, Hasher as _};
+    type Seen = (PathBuf, u64, i64, i64, u64);
+    static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+    let manifest = MANIFEST
+        .get()
+        .map_or(Path::new("build.ninja"), PathBuf::as_path);
+    let path = build_dir.join(manifest);
+    let m = std::fs::metadata(&path).ok()?;
+    let mut seen = SEEN.lock().unwrap();
+    let hash = match &*seen {
+        Some((p, len, s, ns, h))
+            if *p == path && *len == m.len() && *s == m.mtime() && *ns == m.mtime_nsec() =>
+        {
+            *h
+        }
+        _ => {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::fs::read(&path).ok()?.hash(&mut h);
+            let h = h.finish();
+            *seen = Some((path.clone(), m.len(), m.mtime(), m.mtime_nsec(), h));
+            h
+        }
+    };
+    Some(format!("nix-ninja-configure-state v3 {hash:016x}"))
+}
+
+/// Inside a nix build (where earlier passes are not trusted, `begin_pass`),
+/// a record written for another configure is an error, not a fresh start:
+/// a pass that read it as absent would derive against the tree as it stands
+/// and overwrite the record later passes reuse.
+static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The lines of a record under this configure's header. Ok(None) when there
+/// is none; an error when it cannot be read, and (`STRICT`) when it was
+/// written for another configure.
+fn read_lines(path: &Path, build_dir: &Path) -> std::io::Result<Option<Vec<String>>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(std::io::Error::other(format!("{}: {e}", path.display()))),
+    };
     let mut lines = text.lines();
-    if lines.next()? != header(build_dir)? {
-        return None;
+    if lines
+        .next()
+        .is_some_and(|h| Some(h.to_string()) == header(build_dir))
+    {
+        return Ok(Some(lines.map(str::to_owned).collect()));
     }
-    Some(lines.map(str::to_owned).collect())
+    if STRICT.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(std::io::Error::other(format!(
+            "{} was written for another configure: the manifest changed between \
+             passes (a re-configure)",
+            path.display()
+        )));
+    }
+    Ok(None)
 }
 
 /// Writes `lines` under this configure's header, through a file of this
@@ -481,7 +646,7 @@ fn write_lines(
 ) -> std::io::Result<()> {
     let Some(head) = header(build_dir) else {
         return Err(std::io::Error::other(format!(
-            "no build.ninja in {} to key this configure's record on",
+            "no manifest in {} to key this configure's record on",
             build_dir.display()
         )));
     };
@@ -489,7 +654,7 @@ fn write_lines(
         std::fs::create_dir_all(p)?;
     }
     let mut all: Vec<String> = if append {
-        read_lines(path, build_dir).unwrap_or_default()
+        read_lines(path, build_dir)?.unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -497,13 +662,19 @@ fn write_lines(
     all.sort();
     all.dedup();
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-    writeln!(f, "{head}")?;
-    for l in &all {
-        writeln!(f, "{l}")?;
+    let res = (|| {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        writeln!(f, "{head}")?;
+        for l in &all {
+            writeln!(f, "{l}")?;
+        }
+        f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-    std::fs::rename(&tmp, path)
+    res
 }
 
 /// `contents` at `path` through a name of its own and a rename, so a run
@@ -526,7 +697,7 @@ pub fn load(build_dir: &Path) -> std::io::Result<Option<ConfigureState>> {
 fn load_in(state: &Path, build_dir: &Path) -> std::io::Result<Option<ConfigureState>> {
     let mut s = ConfigureState::default();
     let mut malformed = 0usize;
-    let Some(lines) = read_lines(&state.join("configure.v1"), build_dir) else {
+    let Some(lines) = read_lines(&state.join("configure.v1"), build_dir)? else {
         return Ok(None);
     };
     for line in lines {
@@ -679,7 +850,7 @@ fn journal_in<'a>(
     // Keyed by kind and path, so a later pass's placement replaces the stamp
     // an earlier one recorded.
     let mut entries: std::collections::BTreeMap<(char, String), String> =
-        read_lines(&path, build_dir)
+        read_lines(&path, build_dir)?
             .unwrap_or_default()
             .into_iter()
             .filter_map(|l| parse_journal(&l).map(|(k, rel, _)| ((k, rel.to_string()), l.clone())))
@@ -702,6 +873,19 @@ fn journal_in<'a>(
         let Some(key) = written_at(build_dir, rel) else {
             continue;
         };
+        // A FILE CONFIGURE LEFT, WRITTEN WITHOUT ITS COPY KEPT: placement
+        // reached it through a link this pass placed, which did not exist
+        // when the copies were taken. A later pass could not put it back.
+        if r.files.contains(&key)
+            && std::fs::symlink_metadata(originals(state).join(&key)).is_err()
+            && std::fs::symlink_metadata(build_dir.join(&key)).is_ok_and(|m| !m.is_dir())
+        {
+            return Err(std::io::Error::other(format!(
+                "placement wrote over configure's {key} through {} without keeping \
+                 configure's copy; a later pass could not read it",
+                rel.display()
+            )));
+        }
         let rel = Path::new(&key);
         let abs = build_dir.join(rel);
         let Ok(meta) = std::fs::symlink_metadata(&abs) else {
@@ -872,13 +1056,7 @@ impl Rewind {
             return Ok(None);
         }
         let journal_path = state.join("placed.v1");
-        if journal_path.exists() && read_lines(&journal_path, build_dir).is_none() {
-            eprintln!(
-                "nix-ninja: the placement journal is for another build.ninja (a \
-                 re-configure); this pass reads the directory as it stands"
-            );
-        }
-        let Some(journal) = read_lines(&journal_path, build_dir) else {
+        let Some(journal) = read_lines(&journal_path, build_dir)? else {
             rewind.done = true;
             return Ok(None);
         };
@@ -1197,12 +1375,25 @@ mod tests {
         );
         save_in(&state, &d, &s).expect("saved");
         assert_eq!(load_in(&state, &d).unwrap(), Some(s));
+        // Rewritten with the same content (a configure re-run, a touch): the
+        // same configure.
+        write(&d.join("build.ninja"), "default all\n");
+        assert!(
+            load_in(&state, &d).unwrap().is_some(),
+            "a touch is not a re-configure"
+        );
         write(&d.join("build.ninja"), "default all app\n");
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
         assert_eq!(
             load_in(&state, &d).unwrap(),
             None,
-            "a changed build.ninja is a new configure"
+            "outside a build, a changed build.ninja is a new configure"
         );
+        // Inside one it stops the pass: the record must not be read as absent.
+        super::STRICT.store(true, std::sync::atomic::Ordering::Relaxed);
+        let strict = load_in(&state, &d);
+        super::STRICT.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(strict.is_err(), "a re-configure between passes is an error");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -1849,6 +2040,84 @@ mod tests {
             std::fs::read_to_string(bd.join("lib/foo.so")).unwrap(),
             "placed"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A LATER PASS REUSES WHAT EARLIER PASSES WROTE. Pass 1 records its
+    /// tasks and prints nothing; pass 2 reuses them (a recorded task gone
+    /// from the store is a fallback, derived again) and records the edge it
+    /// derived fresh; pass 3 reuses that edge too. A later pass whose task
+    /// record is missing stops rather than deriving everything again.
+    #[test]
+    fn later_passes_reuse_what_earlier_passes_wrote() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let d = scratch("reuse");
+        let bd = d.join("build");
+        write(&bd.join("build.ninja"), "default all\n");
+        let state = super::state_dir(&bd);
+        let _ = std::fs::remove_dir_all(&state);
+        let out = |n: &str| vec![PathBuf::from(n)];
+        let reset = || super::EMITTED.lock().unwrap().clear();
+        // Pass 1: no record of configure yet.
+        reset();
+        super::begin_pass(&bd, true, "v=false").unwrap();
+        assert_eq!(
+            super::reuse(&out("a.o"), |_| true),
+            None,
+            "nothing to reuse"
+        );
+        super::note_task(&out("a.o"), "/nix/store/aaa-a.drv");
+        super::note_task(&out("b.o"), "/nix/store/bbb-b.drv");
+        assert_eq!(super::pass_report().unwrap(), None, "pass 1 says nothing");
+        save_in(&state, &bd, &ConfigureState::default()).expect("saved");
+        // Pass 2.
+        reset();
+        super::begin_pass(&bd, true, "v=false").unwrap();
+        assert_eq!(
+            super::reuse(&out("a.o"), |_| true).as_deref(),
+            Some("/nix/store/aaa-a.drv")
+        );
+        assert_eq!(
+            super::reuse(&out("b.o"), |_| false),
+            None,
+            "gone: derived again"
+        );
+        super::note_task(&out("b.o"), "/nix/store/bb2-b.drv");
+        super::note_task(&out("check"), "/nix/store/ccc-check.drv");
+        let line = super::pass_report().unwrap().expect("a later pass reports");
+        assert!(
+            line.starts_with(
+                "nix-ninja: later-pass reused 1 task(s), derived 1 fresh, 1 fallback: "
+            ),
+            "{line}"
+        );
+        // Pass 3 reuses pass 2's fresh edge, and the first pass's record of
+        // an edge stands (the first writer wins).
+        reset();
+        super::begin_pass(&bd, true, "v=false").unwrap();
+        assert!(super::reuse(&out("check"), |_| true).is_some());
+        assert_eq!(
+            super::reuse(&out("b.o"), |_| true).as_deref(),
+            Some("/nix/store/bbb-b.drv")
+        );
+        let line = super::pass_report().unwrap().unwrap();
+        assert!(
+            line.contains("reused 2 task(s), derived 0 fresh, 0 fallback"),
+            "{line}"
+        );
+        // Untrusted earlier runs only: outside a build nothing is reused.
+        reset();
+        super::begin_pass(&bd, false, "v=false").unwrap();
+        assert_eq!(super::reuse(&out("a.o"), |_| true), None);
+        assert_eq!(super::pass_report().unwrap(), None);
+        // A later pass run another way (`-v`) stops.
+        assert!(super::begin_pass(&bd, true, "v=true").is_err());
+        // A later pass with no task record stops.
+        std::fs::remove_file(state.join("emitted.v1")).unwrap();
+        assert!(super::begin_pass(&bd, true, "v=false").is_err());
+        *super::PASS.lock().unwrap() = None;
+        super::STRICT.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&state);
         let _ = std::fs::remove_dir_all(&d);
     }
 
