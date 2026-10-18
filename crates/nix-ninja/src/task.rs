@@ -3886,22 +3886,39 @@ fn named_dirs_to_create(
         .into_iter()
         .filter(|n| confined_relative_dir(build_dir, Path::new(n)))
         .filter(|n| {
-            let path = Path::new(n);
-            match configure_dirs {
-                // A later pass: under the build dir, where placement and hooks
-                // write, configure's record answers, asked for the walk's
-                // spelling (`-I.` is the build dir itself, `./gen` is `gen`);
-                // a climb out of it is answered by the disk.
-                Some(dirs)
-                    if !path
-                        .components()
-                        .any(|c| c == std::path::Component::ParentDir) =>
-                {
-                    let key: PathBuf = path
-                        .components()
-                        .filter(|c| *c != std::path::Component::CurDir)
-                        .collect();
-                    key.as_os_str().is_empty() || dirs.contains(&*key.to_string_lossy())
+            // A later pass: under the build dir, where placement and hooks
+            // write, configure's record answers, asked for the walk's spelling
+            // of where the name LANDS (`-I.` is the build dir itself, `./gen`
+            // is `gen`, `../build/gen` climbs back to `gen`). Below a symlink
+            // configure left the walk recorded nothing, and outside the build
+            // dir nothing was recorded: there the disk answers, as it did on
+            // the first pass.
+            let mut landed = PathBuf::new();
+            for c in build_dir.join(n).components() {
+                match c {
+                    std::path::Component::ParentDir => {
+                        landed.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    c => landed.push(c),
+                }
+            }
+            let inside = landed.strip_prefix(build_dir).ok().map(|r| {
+                r.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            });
+            match (configure_dirs, inside) {
+                (Some(dirs), Some(parts)) => {
+                    let below_link = (1..parts.len()).any(|k| {
+                        let a = parts[..k].join("/");
+                        dirs.contains(&a) && build_dir.join(&a).is_symlink()
+                    });
+                    if below_link {
+                        build_dir.join(n).is_dir()
+                    } else {
+                        parts.is_empty() || dirs.contains(&parts.join("/"))
+                    }
                 }
                 _ => build_dir.join(n).is_dir(),
             }
@@ -3969,6 +3986,12 @@ pub fn plan_build_dir_walk(
                 plan.seen.dirs.insert(rel.clone());
             } else {
                 plan.seen.files.insert(rel.clone());
+                // A link to a directory is one to whatever follows it (`-I`
+                // dirs, directory listings), which a later pass asks of the
+                // record's dirs.
+                if entry.file_type().is_symlink() && entry.path().is_dir() {
+                    plan.seen.dirs.insert(rel.clone());
+                }
             }
         }
         let produced = matches!(disposition, BuildDirDisposition::Upload) && is_produced(&rel);
@@ -4071,7 +4094,18 @@ mod plan_build_dir_walk_tests {
         std::fs::write(bd.join("prod.json"), "").unwrap();
         let produced = |rel: &str| rel == "prod.json";
 
+        std::fs::create_dir_all(d.join("inc")).unwrap();
+        std::os::unix::fs::symlink("../inc", bd.join("inclink")).unwrap();
         let first = plan_build_dir_walk(&bd, None, produced).unwrap();
+        assert!(
+            first.seen.dirs.contains("inclink") && first.seen.files.contains("inclink"),
+            "a link to a directory is recorded as both"
+        );
+        assert_eq!(
+            super::named_dirs_to_create("cc -Iinclink -c a.c -o a.o", &bd, Some(&first.seen.dirs)),
+            vec!["inclink"],
+            "and a later pass carries it as the first did"
+        );
         assert_eq!(
             rels(&bd, &first.uploads),
             ["build.ninja", "conf.h"].map(String::from).into(),
@@ -4109,7 +4143,7 @@ mod plan_build_dir_walk_tests {
         );
         let later = plan_build_dir_walk(&bd, Some(&first.seen), produced).unwrap();
         assert_eq!(rels(&bd, &later.uploads), rels(&bd, &first.uploads));
-        assert!(later.aliases.is_empty(), "took {:?}", later.aliases);
+        assert_eq!(later.aliases, first.aliases, "configure's aliases only");
         assert_eq!(later.empty_dirs, first.empty_dirs);
     }
 }
@@ -4162,6 +4196,20 @@ mod named_dirs_to_create_tests {
         let first = named_dirs_to_create(meson, &bd, None);
         assert!(first.contains(&".".to_string()), "carried {first:?}");
         assert_eq!(named_dirs_to_create(meson, &bd, Some(&configure)), first);
+        // Below a symlink configure left, the walk recorded nothing: the
+        // disk answers, as it did on the first pass. A climb that lands back
+        // in the build dir is asked of the record by where it lands.
+        std::fs::create_dir_all(d.join("ext/sub")).unwrap();
+        std::os::unix::fs::symlink("../ext", bd.join("link")).unwrap();
+        let build_name = bd.file_name().unwrap().to_string_lossy().into_owned();
+        let cmd =
+            format!("cc -Ilink/sub -I../{build_name}/gen -I../{build_name}/gen/sub -c a.c -o a.o");
+        let configure: std::collections::HashSet<String> =
+            ["gen".to_string(), "link".to_string()].into();
+        assert_eq!(
+            named_dirs_to_create(&cmd, &bd, Some(&configure)),
+            vec!["link/sub".to_string(), format!("../{build_name}/gen")]
+        );
     }
 
     /// THE EXISTENCE GUARD. A directory no part of the tree holds is a typo
@@ -7168,6 +7216,9 @@ fn store_hash(path: &str) -> Option<&[u8]> {
 /// accounted for is left alone, so the residue scan still finds its runs
 /// and placement refuses the file. A pair whose hashes differ in length is
 /// skipped.
+/// DEFER(a placement refused with residue on stores emitted in descending
+/// order): runs are grouped in file order with rising hash offsets, so a
+/// string stored last-store-first is refused, never repaired.
 pub fn repair_residue(data: &[u8], restore: &[(String, String)]) -> Option<Vec<u8>> {
     const NEAR: usize = 64;
     let mut out = data.to_vec();
@@ -7227,29 +7278,53 @@ pub fn repair_residue(data: &[u8], restore: &[(String, String)]) -> Option<Vec<u
                 (lo, hi)
             })
             .collect();
+        // WHAT SURROUNDS THE HASH IN THE PLACEHOLDER: the store dir before
+        // it and `-name` after it. A store holding a short piece of the hash
+        // holds that context too (a store is RESIDUE_WINDOW bytes wide), so a
+        // piece is taken only where the context stands beside it. Every such
+        // piece around an occurrence is swapped, not only one that fills a
+        // gap: an overlapping store runs after the stores it overlaps.
+        let hstart = placeholder.rfind('/').map_or(0, |i| i + 1);
+        let before = &placeholder.as_bytes()[..hstart];
+        let after = &placeholder.as_bytes()[(hstart + hp.len()).min(placeholder.len())..];
+        let head_at = |p: usize, m: usize| {
+            let c = (RESIDUE_WINDOW - m).min(before.len());
+            p >= c
+                && data[p - c..p] == before[before.len() - c..]
+                && data[p..].starts_with(&hp[..m])
+        };
+        let tail_at = |p: usize, k: usize| {
+            let f = hp.len() - k;
+            let c = (RESIDUE_WINDOW - f).min(after.len());
+            data[p..].starts_with(&hp[k..]) && data[p + f..].starts_with(&after[..c])
+        };
         for (o, (lo, hi)) in occurrences.into_iter().zip(bounds) {
             // Every piece to swap, as (file offset, hash offset, length).
             let mut pieces = o.clone();
             let (first, last) = (o[0], o[o.len() - 1]);
             let mut whole = true;
-            // The head piece: the nearest `/` before the first run, then the
-            // LONGEST piece there, since a store overlapping the first run
-            // carries more of the hash than the gap.
-            if first.1 > 0 {
-                let lo = lo.max(first.0.saturating_sub(NEAR));
-                let hit = (lo.max(1)..first.0).rev().find_map(|p| {
-                    if data[p - 1] != b'/' {
-                        return None;
-                    }
-                    (first.1..(first.1 + RESIDUE_WINDOW).min(hp.len()))
-                        .rev()
-                        .find(|&m| p + m <= first.0 && data[p..].starts_with(&hp[..m]))
-                        .map(|m| (p, m))
-                });
-                match hit {
-                    Some((p, m)) => pieces.push((p, 0, m)),
-                    None => whole = false,
+            // HEAD AND TAIL PIECES ANYWHERE AROUND THE OCCURRENCE, between its
+            // neighbours: a store overlapping the hash can be emitted after
+            // the runs it overlaps (and runs last), so neither side of the
+            // runs is the only place to look. Each is the longest at its
+            // place; the hash offsets the runs leave uncovered must be among
+            // them.
+            let short = 1..RESIDUE_WINDOW.min(hp.len());
+            let end = o.iter().map(|r| r.1 + r.2).max().unwrap_or(0);
+            let from = last.0 + last.2;
+            let (mut head, mut tail) = (0, hp.len());
+            for p in lo.max(first.0.saturating_sub(NEAR))..(from + NEAR).min(hi).min(data.len()) {
+                if let Some(m) = short.clone().rev().find(|&m| head_at(p, m)) {
+                    pieces.push((p, 0, m));
+                    head = head.max(m);
                 }
+                if let Some(f) = short.clone().rev().find(|&f| tail_at(p, hp.len() - f)) {
+                    pieces.push((p, hp.len() - f, f));
+                    tail = tail.min(hp.len() - f);
+                }
+            }
+            if head < first.1 || (end < hp.len() && tail > end) {
+                whole = false;
             }
             // An inner piece must occur ONCE between its runs: a short one
             // can also match an opcode byte, and swapping that rewrites code.
@@ -7270,32 +7345,6 @@ pub fn repair_residue(data: &[u8], restore: &[(String, String)]) -> Option<Vec<u
                         [p] => pieces.push((a.0 + a.2 + p, reached, gap.len())),
                         _ => whole = false,
                     }
-                }
-            }
-            // The tail piece, the LONGEST before the `-` (or troff's `\`):
-            // gcc and clang store a tail that is not a multiple of the store
-            // width OVERLAPPING the store before it (`s4lxsx-x` after
-            // `zlhfcs4l`), and that store runs last, so every hash byte in it
-            // is swapped.
-            let end = o.iter().map(|r| r.1 + r.2).max().unwrap_or(0);
-            if end < hp.len() {
-                let from = last.0 + last.2;
-                let window = data
-                    .get(from..(from + NEAR).min(hi).max(from))
-                    .unwrap_or_default();
-                // Nearest first, and at each place the LONGEST piece.
-                let hit = (0..window.len()).find_map(|p| {
-                    (end.saturating_sub(RESIDUE_WINDOW - 1)..=end)
-                        .find(|&k| {
-                            let tail = &hp[k..];
-                            window[p..].starts_with(tail)
-                                && matches!(window.get(p + tail.len()), Some(b'-' | b'\\'))
-                        })
-                        .map(|k| (p, k))
-                });
-                match hit {
-                    Some((p, k)) => pieces.push((from + p, k, hp.len() - k)),
-                    None => whole = false,
                 }
             }
             if !whole {
@@ -7446,6 +7495,14 @@ mod placeholder_residue_tests {
     const XDP_PH: &str = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-xdg-desktop-portal-1.22.1";
     const XDP_REAL: &str = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-xdg-desktop-portal-1.22.1";
 
+    /// A pair whose name is `name`: what follows the hash in the file.
+    fn named(name: &str) -> Vec<(String, String)> {
+        vec![(
+            format!("/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-{name}"),
+            format!("/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-{name}"),
+        )]
+    }
+
     /// THE SHAPES THE RE-EXEC USED TO REBUILD A RUN FOR, now repaired in
     /// place: a man page that spells the path with troff escapes (no whole
     /// path for `rewrite_bytes` to swap) and an immediate-store split
@@ -7508,7 +7565,7 @@ mod placeholder_residue_tests {
     /// pieces alone would leave no window to find and a wrong path placed.
     #[test]
     fn a_hash_in_short_pieces_is_repaired_whole_or_not_at_all() {
-        let restore = vec![(XDP_PH.to_string(), XDP_REAL.to_string())];
+        let restore = named("pkg-1.0");
         let want = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-pkg-";
         let (op, gap) = (b"\x48\xb8".as_slice(), b"\x48\x89\x47\x08".as_slice());
         let stores = |pieces: &[&str]| -> Vec<u8> {
@@ -7598,7 +7655,7 @@ mod placeholder_residue_tests {
     /// residue left to refuse.
     #[test]
     fn overlapping_and_neighbouring_occurrences_come_out_real() {
-        let restore = vec![(XDP_PH.to_string(), XDP_REAL.to_string())];
+        let restore = named("x");
         let ph = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-x";
         let real = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-x";
         let obj = immediate_stores(ph, &[0, 8, 16, 24, 32, 37]);
@@ -7633,6 +7690,94 @@ mod placeholder_residue_tests {
             placeholder_residue(&fixed[45..], &restore).is_some(),
             "the damaged copy is left to be refused"
         );
+    }
+
+    /// RUNS THAT COVER THE HASH DO NOT END THE SEARCH: stores overlapping
+    /// the last run still hold short pieces of the placeholder and run after
+    /// it. A 48-byte path stored at 0, 8, 16, 24, 32, 35, 37 and 40: the runs
+    /// (hash offsets 5, 13, 21 and 24) reach the end, and the stores at 37
+    /// and 40 carry 6 and 3 placeholder characters with the name after them.
+    #[test]
+    fn short_pieces_after_covering_runs_are_swapped() {
+        let restore = named("abcd");
+        let ph = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-abcd";
+        let real = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-abcd";
+        let obj = immediate_stores(ph, &[0, 8, 16, 24, 32, 35, 37, 40]);
+        assert_eq!(
+            run_stores(&obj, 48),
+            ph,
+            "control: the fixture stores the placeholder"
+        );
+        let fixed = repair_residue(&obj, &restore).expect("a repair");
+        assert_eq!(placeholder_residue(&fixed, &restore), None);
+        assert_eq!(run_stores(&fixed, 48), real);
+        // A store overlapping the HEAD emitted after the runs, so it runs
+        // last: 5..13 holds `store/hj`.
+        let obj = immediate_stores(ph, &[0, 8, 16, 24, 32, 40, 5]);
+        assert_eq!(run_stores(&obj, 48), ph, "control");
+        let fixed = repair_residue(&obj, &restore).expect("a repair");
+        assert_eq!(run_stores(&fixed, 48), real, "late head store");
+        // A tail store emitted FIRST whose last bytes no later store covers:
+        // a 45-byte path stored at 37 and then 0 to 32.
+        let restore = named("x");
+        let ph = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-x";
+        let real = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-x";
+        let obj = immediate_stores(ph, &[37, 0, 8, 16, 24, 32]);
+        assert_eq!(run_stores(&obj, 45), ph, "control");
+        let fixed = repair_residue(&obj, &restore).expect("a repair");
+        assert_eq!(run_stores(&fixed, 45), real, "early tail store");
+    }
+
+    /// GCC'S OWN PATTERN, EVERY ALIGNMENT: a string copied by 8-byte stores
+    /// at 0, 8, 16, ... and one overlapping store ending at its end, in that
+    /// order and reversed, with 0 to 23 bytes before the store path and names
+    /// of 1 to 30 characters. Every case either comes out naming the real
+    /// path or is left with residue for placement to refuse; none comes out
+    /// naming a path that is neither. The two shapes the review of c17626b
+    /// found (a 50-byte string stored at 40 and 42; a 49-byte one at 40 and
+    /// 41) are inside this sweep.
+    #[test]
+    fn gccs_store_pattern_is_repaired_or_refused_never_wrong() {
+        let (mut repaired, mut repaired_reversed) = (0, 0);
+        for pre in 0..24usize {
+            for nlen in 1..31usize {
+                let name: String = "abcdefghijklmnopqrstuvwxyz0123"
+                    .chars()
+                    .take(nlen)
+                    .collect();
+                let restore = named(&name);
+                let prefix = &"ABCDEFGHIJKLMNOPQRSTUVW"[..pre];
+                let ph = format!("{prefix}{}", restore[0].0);
+                let real = format!("{prefix}{}", restore[0].1);
+                let len = ph.len();
+                let mut offs: Vec<usize> = (0..len / 8).map(|i| i * 8).collect();
+                if len % 8 != 0 {
+                    offs.push(len - 8);
+                }
+                for rev in [false, true] {
+                    let mut o = offs.clone();
+                    if rev {
+                        o.reverse();
+                    }
+                    let obj = immediate_stores(&ph, &o);
+                    assert_eq!(run_stores(&obj, len), ph);
+                    let fixed = repair_residue(&obj, &restore).unwrap_or_else(|| obj.clone());
+                    let ran = run_stores(&fixed, len);
+                    if placeholder_residue(&fixed, &restore).is_none() {
+                        assert_eq!(ran, real, "pre {pre} name {nlen} reversed {rev}");
+                        repaired += 1;
+                        if rev {
+                            repaired_reversed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "repaired {repaired} of {} layouts ({repaired_reversed} in reverse order); the rest refused",
+            24 * 30 * 2
+        );
+        assert!(repaired > 0, "the sweep repairs something");
     }
 
     /// AN INNER PIECE THAT IS NOT UNIQUE BETWEEN ITS RUNS IS NOT GUESSED: a
