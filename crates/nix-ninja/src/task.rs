@@ -1854,7 +1854,7 @@ impl Runner {
             // build step's input named the download's store path). Steps run
             // in dependency order, so the newest registration is the newest
             // state of the tree.
-            if edited_tree {
+            if output_supersedes(edited_tree, files.by_id[fid].input, result.bid) {
                 self.derived_files.insert(fid, derived_file.clone());
             }
             if rides {
@@ -9447,6 +9447,18 @@ pub fn apply_moc_walk(
             discovered.push(df);
         }
     }
+}
+
+/// Whether a finished edge's output replaces whatever is registered for its
+/// node. Registration is first-writer-wins, and an upload can reach a node
+/// before the edge that produces it finishes: qtdeclarative 6.11.2's moc
+/// `--collect-json` edge names its own `qt6qml_metatypes.json` absolutely
+/// (`cmake -E copy_if_different <gen> <json>`), configure has left a 0-byte
+/// placeholder there, and the upload of that placeholder won the node, so
+/// qmltyperegistrar read an empty file ("Failed to parse JSON"). The edge
+/// that PRODUCES a node owns it, as does a tree a later step edits in place.
+pub fn output_supersedes(edited_tree: bool, producer: Option<BuildId>, finished: BuildId) -> bool {
+    edited_tree || producer == Some(finished)
 }
 
 /// The directories a relative `-I` in `scan` has to ENTER, as absolute paths
@@ -25686,5 +25698,24 @@ mod moc_walk_tests {
         let empty = fresh();
         assert_eq!(drv2.env, empty.env);
         assert_eq!(drv2.inputs, empty.inputs);
+    }
+}
+
+#[cfg(test)]
+mod output_supersedes_tests {
+    use super::output_supersedes;
+    use n2::graph::BuildId;
+
+    /// The producing edge's own output wins its node; an edge finishing with
+    /// a file some other edge produces, or no edge produces, keeps the first
+    /// registration; an edited tree always supersedes.
+    #[test]
+    fn the_producing_edge_owns_its_node() {
+        let edge = BuildId::from(7usize);
+        let other = BuildId::from(9usize);
+        assert!(output_supersedes(false, Some(edge), edge));
+        assert!(!output_supersedes(false, Some(other), edge));
+        assert!(!output_supersedes(false, None, edge));
+        assert!(output_supersedes(true, None, edge));
     }
 }
