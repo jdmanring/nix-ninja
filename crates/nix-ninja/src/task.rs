@@ -9259,9 +9259,12 @@ pub fn autogen_own_products<'a>(
 /// manifest's mtime): files an earlier pass placed there. Configure's own
 /// files in that tree (`<Module>Depends`, `<module>exports.h`) are written
 /// before the manifest and stay. A path some edge declares as an output
-/// keeps its route through that edge. Empty for an edge that writes no
-/// syncqt tree and when there is no boundary; an unreadable time keeps
-/// the input.
+/// keeps its route through that edge. Only syncqt's edge, recognised by
+/// the `<T>_syncqt_timestamp` it declares: `common_include_root` also
+/// answers for any edge with an output under a CMake `include/` subdir
+/// (FreeRDP's `include/CMakeFiles/...`), which writes no such tree. Empty
+/// for any other edge and when there is no boundary; an unreadable time
+/// keeps the input.
 pub fn syncqt_earlier_products<'a>(
     declared: &[PathBuf],
     configured: Option<std::time::SystemTime>,
@@ -9269,7 +9272,12 @@ pub fn syncqt_earlier_products<'a>(
     produced: impl Fn(&Path) -> bool,
     mtime: impl Fn(&Path) -> Option<std::time::SystemTime>,
 ) -> Vec<PathBuf> {
-    let (Some(configured), None) = (configured, autogen_include_root(declared)) else {
+    let syncqt = declared.iter().any(|o| {
+        o.file_name()
+            .is_some_and(|f| f.to_string_lossy().ends_with("_syncqt_timestamp"))
+    });
+    let (true, Some(configured), None) = (syncqt, configured, autogen_include_root(declared))
+    else {
         return Vec::new();
     };
     let Some(tree) = common_include_root(declared) else {
@@ -23579,6 +23587,35 @@ mod syncqt_earlier_products_tests {
             .map(PathBuf::from)
             .to_vec()
         );
+        // The tree itself, and a file exactly as old as the manifest: kept.
+        let tree = [PathBuf::from("include/QtWaylandGlobal")];
+        assert!(
+            syncqt_earlier_products(&declared, Some(configured), tree.iter(), produced, mtime)
+                .is_empty()
+        );
+        let tie = [PathBuf::from(
+            "include/QtWaylandGlobal/QtWaylandGlobalVersion",
+        )];
+        assert!(syncqt_earlier_products(
+            &declared,
+            Some(configured),
+            tie.iter(),
+            produced,
+            |_: &Path| Some(configured)
+        )
+        .is_empty());
+        // An edge with an output under a CMake `include/` subdir is not
+        // syncqt's: FreeRDP's `include/CMakeFiles/ct-...`.
+        let cmake_subdir = [PathBuf::from("include/CMakeFiles/ct-59613f42")];
+        let beside = [PathBuf::from("include/CMakeFiles/placed.txt")];
+        assert!(syncqt_earlier_products(
+            &cmake_subdir,
+            Some(configured),
+            beside.iter(),
+            produced,
+            mtime
+        )
+        .is_empty());
         // No manifest time: nothing dropped.
         assert!(
             syncqt_earlier_products(&declared, None, inputs.iter(), produced, mtime).is_empty()
