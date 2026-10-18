@@ -398,8 +398,6 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // A residue re-exec repeats the argv, whose `-C` may be relative.
-    let launch_dir = std::env::current_dir().context("current_dir")?;
     // Change directory if specified
     if let Some(dir) = &cli.dir {
         std::env::set_current_dir(dir)
@@ -428,7 +426,7 @@ pub fn run() -> Result<()> {
     // NEVER ON THE COMPILER ROUTE: there thousands of drivers share one tree
     // concurrently (NIX_NINJA_NO_BUILD_DIR_SCAN, no walk, so no record), and
     // one moving files aside would pull them from under the others.
-    let _rewind =
+    let rewind =
         if cli.is_output_derivation || std::env::var_os("NIX_NINJA_NO_BUILD_DIR_SCAN").is_some() {
             None
         } else {
@@ -463,39 +461,19 @@ pub fn run() -> Result<()> {
             &derived_files,
             &all_outputs,
         );
-        // A RESTORE THAT CANNOT REACH ITS BYTES IS ANSWERED BY NOT NEEDING ONE.
-        // The run is repeated once with every task on the LTO arm, keyed to
-        // the real outer paths. On the compiler route a run is one TU, so one
-        // object loses its reuse across outer re-derivations; a ninja-route
-        // run repeats the whole graph that way. Residue with the arm already
-        // on is not this mechanism and is refused.
+        // A RESTORE NO REPAIR COULD REACH FAILS THE RUN; IT IS NEVER ANSWERED
+        // BY BUILDING AGAIN. Placement repairs split, escaped and compressed
+        // placeholders in place; re-running every task keyed to the real
+        // outer paths rebuilt the run a second time (the whole graph on the
+        // ninja route), so it is no longer done.
         if let Err(e) = placed {
-            match e.downcast_ref::<local::PlaceholderResidue>() {
-                Some(r) if !crate::task::raw_outer_paths_forced() => {
-                    use std::os::unix::process::CommandExt as _;
-                    eprintln!("nix-ninja: {r}; rebuilding with real outer paths");
-                    drop(rpc_client);
-                    std::env::set_current_dir(&launch_dir).context("set_current_dir")?;
-                    let exe = std::env::current_exe().context("current_exe")?;
-                    let err = std::process::Command::new(exe)
-                        .args(std::env::args_os().skip(1))
-                        .env(crate::task::RAW_OUTER_PATHS_ENV, "1")
-                        .exec();
-                    return Err(anyhow!("re-exec for real outer paths: {err}"));
-                }
-                // The raw arm was already on and still did not reach the
-                // bytes: an input carried the placeholder past it.
-                Some(_) => {
-                    return Err(e.context(format!(
-                        "{} was already set; a placeholder reached the task \
-                         through an input the raw arm does not swap (a locally \
-                         discovered header, an outer-stage header, or a memoised \
-                         upload)",
-                        crate::task::RAW_OUTER_PATHS_ENV
-                    )))
-                }
-                None => return Err(e),
+            if e.downcast_ref::<local::PlaceholderResidue>().is_some() {
+                return Err(e.context(
+                    "an outer-output placeholder survived every repair; nothing was \
+                     rebuilt (the residue names the file)",
+                ));
             }
+            return Err(e);
         }
 
         // UPSTREAM #17, STEPS TWO AND THREE. Step one made the depfile a
@@ -596,16 +574,19 @@ pub fn run() -> Result<()> {
             }
         }
 
-        // Placement succeeded (every failure above returned or re-exec'd):
-        // journal it, so a later pass can set it aside (configure_state).
-        crate::configure_state::journal_placed(
-            &build_dir,
-            all_outputs
-                .keys()
-                .chain(derived_files.iter().map(|d| &d.build_path))
-                .chain(depfiles.iter().map(|d| &d.build_path))
-                .map(PathBuf::as_path),
-        );
+        // Placement succeeded (every failure above returned): journal it, so
+        // a later pass can set it aside (configure_state). Never on the
+        // compiler route, where many drivers share the tree.
+        if std::env::var_os("NIX_NINJA_NO_BUILD_DIR_SCAN").is_none() {
+            crate::configure_state::journal_placed(
+                &build_dir,
+                crate::configure_state::placed_paths(
+                    all_outputs.values().chain(derived_files.iter()),
+                    &depfiles,
+                ),
+                rewind.is_some(),
+            );
+        }
 
         // NINJA'S STATE, AFTER THE DEPFILES IT IS BUILT FROM. Only for the
         // default manifest: real ninja in this directory reads build.ninja, so
@@ -631,6 +612,13 @@ pub fn run() -> Result<()> {
                 ),
             }
         }
+    }
+    // Everything set aside comes back before the run reports success, and a
+    // file that cannot fails it.
+    if let Some(rewind) = rewind {
+        rewind
+            .finish()
+            .context("putting back what this pass set aside")?;
     }
     Ok(())
 }

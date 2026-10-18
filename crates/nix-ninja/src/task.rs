@@ -1013,6 +1013,9 @@ pub struct Runner {
     /// carry them: the blanket's own gate, and a compile writes nothing
     /// beside its object.
     empty_dirs: Vec<String>,
+    /// The directories configure left, from the first pass's record; None
+    /// on the first pass, which asks the disk (configure_state).
+    configure_dirs: Option<HashSet<String>>,
     /// The producer index this discovery pass reads, set once from
     /// `build.rs` before the schedule starts. The Runner keeps it as
     /// `Option`: a run with no produced graph entries is `None`, and the
@@ -1125,6 +1128,7 @@ impl Runner {
             build_dir_inputs: HashMap::new(),
             alias_symlinks: Vec::new(),
             empty_dirs: Vec::new(),
+            configure_dirs: None,
             producer_index: None,
             no_defer: HashSet::new(),
             phony_aliases: HashMap::new(),
@@ -1180,7 +1184,12 @@ impl Runner {
             .collect();
         let files = &mut graph.files;
         // The first pass records what configure left; see configure_state.
-        let first = crate::configure_state::load(&self.config.build_dir).is_none();
+        // A LATER PASS ANSWERS FROM WHAT CONFIGURE LEFT: an upload, an alias
+        // or an empty directory configure did not leave is something a
+        // hook, a test run (ctest's Testing/) or placement wrote since, and
+        // the first pass never saw it. The files stay on disk.
+        let recorded = crate::configure_state::load(&self.config.build_dir);
+        let left = |rel: &str| recorded.as_ref().is_none_or(|r| r.files.contains(rel));
         let mut seen = crate::configure_state::ConfigureState::default();
         for entry in WalkDir::new(&self.config.build_dir)
             .into_iter()
@@ -1244,6 +1253,12 @@ impl Runner {
                 );
             }
             let path = match disposition {
+                BuildDirDisposition::Alias(..) | BuildDirDisposition::AliasAndUpload(..)
+                    if !left(&rel) =>
+                {
+                    continue
+                }
+                BuildDirDisposition::Upload if !left(&rel) => continue,
                 BuildDirDisposition::Alias(link, target) => {
                     self.alias_symlinks.push((link, target));
                     continue;
@@ -1253,15 +1268,17 @@ impl Runner {
                     entry.into_path()
                 }
                 BuildDirDisposition::Skip => {
-                    if entry.file_type().is_dir()
-                        && std::fs::read_dir(entry.path()).is_ok_and(|mut d| d.next().is_none())
-                    {
-                        if let Ok(rel) = entry.path().strip_prefix(&self.config.build_dir) {
-                            let rel = rel.to_string_lossy();
-                            if !rel.is_empty() {
-                                self.empty_dirs.push(rel.into_owned());
-                            }
+                    let empty = match &recorded {
+                        Some(r) => r.empty_dirs.contains(&rel),
+                        None => {
+                            entry.file_type().is_dir()
+                                && std::fs::read_dir(entry.path())
+                                    .is_ok_and(|mut d| d.next().is_none())
                         }
+                    };
+                    if empty && !rel.is_empty() {
+                        seen.empty_dirs.insert(rel.clone());
+                        self.empty_dirs.push(rel);
                     }
                     continue;
                 }
@@ -1309,8 +1326,9 @@ impl Runner {
         self.alias_symlinks.dedup();
         self.empty_dirs.sort();
         self.empty_dirs.dedup();
-        if first {
-            crate::configure_state::save(&self.config.build_dir, &seen);
+        match recorded {
+            Some(r) => self.configure_dirs = Some(r.dirs),
+            None => crate::configure_state::save(&self.config.build_dir, &seen),
         }
         Ok(())
     }
@@ -3768,7 +3786,9 @@ impl Runner {
         let make_dirs = if is_gcc_task {
             cmdline
                 .as_deref()
-                .map(|c| named_dirs_to_create(c, &self.config.build_dir))
+                .map(|c| {
+                    named_dirs_to_create(c, &self.config.build_dir, self.configure_dirs.as_ref())
+                })
                 .unwrap_or_default()
         } else {
             let mut dirs = self.empty_dirs.clone();
@@ -3966,11 +3986,20 @@ fn include_dirs_named(cmdline: &str, build_dir: &Path) -> Vec<String> {
 /// was three chained filters inside `new_task`, where a mutant deleting
 /// either one survives every gate: the confinement guard is exercised by no
 /// fixture that builds, and the existence guard only by one that does not.
-fn named_dirs_to_create(cmdline: &str, build_dir: &Path) -> Vec<String> {
+fn named_dirs_to_create(
+    cmdline: &str,
+    build_dir: &Path,
+    configure_dirs: Option<&HashSet<String>>,
+) -> Vec<String> {
     include_dirs_named(cmdline, build_dir)
         .into_iter()
         .filter(|n| confined_relative_dir(build_dir, Path::new(n)))
-        .filter(|n| build_dir.join(n).is_dir())
+        .filter(|n| match configure_dirs {
+            // A later pass: under the build dir, where placement and hooks
+            // write, configure's record answers; outside it the disk does.
+            Some(dirs) if !n.starts_with("..") => dirs.contains(n),
+            _ => build_dir.join(n).is_dir(),
+        })
         .collect()
 }
 
@@ -3991,8 +4020,27 @@ mod named_dirs_to_create_tests {
         let got = named_dirs_to_create(
             "gcc -Isubprojects/gvdb -I../subprojects/gvdb -c a.c -o a.o",
             &bd,
+            None,
         );
         assert_eq!(got, vec!["subprojects/gvdb", "../subprojects/gvdb"]);
+    }
+
+    /// A LATER PASS ASKS CONFIGURE'S RECORD, NOT THE DISK. `gen/sub` exists
+    /// because something wrote there after configure (placement, a hook);
+    /// carrying it would emit what the first pass did not. With no record
+    /// (the first pass) the disk answers and both are carried.
+    #[test]
+    fn a_later_pass_carries_only_directories_configure_made() {
+        let d = Scratch::new(format!("nn-mkdirs-record-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(bd.join("gen/sub")).unwrap();
+        let cmd = "gcc -Igen -Igen/sub -c a.c -o a.o";
+        let configure: std::collections::HashSet<String> = ["gen".to_string()].into();
+        assert_eq!(
+            named_dirs_to_create(cmd, &bd, Some(&configure)),
+            vec!["gen"]
+        );
+        assert_eq!(named_dirs_to_create(cmd, &bd, None), vec!["gen", "gen/sub"]);
     }
 
     /// THE EXISTENCE GUARD. A directory no part of the tree holds is a typo
@@ -4003,7 +4051,7 @@ mod named_dirs_to_create_tests {
         let d = Scratch::new(format!("nn-mkdirs-absent-{}", std::process::id()));
         let bd = d.join("build");
         std::fs::create_dir_all(&bd).unwrap();
-        let got = named_dirs_to_create("gcc -Ino/such/dir -c a.c -o a.o", &bd);
+        let got = named_dirs_to_create("gcc -Ino/such/dir -c a.c -o a.o", &bd, None);
         assert!(got.is_empty(), "carried {got:?}");
     }
 
@@ -4046,14 +4094,18 @@ mod named_dirs_to_create_tests {
             "the escape must EXIST, or the refusal below would be the \
              existence filter rather than the guard"
         );
-        let got = named_dirs_to_create(&format!("gcc -I../src -I{to_floor} -c a.c -o a.o"), &bd);
+        let got = named_dirs_to_create(
+            &format!("gcc -I../src -I{to_floor} -c a.c -o a.o"),
+            &bd,
+            None,
+        );
         assert_eq!(got, vec!["../src"], "a climb to the floor is an escape");
 
         // AND THE POSITIVE CONTROL: one step less stops inside the tree and is
         // admitted, so a mutant refusing every climb cannot pass by refusing
         // everything.
         let inside = vec![".."; depth - 2].join("/");
-        let got = named_dirs_to_create(&format!("gcc -I{inside} -c a.c -o a.o"), &bd);
+        let got = named_dirs_to_create(&format!("gcc -I{inside} -c a.c -o a.o"), &bd, None);
         assert_eq!(
             got,
             vec![inside.as_str()],
@@ -6967,6 +7019,55 @@ pub fn rewrite_bytes(data: &[u8], map: &[(String, String)]) -> Option<Vec<u8>> {
     changed.then_some(out)
 }
 
+/// The 32-character hash of a store path's base name.
+fn store_hash(path: &str) -> Option<&[u8]> {
+    path.rsplit_once('/')
+        .and_then(|(_, base)| base.split_once('-'))
+        .map(|(h, _)| h.as_bytes())
+}
+
+/// Swaps every run of a placeholder's HASH that survives, whole or in
+/// pieces, for the same characters of the real path's hash, at the same
+/// offsets within the hash. `rewrite_bytes` swaps whole paths only, and a
+/// placeholder also lands split (a compiler's immediate stores: llvm-config
+/// carried `hjbdq8s5j5dkn2a110sy8` then `10sy8zlhfcs4lxsx`) or with escapes
+/// around it (a troff man page spells the dashes `\-`). The hash is the
+/// only part that differs between placeholder and real path, so a run of it
+/// found where `placeholder_residue` finds it is swapped character for
+/// character; runs shorter than `RESIDUE_WINDOW` are neither found nor
+/// residue. A pair whose hashes differ in length is skipped.
+pub fn repair_residue(data: &[u8], restore: &[(String, String)]) -> Option<Vec<u8>> {
+    let mut out = data.to_vec();
+    let mut changed = false;
+    for (placeholder, real) in restore {
+        let (Some(hp), Some(hr)) = (store_hash(placeholder), store_hash(real)) else {
+            continue;
+        };
+        if hp.len() != hr.len() || hp.len() < RESIDUE_WINDOW {
+            continue;
+        }
+        let mut at: rustc_hash::FxHashMap<&[u8], usize> = Default::default();
+        for k in 0..=hp.len() - RESIDUE_WINDOW {
+            at.entry(&hp[k..k + RESIDUE_WINDOW]).or_insert(k);
+        }
+        let mut i = 0;
+        while i + RESIDUE_WINDOW <= out.len() {
+            let Some(&k) = at.get(&out[i..i + RESIDUE_WINDOW]) else {
+                i += 1;
+                continue;
+            };
+            let mut j = 0;
+            while k + j < hp.len() && i + j < out.len() && out[i + j] == hp[k + j] {
+                j += 1;
+            }
+            out[i..i + j].copy_from_slice(&hr[k..k + j]);
+            changed = true;
+            i += j;
+        }
+    }
+    changed.then_some(out)
+}
+
 /// The reverse map: placeholder -> real.
 pub fn outer_restore_map() -> Vec<(String, String)> {
     outer_rewrite_map()
@@ -6975,8 +7076,9 @@ pub fn outer_restore_map() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Set by the driver on itself when a restore left placeholder residue; every
-/// task of the run then takes the LTO arm and sees the real outer paths.
+/// Every task of the run takes the LTO arm and sees the real outer paths. Set
+/// by hand only: the driver no longer re-runs itself with it, since that
+/// rebuilt every task of the run a second time.
 pub const RAW_OUTER_PATHS_ENV: &str = "NIX_NINJA_RAW_OUTER_PATHS";
 
 pub fn raw_outer_paths_forced() -> bool {
@@ -7003,8 +7105,8 @@ const RESIDUE_WINDOW: usize = 8;
 /// config-0.29.2/lib` this way, 2026-10-09: raw scan zero, one `objcopy
 /// --decompress-debug-sections` and the placeholder stood out). Scan those
 /// sections INFLATED. Read-only: the scan answers "is a placeholder in
-/// here"; recovery is the existing re-exec with real outer paths, so the
-/// compressed bytes are never rewritten (a recompress is not byte stable).
+/// here"; placement repairs what it finds (`repair_residue`, and for a
+/// compressed section `local::repair_compressed`).
 pub fn placeholder_residue(data: &[u8], restore: &[(String, String)]) -> Option<String> {
     if let Some(p) = placeholder_residue_plain(data, restore) {
         return Some(p);
@@ -7019,11 +7121,7 @@ fn placeholder_residue_plain(data: &[u8], restore: &[(String, String)]) -> Optio
     // against 83 MB/s on a 210 MB libLLVM.so.
     let mut windows: rustc_hash::FxHashMap<[u8; RESIDUE_WINDOW], &str> = Default::default();
     for (placeholder, _) in restore {
-        let Some(hash) = placeholder
-            .rsplit_once('/')
-            .and_then(|(_, base)| base.split_once('-'))
-            .map(|(h, _)| h.as_bytes())
-        else {
+        let Some(hash) = store_hash(placeholder) else {
             continue;
         };
         for w in hash.windows(RESIDUE_WINDOW) {
@@ -7048,7 +7146,7 @@ pub(crate) fn is_elf64_le(data: &[u8]) -> bool {
 /// ELF file, inflated; empty for anything else, which the caller has already
 /// scanned raw. Parsed by hand: the ELF header, one section-header walk and
 /// the `Elf64_Chdr` are all it needs, and the file is already in memory.
-fn compressed_sections(data: &[u8]) -> Vec<Vec<u8>> {
+pub(crate) fn compressed_sections(data: &[u8]) -> Vec<Vec<u8>> {
     let u16le = |o: usize| {
         data.get(o..o + 2)
             .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
@@ -7101,7 +7199,61 @@ fn compressed_sections(data: &[u8]) -> Vec<Vec<u8>> {
 
 #[cfg(test)]
 mod placeholder_residue_tests {
-    use super::{placeholder_residue, placeholder_residue_plain, rewrite_bytes};
+    use super::{placeholder_residue, placeholder_residue_plain, repair_residue, rewrite_bytes};
+
+    const XDP_PH: &str = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-xdg-desktop-portal-1.22.1";
+    const XDP_REAL: &str = "/nix/store/32a39vx421j6s4zh3nh85a5r1jlgagqg-xdg-desktop-portal-1.22.1";
+
+    /// THE SHAPES THE RE-EXEC USED TO REBUILD A RUN FOR, now repaired in
+    /// place: a man page that spells the path with troff escapes (no whole
+    /// path for `rewrite_bytes` to swap) and an immediate-store split
+    /// (llvm-config's two overlapping pieces). After the repair no residue
+    /// window remains and every hash character is the real one; bytes
+    /// around the pieces are untouched.
+    #[test]
+    fn split_and_escaped_placeholders_are_repaired_in_place() {
+        let restore = vec![(XDP_PH.to_string(), XDP_REAL.to_string())];
+        let man = b".B \\/nix\\/store\\/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx\\-xdg\\-desktop\\-portal\\-1.22.1/share".to_vec();
+        assert_eq!(
+            rewrite_bytes(&man, &restore),
+            None,
+            "control: no whole path to swap"
+        );
+        assert!(
+            placeholder_residue(&man, &restore).is_some(),
+            "control: residue"
+        );
+        let fixed = repair_residue(&man, &restore).unwrap();
+        assert_eq!(placeholder_residue(&fixed, &restore), None);
+        assert_eq!(
+            String::from_utf8(fixed).unwrap(),
+            String::from_utf8(man).unwrap().replace(
+                "hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx",
+                "32a39vx421j6s4zh3nh85a5r1jlgagqg"
+            )
+        );
+        let mut split = b"\x48\xb8hjbdq8s5j5dkn2a110sy8\xc7\x40\x0110sy8zlhfcs4lxsx\x00".to_vec();
+        let before = split.clone();
+        assert!(
+            placeholder_residue(&split, &restore).is_some(),
+            "control: residue"
+        );
+        split = repair_residue(&split, &restore).unwrap();
+        assert_eq!(placeholder_residue(&split, &restore), None);
+        assert_eq!(
+            &split[..2],
+            &before[..2],
+            "bytes before a piece are untouched"
+        );
+        let real = b"32a39vx421j6s4zh3nh85a5r1jlgagqg";
+        assert_eq!(&split[2..23], &real[..21]);
+        assert_eq!(
+            &split[23..26],
+            &before[23..26],
+            "opcode bytes between pieces stay"
+        );
+        assert_eq!(&split[26..42], &real[16..]);
+    }
 
     /// THE SHAPE pkg-config 0.29.2 SHIPPED (2026-10-09): a placeholder that
     /// exists only inside a zlib-compressed debug section. The fixture is
@@ -15711,6 +15863,12 @@ fn walk_dir_capped_uncached(
             fs::read_dir(&d).map_err(|e| anyhow!("read_dir({}) for dir arg: {e}", d.display()))?;
         for entry in entries.flatten() {
             let p = entry.path();
+            // The driver's own state (configure_state) is never an input,
+            // whichever directory argument reaches it (a source root that is
+            // NIX_BUILD_TOP, `-I.` outside a sandbox).
+            if crate::configure_state::is_state_dir(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
             if p.is_dir() {
                 stack.push(p);
             } else if p.is_file() {
