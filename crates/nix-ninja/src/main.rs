@@ -25,7 +25,7 @@ fn main() -> ExitCode {
     let report = cli::report_pass();
     let run = run.and(report);
     if let (Ok(()), Ok(cwd)) = (&run, &cwd) {
-        cli::make_shadowed_out(cwd);
+        cli::after_run(cwd);
     }
     match run {
         Ok(()) => ExitCode::SUCCESS,

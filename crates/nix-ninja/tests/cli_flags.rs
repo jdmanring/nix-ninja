@@ -105,3 +105,33 @@ fn an_empty_metatypes_file_in_the_tree_is_found() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Every gate on the empty `out`: outside a build, without the shadowing
+/// text, on a first pass, over an existing `out`, and over a tree holding
+/// an empty metatypes file, nothing is made; otherwise it is, once.
+#[test]
+fn the_empty_out_is_made_only_when_every_gate_holds() {
+    use nix_ninja::cli::make_shadowed_out as make;
+    let broken =
+        "x=$(for out in $outputs; do find \"${!out}\" -name '*_metatypes.json' -size 0; done)";
+    let fixed = "x=$(for o in $outputs; do find \"${!o}\" -name '*_metatypes.json' -size 0; done)";
+    let d = std::env::temp_dir().join(format!("nn-shadowed-out-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("qt6core_metatypes.json"), "").unwrap();
+    assert!(
+        !make(&d, true, Some(broken), true),
+        "an empty metatypes file"
+    );
+    assert!(!d.join("out").exists());
+    std::fs::write(d.join("qt6core_metatypes.json"), "[]").unwrap();
+    assert!(!make(&d, false, Some(broken), true), "outside a build");
+    assert!(!make(&d, true, Some(fixed), true), "the fixed check");
+    assert!(!make(&d, true, None, true), "no postFixup");
+    assert!(!make(&d, true, Some(broken), false), "a first pass");
+    assert!(!d.join("out").exists());
+    assert!(make(&d, true, Some(broken), true));
+    assert!(d.join("out").is_dir());
+    assert!(!make(&d, true, Some(broken), true), "an existing out");
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -410,6 +410,16 @@ pub fn shadows_out(post_fixup: &str) -> bool {
     post_fixup.contains(r#"for out in $outputs; do find "${!out}""#)
 }
 
+/// After a run that succeeded, started in `cwd`.
+pub fn after_run(cwd: &Path) {
+    make_shadowed_out(
+        cwd,
+        env::var_os("NIX_BUILD_TOP").is_some(),
+        env::var("postFixup").ok().as_deref(),
+        crate::configure_state::later_pass(),
+    );
+}
+
 /// The 0-byte `*_metatypes.json` under `dir`, read through links: what the
 /// shadowed check exists to refuse, and what the install copies into `$out`,
 /// the one output the shadowed check no longer reads.
@@ -431,16 +441,20 @@ pub fn empty_metatypes(dir: &Path) -> Vec<PathBuf> {
 /// first: an empty metatypes file there leaves `out` absent, and fixup fails
 /// as it would without this.
 /// DEFER(next pin bump, when the fixed check from saxum 879e577 enters the target): delete
-pub fn make_shadowed_out(cwd: &Path) {
-    if std::env::var_os("NIX_BUILD_TOP").is_none()
-        || !std::env::var("postFixup").is_ok_and(|v| shadows_out(&v))
-        || !crate::configure_state::later_pass()
-    {
-        return;
+/// `in_build` is NIX_BUILD_TOP set, `post_fixup` the exported postFixup,
+/// `later` a later pass that succeeded; returns whether `out` was made.
+pub fn make_shadowed_out(
+    cwd: &Path,
+    in_build: bool,
+    post_fixup: Option<&str>,
+    later: bool,
+) -> bool {
+    if !in_build || !post_fixup.is_some_and(shadows_out) || !later {
+        return false;
     }
     let out = cwd.join("out");
     if std::fs::symlink_metadata(&out).is_ok() {
-        return;
+        return false;
     }
     let empty = empty_metatypes(cwd);
     if !empty.is_empty() {
@@ -448,14 +462,20 @@ pub fn make_shadowed_out(cwd: &Path) {
         for p in &empty {
             eprintln!("nix-ninja:   {}", p.display());
         }
-        return;
+        return false;
     }
     match std::fs::create_dir(&out) {
-        Ok(()) => eprintln!(
-            "nix-ninja: made an empty {} for postFixup's shadowed $out check",
-            out.display()
-        ),
-        Err(e) => eprintln!("nix-ninja: could not make {}: {e}", out.display()),
+        Ok(()) => {
+            eprintln!(
+                "nix-ninja: made an empty {} for postFixup's shadowed $out check",
+                out.display()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("nix-ninja: could not make {}: {e}", out.display());
+            false
+        }
     }
 }
 
