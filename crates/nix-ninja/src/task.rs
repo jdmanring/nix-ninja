@@ -5300,6 +5300,21 @@ fn build_task_derivation(
         );
     }
 
+    // EVERY ENTRY THAT SURVIVED KEEPS ITS REFERENCE; see
+    // reference_surviving_inputs.
+    let rereferenced = reference_surviving_inputs(
+        &mut drv,
+        &input_set,
+        task.inputs.iter().chain(discovered_inputs.iter()),
+        &task.store_dir,
+    );
+    if rereferenced > 0 {
+        eprintln!(
+            "nix-ninja: {rereferenced} input(s) shared a store path with a dropped entry; \
+             referenced again for the entries that remain"
+        );
+    }
+
     // Sort NIX_NINJA_INPUTS to ensure determinism - BY BUILD PATH, not by
     // the encoded string. The string opens with the store path, and for a
     // Built input that is a placeholder derived from the PRODUCER'S drv
@@ -9528,6 +9543,27 @@ pub fn rebind_produced_inputs(
     }
     rebound.sort();
     rebound
+}
+
+/// Adds to `drv.inputs` the store path of every input whose encoded entry is
+/// still in `input_set`, and returns how many were missing. One store path
+/// can back two entries: an upload is named from the path asked about, so two
+/// files of one basename and one content are one path. qtbase 6.11.2's
+/// `include/QtCore/QtCore` and `include/QtCore/.syncqt_staging/QtCore` are
+/// both `-QtCore`, and the passes in `build_task_derivation` that drop an
+/// entry remove its store path from `drv.inputs` too, unreferencing the twin
+/// that stays in NIX_NINJA_INPUTS. The Xml and DBus autogen tasks then died in
+/// sandbox setup, "symlink source does not exist".
+pub fn reference_surviving_inputs<'a>(
+    drv: &mut Derivation,
+    input_set: &HashSet<String>,
+    inputs: impl Iterator<Item = &'a DerivedFile>,
+    store_dir: &StoreDir,
+) -> usize {
+    inputs
+        .filter(|i| input_set.contains(&i.to_encoded(store_dir)))
+        .filter(|i| drv.inputs.insert(i.derived_path.clone()))
+        .count()
 }
 
 /// The directories a relative `-I` in `scan` has to ENTER, as absolute paths
@@ -25973,5 +26009,88 @@ mod produced_output_tests {
         assert_eq!(ask("src/uploaded.json"), None);
         assert_eq!(ask("src/not-a-node.json"), None);
         assert_eq!(ask("../ext/y.h"), None);
+    }
+}
+
+#[cfg(test)]
+mod reference_surviving_inputs_tests {
+    use super::reference_surviving_inputs;
+    use harmonia_store_derivation::derivation::Derivation;
+    use harmonia_store_derivation::derived_path::SingleDerivedPath;
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::DerivedFile;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+
+    fn store() -> StoreDir {
+        StoreDir::new(Path::new("/nix/store")).unwrap()
+    }
+    fn upload(hash: &str, name: &str, build: &str) -> DerivedFile {
+        DerivedFile {
+            derived_path: SingleDerivedPath::Opaque(
+                store().parse(&format!("/nix/store/{hash}-{name}")).unwrap(),
+            ),
+            build_path: PathBuf::from(build),
+            rel_path: None,
+        }
+    }
+
+    /// qtbase 6.11.2's Xml_autogen task: the upload of `include/QtCore/QtCore`
+    /// is dropped for the syncqt edge's output, and its store path also backs
+    /// the `.syncqt_staging` entry that stays. Dropping the first the way the
+    /// passes do leaves the second unreferenced; the reconciliation puts the
+    /// reference back, and only for an entry still in the manifest.
+    #[test]
+    fn a_dropped_entry_does_not_unreference_its_twin() {
+        let st = store();
+        let shown = upload(
+            "qfy4xvpy89qp6pd8aj8ywzr7k4hdghqs",
+            "QtCore",
+            "include/QtCore/QtCore",
+        );
+        let staged = upload(
+            "qfy4xvpy89qp6pd8aj8ywzr7k4hdghqs",
+            "QtCore",
+            "include/QtCore/.syncqt_staging/QtCore",
+        );
+        let gone = upload(
+            "6zd1c66pp1qpjpryc2h3l8qgy3b94h4q",
+            "qtaskbuilder.h",
+            "../src/concurrent/qtaskbuilder.h",
+        );
+        let mut drv = Derivation::new(
+            "ninja-build".parse().unwrap(),
+            b"x86_64-linux".to_vec().into(),
+            b"/b".to_vec().into(),
+        );
+        let mut set: HashSet<String> = HashSet::new();
+        for i in [&shown, &staged, &gone] {
+            drv.inputs.insert(i.derived_path.clone());
+            set.insert(i.to_encoded(&st));
+        }
+        // The drop, as the shadowed-upload pass does it.
+        for i in [&shown, &gone] {
+            set.remove(&i.to_encoded(&st));
+            drv.inputs.remove(&i.derived_path);
+        }
+        assert!(!drv.inputs.contains(&staged.derived_path), "the defect");
+
+        let all = [shown.clone(), staged.clone(), gone.clone()];
+        assert_eq!(
+            reference_surviving_inputs(&mut drv, &set, all.iter(), &st),
+            1
+        );
+        assert!(drv.inputs.contains(&staged.derived_path));
+        assert!(
+            !drv.inputs.contains(&gone.derived_path),
+            "a dropped entry stays dropped"
+        );
+        // Complete references: nothing changes.
+        let before = drv.inputs.clone();
+        assert_eq!(
+            reference_surviving_inputs(&mut drv, &set, all.iter(), &st),
+            0
+        );
+        assert_eq!(drv.inputs, before);
     }
 }
