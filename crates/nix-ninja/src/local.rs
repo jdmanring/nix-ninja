@@ -250,8 +250,8 @@ fn place_realised(
         return Err(PlaceholderResidue(residue).into());
     }
     placed?;
-    refresh_placed_mtimes(prefix, store_dir, &symlink_files);
-    scrub_placed_runpaths(prefix, &opaque_files);
+    refresh_placed_mtimes(prefix, store_dir, &symlink_files)?;
+    scrub_placed_runpaths(prefix, &opaque_files)?;
     Ok(())
 }
 
@@ -265,7 +265,7 @@ fn place_realised(
 /// DEFER(a refused library inside a placed directory output): the files of
 /// a directory input are not walked here, though `refresh_tree_mtimes`
 /// walks them.
-fn scrub_placed_runpaths(prefix: &Path, files: &[DerivedFile]) {
+fn scrub_placed_runpaths(prefix: &Path, files: &[DerivedFile]) -> Result<()> {
     let mut failed: Vec<String> = Vec::new();
     for df in files {
         let dest = prefix.join(&df.build_path);
@@ -276,11 +276,12 @@ fn scrub_placed_runpaths(prefix: &Path, files: &[DerivedFile]) {
             failed.push(format!("{}: {e}", dest.display()));
         }
     }
-    if let Some(first) = failed.first() {
-        eprintln!(
-            "nix-ninja: runpath scrub failed on {} placed file(s); first {first}",
+    match failed.first() {
+        Some(first) => Err(anyhow::anyhow!(
+            "runpath scrub failed on {} placed file(s); first {first}",
             failed.len()
-        );
+        )),
+        None => Ok(()),
     }
 }
 
@@ -356,7 +357,11 @@ fn write_restored(tmp: &Path, data: &[u8], target: &Path) -> std::io::Result<()>
 ///
 /// Best effort per file: a failure here costs a redundant compile, which is
 /// the behavior that has always been in force.
-fn refresh_placed_mtimes(prefix: &Path, store_dir: &StoreDir, files: &[DerivedFile]) {
+fn refresh_placed_mtimes(
+    prefix: &Path,
+    store_dir: &StoreDir,
+    files: &[DerivedFile],
+) -> std::io::Result<()> {
     for df in files {
         let src = df.absolute_path(store_dir);
         let dest = prefix.join(&df.build_path);
@@ -370,7 +375,7 @@ fn refresh_placed_mtimes(prefix: &Path, store_dir: &StoreDir, files: &[DerivedFi
         // resolution began expanding an edge's co-outputs; before that it
         // needed NIX_NINJA_MATERIALIZE_ALL.
         if src.is_dir() {
-            refresh_tree_mtimes(&src, &dest);
+            refresh_tree_mtimes(&src, &dest)?;
             continue;
         }
         if !dest.is_symlink() {
@@ -394,14 +399,15 @@ fn refresh_placed_mtimes(prefix: &Path, store_dir: &StoreDir, files: &[DerivedFi
         if !placement_is_ours(&dest, &src) {
             continue;
         }
-        refresh_one(&dest, &src);
+        refresh_one(&dest, &src)?;
     }
+    Ok(())
 }
 
 /// Replace one placed symlink with the bytes it points at, carrying a fresh
-/// mtime and the store mode plus owner write. Best effort: a failure costs a
-/// redundant compile, which is the behavior that has always been in force.
-fn refresh_one(dest: &Path, src: &Path) {
+/// mtime and the store mode plus owner write. A failure is the run's: the
+/// link it leaves reads as older than every source to real ninja.
+fn refresh_one(dest: &Path, src: &Path) -> std::io::Result<()> {
     if std::env::var_os("NIX_NINJA_DIAG").is_some() {
         eprintln!(
             "nix-ninja: DIAG refresh copies {} from {}",
@@ -410,18 +416,18 @@ fn refresh_one(dest: &Path, src: &Path) {
         );
     }
     let tmp = unique_sibling(dest);
-    if clone_or_copy(src, &tmp).is_err() {
+    let res = clone_or_copy(src, &tmp)
+        .and_then(|_| std::fs::metadata(src))
+        .and_then(|md| {
+            let mut perm = md.permissions();
+            perm.set_mode(perm.mode() | 0o200);
+            std::fs::set_permissions(&tmp, perm)
+        })
+        .and_then(|_| std::fs::rename(&tmp, dest));
+    if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return;
     }
-    if let Ok(md) = std::fs::metadata(src) {
-        let mut perm = md.permissions();
-        perm.set_mode(perm.mode() | 0o200);
-        let _ = std::fs::set_permissions(&tmp, perm);
-    }
-    if std::fs::rename(&tmp, dest).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    res.map_err(|e| std::io::Error::other(format!("refreshing {}: {e}", dest.display())))
 }
 
 /// Every file placed under a directory input, walked in step with the
@@ -431,19 +437,18 @@ fn refresh_one(dest: &Path, src: &Path) {
 /// `placement_is_ours` on its own; a file the BUILD TREE already held was
 /// skipped at placement and is a real file rather than a link, so it is
 /// skipped here too and keeps the time it has.
-fn refresh_tree_mtimes(src: &Path, dest: &Path) {
-    let Ok(entries) = std::fs::read_dir(src) else {
-        return;
-    };
-    for entry in entries.flatten() {
+fn refresh_tree_mtimes(src: &Path, dest: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
         let from = entry.path();
         let to = dest.join(entry.file_name());
         if from.is_dir() {
-            refresh_tree_mtimes(&from, &to);
+            refresh_tree_mtimes(&from, &to)?;
         } else if to.is_symlink() && placement_is_ours(&to, &from) {
-            refresh_one(&to, &from);
+            refresh_one(&to, &from)?;
         }
     }
+    Ok(())
 }
 
 /// This symlink is the one this placement created, rather than a name the
@@ -920,7 +925,7 @@ mod refresh_tree_mtimes_tests {
         let store_dir = StoreDir::new(&store_root).unwrap();
         let df =
             DerivedFile::from_encoded(&store_dir, &format!("{}:gen:", store.display())).unwrap();
-        refresh_placed_mtimes(&d.join("build"), &store_dir, &[df]);
+        refresh_placed_mtimes(&d.join("build"), &store_dir, &[df]).expect("refreshed");
 
         for placed in ["moc_a.cpp", "sub/moc_b.cpp"] {
             assert!(

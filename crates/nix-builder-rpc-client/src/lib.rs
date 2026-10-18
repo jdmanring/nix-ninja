@@ -1923,7 +1923,19 @@ impl BuilderRpcClient {
                             _ => Ok(path.clone()),
                         }
                     }
-                    SingleDerivedPath::Built { output, .. } => {
+                    SingleDerivedPath::Built { drv_path, output } => {
+                        // A WATCHED DERIVATION WITH NO RESULT OF ITS OWN is
+                        // counted as built: a reply keyed by another path
+                        // (a CA derivation's resolved one) cannot say it
+                        // was not, and a count must fail toward work done.
+                        if !by_key.contains_key(&key) {
+                            let shown = store_dir.display(drv_path.as_ref()).to_string();
+                            if let Some(w) = WATCHED.lock().unwrap().as_mut() {
+                                if w.0.contains(&shown) {
+                                    w.1.push(format!("{shown} (no result of its own)"));
+                                }
+                            }
+                        }
                         if let Some(result) = by_key.get(&key) {
                             if result.success().is_none() {
                                 let own = match &result.inner {

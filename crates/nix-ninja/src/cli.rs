@@ -470,12 +470,29 @@ pub fn run() -> Result<()> {
         !cli.is_output_derivation && std::env::var_os("NIX_NINJA_NO_BUILD_DIR_SCAN").is_none();
     if scanned {
         crate::configure_state::use_manifest(&cli.build_filename);
-        crate::configure_state::begin_pass(
-            &build_dir,
-            !crate::resolve_cache::earlier_runs_trusted(),
-            &invocation(&cli),
-        )
-        .context("reading the tasks earlier passes wrote")?;
+        let reuse_allowed = !crate::resolve_cache::earlier_runs_trusted();
+        if let Err(e) =
+            crate::configure_state::begin_pass(&build_dir, reuse_allowed, &invocation(&cli))
+        {
+            // A later pass stopped before it could reuse still reports, as
+            // one that did pass-1 work again, so a round never reads its
+            // silence as "not a later pass".
+            if reuse_allowed && crate::configure_state::record_present(&build_dir) {
+                eprintln!(
+                    "nix-ninja: later-pass reused 0 task(s), derived 0 fresh, 1 fallback, 0 \
+                     stale: <stopped before reuse>; stale: ; fresh: "
+                );
+            }
+            return Err(anyhow::Error::from(e).context("reading the tasks earlier passes wrote"));
+        }
+        // A later pass that may not reuse (earlier runs trusted: outside a
+        // build, or NIX_NINJA_RESOLVE_CACHE=1) says so rather than nothing.
+        if !reuse_allowed && crate::configure_state::record_present(&build_dir) {
+            eprintln!(
+                "nix-ninja: later-pass reused 0 task(s), derived 0 fresh, 1 fallback, 0 stale: \
+                 <reuse off: earlier runs trusted>; stale: ; fresh: "
+            );
+        }
     }
     let rewind = if !scanned {
         None

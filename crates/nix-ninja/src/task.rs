@@ -234,6 +234,11 @@ struct Task {
     /// Local mode (configurations A and B), where discovery may realise a
     /// carried tree to show the confirming preprocessor what the task sees.
     local_mode: bool,
+    // Why resolving this edge failed, for a task built only to place an
+    // earlier pass's derivation (`reused_task`): if that derivation cannot
+    // be reused after all, the edge fails with it instead of deriving from
+    // nothing.
+    unresolved: Option<String>,
 }
 
 impl Deref for Task {
@@ -1428,7 +1433,13 @@ impl Runner {
         // is always on because its cost is two atomics per task.
         use std::sync::atomic::Ordering;
         let t0 = std::time::Instant::now();
-        let mut task = self.new_task(files, build)?;
+        let mut task = match self.new_task(files, build) {
+            Ok(task) => task,
+            // A LATER PASS DOES NOT NEED TO RESOLVE AN EDGE IT REUSES: the
+            // tree hooks and placement changed can fail a resolution that
+            // pass 1 completed, and the derivation pass 1 wrote stands.
+            Err(e) => self.reused_task(files, build, &e).ok_or(e)?,
+        };
         if self.no_defer.contains(&bid) {
             task.producer_index = None;
         }
@@ -1547,6 +1558,14 @@ impl Runner {
                         Some(e.context("placing a reused task's outer-stage outputs")),
                     ),
                 }
+            } else if let Some(why) = &task.unresolved {
+                (
+                    None,
+                    Some(anyhow!(
+                        "an earlier pass's derivation for this edge cannot be reused and \
+                         resolving it failed: {why}"
+                    )),
+                )
             } else {
                 match build_task_derivation(tools.clone(), &rpc_client, task.clone()) {
                     Ok(drv) => match handle_derivation_result(
@@ -1951,6 +1970,69 @@ impl Runner {
     /// The producing edge's output for a path named inside a `-Wl` group.
     fn wl_produced_output(&self, files: &graph::GraphFiles, cand: &str) -> Option<DerivedFile> {
         wl_produced_output(&self.config.build_dir, files, &self.derived_files, cand)
+    }
+
+    /// The task for an edge an earlier pass wrote a derivation for, as far
+    /// as placing that derivation's outputs needs it, without resolving its
+    /// inputs. None when no earlier pass recorded one.
+    fn reused_task(
+        &self,
+        files: &graph::GraphFiles,
+        build: &Build,
+        why: &anyhow::Error,
+    ) -> Option<Task> {
+        let mut outputs = Vec::new();
+        let mut outer_stage_outputs = Vec::new();
+        for fid in build.outs() {
+            let declared = PathBuf::from(&files.by_id[*fid].name);
+            let placed = staged_or_normalized_output(
+                &self.config.build_dir,
+                declared.clone(),
+                !self.config.is_output_derivation,
+            )
+            .ok()?;
+            if placed != declared && outer_stage_output_path(&declared).as_ref() == Some(&placed) {
+                outer_stage_outputs.push((declared, placed.clone()));
+            }
+            outputs.push(placed);
+        }
+        if !crate::configure_state::recorded(&outputs) {
+            return None;
+        }
+        Some(Task {
+            system: self.config.system.clone(),
+            wrapper_vars: HashMap::new(),
+            input_srcs: Vec::new(),
+            build_dir: self.config.build_dir.clone(),
+            build_deps: build.dependencies.clone(),
+            store_dir: self.config.store_dir.clone(),
+            // No command: nothing below derives, and the copy-stamp writes
+            // read from it are filtered by inputs this task does not hold.
+            cmdline: None,
+            desc: build.desc.clone(),
+            deps: build.deps.clone(),
+            rspfile: None,
+            depfile: build.depfile.clone(),
+            files: build
+                .ordering_ins()
+                .iter()
+                .chain(build.outs())
+                .map(|fid| (*fid, files.by_id[*fid].clone()))
+                .collect(),
+            inputs: Vec::new(),
+            store_srcs: Vec::new(),
+            moc_scan: None,
+            emit_only: self.config.emit_only,
+            outputs,
+            outer_stage_outputs,
+            verbose: self.config.verbose,
+            alias_symlinks: Vec::new(),
+            make_dirs: Vec::new(),
+            producer_index: None,
+            is_gcc_task: false,
+            local_mode: !self.config.is_output_derivation,
+            unresolved: Some(format!("{why:#}")),
+        })
     }
 
     fn new_task(&mut self, files: &mut graph::GraphFiles, build: &Build) -> Result<Task> {
@@ -3780,6 +3862,7 @@ impl Runner {
             make_dirs,
             is_gcc_task,
             local_mode: !self.config.is_output_derivation,
+            unresolved: None,
         })
     }
 }
@@ -6845,6 +6928,7 @@ fn handle_derivation_result(
             crate::configure_state::note_task(
                 &task.outputs,
                 &config.store_dir.display(&drv_path).to_string(),
+                task_tree_inputs(&drv, &config.store_dir),
             );
             DYN_ADDDRV_MS.fetch_add(
                 t_addrv.elapsed().as_millis() as u64,
@@ -6874,6 +6958,7 @@ fn handle_derivation_result(
         crate::configure_state::note_task(
             &task.outputs,
             &config.store_dir.display(&drv_path).to_string(),
+            task_tree_inputs(&drv, &config.store_dir),
         );
         DYN_PLAIN_ADDDRV_MS.fetch_add(
             t_add.elapsed().as_millis() as u64,
@@ -6883,6 +6968,35 @@ fn handle_derivation_result(
         place_outer_stage_outputs(rpc_client, config, &task, &drv_path)?;
         Ok(SingleDerivedPath::Opaque(drv_path))
     }
+}
+
+/// The tree files a task derivation reads, from its `NIX_NINJA_INPUTS`:
+/// each input's build path, with the store path its bytes come from when
+/// that is a store path (an upload, a realised discovery) and None for
+/// another task's output, named by placeholder. Build paths in the store are
+/// not the tree's.
+fn task_tree_inputs(
+    drv: &Derivation,
+    store_dir: &StoreDir,
+) -> Vec<crate::configure_state::TaskInput> {
+    let Some(encoded) = drv.env.get(&b"NIX_NINJA_INPUTS"[..]) else {
+        return Vec::new();
+    };
+    let store = store_dir.to_string();
+    String::from_utf8_lossy(encoded)
+        .split(ENCODED_LIST_SEP)
+        .filter_map(|entry| {
+            let mut parts = entry.splitn(3, ':');
+            let from = parts.next()?;
+            let build = parts.next()?;
+            let rel = parts.next().unwrap_or_default();
+            if build.is_empty() || build.starts_with(&store) {
+                return None;
+            }
+            let from = (from.starts_with(&store) && rel.is_empty()).then(|| from.to_string());
+            Some((build.to_string(), from))
+        })
+        .collect()
 }
 
 /// Copy an output the edge declared inside the outer derivation's own output
