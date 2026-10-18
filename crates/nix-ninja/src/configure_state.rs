@@ -684,12 +684,14 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
                 .iter()
                 .filter(|(_, ix)| ix.iter().any(|i| overwritten_under.contains(i)))
                 .filter_map(|(k, _)| {
-                    if pass.replaced.contains(k) {
-                        emitted.get(k)
-                    } else {
-                        earlier.get(k)
-                    }
-                    .cloned()
+                    // One whose replacement was never written (the pass
+                    // failed) keeps the name it had.
+                    pass.replaced
+                        .contains(k)
+                        .then(|| emitted.get(k))
+                        .flatten()
+                        .or_else(|| earlier.get(k))
+                        .cloned()
                 }),
         );
     }
@@ -2758,7 +2760,9 @@ mod tests {
         for (o, drv, inputs) in edges {
             let out = [PathBuf::from(o)];
             let missing = MISSING.lock().unwrap().clone();
-            if super::reuse(&out, |d| missing.as_deref() != Some(d)).is_none() {
+            if super::reuse(&out, |d| missing.as_deref() != Some(d)).is_none()
+                && !NO_FRESH.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 super::note_task(&out, drv, inputs.iter().map(|s| s.to_string()).collect());
             }
         }
@@ -2808,6 +2812,9 @@ mod tests {
         }
         super::pass_report().unwrap()
     }
+
+    /// A fallback's fresh derivation is never written (it failed).
+    static NO_FRESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     /// A recorded task derivation gone from the store: its edge falls back.
     static MISSING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -3614,12 +3621,24 @@ mod tests {
         *MISSING.lock().unwrap() = Some("/nix/store/xxx-x.drv".into());
         let again: Edge = ("x.o", "/nix/store/x22-x.drv", &["g.h"]);
         let line = drive_pass(&bd, &r, &[again], &place).unwrap();
-        *MISSING.lock().unwrap() = None;
         assert!(
             line.contains(
                 "1 fallback, 1 stale: /nix/store/xxx-x.drv; stale: /nix/store/x22-x.drv;"
             ),
             "{line}"
+        );
+        // One whose fresh derivation failed keeps the name it had.
+        write(&bd.join("g.h"), "a hook's second edit");
+        *MISSING.lock().unwrap() = Some("/nix/store/x22-x.drv".into());
+        NO_FRESH.store(true, std::sync::atomic::Ordering::Relaxed);
+        let line = drive_pass(&bd, &r, &[again], &place).unwrap();
+        NO_FRESH.store(false, std::sync::atomic::Ordering::Relaxed);
+        *MISSING.lock().unwrap() = None;
+        assert!(
+            line.contains(
+                "1 fallback, 1 stale: /nix/store/x22-x.drv; stale: /nix/store/x22-x.drv;"
+            ),
+            "not written: {line}"
         );
         end_passes(&d, &bd);
     }
