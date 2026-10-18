@@ -184,6 +184,11 @@ struct Task {
     // inputSrcs carries them - but seeds for the include scan, which is
     // otherwise seeded only from `inputs`. See new_task.
     store_srcs: Vec<PathBuf>,
+    // What a moc response-file walk found that `inputs` cannot hold: store
+    // paths its includes reached and the `..` directories they enter. Empty
+    // for every edge but a moc over a generated header; see moc_rsp_scan.
+    rsp_store_paths: Vec<StorePath>,
+    rsp_dotdot_dirs: Vec<PathBuf>,
     outputs: Vec<PathBuf>,
     // Outputs this edge declares INSIDE the outer derivation's own output,
     // as (the path the graph declared, the staged build-relative path the
@@ -2373,6 +2378,8 @@ impl Runner {
         // cmdline rewrite it needs. Filled by the `@` branch below, applied
         // after the loop (the loop holds cmdline borrowed).
         let mut extra_rspfile: Option<(PathBuf, String)> = None;
+        let mut rsp_store_paths: Vec<StorePath> = Vec::new();
+        let mut rsp_dotdot_dirs: Vec<PathBuf> = Vec::new();
         let mut arg_rewrites: Vec<(String, String)> = Vec::new();
         // Positions FROM THE END of the split argv that the `@` branch
         // respelled, so the same respelling can be applied to the ORIGINAL
@@ -2653,6 +2660,76 @@ impl Runner {
                                             }
                                         }
                                     }
+                                }
+                                // A MOC OVER A GENERATED HEADER READS ITS INCLUDES
+                                // through the `-I` flags above, which the token
+                                // scan skips; see moc_rsp_scan. Walked by the
+                                // compile discovery, the generated header read
+                                // from its realised copy.
+                                if let Some((scan, seeds)) =
+                                    moc_rsp_scan(cmdline, &root_view, |p| {
+                                        files
+                                            .lookup(&p.to_string_lossy())
+                                            .is_some_and(|f| files.by_id[f].input.is_some())
+                                    })
+                                {
+                                    let store_dir = &self.config.store_dir;
+                                    let mut virtual_paths: HashMap<PathBuf, PathBuf> =
+                                        HashMap::new();
+                                    let mut unbuilt: Vec<DerivedFile> = Vec::new();
+                                    for (bp, df) in input_set.iter() {
+                                        match df.derived_path {
+                                            SingleDerivedPath::Opaque(_) => {
+                                                virtual_paths.insert(
+                                                    bp.clone(),
+                                                    df.absolute_path(store_dir),
+                                                );
+                                            }
+                                            SingleDerivedPath::Built { .. } => {
+                                                if seeds.contains(bp)
+                                                    && !self.config.is_output_derivation
+                                                {
+                                                    unbuilt.push(df.clone());
+                                                } else {
+                                                    virtual_paths.insert(bp.clone(), bp.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if !unbuilt.is_empty() {
+                                        virtual_paths.extend(local::build_derived_files(
+                                            &self.rpc_client,
+                                            store_dir,
+                                            &unbuilt,
+                                        )?);
+                                    }
+                                    let seed_count = seeds.len();
+                                    let (found, _) = discover_c_includes(
+                                        &self.rpc_client,
+                                        store_dir,
+                                        &self.config.build_dir,
+                                        &scan,
+                                        seeds,
+                                        Some(virtual_paths),
+                                        None,
+                                        None,
+                                        &[],
+                                        &|| None,
+                                    )?;
+                                    eprintln!(
+                                        "nix-ninja: moc {rsp_rel}: {} include(s) carried, \
+                                         {} store path(s), from {seed_count} seed(s)",
+                                        found.deps.len(),
+                                        found.store_paths.len(),
+                                    );
+                                    for input in found.deps {
+                                        self.add_derived_file(files, input.clone());
+                                        input_set.insert(input.build_path.clone(), input);
+                                    }
+                                    rsp_store_paths.extend(found.store_paths);
+                                    rsp_dotdot_dirs.extend(found.dotdot_dirs);
+                                    rsp_dotdot_dirs
+                                        .extend(include_dir_dotdots(&scan, &self.config.build_dir));
                                 }
                                 // WHAT THE CONTENT SCAN ACTUALLY TOOK, once
                                 // per rspfile. syncqt's args file names the
@@ -3791,6 +3868,8 @@ impl Runner {
             files: build_files,
             inputs,
             store_srcs,
+            rsp_store_paths,
+            rsp_dotdot_dirs,
             outputs,
             outer_stage_outputs,
             alias_symlinks: self.alias_symlinks.clone(),
@@ -4877,6 +4956,11 @@ fn build_task_derivation(
     // class, 2026-08-23). The scan over a non-source input is inert - a
     // file with no include directives contributes nothing - so the wider
     // gate can only over-declare, which is the pipeline's safe polarity.
+    declare_dotdot_dirs(&mut drv, &task.build_dir, &task.rsp_dotdot_dirs);
+    for store_path in &task.rsp_store_paths {
+        drv.inputs
+            .insert(SingleDerivedPath::Opaque(store_path.clone()));
+    }
     let mut discovered_inputs: Vec<DerivedFile> = Vec::new();
     {
         let wants_discovery = wants_dependency_discovery(&task);
@@ -9252,6 +9336,78 @@ pub fn autogen_own_products<'a>(
         .filter(|p| plan != Some(p.as_path()))
         .cloned()
         .collect()
+}
+
+/// The include walk a `moc @<params>` edge needs: a scan command carrying
+/// the response file's `-I`, `-D` and `-U` flags, and the files moc reads
+/// (the headers it is handed and any `--include` file). `root_view` is the
+/// response file rewritten root-relative. `None` unless the program is moc
+/// and some header it is handed is produced by another edge (`produced`).
+///
+/// kdsoap 2.2.0's `qt_wrap_cpp` edge runs moc over `wsdl_helloworld.h`,
+/// which kdwsdl2cpp generates and which includes
+/// `<KDSoapServer/KDSoapServerObjectInterface.h>` through a source-tree
+/// `-I` named only in the parameters file. The edge has no depfile, so no
+/// discovery ran, and the response-file scan skips flag tokens, so nothing
+/// under the source tree was carried. moc skips an include it cannot open
+/// and then fails `Undefined interface` at the header's `Q_INTERFACES`.
+/// A moc edge over source headers only is left as it was.
+pub fn moc_rsp_scan(
+    cmdline: &str,
+    root_view: &str,
+    produced: impl Fn(&Path) -> bool,
+) -> Option<(String, Vec<PathBuf>)> {
+    if Path::new(command_program(cmdline)?).file_name()? != "moc" {
+        return None;
+    }
+    let mut scan = String::from("moc");
+    let mut seeds: Vec<PathBuf> = Vec::new();
+    let mut toks = root_view.lines().map(str::trim).filter(|t| !t.is_empty());
+    while let Some(t) = toks.next() {
+        if t.len() > 2 && ["-I", "-D", "-U"].iter().any(|f| t.starts_with(f)) {
+            scan.push(' ');
+            scan.push_str(t);
+        } else if t == "--include" {
+            seeds.extend(toks.next().map(PathBuf::from));
+        } else if matches!(
+            t,
+            "-o" | "-b" | "-p" | "--dep-file-path" | "--dep-file-rule-name" | "--compiler-flavor"
+        ) {
+            toks.next();
+        } else if !t.starts_with('-') {
+            seeds.push(PathBuf::from(t));
+        }
+    }
+    seeds.iter().any(|s| produced(s)).then_some((scan, seeds))
+}
+
+/// The directories a relative `-I` in `scan` has to ENTER, as absolute paths
+/// under `build_dir`: `-I../examples/../src` needs `../examples` to exist,
+/// though nothing is read from it, or the kernel cannot resolve the rest.
+/// `dotdot_prefix` answers `None` for a leading `..`, which every in-tree
+/// source dir carries once rewritten root-relative, so the leading climbs
+/// are stepped over first.
+pub fn include_dir_dotdots(scan: &str, build_dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in scan.split_whitespace().filter_map(|t| t.strip_prefix("-I")) {
+        let dir = Path::new(dir);
+        if dir.is_absolute() {
+            continue;
+        }
+        let climbs = dir
+            .components()
+            .take_while(|c| *c == std::path::Component::ParentDir)
+            .count();
+        let rest: PathBuf = dir.components().skip(climbs).collect();
+        if let Some(prefix) = c_include_parser::dotdot_prefix(&rest) {
+            let ups: PathBuf = std::iter::repeat_n("..", climbs).collect();
+            let abs = lexical_join(build_dir, &ups.join(prefix));
+            if !out.contains(&abs) {
+                out.push(abs);
+            }
+        }
+    }
+    out
 }
 
 /// The inputs beneath the syncqt tree (`include/<Module>`) that an edge
@@ -25194,5 +25350,111 @@ mod unresolved_include_defer_tests {
             climbed,
             "a `..` out of a tree must land beside it in the view"
         );
+    }
+}
+
+#[cfg(test)]
+mod moc_rsp_scan_tests {
+    use super::{include_dir_dotdots, moc_rsp_scan, rewrite_ancestor_paths, CHDIR_LOCK};
+    use deps_infer::c_include_parser;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    /// kdsoap 2.2.0's `moc_wsdl_helloworld.cpp_parameters` as the KDE round
+    /// emitted it (task `y2hixv9c`), over a tree of the same shape: the
+    /// generated header sits in the build dir and is read from a separate
+    /// copy, as the task reads it from the store, and the interface header
+    /// it includes is in the source tree, named only by a `-I` flag.
+    #[test]
+    fn a_moc_over_a_generated_header_walks_its_source_tree_includes() {
+        let _g = CHDIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("nn-moc-{}-{uniq}", std::process::id()));
+        let src = root.join("kdsoap-2.2.0");
+        let build = src.join("build");
+        std::fs::create_dir_all(src.join("src/KDSoapServer")).unwrap();
+        std::fs::create_dir_all(src.join("examples/helloworld_server")).unwrap();
+        std::fs::create_dir_all(build.join("examples/helloworld_server")).unwrap();
+        std::fs::write(
+            src.join("src/KDSoapServer/KDSoapServerObjectInterface.h"),
+            "#include \"KDSoapServerGlobal.h\"\nQ_DECLARE_INTERFACE(KDSoapServerObjectInterface, \"x\")\n",
+        )
+        .unwrap();
+        std::fs::write(src.join("src/KDSoapServer/KDSoapServerGlobal.h"), "\n").unwrap();
+        let realised = root.join("realised-wsdl_helloworld.h");
+        std::fs::write(
+            &realised,
+            "#include <KDSoapServer/KDSoapServerObjectInterface.h>\nQ_INTERFACES(KDSoapServerObjectInterface)\n",
+        )
+        .unwrap();
+        let b = build.display();
+        let s = src.display();
+        let raw = format!(
+            "-I/nix/store/afi66ica100hgzl8ik05n5bkcvpyclry-boost-1.89.0-dev/include\n\
+             -I{s}/examples/../src\n-I{s}/examples/../src/KDSoapClient\n\
+             -I{s}/examples/../src/KDSoapServer\n-I{s}/examples/helloworld_server\n\
+             -I{b}/examples/helloworld_server\n-DQT_NO_CAST_TO_ASCII\n-DNDEBUG\n-o\n\
+             {b}/examples/helloworld_server/moc_wsdl_helloworld.cpp\n\
+             {b}/examples/helloworld_server/wsdl_helloworld.h\n"
+        );
+        let cmdline = format!(
+            "cd {b}/examples/helloworld_server && /nix/store/7csri55pcaybx5axmvkfph9x97zs477s-qtbase-6.11.2/libexec/moc @{b}/examples/helloworld_server/moc_wsdl_helloworld.cpp_parameters.nn-rsp"
+        );
+        let header = PathBuf::from("examples/helloworld_server/wsdl_helloworld.h");
+        let root_view = rewrite_ancestor_paths(&raw, &build);
+        let produced = |p: &Path| p == header;
+
+        let (scan, seeds) =
+            moc_rsp_scan(&cmdline, &root_view, produced).expect("a moc over a generated header");
+        assert_eq!(
+            seeds,
+            vec![header.clone()],
+            "the output after -o is not a seed"
+        );
+        assert!(!scan.contains("moc_wsdl_helloworld.cpp"), "{scan}");
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&build).unwrap();
+        let virt: HashMap<PathBuf, PathBuf> = [(header.clone(), realised.clone())].into();
+        let walked =
+            c_include_parser::retrieve_c_includes_checked(&scan, seeds.clone(), Some(virt.clone()));
+        let dotdot = c_include_parser::seed_dotdot_dirs(&scan, &seeds, Some(&virt));
+        std::env::set_current_dir(prev).unwrap();
+        let names: Vec<String> = walked
+            .unwrap()
+            .includes
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        for want in ["KDSoapServerObjectInterface.h", "KDSoapServerGlobal.h"] {
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n.ends_with(&format!("src/KDSoapServer/{want}"))),
+                "{want} must be reached through the -I flags: {names:?}"
+            );
+        }
+        // The scanner's own `..` reading cannot see a leading climb.
+        assert!(dotdot.is_empty(), "{dotdot:?}");
+        assert_eq!(
+            include_dir_dotdots(&scan, &build),
+            vec![src.join("examples")],
+            "`../examples/../src` must enter the source tree's examples/ and nothing else"
+        );
+        // An absolute dir is not this tree's to create, `..` or not.
+        assert!(include_dir_dotdots(
+            "moc -I/nix/store/afi66ica100hgzl8ik05n5bkcvpyclry-boost-1.89.0-dev/x/../include",
+            &build
+        )
+        .is_empty());
+
+        // A moc edge over source headers only, and a program that is not moc.
+        assert!(moc_rsp_scan(&cmdline, &root_view, |_| false).is_none());
+        let syncqt = cmdline.replace("libexec/moc", "libexec/syncqt");
+        assert!(moc_rsp_scan(&syncqt, &root_view, produced).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
