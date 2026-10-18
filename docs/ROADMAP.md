@@ -46,7 +46,7 @@ And the supporting sections:
 
 - [What does not work today](#what-does-not-work-today), the open list
 - [The next concrete work, item by item](#the-next-concrete-work-item-by-item),
-  nine items with a first action each
+  ten items with a first action each
 - [What could stop this](#what-could-stop-this), the risks
 - [How a milestone ships](#how-a-milestone-ships)
 
@@ -288,7 +288,7 @@ What is missing is larger than that: a STRANGER cannot reach the same place. The
 difference is the published apparatus rather than the driver, the corpus, the
 failure signatures, and the record of what is already known to break.
 
-The route is the nine items below, which is where each one's first action lives.
+The route is the ten items below, which is where each one's first action lives.
 What belongs here is the criterion they add up to.
 
 EXIT CRITERION: a clone of this repository, with nothing installed but an
@@ -693,6 +693,48 @@ specific. First action: run one real build with a `builders` line naming a secon
 machine and read whether the tasks are scheduled there or refused. The failure
 mode is specific and worth one afternoon, and the answer decides whether `0.8`'s
 third axis is a feature to build or a claim to verify.
+
+### 10. Make an install pass reuse the build pass, then cut the re-check
+
+A ninja-route package whose install phase runs the driver a second time
+(`ninja install` over `all` with every output materialized) should find every
+task it emitted in the build pass already realised. On qtbase 6.11.2 it does
+not: the second pass emits a different derivation for every edge and rebuilds
+the package. Read from one edge (the Xml precompiled header), three fields
+differ between the passes:
+
+- `NIX_NINJA_ALIASES` appears, because the build-dir walk reads the soname
+  links the first pass PLACED as configure-time aliases (`read_build_dir`
+  checks produced nodes for uploads only, not for aliases).
+- `NIX_NINJA_INPUTS` grows from 510 to 852 entries, mostly headers under
+  `include/QtCore/` uploaded from the first pass's placed copies where the
+  first pass bound them through the producing edges' directories.
+- `NIX_NINJA_MAKE_DIRS` gains the versioned private include dirs.
+
+First action: `-t drv` over a kept tree after a build pass, diffed edge by
+edge against the build pass's emission; the fix is done when the diff is
+empty for every edge. It is an emission change confined to second-pass
+shapes, priced with `local/gates/emission-price.sh` before it lands.
+
+After it, in order of measured saving, each measured before it is designed:
+
+- Driver CPU during emission (about one core): a flat profile of the second
+  pass puts 28% in lossy UTF-8 path conversion and 7% in
+  `discover_c_includes`; the call graph that names the callers is owed.
+- Input narrowing to depfile dependencies: the size of every emitted
+  `NIX_NINJA_INPUTS` and what narrowing saves per derivation. It re-keys
+  every banked task, so it is decided at a boundary.
+- Materialization into the build tree: its share of a re-check, and whether
+  placement can be lazy or use hard links (`copy_not_link` names what must
+  stay a copy; hard links across the store are EXDEV).
+- The driver's serial work and a persistent per-edge derivation cache: in
+  the qtbase build pass, resolution is 6.5 s and derivation adds 36 s of
+  thread time against 456 s of daemon realise, so the cache is a small win.
+- A width the consumer can change while a driver runs. n2's `Runner` reads
+  `parallelism` on every scheduling tick, but `vendor-n2` is inside the
+  task binary's fileset, so the knob belongs on the driver's side of
+  admission. n2 has no jobserver client. Measure first whether the daemon's
+  `max-jobs` on the inner connection also binds.
 
 ## What could stop this
 
