@@ -12,40 +12,54 @@
 //! install pass emitted a derivation the build pass had not, and qtbase
 //! 6.11.2 was built twice.
 //!
-//! So the first pass's walk records every directory and file configure left
-//! (`save`), and a later pass that does not trust earlier invocations' state
-//! (the resolve memo's switch: off inside a build) moves everything else
-//! aside before it reads the directory and puts it back once it has placed
-//! its own products (`Rewind`). Anything the later pass places again wins
-//! over the copy moved aside. A changed build.ninja is a re-configure: no
-//! record answers for it and the walk records afresh.
+//! The first walk records the directories and files configure left
+//! (`save`). After a run's placement has succeeded, the run journals what
+//! placement wrote (`journal_placed`). A later pass that does not trust
+//! earlier invocations' state (the resolve memo's switch: off inside a
+//! build) moves the journaled paths aside before it reads the directory and
+//! puts them back once it has placed its own outputs (`Rewind`). Only the
+//! driver's own placements move: a file a hook or the build system wrote
+//! between phases stays where it is, and a configure file placement
+//! overwrote stays too. A changed build.ninja is a re-configure: no record
+//! answers for it and the walk records afresh.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::Write as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-/// Under `NIX_BUILD_TOP` inside a build (beside the NAR stamps), else in the
-/// build dir, where the walk skips it as the driver's own state.
-pub const FILE_NAME: &str = ".nix-ninja-configure-state.v1";
-/// Where a later pass keeps what it moved aside, beside the record.
-const ASIDE: &str = ".nix-ninja-rewind";
+/// The walk does not descend these, so the record knows nothing below them.
+const STATE_DIR: &str = ".nix-ninja-state";
+
+pub fn walk_skips(name: &str) -> bool {
+    name.starts_with("meson-") || name == STATE_DIR
+}
+
+/// This build dir's own state directory: under `NIX_BUILD_TOP` inside a
+/// build, else in the build dir (walk-skipped), and keyed by the build dir
+/// either way, so two trees in one build never share a record or an aside.
+pub fn state_dir(build_dir: &Path) -> PathBuf {
+    state_dir_in(
+        std::env::var_os("NIX_BUILD_TOP")
+            .map(PathBuf::from)
+            .as_deref(),
+        build_dir,
+    )
+}
+
+fn state_dir_in(top: Option<&Path>, build_dir: &Path) -> PathBuf {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    build_dir.hash(&mut h);
+    top.unwrap_or(build_dir)
+        .join(STATE_DIR)
+        .join(format!("{:016x}", h.finish()))
+}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ConfigureState {
     pub dirs: HashSet<String>,
     pub files: HashSet<String>,
-}
-
-/// The walk does not descend these, so the record knows nothing below them.
-pub fn walk_skips(name: &str) -> bool {
-    name.starts_with("meson-") || name == ASIDE
-}
-
-fn home(build_dir: &Path) -> PathBuf {
-    std::env::var_os("NIX_BUILD_TOP")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| build_dir.to_path_buf())
 }
 
 /// What identifies one configure: build.ninja's length and mtime.
@@ -59,20 +73,56 @@ fn header(build_dir: &Path) -> Option<String> {
     ))
 }
 
-/// The record a first pass wrote for this configure, or None: no record, an
-/// unreadable one, or one for another build.ninja.
-pub fn load(build_dir: &Path) -> Option<ConfigureState> {
-    load_from(&home(build_dir).join(FILE_NAME), build_dir)
-}
-
-fn load_from(record: &Path, build_dir: &Path) -> Option<ConfigureState> {
-    let text = std::fs::read_to_string(record).ok()?;
+fn read_lines(path: &Path, build_dir: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     if lines.next()? != header(build_dir)? {
         return None;
     }
+    Some(lines.map(str::to_owned).collect())
+}
+
+/// Writes `lines` under this configure's header, through a file of this
+/// process's own, so two drivers saving at once cannot interleave.
+fn write_lines(
+    path: &Path,
+    build_dir: &Path,
+    lines: &[String],
+    append: bool,
+) -> std::io::Result<()> {
+    let Some(head) = header(build_dir) else {
+        return Ok(());
+    };
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    let mut all: Vec<String> = if append {
+        read_lines(path, build_dir).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    all.extend(lines.iter().cloned());
+    all.sort();
+    all.dedup();
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+    writeln!(f, "{head}")?;
+    for l in &all {
+        writeln!(f, "{l}")?;
+    }
+    f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
+/// The record the first walk wrote for this configure, or None: no record,
+/// an unreadable one, or one for another build.ninja.
+pub fn load(build_dir: &Path) -> Option<ConfigureState> {
+    load_in(&state_dir(build_dir), build_dir)
+}
+
+fn load_in(state: &Path, build_dir: &Path) -> Option<ConfigureState> {
     let mut s = ConfigureState::default();
-    for line in lines {
+    for line in read_lines(&state.join("configure.v1"), build_dir)? {
         match line.split_once(' ')? {
             ("D", rel) => s.dirs.insert(rel.to_string()),
             ("F", rel) => s.files.insert(rel.to_string()),
@@ -86,26 +136,17 @@ fn load_from(record: &Path, build_dir: &Path) -> Option<ConfigureState> {
 /// without a record a later pass reads the directory as it stands, as every
 /// pass did before.
 pub fn save(build_dir: &Path, s: &ConfigureState) {
-    save_to(&home(build_dir).join(FILE_NAME), build_dir, s)
+    save_in(&state_dir(build_dir), build_dir, s)
 }
 
-fn save_to(path: &Path, build_dir: &Path, s: &ConfigureState) {
-    let write = || -> std::io::Result<()> {
-        let head = header(build_dir).ok_or_else(|| std::io::Error::other("no build.ninja"))?;
-        let tmp = path.with_extension("tmp");
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        writeln!(f, "{head}")?;
-        for (kind, set) in [("D", &s.dirs), ("F", &s.files)] {
-            let mut v: Vec<&String> = set.iter().collect();
-            v.sort();
-            for rel in v {
-                writeln!(f, "{kind} {rel}")?;
-            }
-        }
-        f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-        std::fs::rename(&tmp, path)
-    };
-    if let Err(e) = write() {
+fn save_in(state: &Path, build_dir: &Path, s: &ConfigureState) {
+    let lines: Vec<String> = s
+        .dirs
+        .iter()
+        .map(|d| format!("D {d}"))
+        .chain(s.files.iter().map(|f| format!("F {f}")))
+        .collect();
+    if let Err(e) = write_lines(&state.join("configure.v1"), build_dir, &lines, false) {
         eprintln!(
             "nix-ninja: could not record the configure-time build directory ({e}); \
              a later pass reads the directory as it stands"
@@ -113,102 +154,170 @@ fn save_to(path: &Path, build_dir: &Path, s: &ConfigureState) {
     }
 }
 
-/// What a later pass moves aside: every file under `build_dir` the record
-/// does not hold, and every directory it does not hold (deepest first), as
-/// relative paths. The driver's own state files stay (`own_state`).
-fn not_left_by_configure(
-    build_dir: &Path,
-    r: &ConfigureState,
-    own_state: impl Fn(&Path) -> bool,
-) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let mut files = Vec::new();
-    let mut dirs = Vec::new();
-    let walk = walkdir::WalkDir::new(build_dir)
-        .min_depth(1)
-        .into_iter()
-        .filter_entry(|e| !walk_skips(&e.file_name().to_string_lossy()));
-    for e in walk.flatten() {
-        let Ok(rel) = e.path().strip_prefix(build_dir) else {
+/// Journals what this run's placement wrote: each of `placed` (relative
+/// build paths) that exists, every file below one that is a directory, and
+/// every ancestor directory configure did not leave. Called only once
+/// placement has succeeded, so a run that never finished placing (a residue
+/// re-exec) leaves its successor nothing of its own to set aside.
+pub fn journal_placed<'a>(build_dir: &Path, placed: impl IntoIterator<Item = &'a Path>) {
+    journal_in(&state_dir(build_dir), build_dir, placed)
+}
+
+fn journal_in<'a>(state: &Path, build_dir: &Path, placed: impl IntoIterator<Item = &'a Path>) {
+    let Some(r) = load_in(state, build_dir) else {
+        return;
+    };
+    let mut lines = BTreeSet::new();
+    let mut add = |rel: &Path, is_dir: bool| {
+        let key = rel.to_string_lossy().into_owned();
+        if is_dir {
+            if !r.dirs.contains(&key) {
+                lines.insert(format!("D {key}"));
+            }
+        } else if !r.files.contains(&key) {
+            lines.insert(format!("F {key}"));
+        }
+    };
+    for rel in placed {
+        if !rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
+        let abs = build_dir.join(rel);
+        let Ok(meta) = std::fs::symlink_metadata(&abs) else {
             continue;
         };
-        let key = rel.to_string_lossy();
-        if e.file_type().is_dir() {
-            if !r.dirs.contains(key.as_ref()) {
-                dirs.push(rel.to_path_buf());
+        let mut anc = rel.parent();
+        while let Some(a) = anc.filter(|a| !a.as_os_str().is_empty()) {
+            add(a, true);
+            anc = a.parent();
+        }
+        if meta.is_dir() {
+            for e in walkdir::WalkDir::new(&abs).into_iter().flatten() {
+                if let Ok(r) = e.path().strip_prefix(build_dir) {
+                    add(r, e.file_type().is_dir());
+                }
             }
-        } else if !r.files.contains(key.as_ref()) && !own_state(e.path()) {
-            files.push(rel.to_path_buf());
+        } else {
+            add(rel, false);
         }
     }
-    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
-    (files, dirs)
+    let lines: Vec<String> = lines.into_iter().collect();
+    if let Err(e) = write_lines(&state.join("placed.v1"), build_dir, &lines, true) {
+        eprintln!(
+            "nix-ninja: could not journal this run's placement ({e}); a later pass \
+             reads what it placed"
+        );
+    }
 }
 
 /// The later pass's view of the build dir as the first pass found it, held
 /// for the life of the value; dropping it puts back whatever was moved aside
-/// and not placed again.
+/// and not placed again, and the directories removed with it.
 pub struct Rewind {
     build_dir: PathBuf,
     aside: PathBuf,
+    removed_dirs: Vec<PathBuf>,
+    /// Held exclusively for the rewind's life: a second driver in the same
+    /// build dir meanwhile neither sets aside nor puts back.
+    _lock: Option<std::fs::File>,
 }
 
 impl Rewind {
     /// Puts back anything a run that never finished left aside, then, when
-    /// earlier invocations' state is not trusted and a record answers for
-    /// this configure, moves aside what configure did not leave. None when
-    /// there is nothing to do.
-    pub fn begin(
-        build_dir: &Path,
-        trusted: bool,
-        own_state: impl Fn(&Path) -> bool,
-    ) -> Option<Self> {
-        let aside = home(build_dir).join(ASIDE);
-        let rewind = Rewind {
+    /// earlier invocations' state is not trusted, moves aside what earlier
+    /// runs journaled as placed. None when there is nothing to do.
+    pub fn begin(build_dir: &Path, trusted: bool) -> Option<Self> {
+        Self::begin_in(&state_dir(build_dir), build_dir, trusted)
+    }
+
+    fn begin_in(state: &Path, build_dir: &Path, trusted: bool) -> Option<Self> {
+        std::fs::create_dir_all(state).ok()?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(state.join("lock"))
+            .ok()?;
+        if lock.try_lock().is_err() {
+            eprintln!(
+                "nix-ninja: another driver holds this build directory's rewind; this one \
+                 reads the directory as it stands"
+            );
+            return None;
+        }
+        let mut rewind = Rewind {
             build_dir: build_dir.to_path_buf(),
-            aside,
+            aside: state.join("aside"),
+            removed_dirs: Vec::new(),
+            _lock: Some(lock),
         };
         rewind.restore();
         if trusted {
             return None;
         }
-        let r = load(build_dir)?;
-        let (files, dirs) = not_left_by_configure(build_dir, &r, own_state);
+        let journal = read_lines(&state.join("placed.v1"), build_dir)?;
         let mut moved = 0usize;
-        for rel in &files {
-            let dest = rewind.aside.join(rel);
-            let ok = dest
-                .parent()
-                .is_some_and(|p| std::fs::create_dir_all(p).is_ok())
-                && std::fs::rename(build_dir.join(rel), &dest).is_ok();
-            if ok {
-                moved += 1;
-            } else {
-                eprintln!(
-                    "nix-ninja: could not move {} aside; this pass reads it",
-                    rel.display()
-                );
+        let mut failed: Option<(PathBuf, std::io::Error)> = None;
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for line in &journal {
+            match line.split_once(' ') {
+                Some(("F", rel)) => {
+                    let (src, dest) = (build_dir.join(rel), rewind.aside.join(rel));
+                    if std::fs::symlink_metadata(&src).is_err() {
+                        continue;
+                    }
+                    let res = dest
+                        .parent()
+                        .map_or(Ok(()), std::fs::create_dir_all)
+                        .and_then(|_| std::fs::rename(&src, &dest));
+                    match res {
+                        Ok(()) => moved += 1,
+                        Err(e) => {
+                            failed.get_or_insert((PathBuf::from(rel), e));
+                        }
+                    }
+                }
+                Some(("D", rel)) => dirs.push(PathBuf::from(rel)),
+                _ => {}
             }
         }
-        for rel in &dirs {
-            // Only an emptied directory goes; one still holding files the
-            // walk skips stays.
-            let _ = std::fs::remove_dir(build_dir.join(rel));
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+        for rel in dirs {
+            // Only an emptied directory goes, and it comes back on drop.
+            if std::fs::remove_dir(build_dir.join(&rel)).is_ok() {
+                rewind.removed_dirs.push(rel);
+            }
         }
         eprintln!(
-            "nix-ninja: an earlier pass ran in this build directory; {moved} file(s) and \
-             {} directory(ies) configure did not leave are set aside until this pass \
-             has placed its outputs",
-            dirs.len()
+            "nix-ninja: an earlier pass placed outputs in this build directory; {moved} \
+             file(s) and {} directory(ies) it placed are set aside until this pass has \
+             placed its own",
+            rewind.removed_dirs.len()
         );
+        if let Some((rel, e)) = failed {
+            eprintln!(
+                "nix-ninja: could not set aside every placed file (first: {}: {e}); this \
+                 pass reads those it could not",
+                rel.display()
+            );
+        }
         Some(rewind)
     }
 
-    /// Moves back every file set aside whose place is still empty; a file
-    /// this pass placed again stays as placed.
-    fn restore(&self) {
+    /// Moves back every file set aside whose place is still empty (a file
+    /// this pass placed again stays as placed), and recreates the
+    /// directories set aside with them.
+    fn restore(&mut self) {
+        for rel in self.removed_dirs.drain(..) {
+            let _ = std::fs::create_dir_all(self.build_dir.join(rel));
+        }
         if std::fs::symlink_metadata(&self.aside).is_err() {
             return;
         }
+        let mut failed: Option<(PathBuf, std::io::Error)> = None;
         let walk = walkdir::WalkDir::new(&self.aside)
             .min_depth(1)
             .contents_first(true);
@@ -217,6 +326,7 @@ impl Rewind {
                 continue;
             };
             if e.file_type().is_dir() {
+                let _ = std::fs::create_dir_all(self.build_dir.join(rel));
                 let _ = std::fs::remove_dir(e.path());
                 continue;
             }
@@ -225,19 +335,23 @@ impl Rewind {
                 let _ = std::fs::remove_file(e.path());
                 continue;
             }
-            let back = dest
+            let res = dest
                 .parent()
-                .is_some_and(|p| std::fs::create_dir_all(p).is_ok())
-                && std::fs::rename(e.path(), &dest).is_ok();
-            if !back {
-                eprintln!(
-                    "nix-ninja: could not put {} back from {}",
-                    rel.display(),
-                    self.aside.display()
-                );
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|_| std::fs::rename(e.path(), &dest));
+            if let Err(err) = res {
+                failed.get_or_insert((rel.to_path_buf(), err));
             }
         }
         let _ = std::fs::remove_dir(&self.aside);
+        if let Some((rel, e)) = failed {
+            eprintln!(
+                "nix-ninja: could not put every set-aside file back (first: {}: {e}); \
+                 the rest wait in {}",
+                rel.display(),
+                self.aside.display()
+            );
+        }
     }
 }
 
@@ -249,7 +363,7 @@ impl Drop for Rewind {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_from, not_left_by_configure, save_to, ConfigureState, Rewind};
+    use super::{journal_in, load_in, save_in, state_dir_in, ConfigureState, Rewind};
     use std::path::{Path, PathBuf};
 
     fn scratch(tag: &str) -> PathBuf {
@@ -258,101 +372,121 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         d
     }
+    fn write(p: &Path, v: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, v).unwrap();
+    }
 
     /// A record answers only for the build.ninja it was written against:
     /// read back unchanged, refused once build.ninja changes (a re-configure).
     #[test]
     fn a_record_answers_for_its_own_configure_only() {
         let d = scratch("roundtrip");
-        let rec = d.join(super::FILE_NAME);
-        std::fs::write(d.join("build.ninja"), "default all\n").unwrap();
+        let state = d.join("state");
+        write(&d.join("build.ninja"), "default all\n");
         let s = ConfigureState {
             dirs: ["CMakeFiles/foo.dir".to_string()].into(),
             files: ["build.ninja".to_string(), "config.h".to_string()].into(),
         };
-        assert_eq!(load_from(&rec, &d), None, "no record before the first pass");
-        save_to(&rec, &d, &s);
-        assert_eq!(load_from(&rec, &d), Some(s));
-        std::fs::write(d.join("build.ninja"), "default all app\n").unwrap();
+        assert_eq!(load_in(&state, &d), None, "no record before the first pass");
+        save_in(&state, &d, &s);
+        assert_eq!(load_in(&state, &d), Some(s));
+        write(&d.join("build.ninja"), "default all app\n");
         assert_eq!(
-            load_from(&rec, &d),
+            load_in(&state, &d),
             None,
             "a changed build.ninja is a new configure"
         );
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// THE QT SHAPE. Configure left `include/Foo/fooexports.h` and an empty
-    /// `CMakeFiles/foo.dir`; the build pass placed `include/Foo/a.h` (a tree
-    /// interior no edge declares), an object into the empty directory, and
-    /// a whole new directory. A later pass sets aside exactly what
-    /// configure did not leave, the driver's own state excepted, and the
-    /// directories go deepest first.
+    /// Two build dirs under one NIX_BUILD_TOP get two state directories.
     #[test]
-    fn a_later_pass_sets_aside_exactly_what_configure_did_not_leave() {
-        let d = scratch("aside");
-        for f in [
-            "build.ninja",
-            "include/Foo/fooexports.h",
+    fn each_build_dir_has_its_own_state() {
+        let top = Path::new("/build");
+        assert_ne!(
+            state_dir_in(Some(top), Path::new("/build/a/build")),
+            state_dir_in(Some(top), Path::new("/build/b/build"))
+        );
+    }
+
+    /// THE QT SHAPE, end to end through the journal. Configure left
+    /// `include/Foo/fooexports.h` and an empty `CMakeFiles/foo.dir`; the
+    /// build pass placed a whole tree output `include/Foo` (its interior
+    /// `a.h` no edge declares), an object into the empty directory, and a
+    /// header in a directory it created. A hook wrote `docs/index.html`
+    /// between phases. The later pass sets aside exactly the placed paths,
+    /// leaving configure's file and the hook's; dropping the rewind puts
+    /// back what this pass did not place again and keeps what it did.
+    #[test]
+    fn a_later_pass_sets_aside_exactly_what_placement_wrote() {
+        let d = scratch("journal");
+        let bd = d.join("build");
+        let state = d.join("state");
+        write(&bd.join("build.ninja"), "default all\n");
+        write(&bd.join("include/Foo/fooexports.h"), "cfg");
+        std::fs::create_dir_all(bd.join("CMakeFiles/foo.dir")).unwrap();
+        save_in(
+            &state,
+            &bd,
+            &ConfigureState {
+                dirs: ["include", "include/Foo", "CMakeFiles", "CMakeFiles/foo.dir"]
+                    .map(String::from)
+                    .into(),
+                files: ["build.ninja", "include/Foo/fooexports.h"]
+                    .map(String::from)
+                    .into(),
+            },
+        );
+        write(&bd.join("include/Foo/a.h"), "placed");
+        write(&bd.join("CMakeFiles/foo.dir/foo.c.o"), "placed");
+        write(&bd.join("gen/sub/y.h"), "placed");
+        let placed =
+            ["include/Foo", "CMakeFiles/foo.dir/foo.c.o", "gen/sub/y.h"].map(PathBuf::from);
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
+        write(&bd.join("docs/index.html"), "hook");
+
+        let rewind = Rewind::begin_in(&state, &bd, false).expect("a journal to act on");
+        for gone in [
             "include/Foo/a.h",
             "CMakeFiles/foo.dir/foo.c.o",
             "gen/sub/y.h",
-            ".ninja_log",
-            "meson-private/x",
+            "gen",
         ] {
-            let p = d.join(f);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, "x").unwrap();
+            assert!(!bd.join(gone).exists(), "{gone} should be set aside");
         }
-        let r = ConfigureState {
-            dirs: ["include", "include/Foo", "CMakeFiles", "CMakeFiles/foo.dir"]
-                .map(String::from)
-                .into(),
-            files: ["build.ninja", "include/Foo/fooexports.h"]
-                .map(String::from)
-                .into(),
-        };
-        let (mut files, dirs) =
-            not_left_by_configure(&d, &r, |p| p.file_name().is_some_and(|n| n == ".ninja_log"));
-        files.sort();
-        assert_eq!(
-            files,
-            [
-                "CMakeFiles/foo.dir/foo.c.o",
-                "gen/sub/y.h",
-                "include/Foo/a.h"
-            ]
-            .map(PathBuf::from)
+        for kept in [
+            "include/Foo/fooexports.h",
+            "docs/index.html",
+            "CMakeFiles/foo.dir",
+        ] {
+            assert!(bd.join(kept).exists(), "{kept} should stay");
+        }
+        assert!(
+            Rewind::begin_in(&state, &bd, false).is_none(),
+            "a second driver in the same build dir leaves the rewind alone"
         );
-        assert_eq!(dirs, ["gen/sub", "gen"].map(PathBuf::from));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// Dropping the rewind puts back what was set aside, except where the
-    /// pass placed the path again: the new placement wins.
-    #[test]
-    fn what_was_set_aside_comes_back_unless_placed_again() {
-        let d = scratch("restore");
-        let bd = d.join("build");
-        let aside = d.join("aside");
-        for (p, v) in [("aside/kept.h", "old"), ("aside/re/placed.h", "old")] {
-            let p = d.join(p);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, v).unwrap();
-        }
-        std::fs::create_dir_all(bd.join("re")).unwrap();
-        std::fs::write(bd.join("re/placed.h"), "new").unwrap();
-        drop(Rewind {
-            build_dir: bd.clone(),
-            aside: aside.clone(),
-        });
-        assert_eq!(std::fs::read_to_string(bd.join("kept.h")).unwrap(), "old");
+        assert!(
+            !bd.join("include/Foo/a.h").exists(),
+            "and puts nothing back"
+        );
+        // The pass places one output again; the rest come back on drop.
+        write(&bd.join("gen/sub/y.h"), "new");
+        drop(rewind);
         assert_eq!(
-            std::fs::read_to_string(bd.join("re/placed.h")).unwrap(),
+            std::fs::read_to_string(bd.join("gen/sub/y.h")).unwrap(),
             "new"
         );
-        assert!(!aside.exists(), "the aside directory is removed once empty");
+        assert_eq!(
+            std::fs::read_to_string(bd.join("include/Foo/a.h")).unwrap(),
+            "placed"
+        );
+        assert!(bd.join("CMakeFiles/foo.dir/foo.c.o").exists());
+        assert!(
+            Rewind::begin_in(&state, &bd, true).is_none(),
+            "a run that trusts earlier state never rewinds"
+        );
+        assert!(bd.join("include/Foo/a.h").exists());
         let _ = std::fs::remove_dir_all(&d);
-        let _ = Path::new("");
     }
 }

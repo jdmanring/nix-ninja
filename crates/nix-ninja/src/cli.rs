@@ -435,7 +435,6 @@ pub fn run() -> Result<()> {
             crate::configure_state::Rewind::begin(
                 &build_dir,
                 crate::resolve_cache::earlier_runs_trusted(),
-                crate::task::is_driver_state,
             )
         };
     let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
@@ -596,6 +595,17 @@ pub fn run() -> Result<()> {
                 ),
             }
         }
+
+        // Placement succeeded (every failure above returned or re-exec'd):
+        // journal it, so a later pass can set it aside (configure_state).
+        crate::configure_state::journal_placed(
+            &build_dir,
+            all_outputs
+                .keys()
+                .chain(derived_files.iter().map(|d| &d.build_path))
+                .chain(depfiles.iter().map(|d| &d.build_path))
+                .map(PathBuf::as_path),
+        );
 
         // NINJA'S STATE, AFTER THE DEPFILES IT IS BUILT FROM. Only for the
         // default manifest: real ninja in this directory reads build.ninja, so

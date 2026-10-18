@@ -1243,18 +1243,7 @@ impl Runner {
                     entry.file_type().is_file()
                 );
             }
-            // A LINK AN EDGE PRODUCES IS NOT A CONFIGURE-TIME ALIAS: an
-            // earlier pass over this directory placed it (a soname link from
-            // CMAKE_SYMLINK_LIBRARY), and recording it writes it into
-            // NIX_NINJA_ALIASES of every task.
-            let produced_link = matches!(
-                disposition,
-                BuildDirDisposition::Alias(..) | BuildDirDisposition::AliasAndUpload(..)
-            ) && files
-                .lookup(&rel)
-                .is_some_and(|f| files.by_id[f].input.is_some());
             let path = match disposition {
-                _ if produced_link => continue,
                 BuildDirDisposition::Alias(link, target) => {
                     self.alias_symlinks.push((link, target));
                     continue;
@@ -10175,7 +10164,6 @@ pub fn is_driver_state(path: &Path) -> bool {
     path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
         n == crate::resolve_cache::FILE_NAME
             || n == crate::resolve_cache::NAR_FILE
-            || n == crate::configure_state::FILE_NAME
             || n.starts_with(".ninja_log")
             || n.starts_with(".ninja_deps")
             || n.starts_with(".ninja_state_start")
