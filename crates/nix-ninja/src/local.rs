@@ -355,8 +355,8 @@ fn write_restored(tmp: &Path, data: &[u8], target: &Path) -> std::io::Result<()>
 /// four passes to two and reads as a partial success. The acceptance test is
 /// bison reaching ONE, with guile as the floor.
 ///
-/// Best effort per file: a failure here costs a redundant compile, which is
-/// the behavior that has always been in force.
+/// A failure fails the run: a link left behind reads as older than every
+/// source to real ninja.
 fn refresh_placed_mtimes(
     prefix: &Path,
     store_dir: &StoreDir,

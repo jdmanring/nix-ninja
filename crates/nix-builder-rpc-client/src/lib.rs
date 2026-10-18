@@ -773,14 +773,17 @@ pub fn watch_built(drv: String) {
         .insert(drv);
 }
 
-/// The watched derivations a realise built or substituted.
+/// The watched derivations a realise built or substituted, each once.
 pub fn built_watched() -> Vec<String> {
-    WATCHED
+    let mut built = WATCHED
         .lock()
         .unwrap()
         .as_ref()
         .map(|w| w.1.clone())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    built.sort();
+    built.dedup();
+    built
 }
 
 static BUILD_PATHS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1925,9 +1928,10 @@ impl BuilderRpcClient {
                     }
                     SingleDerivedPath::Built { drv_path, output } => {
                         // A WATCHED DERIVATION WITH NO RESULT OF ITS OWN is
-                        // counted as built: a reply keyed by another path
-                        // (a CA derivation's resolved one) cannot say it
-                        // was not, and a count must fail toward work done.
+                        // counted as built. Nix keys every result by the
+                        // path requested, so this does not happen; if a
+                        // daemon ever replied otherwise, a count must fail
+                        // toward work done.
                         if !by_key.contains_key(&key) {
                             let shown = store_dir.display(drv_path.as_ref()).to_string();
                             if let Some(w) = WATCHED.lock().unwrap().as_mut() {

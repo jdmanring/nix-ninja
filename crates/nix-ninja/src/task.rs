@@ -1548,9 +1548,11 @@ impl Runner {
                 .flatten()
                 .and_then(|d| config.store_dir.parse::<StorePath>(&d).ok());
             let (derived_path, err) = if let Some(drv_path) = reused {
-                nix_builder_rpc_client::watch_built(
-                    config.store_dir.display(&drv_path).to_string(),
-                );
+                let shown = config.store_dir.display(&drv_path).to_string();
+                if task.unresolved.is_some() {
+                    crate::configure_state::note_unresolved(&shown);
+                }
+                nix_builder_rpc_client::watch_built(shown);
                 match place_outer_stage_outputs(&rpc_client, &config, &task, &drv_path) {
                     Ok(()) => (Some(SingleDerivedPath::Opaque(drv_path)), None),
                     Err(e) => (
@@ -2006,8 +2008,9 @@ impl Runner {
             build_dir: self.config.build_dir.clone(),
             build_deps: build.dependencies.clone(),
             store_dir: self.config.store_dir.clone(),
-            // No command: nothing below derives, and the copy-stamp writes
-            // read from it are filtered by inputs this task does not hold.
+            // No command: nothing below derives. What the command alone
+            // names (its depfile, outputs it writes undeclared, copy-stamp
+            // writes) is not placed for this edge, which is counted stale.
             cmdline: None,
             desc: build.desc.clone(),
             deps: build.deps.clone(),
@@ -6970,32 +6973,18 @@ fn handle_derivation_result(
     }
 }
 
-/// The tree files a task derivation reads, from its `NIX_NINJA_INPUTS`:
-/// each input's build path, with the store path its bytes come from when
-/// that is a store path (an upload, a realised discovery) and None for
-/// another task's output, named by placeholder. Build paths in the store are
-/// not the tree's.
-fn task_tree_inputs(
-    drv: &Derivation,
-    store_dir: &StoreDir,
-) -> Vec<crate::configure_state::TaskInput> {
+/// The tree files a task derivation reads (build paths), from its
+/// `NIX_NINJA_INPUTS`. Build paths in the store are not the tree's.
+fn task_tree_inputs(drv: &Derivation, store_dir: &StoreDir) -> Vec<String> {
     let Some(encoded) = drv.env.get(&b"NIX_NINJA_INPUTS"[..]) else {
         return Vec::new();
     };
     let store = store_dir.to_string();
     String::from_utf8_lossy(encoded)
         .split(ENCODED_LIST_SEP)
-        .filter_map(|entry| {
-            let mut parts = entry.splitn(3, ':');
-            let from = parts.next()?;
-            let build = parts.next()?;
-            let rel = parts.next().unwrap_or_default();
-            if build.is_empty() || build.starts_with(&store) {
-                return None;
-            }
-            let from = (from.starts_with(&store) && rel.is_empty()).then(|| from.to_string());
-            Some((build.to_string(), from))
-        })
+        .filter_map(|entry| entry.split(':').nth(1))
+        .filter(|build| !build.is_empty() && !build.starts_with(&store))
+        .map(str::to_string)
         .collect()
 }
 
