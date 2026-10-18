@@ -4135,6 +4135,22 @@ mod plan_build_dir_walk_tests {
 mod named_dirs_to_create_tests {
     use super::{named_dirs_to_create, plan_build_dir_walk, Scratch};
 
+    /// A BUILD DIR REACHED THROUGH A SYMLINK climbs from where it really is,
+    /// as the kernel does: `../build/sub` from `blink -> x/build` is the
+    /// tree's own `sub`, which a hook made between phases.
+    #[test]
+    fn a_climb_from_a_linked_build_dir_starts_where_it_really_is() {
+        let d = Scratch::new(format!("nn-mkdirs-blink-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("x/build")).unwrap();
+        std::os::unix::fs::symlink("x/build", d.join("blink")).unwrap();
+        let bd = d.join("blink");
+        let cmd = "cc -I../build/sub -c a.c -o a.o";
+        let first = named_dirs_to_create(cmd, &bd, None);
+        let record = plan_build_dir_walk(&bd, None, |_| false).unwrap().seen;
+        std::fs::create_dir_all(d.join("x/build/sub")).unwrap();
+        assert_eq!(named_dirs_to_create(cmd, &bd, Some(&record.dirs)), first);
+    }
+
     /// EVERY -I SPELLING ANSWERS ON A LATER PASS AS ON THE FIRST. Pass 1
     /// asks the disk as configure left it; a later pass asks the record,
     /// after a hook made directories between phases. Spellings of up to four
@@ -4157,9 +4173,11 @@ mod named_dirs_to_create_tests {
         ln("..", "up");
         ln("nothing", "dangling");
         ln("real/inner", "deep");
+        // A link OUTSIDE the tree that leads back into it.
+        std::os::unix::fs::symlink(bd.join("real"), d.join("inlink")).unwrap();
         let words = [
             "gen", "real", "alias", "abslink", "out", "up", "dangling", "deep", "inner", "sub",
-            "new", "..", ".", "build", "ext",
+            "new", "..", ".", "build", "ext", "inlink",
         ];
         let mut spellings: Vec<String> = Vec::new();
         let mut cur: Vec<Vec<&str>> = vec![vec![]];
