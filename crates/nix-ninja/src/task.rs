@@ -3388,25 +3388,6 @@ impl Runner {
             }
         }
 
-        // A NODE ANOTHER EDGE PRODUCES IS READ FROM THAT EDGE, whatever route
-        // reached it; see rebind_produced_inputs.
-        let rebound = rebind_produced_inputs(&mut input_set, |p| {
-            let fid = files.lookup(&p.to_string_lossy())?;
-            files.by_id[fid].input?;
-            self.derived_files
-                .get(&fid)
-                .filter(|d| matches!(d.derived_path, SingleDerivedPath::Built { .. }))
-                .cloned()
-        });
-        if let Some(first) = rebound.first() {
-            eprintln!(
-                "nix-ninja: {} input(s) another edge produces were reached as uploads \
-                 of the copy on disk; bound to the producing edge's output, first {}",
-                rebound.len(),
-                first.display()
-            );
-        }
-
         // ONE CHOKE POINT for the rule above, rather than a guard in each of
         // the half-dozen branches that can turn a cmdline token into an
         // input. Whatever route it arrived by, a path this edge DECLARES as
@@ -3674,6 +3655,21 @@ impl Runner {
             for w in gdbus_c_code_writes(c, &outputs) {
                 input_set.remove(&w);
             }
+        }
+        // A NODE ANOTHER EDGE PRODUCES IS READ FROM THAT EDGE: the last step
+        // before the inputs are taken, after every route that tests the disk
+        // (argv and response-file tokens, readers, the python, template and
+        // grd sibling passes). See rebind_produced_inputs.
+        let rebound = rebind_produced_inputs(&mut input_set, |p| {
+            produced_output(&self.config.build_dir, files, &self.derived_files, p)
+        });
+        if let Some(first) = rebound.first() {
+            eprintln!(
+                "nix-ninja: {} input(s) another edge produces were reached as uploads \
+                 of the copy on disk; bound to the producing edge's output, first {}",
+                rebound.len(),
+                first.display()
+            );
         }
         let mut inputs: Vec<DerivedFile> = input_set.into_values().collect();
         // Normalize away `.` components and dedup exact repeats: the same
@@ -9481,13 +9477,38 @@ pub fn output_supersedes(edited_tree: bool, producer: Option<BuildId>, finished:
     edited_tree || producer == Some(finished)
 }
 
-/// Binds every uploaded input whose path is a node another edge produces to
-/// that edge's registered output (`producer_output`, `None` for a path no
-/// edge produces or whose producer has not registered), and returns the
-/// paths it rebound. The upload routes (argv tokens, response-file tokens,
-/// readers) test the disk and replace the entry the input walk made, and a
-/// produced path on disk is a configure placeholder or an earlier pass's
-/// placement, never the source. qtdeclarative 6.11.2's qmltyperegistrar edge
+/// The output an edge registered for the produced node `path` names, if it
+/// is a Built one. `wl_produced_output` answers for a spelling as given
+/// (absolute or relative, with the produced-node guard); the key is
+/// canonicalized first, since an upload's build path is not, and a `../`
+/// climb out of the build dir is also asked as the absolute spelling CMake
+/// declares such an output under (the `add_derived_file` openfec case).
+pub fn produced_output(
+    build_dir: &Path,
+    files: &graph::GraphFiles,
+    derived_files: &HashMap<FileId, DerivedFile>,
+    path: &Path,
+) -> Option<DerivedFile> {
+    let name = n2::canon::to_owned_canon_path(path.to_string_lossy().into_owned());
+    wl_produced_output(build_dir, files, derived_files, &name)
+        .or_else(|| {
+            let rest = name.strip_prefix("../")?;
+            let mut abs = format!("{}/../{rest}", build_dir.to_string_lossy());
+            n2::canon::canonicalize_path(&mut abs);
+            let fid = files.lookup(&abs)?;
+            files.by_id[fid].input?;
+            derived_files.get(&fid).cloned()
+        })
+        .filter(|d| matches!(d.derived_path, SingleDerivedPath::Built { .. }))
+}
+
+/// Binds every uploaded input whose path is a node an edge produces to that
+/// edge's registered output (`producer_output`, normally `produced_output`;
+/// `None` for a path no edge produces or whose producer has not registered),
+/// and returns the paths it rebound. The upload routes in `new_task` test
+/// the disk and replace the entry the input walk made, and a produced path
+/// on disk is a configure placeholder or an earlier pass's placement, never
+/// the source. qtdeclarative 6.11.2's qmltyperegistrar edge
 /// names `meta_types/qt6qml_metatypes.json` after `cd src/qml`; the rebased
 /// token found configure's 0-byte file, its upload replaced the moc edge's
 /// output, and the task failed "Failed to parse JSON: 5 illegal value".
@@ -25853,5 +25874,104 @@ mod rebind_produced_inputs_tests {
         assert!(inputs[&source] == upload("qml.h", &source));
         assert!(inputs[&pending] == upload("pending.json", &pending));
         assert!(inputs[&gen] == built(&gen));
+    }
+}
+
+#[cfg(test)]
+mod produced_output_tests {
+    //! The lookup `new_task` hands `rebind_produced_inputs`. WHAT THESE
+    //! ASSERTIONS CANNOT REACH IS THE CALL'S POSITION: it must run after every
+    //! upload route in `new_task`, and only `-t drv` over the real edge (or a
+    //! package build) witnesses that.
+    use super::produced_output;
+    use harmonia_store_derivation::derived_path::SingleDerivedPath;
+    use harmonia_store_path::StorePath;
+    use n2::graph::{BuildId, FileId, GraphFiles};
+    use nix_ninja_task::derived_file::DerivedFile;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    const BD: &str = "/build/qtdeclarative-everywhere-src-6.11.2/build";
+    const JSON: &str = "src/qml/meta_types/qt6qml_metatypes.json";
+
+    fn sp(name: &str) -> StorePath {
+        StorePath::from_bytes(format!("00000000000000000000000000000000-{name}").as_bytes())
+            .expect("fixture store path")
+    }
+    fn built(name: &str) -> DerivedFile {
+        DerivedFile {
+            derived_path: SingleDerivedPath::Built {
+                drv_path: Arc::new(SingleDerivedPath::Opaque(sp("ninja-build.drv"))),
+                output: "out".parse().unwrap(),
+            },
+            build_path: PathBuf::from(name),
+            rel_path: None,
+        }
+    }
+    fn opaque(name: &str) -> DerivedFile {
+        DerivedFile {
+            derived_path: SingleDerivedPath::Opaque(sp("x")),
+            build_path: PathBuf::from(name),
+            rel_path: None,
+        }
+    }
+
+    /// The moc edge's json (produced, registered Built), an output declared
+    /// absolute outside the build dir (produced, registered Built), a source
+    /// file the graph holds, a produced node whose edge has not registered,
+    /// and a produced node registered by an upload (Opaque).
+    fn fixture() -> (GraphFiles, HashMap<FileId, DerivedFile>) {
+        let mut files = GraphFiles::default();
+        let mut derived = HashMap::new();
+        let json = files.id_from_canonical(JSON.to_string());
+        files.by_id[json].input = Some(BuildId::from(0usize));
+        derived.insert(json, built(JSON));
+        let outside = files.id_from_canonical(
+            "/build/qtdeclarative-everywhere-src-6.11.2/bin/Release/libx.so".to_string(),
+        );
+        files.by_id[outside].input = Some(BuildId::from(1usize));
+        derived.insert(outside, built("../bin/Release/libx.so"));
+        // Outside the build dir, held by the graph, produced by no edge.
+        let ext = files
+            .id_from_canonical("/build/qtdeclarative-everywhere-src-6.11.2/ext/y.h".to_string());
+        derived.insert(ext, built("../ext/y.h"));
+        let source = files.id_from_canonical("src/qml/qml.h".to_string());
+        derived.insert(source, opaque("src/qml/qml.h"));
+        let pending = files.id_from_canonical("src/pending.json".to_string());
+        files.by_id[pending].input = Some(BuildId::from(2usize));
+        let uploaded = files.id_from_canonical("src/uploaded.json".to_string());
+        files.by_id[uploaded].input = Some(BuildId::from(3usize));
+        derived.insert(uploaded, opaque("src/uploaded.json"));
+        (files, derived)
+    }
+
+    fn ask(p: &str) -> Option<PathBuf> {
+        let (files, derived) = fixture();
+        produced_output(Path::new(BD), &files, &derived, Path::new(p)).map(|d| d.build_path)
+    }
+
+    #[test]
+    fn a_produced_node_answers_with_its_edges_built_output() {
+        assert_eq!(ask(JSON), Some(PathBuf::from(JSON)));
+        // An upload's build path is not canonical.
+        assert_eq!(
+            ask("src/qml/./meta_types/../meta_types/qt6qml_metatypes.json"),
+            Some(PathBuf::from(JSON))
+        );
+        // A climb out of the build dir is asked as its absolute node.
+        assert_eq!(
+            ask("../bin/Release/libx.so"),
+            Some(PathBuf::from("../bin/Release/libx.so"))
+        );
+    }
+
+    #[test]
+    fn a_source_an_unregistered_producer_and_an_upload_answer_nothing() {
+        assert_eq!(ask("src/qml/qml.h"), None);
+        assert_eq!(ask("src/pending.json"), None);
+        assert_eq!(ask("src/uploaded.json"), None);
+        assert_eq!(ask("src/not-a-node.json"), None);
+        assert_eq!(ask("../ext/y.h"), None);
     }
 }
