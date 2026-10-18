@@ -1853,7 +1853,8 @@ impl Runner {
             // the build step compiled UNPATCHED sources (measured on A: the
             // build step's input named the download's store path). Steps run
             // in dependency order, so the newest registration is the newest
-            // state of the tree.
+            // state of the tree. An edge's own output likewise replaces an
+            // upload that reached its node first (output_supersedes).
             if output_supersedes(edited_tree, files.by_id[fid].input, result.bid) {
                 self.derived_files.insert(fid, derived_file.clone());
             }
@@ -3385,6 +3386,25 @@ impl Runner {
             for input in self.build_dir_inputs.values() {
                 input_set.insert(input.build_path.clone(), input.clone());
             }
+        }
+
+        // A NODE ANOTHER EDGE PRODUCES IS READ FROM THAT EDGE, whatever route
+        // reached it; see rebind_produced_inputs.
+        let rebound = rebind_produced_inputs(&mut input_set, |p| {
+            let fid = files.lookup(&p.to_string_lossy())?;
+            files.by_id[fid].input?;
+            self.derived_files
+                .get(&fid)
+                .filter(|d| matches!(d.derived_path, SingleDerivedPath::Built { .. }))
+                .cloned()
+        });
+        if let Some(first) = rebound.first() {
+            eprintln!(
+                "nix-ninja: {} input(s) another edge produces were reached as uploads \
+                 of the copy on disk; bound to the producing edge's output, first {}",
+                rebound.len(),
+                first.display()
+            );
         }
 
         // ONE CHOKE POINT for the rule above, rather than a guard in each of
@@ -9459,6 +9479,34 @@ pub fn apply_moc_walk(
 /// that PRODUCES a node owns it, as does a tree a later step edits in place.
 pub fn output_supersedes(edited_tree: bool, producer: Option<BuildId>, finished: BuildId) -> bool {
     edited_tree || producer == Some(finished)
+}
+
+/// Binds every uploaded input whose path is a node another edge produces to
+/// that edge's registered output (`producer_output`, `None` for a path no
+/// edge produces or whose producer has not registered), and returns the
+/// paths it rebound. The upload routes (argv tokens, response-file tokens,
+/// readers) test the disk and replace the entry the input walk made, and a
+/// produced path on disk is a configure placeholder or an earlier pass's
+/// placement, never the source. qtdeclarative 6.11.2's qmltyperegistrar edge
+/// names `meta_types/qt6qml_metatypes.json` after `cd src/qml`; the rebased
+/// token found configure's 0-byte file, its upload replaced the moc edge's
+/// output, and the task failed "Failed to parse JSON: 5 illegal value".
+pub fn rebind_produced_inputs(
+    inputs: &mut rustc_hash::FxHashMap<PathBuf, DerivedFile>,
+    producer_output: impl Fn(&Path) -> Option<DerivedFile>,
+) -> Vec<PathBuf> {
+    let mut rebound: Vec<PathBuf> = Vec::new();
+    for (path, input) in inputs.iter_mut() {
+        if !matches!(input.derived_path, SingleDerivedPath::Opaque(_)) {
+            continue;
+        }
+        if let Some(out) = producer_output(path) {
+            *input = out;
+            rebound.push(path.clone());
+        }
+    }
+    rebound.sort();
+    rebound
 }
 
 /// The directories a relative `-I` in `scan` has to ENTER, as absolute paths
@@ -25717,5 +25765,93 @@ mod output_supersedes_tests {
         assert!(!output_supersedes(false, Some(other), edge));
         assert!(!output_supersedes(false, None, edge));
         assert!(output_supersedes(true, None, edge));
+    }
+}
+
+#[cfg(test)]
+mod rebind_produced_inputs_tests {
+    use super::{rebase_post_cd, rebind_produced_inputs, rewrite_cmdline};
+    use harmonia_store_derivation::derived_path::SingleDerivedPath;
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::DerivedFile;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    fn store() -> StoreDir {
+        StoreDir::new(Path::new("/nix/store")).unwrap()
+    }
+    fn upload(name: &str, build: &Path) -> DerivedFile {
+        DerivedFile {
+            derived_path: SingleDerivedPath::Opaque(
+                store()
+                    .parse(&format!(
+                        "/nix/store/caia63n1jh7d05nkq8mr30392vv3q170-{name}"
+                    ))
+                    .unwrap(),
+            ),
+            build_path: build.to_path_buf(),
+            rel_path: None,
+        }
+    }
+    fn built(build: &Path) -> DerivedFile {
+        let drv = store()
+            .parse("/nix/store/95s00phgrda36g09s74vcc9qs3fppm7c-ninja-build.drv")
+            .unwrap();
+        DerivedFile {
+            derived_path: SingleDerivedPath::Built {
+                drv_path: Arc::new(SingleDerivedPath::Opaque(drv)),
+                output: "src-qml-meta_types-qt6qml_metatypes.json".parse().unwrap(),
+            },
+            build_path: build.to_path_buf(),
+            rel_path: None,
+        }
+    }
+
+    /// qtdeclarative 6.11.2's qmltyperegistrar edge as build.ninja holds it.
+    /// The json token, rewritten and rebased the way the argv scan does it,
+    /// is the moc edge's node; its upload of configure's placeholder is
+    /// rebound to the moc edge's output. A source file no edge produces, a
+    /// produced node whose producer has not registered, and an input
+    /// already bound to an edge are left alone.
+    #[test]
+    fn an_upload_of_a_produced_node_is_bound_to_its_producer() {
+        let bd = Path::new("/build/qtdeclarative-everywhere-src-6.11.2/build");
+        let cmd = "cd /build/qtdeclarative-everywhere-src-6.11.2/build/src/qml && \
+                   /build/qtdeclarative-everywhere-src-6.11.2/build/libexec/qmltyperegistrar \
+                   --generate-qmltypes=/build/qtdeclarative-everywhere-src-6.11.2/build/lib/qt-6/qml/QML/plugins.qmltypes \
+                   --import-name=QML --major-version=1 --minor-version=0 \
+                   @/build/qtdeclarative-everywhere-src-6.11.2/build/src/qml/qmltypes/Qml_foreign_types.txt \
+                   --private-includes \
+                   -o /build/qtdeclarative-everywhere-src-6.11.2/build/src/qml/qml_qmltyperegistrations.cpp \
+                   /build/qtdeclarative-everywhere-src-6.11.2/build/src/qml/meta_types/qt6qml_metatypes.json";
+        let rewritten = rewrite_cmdline(cmd, bd);
+        let args = shell_words::split(&rewritten).unwrap();
+        let cd_dir = PathBuf::from(&args[1]);
+        let tok = args.last().unwrap();
+        let json = rebase_post_cd(&cd_dir, tok);
+        assert_eq!(
+            json,
+            Path::new("src/qml/meta_types/qt6qml_metatypes.json"),
+            "the scan's spelling of the json token ({rewritten})"
+        );
+
+        let source = PathBuf::from("../src/qml/qml.h");
+        let pending = PathBuf::from("src/qml/meta_types/pending.json");
+        let gen = PathBuf::from("src/qml/meta_types/qt6qml_metatypes.json.gen");
+        let mut inputs: rustc_hash::FxHashMap<PathBuf, DerivedFile> = [
+            (json.clone(), upload("qt6qml_metatypes.json", &json)),
+            (source.clone(), upload("qml.h", &source)),
+            (pending.clone(), upload("pending.json", &pending)),
+            (gen.clone(), built(&gen)),
+        ]
+        .into_iter()
+        .collect();
+        let producer = |p: &Path| (p == json || p == gen).then(|| built(p));
+        let rebound = rebind_produced_inputs(&mut inputs, producer);
+        assert_eq!(rebound, vec![json.clone()]);
+        assert!(inputs[&json] == built(&json));
+        assert!(inputs[&source] == upload("qml.h", &source));
+        assert!(inputs[&pending] == upload("pending.json", &pending));
+        assert!(inputs[&gen] == built(&gen));
     }
 }
