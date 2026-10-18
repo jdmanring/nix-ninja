@@ -452,6 +452,19 @@ Mechanisms, cited by symbol because line numbers rot:
   manifest, edges with ALL outputs placed are recorded (`.ninja_log` v7,
   `.ninja_deps` v4), stamped with the run START (`mark_start`); a depfile
   older than the start is not recorded; errors read DIRTY, never clean.
+- **Later passes** (`configure_state`; B, where a build runs the driver
+  once per phase): a pass after the first sets aside what earlier passes
+  placed (`Rewind`, journal `placed.v1`), answers the walk from configure's
+  record, and REUSES each edge's recorded task derivation (`emitted.v1`),
+  deriving only edges none recorded. Every later-pass exit, error exits
+  included, prints `nix-ninja: later-pass reused R task(s), derived M fresh,
+  F fallback, S stale: ...` (never pass 1, the compiler route or a subtool);
+  the consumer's tripwire stops on F>0 or S>0. S compares each reused edge's
+  recorded inputs (`files.v1`, `inputs.v1`) at exit and counts every
+  recorded reader of a hook's edit that placement wrote over. A missing,
+  corrupt or other-configure record, or another invocation (`-v`, builder
+  knobs), is a hard error. Gate `install-pass-reuse-repro.sh`; open gaps in
+  the queue (2026-10-18 14:40).
 - **Daemon exchanges** are bounded (`bounded`; ladder `300 << 2n` on
   `build_paths`); `BuilderRpcClient::pool` is a `BoundedPool` whose only
   acquire takes a deadline, so a bare acquire is a COMPILE error.

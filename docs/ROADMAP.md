@@ -716,18 +716,23 @@ configure left (a 0-byte `qt6core_metatypes.json` that syncqt's
 `-binaryDir` directory upload carries), and files written into the tree
 between phases.
 
-Where it stands: `5de3682` through the current revision (driver only,
-priced free on the corpus's five shapes) record what configure left,
-journal what placement wrote, and make a later pass set that aside, put back
-configure's version of a path placement replaced, and answer the build-dir
-walk, include dirs and directory listings from configure's record. The
-placeholder residue that used to re-run the whole build is refused at
-placement; a repair of its pieces in place was tried and withdrawn when
-real compiler output placed files naming neither path. `local/gates/install-pass-reuse-repro.sh` builds nothing in passes 2
-and 3 on three fixture shapes, and fails with each of the three later
-mechanisms switched off. Done when a qtbase round builds only its configure
-probes in the build pass and nothing in the install pass. Not covered: a file
-written between phases that a command names directly.
+Where it stands: met, by a qtbase 6.11.2 round on `fb8c2d7` (driver only,
+priced free on the corpus's five shapes). `5de3682` onward record what
+configure left, journal what placement wrote, and make a later pass set that
+aside, put back configure's version of a path placement replaced, and answer
+the build-dir walk, include dirs and directory listings from configure's
+record; `a92cdad` onward make a later pass inside a build reuse the task
+derivation each edge recorded and derive only edges no earlier pass wrote.
+Every later pass prints how many tasks it reused, derived fresh, fell back on
+(a recorded task gone from the store) and counted stale (a hook changed what
+an edge read), so a round can stop on the last two. The placeholder residue
+that used to re-run the whole build is refused at placement; a repair of its
+pieces in place was tried and withdrawn when real compiler output placed
+files naming neither path. In the round, the build pass built its 5
+configure probes and no task, and the install pass reused all 2150 of its
+tasks with none derived fresh, fallen back on or stale. Not covered: a file
+written between phases that a command names directly, and a pass that
+places only its targets can hide a hook's edit to a file it journals.
 
 After it, in order of measured saving, each measured before it is designed:
 
