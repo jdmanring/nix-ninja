@@ -434,6 +434,7 @@ pub fn run() -> Result<()> {
                 &build_dir,
                 crate::resolve_cache::earlier_runs_trusted(),
             )
+            .context("reading the build directory as the first pass found it")?
         };
     let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
         resolved_connections(&cli, crate::task::available_gib()),
@@ -1033,7 +1034,17 @@ mod record_placement_tests {
             "ninja's state recorded the output"
         );
 
-        let rewind = Rewind::begin(&bd, false).expect("a journal to act on");
+        // The lock is retried: a fork in a parallel test thread can hold a
+        // copy of an earlier descriptor for a moment, which separate
+        // drivers never see.
+        let rewind = (0..200)
+            .find_map(|_| {
+                Rewind::begin(&bd, false).unwrap().or_else(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    None
+                })
+            })
+            .expect("a journal to act on");
         assert!(
             !bd.join("gen.h").exists(),
             "the recorded output is set aside"

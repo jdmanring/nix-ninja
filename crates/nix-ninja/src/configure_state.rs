@@ -104,45 +104,64 @@ pub fn left_by_configure(build_dir: &Path, path: &Path) -> bool {
 }
 
 fn left_by(files: Option<&HashSet<String>>, build_dir: &Path, path: &Path) -> bool {
-    files.is_none_or(|files| left_in(files, build_dir, path, 2))
+    files.is_none_or(|files| left_in(files, build_dir, path))
 }
 
-fn left_in(files: &HashSet<String>, build_dir: &Path, path: &Path, depth: u8) -> bool {
-    let abs = build_dir.join(path);
-    let Some(rel) = abs.strip_prefix(build_dir).ok().and_then(normal_rel) else {
-        return true;
-    };
+fn left_in(files: &HashSet<String>, build_dir: &Path, path: &Path) -> bool {
     // THE RECORD KNOWS ONLY WHAT THE WALK ENTERED: not a directory the walk
     // skips (`walk_skips`), not what lies below a symlink (recorded as a
-    // file). A link landing back in the build dir is asked as where it
-    // lands; one leaving it reaches configure's tree, which the listing reads.
-    let parts: Vec<&str> = rel.split('/').collect();
-    if files.contains(&rel) || parts.iter().any(|c| walk_skips(c)) {
-        return true;
+    // file, so a recorded file with more of the path below it is one), and
+    // nothing outside the build dir, which the listing reads.
+    match landed_rel(build_dir, path, |r| files.contains(r)) {
+        Some(rel) => rel.is_empty() || files.contains(&rel) || rel.split('/').any(walk_skips),
+        None => true,
     }
-    for n in 1..parts.len() {
-        let link = parts[..n].join("/");
-        if !files.contains(&link) {
-            continue;
+}
+
+/// Where `spelled` (relative to `build_dir`, or absolute) lands, as the walk
+/// spells it: `Some("")` for the build dir itself, None outside it. ONE
+/// ANSWER FOR EVERY PASS: `.` and `..` are taken lexically, as the kernel
+/// takes them in a tree of plain directories, but at a symlink configure
+/// left (`left_link`) with more of the spelling to follow, the kernel's
+/// answer is taken (a `..` after it climbs from the link's target), and the
+/// rest goes on from where the link lands. A link landing outside, or one
+/// that does not resolve, is None: there the disk answers, as on the first
+/// pass.
+pub fn landed_rel(
+    build_dir: &Path,
+    spelled: &Path,
+    left_link: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let spelled = build_dir.join(spelled);
+    let comps: Vec<_> = spelled.components().collect();
+    let mut cur = PathBuf::new();
+    let mut hops = 0;
+    for (i, c) in comps.iter().enumerate() {
+        match c {
+            std::path::Component::ParentDir => {
+                cur.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => cur.push(c),
         }
-        let landed = std::fs::canonicalize(build_dir.join(&link))
-            .ok()
-            .and_then(|t| {
-                let bd = std::fs::canonicalize(build_dir).ok()?;
-                t.strip_prefix(&bd).ok().map(Path::to_path_buf)
-            });
-        return match landed {
-            Some(inside) if depth > 0 => left_in(
-                files,
-                build_dir,
-                &inside.join(parts[n..].join("/")),
-                depth - 1,
-            ),
-            Some(_) => false,
-            None => true,
+        if i + 1 == comps.len() {
+            break;
+        }
+        let Some(rel) = cur.strip_prefix(build_dir).ok().and_then(normal_rel) else {
+            continue;
         };
+        if left_link(&rel) {
+            hops += 1;
+            let bd = std::fs::canonicalize(build_dir).ok()?;
+            let inside = std::fs::canonicalize(&cur).ok()?;
+            cur = build_dir.join(inside.strip_prefix(&bd).ok()?);
+            if hops > 8 {
+                return None;
+            }
+        }
     }
-    false
+    let rel = cur.strip_prefix(build_dir).ok()?;
+    Some(normal_rel(rel).unwrap_or_default())
 }
 
 /// `rel` as the walk spells it (plain names joined by `/`, no `.`, no empty
@@ -198,10 +217,17 @@ fn same_entry(a: &Path, b: &Path) -> bool {
 /// path, and every one below it when the path is a directory configure
 /// left. Called before anything is written; no record (the compiler route,
 /// a first walk that never ran) means nothing to keep.
-pub fn keep_originals<'a>(build_dir: &Path, placed: impl IntoIterator<Item = &'a Path>) {
+/// AN ERROR WHERE A LATER PASS WOULD READ THE PLACED FILE: configure's
+/// copy that cannot be kept, or a path configure left that is gone before
+/// placement replaces it.
+pub fn keep_originals<'a>(
+    build_dir: &Path,
+    placed: impl IntoIterator<Item = &'a Path>,
+) -> std::io::Result<()> {
     let state = state_dir(build_dir);
-    if let Some(r) = load_in(&state, build_dir) {
-        keep_originals_in(&state, build_dir, &r, placed);
+    match load_in(&state, build_dir) {
+        Some(r) => keep_originals_in(&state, build_dir, &r, placed),
+        None => Ok(()),
     }
 }
 
@@ -210,7 +236,7 @@ fn keep_originals_in<'a>(
     build_dir: &Path,
     r: &ConfigureState,
     placed: impl IntoIterator<Item = &'a Path>,
-) {
+) -> std::io::Result<()> {
     let orig = originals(state);
     let mut failed: Option<(PathBuf, std::io::Error)> = None;
     let mut keep = |rel: &Path| {
@@ -221,24 +247,24 @@ fn keep_originals_in<'a>(
         if std::fs::symlink_metadata(&dest).is_ok() {
             return;
         }
-        let Ok(meta) = std::fs::symlink_metadata(&src) else {
-            return;
-        };
-        if !meta.is_file() && !meta.file_type().is_symlink() {
-            return;
-        }
-        let res = dest
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| copy_entry(&src, &dest, &meta));
+        let res = std::fs::symlink_metadata(&src).and_then(|meta| {
+            if !meta.is_file() && !meta.file_type().is_symlink() {
+                return Ok(());
+            }
+            dest.parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|_| copy_entry(&src, &dest, &meta))
+        });
         if let Err(e) = res {
             failed.get_or_insert((rel.to_path_buf(), e));
         }
     };
     for rel in placed {
-        if !confined(&rel.to_string_lossy()) {
+        // As the journal spells it, so `./m.json` is kept as `m.json` is.
+        let Some(rel) = normal_rel(rel) else {
             continue;
-        }
+        };
+        let rel = Path::new(&rel);
         let abs = build_dir.join(rel);
         match std::fs::symlink_metadata(&abs) {
             Ok(m) if m.is_dir() => {
@@ -255,15 +281,17 @@ fn keep_originals_in<'a>(
                 }
             }
             Ok(_) => keep(rel),
-            Err(_) => {}
+            // Configure left it and it is gone: no copy to keep.
+            Err(_) => keep(rel),
         }
     }
-    if let Some((rel, e)) = failed {
-        eprintln!(
-            "nix-ninja: could not keep configure's copy of every path placement replaces \
-             (first: {}: {e}); a later pass reads the placed one there",
+    match failed {
+        None => Ok(()),
+        Some((rel, e)) => Err(std::io::Error::other(format!(
+            "could not keep configure's copy of {} ({e}), which placement replaces; a \
+             later pass would read the placed one there",
             rel.display()
-        );
+        ))),
     }
 }
 
@@ -319,6 +347,17 @@ fn write_lines(
     std::fs::rename(&tmp, path)
 }
 
+/// `contents` at `path` through a name of its own and a rename, so a run
+/// killed meanwhile leaves the old file or the new one, never a part.
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, contents)
+        .and_then(|_| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+}
+
 /// The record the first walk wrote for this configure, or None: no record,
 /// an unreadable one, or one for another build.ninja.
 pub fn load(build_dir: &Path) -> Option<ConfigureState> {
@@ -371,9 +410,13 @@ fn save_in(state: &Path, build_dir: &Path, s: &ConfigureState) {
     }
     // A new record is a new configure: what an earlier one left at a path
     // placement replaced is not this configure's. Not while a pass holds
-    // files aside: its restore asks these copies what gives way.
+    // files or directories aside: its restore asks these copies what gives
+    // way.
     let orig = originals(state);
-    if std::fs::symlink_metadata(state.join("aside")).is_ok() {
+    if ["aside", "removed-dirs"]
+        .iter()
+        .any(|n| std::fs::symlink_metadata(state.join(n)).is_ok())
+    {
         return;
     }
     if let Err(e) = std::fs::remove_dir_all(&orig) {
@@ -528,12 +571,13 @@ fn journal_in<'a>(state: &Path, build_dir: &Path, placed: impl IntoIterator<Item
             continue;
         }
         let now = build_dir.join(rel);
-        entries.remove(&('O', key.clone()));
         // Configure's version at the path is no change: a generator that
-        // wrote identical bytes.
+        // wrote identical bytes, or a pass that covered the path (a tree
+        // around it) without writing it. An earlier pass's line stays.
         if same_entry(&now, e.path()) {
             continue;
         }
+        entries.remove(&('O', key.clone()));
         if let Ok(m) = std::fs::symlink_metadata(&now) {
             entries.insert(('O', key.clone()), format!("O {} {key}", stamp(&m)));
         }
@@ -601,11 +645,15 @@ impl Rewind {
     /// Puts back anything a run that never finished left aside, then, when
     /// earlier invocations' state is not trusted, moves aside what earlier
     /// runs journaled as placed. None when there is nothing to do.
-    pub fn begin(build_dir: &Path, trusted: bool) -> Option<Self> {
+    /// AN ERROR WHERE THIS PASS WOULD READ ANOTHER TREE THAN THE FIRST: a
+    /// placed file that cannot be set aside, configure's version that cannot
+    /// be put back, a record of removed directories that cannot be written.
+    /// Everything already moved comes back before it is returned.
+    pub fn begin(build_dir: &Path, trusted: bool) -> std::io::Result<Option<Self>> {
         Self::begin_in(&state_dir(build_dir), build_dir, trusted)
     }
 
-    fn begin_in(state: &Path, build_dir: &Path, trusted: bool) -> Option<Self> {
+    fn begin_in(state: &Path, build_dir: &Path, trusted: bool) -> std::io::Result<Option<Self>> {
         let lock = std::fs::create_dir_all(state).and_then(|_| {
             std::fs::OpenOptions::new()
                 .create(true)
@@ -621,7 +669,7 @@ impl Rewind {
                      directory as it stands",
                     state.display()
                 );
-                return None;
+                return Ok(None);
             }
         };
         if lock.try_lock().is_err() {
@@ -629,7 +677,7 @@ impl Rewind {
                 "nix-ninja: another driver holds this build directory's rewind; this one \
                  reads the directory as it stands"
             );
-            return None;
+            return Ok(None);
         }
         let mut rewind = Rewind {
             build_dir: build_dir.to_path_buf(),
@@ -641,11 +689,10 @@ impl Rewind {
             done: false,
             _lock: Some(lock),
         };
-        if let Err(e) = rewind.restore() {
-            eprintln!("nix-ninja: {e}");
-        }
+        rewind.restore()?;
         if trusted {
-            return None;
+            rewind.done = true;
+            return Ok(None);
         }
         let journal_path = state.join("placed.v1");
         if journal_path.exists() && read_lines(&journal_path, build_dir).is_none() {
@@ -654,10 +701,20 @@ impl Rewind {
                  re-configure); this pass reads the directory as it stands"
             );
         }
-        let journal = read_lines(&journal_path, build_dir)?;
+        let Some(journal) = read_lines(&journal_path, build_dir) else {
+            rewind.done = true;
+            return Ok(None);
+        };
+        // Whatever fails from here, `rewind` drops and puts back what moved.
+        let fail = |what: &str, rel: &Path, e: std::io::Error| {
+            std::io::Error::other(format!(
+                "could not {what} {} ({e}); this pass would read another build \
+                 directory than the first, so it stops",
+                rel.display()
+            ))
+        };
         let mut moved = 0usize;
         let mut changed = 0usize;
-        let mut failed: Option<(PathBuf, std::io::Error)> = None;
         let mut dirs: Vec<PathBuf> = Vec::new();
         let mut replaced: Vec<(&str, &str)> = Vec::new();
         for line in &journal {
@@ -674,16 +731,11 @@ impl Rewind {
                         changed += 1;
                         continue;
                     }
-                    let res = dest
-                        .parent()
+                    dest.parent()
                         .map_or(Ok(()), std::fs::create_dir_all)
-                        .and_then(|_| std::fs::rename(&src, &dest));
-                    match res {
-                        Ok(()) => moved += 1,
-                        Err(e) => {
-                            failed.get_or_insert((PathBuf::from(rel), e));
-                        }
-                    }
+                        .and_then(|_| std::fs::rename(&src, &dest))
+                        .map_err(|e| fail("set aside", Path::new(rel), e))?;
+                    moved += 1;
                 }
                 Some(('D', rel, _)) => dirs.push(PathBuf::from(rel)),
                 Some(('O', rel, Some(st))) => replaced.push((rel, st)),
@@ -699,13 +751,8 @@ impl Rewind {
             .chain(dirs.iter().filter(|d| build_dir.join(d).is_dir()))
             .map(|d| format!("{}\n", d.display()))
             .collect();
-        if let Err(e) = std::fs::write(&rewind.removed_file, candidates) {
-            eprintln!(
-                "nix-ninja: could not record the directories this pass removes ({e}); \
-                 they stay"
-            );
-            dirs.clear();
-        }
+        write_atomic(&rewind.removed_file, &candidates)
+            .map_err(|e| fail("record the directories it removes in", state, e))?;
         for rel in dirs {
             // Only an emptied directory goes, and it comes back on drop.
             if std::fs::remove_dir(build_dir.join(&rel)).is_ok() {
@@ -716,25 +763,38 @@ impl Rewind {
         // directories (one placed where configure left a file is gone by now).
         for (rel, placed_stamp) in replaced {
             let (src, dest) = (build_dir.join(rel), rewind.aside.join(rel));
-            let res = match std::fs::symlink_metadata(&src) {
-                Err(_) => Ok(()),
-                Ok(m) if !m.is_dir() && placed_stamp == stamp(&m) => dest
-                    .parent()
-                    .map_or(Ok(()), std::fs::create_dir_all)
-                    .and_then(|_| std::fs::rename(&src, &dest)),
+            let orig = rewind.originals.join(rel);
+            // A copy left by a run killed between the copy and the rename.
+            let name = src.file_name().unwrap_or_default().to_string_lossy();
+            let stale = format!(".{name}.nn-orig.");
+            if let Ok(entries) = src
+                .parent()
+                .map_or(Ok(None), |p| std::fs::read_dir(p).map(Some))
+            {
+                for e in entries.into_iter().flatten().flatten() {
+                    if e.file_name().to_string_lossy().starts_with(&stale) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+            match std::fs::symlink_metadata(&src) {
+                Err(_) => {}
+                Ok(m) if !m.is_dir() && placed_stamp == stamp(&m) => {
+                    dest.parent()
+                        .map_or(Ok(()), std::fs::create_dir_all)
+                        .and_then(|_| std::fs::rename(&src, &dest))
+                        .map_err(|e| fail("set aside", Path::new(rel), e))?;
+                }
                 Ok(_) => {
                     changed += 1;
                     continue;
                 }
-            };
+            }
             // Through a name of its own and a rename, so the path never holds
             // a partial copy that reads as a placement of this pass.
-            let orig = rewind.originals.join(rel);
-            let res = res.and_then(|_| {
-                let meta = std::fs::symlink_metadata(&orig)?;
+            let res = std::fs::symlink_metadata(&orig).and_then(|meta| {
                 src.parent().map_or(Ok(()), std::fs::create_dir_all)?;
-                let name = src.file_name().unwrap_or_default().to_string_lossy();
-                let tmp = src.with_file_name(format!(".{name}.nn-orig.{}", std::process::id()));
+                let tmp = src.with_file_name(format!("{stale}{}", std::process::id()));
                 let _ = std::fs::remove_file(&tmp);
                 copy_entry(&orig, &tmp, &meta)
                     .and_then(|_| std::fs::rename(&tmp, &src))
@@ -742,27 +802,17 @@ impl Rewind {
                         let _ = std::fs::remove_file(&tmp);
                     })
             });
-            match res {
-                Ok(()) => {
-                    rewind.restored += 1;
-                    moved += 1;
-                }
-                Err(e) => {
-                    failed.get_or_insert((PathBuf::from(rel), e));
-                }
-            }
+            res.map_err(|e| fail("put configure's version back at", Path::new(rel), e))?;
+            rewind.restored += 1;
+            moved += 1;
         }
         let list: String = rewind
             .removed_dirs
             .iter()
             .map(|d| format!("{}\n", d.display()))
             .collect();
-        if let Err(e) = std::fs::write(&rewind.removed_file, list) {
-            eprintln!(
-                "nix-ninja: could not record what this pass set aside ({e}); a run that \
-                 dies before it ends leaves it aside"
-            );
-        }
+        write_atomic(&rewind.removed_file, &list)
+            .map_err(|e| fail("record what it set aside in", state, e))?;
         eprintln!(
             "nix-ninja: an earlier pass placed outputs in this build directory; {moved} \
              file(s) and {} directory(ies) it placed are set aside until this pass has \
@@ -771,14 +821,7 @@ impl Rewind {
             rewind.removed_dirs.len(),
             rewind.restored
         );
-        if let Some((rel, e)) = failed {
-            eprintln!(
-                "nix-ninja: could not set aside every placed file (first: {}: {e}); this \
-                 pass reads those it could not",
-                rel.display()
-            );
-        }
-        Some(rewind)
+        Ok(Some(rewind))
     }
 
     /// Moves back every file set aside whose place is still empty (a file
@@ -812,12 +855,20 @@ impl Rewind {
             }
         }
         let mut failed: Option<(PathBuf, std::io::Error)> = None;
+        // A directory that cannot be recreated stays on the record, so a
+        // later run retries it: configure's file at its path is gone already.
+        let mut still = String::new();
         for rel in self.removed_dirs.drain(..) {
             if let Err(e) = std::fs::create_dir_all(self.build_dir.join(&rel)) {
+                still.push_str(&format!("{}\n", rel.display()));
                 failed.get_or_insert((rel, e));
             }
         }
-        let _ = std::fs::remove_file(&self.removed_file);
+        if still.is_empty() {
+            let _ = std::fs::remove_file(&self.removed_file);
+        } else {
+            let _ = write_atomic(&self.removed_file, &still);
+        }
         let walk = walkdir::WalkDir::new(&self.aside)
             .min_depth(1)
             .contents_first(true);
@@ -912,14 +963,20 @@ mod tests {
     /// while the test, one process, takes the lock again; separate drivers
     /// never meet that.
     fn begin(state: &Path, bd: &Path) -> Rewind {
-        (0..200)
-            .find_map(|_| {
-                Rewind::begin_in(state, bd, false).or_else(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    None
-                })
-            })
+        begin_result(state, bd)
+            .expect("no failure")
             .expect("a journal")
+    }
+    /// The same, for a rewind that may fail: the first answer that is not
+    /// the lock held.
+    fn begin_result(state: &Path, bd: &Path) -> std::io::Result<Option<Rewind>> {
+        for _ in 0..200 {
+            match Rewind::begin_in(state, bd, false) {
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                done => return done,
+            }
+        }
+        Ok(None)
     }
     fn write(p: &Path, v: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -1063,7 +1120,7 @@ mod tests {
             assert!(bd.join(kept).exists(), "{kept} should stay");
         }
         assert!(
-            Rewind::begin_in(&state, &bd, false).is_none(),
+            Rewind::begin_in(&state, &bd, false).unwrap().is_none(),
             "a second driver in the same build dir leaves the rewind alone"
         );
         assert!(
@@ -1092,7 +1149,7 @@ mod tests {
             "a removed empty directory is recreated"
         );
         assert!(
-            Rewind::begin_in(&state, &bd, true).is_none(),
+            Rewind::begin_in(&state, &bd, true).unwrap().is_none(),
             "a run that trusts earlier state never rewinds"
         );
         assert!(bd.join("include/Foo/a.h").exists());
@@ -1157,7 +1214,7 @@ mod tests {
             "again.h",
         ]
         .map(PathBuf::from);
-        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path));
+        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
 
         // Placement.
         write(&bd.join(json), &"m".repeat(385));
@@ -1240,6 +1297,11 @@ mod tests {
             ("/build/pkg/build/meta/d/w123.tmp", false),
             ("../src/x.h", true),
             ("/nix/store/x-y/z.h", true),
+            // A climb that comes back into the build dir is asked as where
+            // it lands.
+            ("../build/meta/d/meta.json", true),
+            ("../build/meta/d/w123.tmp", false),
+            ("/build/pkg/src/../build/meta/d/w123.tmp", false),
         ] {
             assert_eq!(
                 super::left_by(Some(&files), bd, Path::new(path)),
@@ -1314,7 +1376,7 @@ mod tests {
         };
         save_in(&state, &bd, &record);
         let placed = [PathBuf::from("m.json")];
-        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path));
+        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("m.json"), "placed");
         journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
         let read = || std::fs::read_to_string(bd.join("m.json")).unwrap();
@@ -1354,7 +1416,7 @@ mod tests {
             !super::originals(&state).exists(),
             "the old originals are gone"
         );
-        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path));
+        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         assert_eq!(
             std::fs::read_to_string(super::originals(&state).join("m.json")).unwrap(),
             "configure B"
@@ -1396,6 +1458,156 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// A pass 1 that placed `m` over configure's file: the record, the kept
+    /// original and the journal line, as placement leaves them.
+    fn placed_over_configure(tag: &str, spelled: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let d = scratch(tag);
+        let bd = d.join("build");
+        let state = d.join("state");
+        write(&bd.join("build.ninja"), "default all\n");
+        write(&bd.join("D/m.json"), "");
+        let record = ConfigureState {
+            files: ["build.ninja", "D/m.json"].map(String::from).into(),
+            dirs: ["D".to_string()].into(),
+            ..Default::default()
+        };
+        save_in(&state, &bd, &record);
+        let placed = [PathBuf::from(spelled)];
+        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
+        write(&bd.join("D/m.json"), "placed");
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
+        (d, bd, state)
+    }
+
+    /// A PASS THAT COVERS THE PATH WITHOUT WRITING IT (it places the tree
+    /// around it, and the file already there is skipped) keeps the earlier
+    /// pass's line, so the pass after it reads configure's version too.
+    #[test]
+    fn an_o_line_survives_a_pass_that_covers_the_path_without_writing_it() {
+        let (d, bd, state) = placed_over_configure("o-covered", "D/m.json");
+        let read = || std::fs::read_to_string(bd.join("D/m.json")).unwrap();
+        let rewind = begin(&state, &bd);
+        assert_eq!(read(), "", "pass 2 reads configure's version");
+        journal_in(&state, &bd, [Path::new("D")]);
+        rewind.finish().expect("everything comes back");
+        let rewind = begin(&state, &bd);
+        assert_eq!(read(), "", "and so does pass 3");
+        rewind.finish().expect("everything comes back");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A PLACED PATH SPELLED `./D/m.json` keeps configure's version as
+    /// `D/m.json` does: the journal takes either spelling.
+    #[test]
+    fn a_leading_dot_placed_path_keeps_configures_version() {
+        let (d, bd, state) = placed_over_configure("o-dot", "./D/m.json");
+        let rewind = begin(&state, &bd);
+        assert_eq!(std::fs::read_to_string(bd.join("D/m.json")).unwrap(), "");
+        rewind.finish().expect("everything comes back");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// CONFIGURE'S VERSION THAT CANNOT BE PUT BACK STOPS THE PASS, with the
+    /// placed file back in its place, never an empty path read as if
+    /// nothing were there. A copy a killed run left beside it goes.
+    #[test]
+    fn a_failed_copy_back_stops_the_pass_and_leaves_the_placed_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let (d, bd, state) = placed_over_configure("o-copyback", "D/m.json");
+        let stale = bd.join("D/.m.json.nn-orig.1");
+        write(&stale, "left by a killed run");
+        let kept = super::originals(&state).join("D/m.json");
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let res = begin_result(&state, &bd);
+        std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(res.is_err(), "the pass stops");
+        assert_eq!(
+            std::fs::read_to_string(bd.join("D/m.json")).unwrap(),
+            "placed",
+            "and the placed file is where it was"
+        );
+        assert!(!stale.exists(), "the killed run's copy is gone");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A PLACED FILE THAT CANNOT BE SET ASIDE STOPS THE PASS: reading it
+    /// would read another tree than the first pass did.
+    #[test]
+    fn a_placed_file_that_cannot_be_set_aside_stops_the_pass() {
+        let d = scratch("f-stuck");
+        let bd = d.join("build");
+        let state = d.join("state");
+        write(&bd.join("build.ninja"), "default all\n");
+        let record = ConfigureState {
+            files: ["build.ninja".to_string()].into(),
+            ..Default::default()
+        };
+        save_in(&state, &bd, &record);
+        write(&bd.join("gen.h"), "placed");
+        journal_in(&state, &bd, [Path::new("gen.h")]);
+        // Nothing can be made below a file.
+        write(&state.join("aside"), "in the way");
+        assert!(begin_result(&state, &bd).is_err());
+        assert_eq!(std::fs::read_to_string(bd.join("gen.h")).unwrap(), "placed");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A FILE CONFIGURE LEFT THAT IS GONE when placement replaces it has no
+    /// copy to keep: the run stops rather than leave a later pass reading
+    /// the placed one.
+    #[test]
+    fn a_configure_file_gone_before_placement_stops_the_run() {
+        let d = scratch("orig-gone");
+        let bd = d.join("build");
+        let state = d.join("state");
+        write(&bd.join("build.ninja"), "default all\n");
+        let record = ConfigureState {
+            files: ["build.ninja", "m.json"].map(String::from).into(),
+            ..Default::default()
+        };
+        save_in(&state, &bd, &record);
+        assert!(keep_originals_in(&state, &bd, &record, [Path::new("m.json")]).is_err());
+        // A path configure did not leave has nothing to keep.
+        assert!(keep_originals_in(&state, &bd, &record, [Path::new("new.h")]).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A DIRECTORY THAT CANNOT BE RECREATED STAYS ON THE RECORD: configure's
+    /// file at its path went first, so dropping the record loses both, and
+    /// a new configure's record does not clear the originals meanwhile.
+    #[test]
+    fn a_directory_that_cannot_come_back_stays_on_the_record() {
+        let d = scratch("removed-stuck");
+        let bd = d.join("build");
+        let state = d.join("state");
+        // `a` is a file now, so `a/b` cannot be made.
+        write(&bd.join("a"), "in the way");
+        write(&super::originals(&state).join("x"), "configure's");
+        write(&state.join("removed-dirs"), "a/b\n");
+        let mut r = Rewind {
+            build_dir: bd.clone(),
+            aside: state.join("aside"),
+            removed_dirs: super::read_removed(&state),
+            removed_file: state.join("removed-dirs"),
+            originals: super::originals(&state),
+            restored: 0,
+            done: true,
+            _lock: None,
+        };
+        assert!(r.restore().is_err(), "the run fails");
+        assert_eq!(
+            super::read_removed(&state),
+            [PathBuf::from("a/b")],
+            "and the directory waits on the record"
+        );
+        save_in(&state, &bd, &ConfigureState::default());
+        assert!(
+            super::originals(&state).join("x").exists(),
+            "the originals are kept while it waits"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// A HOOK'S EDIT OF A REPLACED PATH between passes reads the same on
     /// every later pass, as an edited placed file does: the edit is not
     /// journaled as a placement, so no later pass sets it aside.
@@ -1412,7 +1624,7 @@ mod tests {
         };
         save_in(&state, &bd, &record);
         let placed = [PathBuf::from("m.json")];
-        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path));
+        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("m.json"), "placed");
         journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1443,7 +1655,7 @@ mod tests {
         };
         save_in(&state, &bd, &record);
         let placed = [PathBuf::from("x")];
-        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path));
+        keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         std::fs::remove_file(bd.join("x")).unwrap();
         std::fs::create_dir(bd.join("x")).unwrap();
         journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));

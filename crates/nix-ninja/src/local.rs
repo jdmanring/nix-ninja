@@ -152,7 +152,7 @@ fn place_realised(
         crate::configure_state::keep_originals(
             prefix,
             opaque_files.iter().map(|d| d.build_path.as_path()),
-        );
+        )?;
     }
 
     // PLACEHOLDER -> REAL OUTER PATH, by COPY, and NEVER exposed as the
@@ -1066,9 +1066,10 @@ pub fn copy_derived_files(
 fn repair(data: &[u8], restore: &[(String, String)]) -> Option<Vec<u8>> {
     let plain = crate::task::repair_residue(data, restore);
     let now = plain.as_deref().unwrap_or(data);
-    let carries = crate::task::compressed_sections(now)
-        .iter()
-        .any(|sec| crate::task::placeholder_residue(sec, restore).is_some());
+    let carries = crate::task::compressed_sections(now).iter().any(|sec| {
+        sec.as_ref()
+            .is_none_or(|sec| crate::task::placeholder_residue(sec, restore).is_some())
+    });
     if !carries {
         return plain;
     }
@@ -1526,9 +1527,12 @@ mod repair_tests {
         let fixed = repair(&obj, &restore).expect("a repair");
         assert_eq!(crate::task::placeholder_residue(&fixed, &restore), None);
         assert!(
-            crate::task::compressed_sections(&fixed).iter().any(|s| s
-                .windows(32)
-                .any(|w| w == b"32a39vx421j6s4zh3nh85a5r1jlgagqg")),
+            crate::task::compressed_sections(&fixed)
+                .iter()
+                .flatten()
+                .any(|s| s
+                    .windows(32)
+                    .any(|w| w == b"32a39vx421j6s4zh3nh85a5r1jlgagqg")),
             "the real hash is inside the recompressed section"
         );
     }
