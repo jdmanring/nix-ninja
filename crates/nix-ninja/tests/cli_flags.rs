@@ -83,3 +83,25 @@ fn only_the_shadowing_metatypes_check_gets_an_out() {
     assert!(!nix_ninja::cli::shadows_out(fixed));
     assert!(!nix_ninja::cli::shadows_out(""));
 }
+
+/// The build-tree check that stands in for the shadowed `$out`: a 0-byte
+/// metatypes file is found, also behind a link; a written one is not.
+#[test]
+fn an_empty_metatypes_file_in_the_tree_is_found() {
+    let d = std::env::temp_dir().join(format!("nn-metatypes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(d.join("lib/metatypes")).unwrap();
+    std::fs::write(d.join("lib/metatypes/qt6core_metatypes.json"), "[]").unwrap();
+    assert!(nix_ninja::cli::empty_metatypes(&d).is_empty());
+    std::fs::write(d.join("placeholder"), "").unwrap();
+    std::os::unix::fs::symlink(
+        d.join("placeholder"),
+        d.join("lib/metatypes/qt6gui_metatypes.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        nix_ninja::cli::empty_metatypes(&d),
+        vec![d.join("lib/metatypes/qt6gui_metatypes.json")]
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

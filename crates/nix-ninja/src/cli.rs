@@ -410,11 +410,26 @@ pub fn shadows_out(post_fixup: &str) -> bool {
     post_fixup.contains(r#"for out in $outputs; do find "${!out}""#)
 }
 
+/// The 0-byte `*_metatypes.json` under `dir`, read through links: what the
+/// shadowed check exists to refuse, and what the install copies into `$out`,
+/// the one output the shadowed check no longer reads.
+pub fn empty_metatypes(dir: &Path) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_metatypes.json"))
+        .filter(|e| std::fs::metadata(e.path()).is_ok_and(|m| m.len() == 0))
+        .map(|e| e.into_path())
+        .collect()
+}
+
 /// Makes an empty `out` where fixup runs (`cwd`, the directory ninja was
 /// started in) when postFixup carries the shadowing check, so its first
 /// iteration finds nothing. Only after a later pass succeeds: no walk or
 /// listing of this build sees a path configure did not leave. An existing
-/// `out` is never touched.
+/// `out` is never touched. The build tree is checked in the check's place
+/// first: an empty metatypes file there leaves `out` absent, and fixup fails
+/// as it would without this.
 /// DEFER(next pin bump, when the fixed check from saxum 879e577 enters the target): delete
 pub fn make_shadowed_out(cwd: &Path) {
     if std::env::var_os("NIX_BUILD_TOP").is_none()
@@ -425,6 +440,14 @@ pub fn make_shadowed_out(cwd: &Path) {
     }
     let out = cwd.join("out");
     if std::fs::symlink_metadata(&out).is_ok() {
+        return;
+    }
+    let empty = empty_metatypes(cwd);
+    if !empty.is_empty() {
+        eprintln!("nix-ninja: not making {}: 0-byte metatypes:", out.display());
+        for p in &empty {
+            eprintln!("nix-ninja:   {}", p.display());
+        }
         return;
     }
     match std::fs::create_dir(&out) {
