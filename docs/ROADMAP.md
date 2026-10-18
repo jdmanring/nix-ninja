@@ -20,7 +20,7 @@ are met and `0.3` is in progress rather than finished, which is why its open
 classes are listed below. A reader should not take the number as a claim that
 the milestone it names is complete.
 
-The state of the tree TODAY, class by class, is a table of 138 rows. It is not in
+The state of the tree TODAY, class by class, is a table of 139 rows. It is not in
 this repository: it grew beside a private distribution and is development
 material rather than a public document, which is the same reason the gate corpus
 is not here (`0.5`). What this file carries is the part that is publishable now,
@@ -242,7 +242,7 @@ the client's, or it fails with a message that blames the client.
 The project also keeps a wider corpus of gate scripts, one per closed class,
 each written to reproduce a defect so that it fails on the revision before the
 fix. That corpus is not yet in this repository: it grew beside a consumer
-distribution, and 11 of its 92 scripts reach into trees and paths that are
+distribution, and 11 of its 93 scripts reach into trees and paths that are
 private. Publishing it is tracked work rather than a claim, and the triage under
 [the next concrete work](#the-next-concrete-work-item-by-item), item 1, is what
 decides the order. What the wider corpus enforces is worth stating anyway,
@@ -486,7 +486,7 @@ provide: what to open, and how to know the change is right.
 ### 1. Publish the wider corpus, cheapest group first
 
 The instrument that verifies every closed class is not in this repository. A
-triage over the whole corpus, measured rather than asserted, splits 92 gate
+triage over the whole corpus, measured rather than asserted, splits 93 gate
 scripts three ways:
 
 1. **Gates that reach for a store path that can be collected.** ONE script,
@@ -497,7 +497,7 @@ scripts three ways:
    `round-intercept-sweep.sh`'s retained round's leaf log, which is NOT
    derivable: resolving the same subject by attribute returns a different
    derivation. It stays, and fails loud when the path is gone.
-2. **Gates that are self-contained.** 80 scripts. A copy into the repository,
+2. **Gates that are self-contained.** 81 scripts. A copy into the repository,
    plus the one path assumption in the runner, which resolves its own directory
    and then expects the gates beside it.
 3. **Gates coupled to a private tree on the executable path.** 11 scripts,
@@ -506,12 +506,12 @@ scripts three ways:
    turned into a fixture first. Two read a consumer shim by design and report
    NO ANSWER when it is absent, which is correct and stays.
 
-The split is exact and exhaustive: 1 + 80 + 11 = 92, and no script falls in two
+The split is exact and exhaustive: 1 + 81 + 11 = 93, and no script falls in two
 groups. The work is therefore almost entirely group 2, which is a copy and one
 runner assumption, and group 3, which is the real cost.
 
 **Publishing is a copy; RUNNING is the cost, and the two are not the same
-size.** Measured over the same corpus: 78 of the 92 scripts invoke nix at all
+size.** Measured over the same corpus: 79 of the 93 scripts invoke nix at all
 (a `build`, an `eval` or a `develop`), counting an invocation in CODE rather
 than any mention of the word, because one probe prints the words "nix builds at
 once" in an explanatory line and needs no nix whatsoever. Of the 14 that do not,
@@ -520,7 +520,7 @@ has none of it, and a gate that reads it FAILS SPURIOUSLY there rather than
 reporting an answer - measured by hiding the file and running one, which printed
 `grep: CLAUDE.md: No such file or directory` and then two FAIL lines.
 
-4 of the 92 EXECUTE in a clean clone, checked out with `git clone` and run
+4 of the 93 EXECUTE in a clean clone, checked out with `git clone` and run
 there with `local/` absent, no argument and nothing installed. Two of those 4
 assert about this repository's own source and are therefore worth publishing as
 corpus arms: `stdout-contract-sweep.sh` exits 0, and
@@ -711,10 +711,22 @@ differ between the passes:
   first pass bound them through the producing edges' directories.
 - `NIX_NINJA_MAKE_DIRS` gains the versioned private include dirs.
 
-First action: `-t drv` over a kept tree after a build pass, diffed edge by
-edge against the build pass's emission; the fix is done when the diff is
-empty for every edge. It is an emission change confined to second-pass
-shapes, priced with `local/gates/emission-price.sh` before it lands.
+Two more fields followed on the real package: an output placed over a file
+configure left (a 0-byte `qt6core_metatypes.json` that syncqt's
+`-binaryDir` directory upload carries), and files written into the tree
+between phases.
+
+Where it stands: `5de3682`, `da700bd`, `79e1d51` and `998b14f` (driver
+only, priced free on the corpus's five shapes) record what configure left,
+journal what placement wrote, and make a later pass set that aside, put back
+configure's version of a path placement replaced, and answer the build-dir
+walk, include dirs and directory listings from configure's record. The
+placeholder residue that used to re-run the whole build is repaired in
+place. `local/gates/install-pass-reuse-repro.sh` builds nothing in passes 2
+and 3 on three fixture shapes, and fails with each of the three later
+mechanisms switched off. Done when a qtbase round builds only its configure
+probes in the build pass and nothing in the install pass. Not covered: a file
+written between phases that a command names directly.
 
 After it, in order of measured saving, each measured before it is designed:
 
@@ -756,7 +768,7 @@ None is hypothetical: the first three are why upstream is dormant.
   also its exit criterion, so this risk and that milestone are the same problem
   seen from two directions.
 - **The verification apparatus is private.** The 90-row class table and the
-  whole gate corpus, all 92 scripts, live outside this repository. `0.5` and
+  whole gate corpus, all 93 scripts, live outside this repository. `0.5` and
   work item 1 exist to publish them, and until they land, every claim here is
   checkable only by its
   author, which is the property that made upstream's work hard to continue.

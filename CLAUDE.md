@@ -414,8 +414,10 @@ Mechanisms, cited by symbol because line numbers rot:
   or the outer-stage copy, never in the task, so a task's store output
   legitimately carries placeholders; audit residue only where a path is
   FINAL. `placeholder_residue` scans 8-char windows (`RESIDUE_WINDOW`),
-  inflating `SHF_COMPRESSED` sections (`compressed_sections`); residue
-  triggers one re-exec with `NIX_NINJA_RAW_OUTER_PATHS`. Scanning an
+  inflating `SHF_COMPRESSED` sections (`compressed_sections`); placement
+  repairs residue in place (`repair_residue` swaps a hash only whole,
+  `repair_compressed` via objcopy) and refuses a file it cannot repair;
+  nothing re-runs the build. Scanning an
   artifact by hand, use the same window length on stand-in and control.
   The `out` stand-in is `hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx`.
 - **Outer-output staging**: `-I$out/...` and outputs inside the outer
