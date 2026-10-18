@@ -3406,6 +3406,43 @@ impl Runner {
                 first.display()
             );
         }
+        // AND FOR SYNCQT'S `include/<Module>`, where configure also writes
+        // (`<Module>Depends`, `<module>exports.h`), so the line between its
+        // files and an earlier pass's is the manifest's mtime: CMake writes
+        // build.ninja last. syncqt rewrites an alias older than its source,
+        // and an inherited alias is a store link with mtime 1: qtbase's
+        // install pass, "Unable to write header file alias:
+        // .../QtWaylandGlobalVersion", 2026-10-17.
+        let build_dir = &self.config.build_dir;
+        let configured = std::fs::metadata(build_dir.join("build.ninja"))
+            .and_then(|m| m.modified())
+            .ok();
+        let earlier = syncqt_earlier_products(
+            &declared,
+            configured,
+            input_set.keys(),
+            |p| {
+                files
+                    .lookup(&p.to_string_lossy())
+                    .is_some_and(|f| files.by_id[f].input.is_some())
+            },
+            |p| {
+                std::fs::symlink_metadata(build_dir.join(p))
+                    .and_then(|m| m.modified())
+                    .ok()
+            },
+        );
+        for p in &earlier {
+            input_set.remove(p);
+        }
+        if let Some(first) = earlier.first() {
+            eprintln!(
+                "nix-ninja: {} input(s) beneath this edge's syncqt tree newer than \
+                 build.ninja dropped, first {} (its own output from an earlier pass)",
+                earlier.len(),
+                first.display()
+            );
+        }
 
         lap(&NT_CMDLINE_MS);
 
@@ -9213,6 +9250,35 @@ pub fn autogen_own_products<'a>(
     inputs
         .filter(|p| trees.iter().any(|t| p.starts_with(t) && *p != t))
         .filter(|p| plan != Some(p.as_path()))
+        .cloned()
+        .collect()
+}
+
+/// The inputs beneath the syncqt tree (`include/<Module>`) that an edge
+/// with these declared outputs writes, newer than `configured` (the
+/// manifest's mtime): files an earlier pass placed there. Configure's own
+/// files in that tree (`<Module>Depends`, `<module>exports.h`) are written
+/// before the manifest and stay. A path some edge declares as an output
+/// keeps its route through that edge. Empty for an edge that writes no
+/// syncqt tree and when there is no boundary; an unreadable time keeps
+/// the input.
+pub fn syncqt_earlier_products<'a>(
+    declared: &[PathBuf],
+    configured: Option<std::time::SystemTime>,
+    inputs: impl Iterator<Item = &'a PathBuf>,
+    produced: impl Fn(&Path) -> bool,
+    mtime: impl Fn(&Path) -> Option<std::time::SystemTime>,
+) -> Vec<PathBuf> {
+    let (Some(configured), None) = (configured, autogen_include_root(declared)) else {
+        return Vec::new();
+    };
+    let Some(tree) = common_include_root(declared) else {
+        return Vec::new();
+    };
+    inputs
+        .filter(|p| p.starts_with(&tree) && **p != tree)
+        .filter(|p| !produced(p))
+        .filter(|p| mtime(p).is_some_and(|m| m > configured))
         .cloned()
         .collect()
 }
@@ -23452,6 +23518,80 @@ mod autogen_own_products_tests {
         // Not an autogen edge: its outputs name no `<T>_autogen` root.
         let other = [PathBuf::from("src/corelib/Core_autogen/include/x.o")];
         assert!(autogen_own_products(&other, None, inputs.iter()).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod syncqt_earlier_products_tests {
+    use super::syncqt_earlier_products;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    /// qtbase 6.11.2's WaylandGlobalPrivate syncqt edge as the install pass
+    /// emitted it (`3i6i6j4p...-ninja-build.drv`), with the mtimes the kept
+    /// outer build dir held: Depends at configure, the rest placed later.
+    #[test]
+    fn a_syncqt_edge_drops_what_an_earlier_pass_placed_and_keeps_configure_files() {
+        let declared: Vec<PathBuf> = [
+            "include/QtWaylandGlobal/QtWaylandGlobal",
+            "src/plugins/platforms/wayland/WaylandGlobalPrivate_syncqt_timestamp",
+        ]
+        .map(PathBuf::from)
+        .to_vec();
+        let configured = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let old = configured - Duration::from_secs(1);
+        let new = configured + Duration::from_secs(600);
+        let inputs: Vec<PathBuf> = [
+            "include/QtWaylandGlobal/QtWaylandGlobalDepends",
+            "include/QtWaylandGlobal/QtWaylandGlobalVersion",
+            "include/QtWaylandGlobal/.syncqt_staging/QtWaylandGlobalVersion",
+            "include/QtWaylandGlobal/6.11.2/QtWaylandGlobal/private/qtwaylandglobal-config_p.h",
+            // Another edge's declared output in the tree keeps its route.
+            "include/QtWaylandGlobal/6.11.2/QtWaylandGlobal/private/qwayland-x.h",
+            // No readable time: kept.
+            "include/QtWaylandGlobal/unreadable",
+            // Newer but outside the tree.
+            "include/QtCore/QtCoreVersion",
+            "src/plugins/platforms/wayland/qtwaylandglobal-config.h",
+        ]
+        .map(PathBuf::from)
+        .to_vec();
+        let produced = |p: &Path| p.ends_with("qwayland-x.h");
+        let mtime = |p: &Path| {
+            if p.ends_with("QtWaylandGlobalDepends") {
+                Some(old)
+            } else if p.ends_with("unreadable") {
+                None
+            } else {
+                Some(new)
+            }
+        };
+        let mut got =
+            syncqt_earlier_products(&declared, Some(configured), inputs.iter(), produced, mtime);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "include/QtWaylandGlobal/.syncqt_staging/QtWaylandGlobalVersion",
+                "include/QtWaylandGlobal/6.11.2/QtWaylandGlobal/private/qtwaylandglobal-config_p.h",
+                "include/QtWaylandGlobal/QtWaylandGlobalVersion",
+            ]
+            .map(PathBuf::from)
+            .to_vec()
+        );
+        // No manifest time: nothing dropped.
+        assert!(
+            syncqt_earlier_products(&declared, None, inputs.iter(), produced, mtime).is_empty()
+        );
+        // An autogen edge is the other rule's, not this one's.
+        let autogen: Vec<PathBuf> = ["src/corelib/Core_autogen/timestamp"]
+            .map(PathBuf::from)
+            .to_vec();
+        let under = [PathBuf::from("src/corelib/Core_autogen/include/moc_x.cpp")];
+        assert!(
+            syncqt_earlier_products(&autogen, Some(configured), under.iter(), produced, mtime)
+                .is_empty()
+        );
     }
 }
 
