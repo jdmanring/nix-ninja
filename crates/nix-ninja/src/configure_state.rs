@@ -137,15 +137,11 @@ struct Pass {
     /// `files` (path, content hash when an earlier pass wrote the edge).
     edge_inputs: std::collections::HashMap<String, Vec<usize>>,
     files: Vec<(String, String)>,
-    /// Paths placement put over a configure file (journaled O): during a
-    /// later pass they hold configure's version, so they are not compared.
-    replaced_configure: std::collections::HashSet<String>,
-    /// Every path an earlier pass placed (journaled): one gone is set aside
-    /// by the rewind and comes back as the reused task places it.
-    placed: std::collections::HashSet<String>,
-    /// Reused edges a tree file of which changed since it was written, or
-    /// that could not be resolved against the tree as it stands.
-    stale: Vec<String>,
+    /// The edges this pass reused (key, derivation), compared at exit.
+    reused_edges: Vec<(String, String)>,
+    /// Reused edges that could not be resolved against the tree as it
+    /// stands, by derivation.
+    unresolved: std::collections::BTreeSet<String>,
 }
 
 /// The record's key for an edge: its outputs, joined on NUL, which no path
@@ -221,7 +217,6 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
     } else {
         Default::default()
     };
-    let (replaced_configure, placed) = journaled(&state, build_dir)?;
     *PASS.lock().unwrap() = Some(Pass {
         state,
         build_dir: build_dir.to_path_buf(),
@@ -231,9 +226,8 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
         replaced: Default::default(),
         edge_inputs,
         files,
-        replaced_configure,
-        placed,
-        stale: Vec::new(),
+        reused_edges: Vec::new(),
+        unresolved: Default::default(),
     });
     Ok(())
 }
@@ -261,8 +255,8 @@ pub fn recorded(outputs: &[PathBuf]) -> bool {
 /// with `outputs`. `present` says whether it is still in the store; one
 /// that is not is counted as a fallback, and the edge is derived again.
 pub fn reuse(outputs: &[PathBuf], present: impl Fn(&str) -> bool) -> Option<String> {
-    let mut guard = PASS.lock().unwrap();
-    let pass = guard.as_mut()?;
+    let mut pass = PASS.lock().unwrap();
+    let pass = pass.as_mut()?;
     let earlier = pass.earlier.as_ref()?;
     // Outputs no record line can hold are derived on every pass: counted.
     let Some(key) = task_key(outputs) else {
@@ -273,38 +267,7 @@ pub fn reuse(outputs: &[PathBuf], present: impl Fn(&str) -> bool) -> Option<Stri
     let drv = earlier.get(&key)?.clone();
     if present(&drv) {
         pass.reused += 1;
-        // A TREE FILE THE EDGE READ THAT CHANGED SINCE (a hook edited a
-        // source or a generated file between phases) is not rebuilt, as
-        // reuse is the point; it is counted, so the round sees it. Hashed
-        // with `PASS` released, so task threads do not queue behind it.
-        let inputs: Vec<(String, String, bool)> = pass
-            .edge_inputs
-            .get(&key)
-            .into_iter()
-            .flatten()
-            .map(|&i| pass.files[i].clone())
-            .filter(|(p, _)| !pass.replaced_configure.contains(p))
-            .map(|(p, h)| {
-                let placed = pass.placed.contains(&p);
-                (p, h, placed)
-            })
-            .collect();
-        let build_dir = pass.build_dir.clone();
-        drop(guard);
-        let changed = inputs.iter().any(|(p, then, placed)| {
-            match now_hash(&build_dir, p) {
-                Some(n) => &n != then,
-                // Gone is changed (a hook removed a source), except for a
-                // placed output, which the rewind set aside and the reused
-                // task places again.
-                None => !placed,
-            }
-        });
-        if changed {
-            if let Some(p) = PASS.lock().unwrap().as_mut() {
-                p.stale.push(drv.clone());
-            }
-        }
+        pass.reused_edges.push((key, drv.clone()));
         Some(drv)
     } else {
         pass.fallback.push(drv);
@@ -317,7 +280,7 @@ pub fn reuse(outputs: &[PathBuf], present: impl Fn(&str) -> bool) -> Option<Stri
 /// stands: the tree changed under it since it was written.
 pub fn note_unresolved(drv: &str) {
     if let Some(p) = PASS.lock().unwrap().as_mut() {
-        p.stale.push(format!("{drv} <unresolved>"));
+        p.unresolved.insert(drv.to_string());
     }
 }
 
@@ -343,7 +306,23 @@ pub fn note_task(outputs: &[PathBuf], drv: &str, inputs: Vec<String>) {
     }
 }
 
-/// What the tree file or directory at `rel` holds now, hashed once.
+/// Placed files the rewind found changed since placement (a hook edited a
+/// generated file between phases). Placement may write the reused output
+/// over the edit before the pass ends, so the exit comparison cannot see
+/// it; every reused edge that read one is counted stale.
+static CHANGED_SINCE_PLACEMENT: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+fn note_changed_since_placement(rel: &str) {
+    CHANGED_SINCE_PLACEMENT
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(rel.to_string());
+}
+
+/// What the tree file or directory at `rel` holds now, hashed once per
+/// process.
 fn now_hash(build_dir: &Path, rel: &str) -> Option<String> {
     if let Some(h) = NOW.lock().unwrap().as_ref().and_then(|m| m.get(rel)) {
         return h.clone();
@@ -356,46 +335,35 @@ fn now_hash(build_dir: &Path, rel: &str) -> Option<String> {
     h
 }
 
-/// The paths an earlier pass placed, from its journal: those it put over a
-/// configure file (O), and all of them.
-type Journaled = (
-    std::collections::HashSet<String>,
-    std::collections::HashSet<String>,
-);
-
-fn journaled(state: &Path, build_dir: &Path) -> std::io::Result<Journaled> {
-    let mut o = std::collections::HashSet::new();
-    let mut all = std::collections::HashSet::new();
-    for l in read_lines(&state.join("placed.v1"), build_dir)?.unwrap_or_default() {
-        if let Some((k, rel, _)) = parse_journal(&l) {
-            if k == 'O' {
-                o.insert(rel.to_string());
-            }
-            all.insert(rel.to_string());
-        }
-    }
-    Ok((o, all))
-}
-
-/// A tree file's content hash, or a directory's (every file below it,
-/// path and content, in order), or None for what is neither or unreadable.
+/// A tree file's hash (content and executable bit, as an upload keeps
+/// them), or a directory's (every entry below it in order: each file's path
+/// and hash, each symlink's path and link text), or None for what is
+/// neither or unreadable.
 fn tree_hash(path: &Path) -> Option<String> {
     use std::hash::{Hash as _, Hasher as _};
+    let file = |p: &Path, h: &mut std::collections::hash_map::DefaultHasher| -> Option<()> {
+        std::fs::read(p).ok()?.hash(h);
+        (std::fs::metadata(p).ok()?.mode() & 0o111 != 0).hash(h);
+        Some(())
+    };
     let mut h = std::collections::hash_map::DefaultHasher::new();
     if path.is_file() {
-        std::fs::read(path).ok()?.hash(&mut h);
+        file(path, &mut h)?;
     } else if path.is_dir() {
         let mut entries: Vec<_> = walkdir::WalkDir::new(path)
             .min_depth(1)
             .into_iter()
             .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-            .map(|e| e.into_path())
+            .filter(|e| e.file_type().is_file() || e.file_type().is_symlink())
             .collect();
-        entries.sort();
+        entries.sort_by(|a, b| a.path().cmp(b.path()));
         for e in entries {
-            e.strip_prefix(path).ok()?.hash(&mut h);
-            std::fs::read(&e).ok()?.hash(&mut h);
+            e.path().strip_prefix(path).ok()?.hash(&mut h);
+            if e.file_type().is_symlink() {
+                std::fs::read_link(e.path()).ok()?.hash(&mut h);
+            } else {
+                file(e.path(), &mut h)?;
+            }
         }
     } else {
         return None;
@@ -486,7 +454,6 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
             .enumerate()
             .map(|(i, f)| (f.clone(), i))
             .collect();
-        let replaced_configure = journaled(&pass.state, &pass.build_dir)?.0;
         let names = INTERNED.lock().unwrap().clone().unwrap_or_default().0;
         for (k, inputs) in EMITTED_INPUTS.lock().unwrap().iter() {
             if edges.contains_key(k) && !pass.replaced.contains(k) {
@@ -495,13 +462,13 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
             let mut ix = Vec::new();
             for &n in inputs {
                 let p = &names[n as usize];
-                if p.contains(['\n', '\t']) || replaced_configure.contains(p) {
+                if p.contains(['\n', '\t']) {
                     continue;
                 }
                 // As the tree holds it at this pass's exit: hooks run between
                 // passes, not during one, and this is the file as the task
                 // was given it, whatever the driver rewrote in its upload.
-                let Some(h) = tree_hash(&pass.build_dir.join(p)) else {
+                let Some(h) = now_hash(&pass.build_dir, p) else {
                     continue;
                 };
                 let next = files.len();
@@ -545,6 +512,29 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
     let mut pass = pass;
     pass.fallback
         .extend(nix_builder_rpc_client::built_watched());
+    // A REUSED EDGE A TREE FILE OF WHICH CHANGED SINCE IT WAS WRITTEN (a
+    // hook edited or removed a source or a generated file between phases)
+    // is not rebuilt, as reuse is the point; it is counted, so the round
+    // sees it. Compared here, at exit, as the record was taken: placement
+    // has put this pass's outputs back and the rewind has finished, so
+    // both sides see the tree as a pass leaves it.
+    let edited = CHANGED_SINCE_PLACEMENT
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_default();
+    let mut stale: std::collections::BTreeSet<String> = pass
+        .reused_edges
+        .iter()
+        .filter(|(k, _)| {
+            pass.edge_inputs.get(k).into_iter().flatten().any(|&i| {
+                let (p, then) = &pass.files[i];
+                edited.contains(p) || now_hash(&pass.build_dir, p).as_ref() != Some(then)
+            })
+        })
+        .map(|(_, d)| d.clone())
+        .collect();
+    stale.extend(pass.unresolved.iter().cloned());
     let first3 = |v: Vec<&str>| v.into_iter().take(3).collect::<Vec<_>>().join(" ");
     Ok(Some(format!(
         "nix-ninja: later-pass reused {} task(s), derived {} fresh, {} fallback, {} stale: \
@@ -552,9 +542,9 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
         pass.reused,
         fresh.len(),
         pass.fallback.len(),
-        pass.stale.len(),
+        stale.len(),
         first3(pass.fallback.iter().map(String::as_str).collect()),
-        first3(pass.stale.iter().map(String::as_str).collect()),
+        first3(stale.iter().map(String::as_str).collect()),
         first3(fresh.iter().map(|d| d.as_str()).collect()),
     )))
 }
@@ -1384,6 +1374,7 @@ impl Rewind {
                     // directory): it stays visible, as it was before.
                     if placed_stamp != Some(stamp(&meta).as_str()) {
                         changed += 1;
+                        note_changed_since_placement(rel);
                         continue;
                     }
                     dest.parent()
@@ -1442,6 +1433,7 @@ impl Rewind {
                 }
                 Ok(_) => {
                     changed += 1;
+                    note_changed_since_placement(rel);
                     continue;
                 }
             }
@@ -2452,10 +2444,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// STALE IS COUNTED AGAINST WHAT EACH EDGE READ: an edge a later pass
-    /// derived after a hook changed a file read the new content and is not
-    /// stale on the pass after; a file inside a directory input counts; a
-    /// path placement put over a configure file is not compared.
+    /// STALE IS COUNTED AGAINST WHAT EACH EDGE READ, at exit, as the record
+    /// was taken: a source a hook changed or removed counts, and so does a
+    /// file inside a directory input; an edge a later pass derived after
+    /// the change read the new content and does not count on the pass
+    /// after; a placed output placed again does not count, but one the
+    /// rewind found edited since placement does, though placement wrote the
+    /// reused output back over the edit.
     #[test]
     fn stale_counts_what_each_edge_read() {
         let _g = super::PASS_TEST_LOCK.lock().unwrap();
@@ -2469,59 +2464,49 @@ mod tests {
             super::EMITTED.lock().unwrap().clear();
             super::EMITTED_INPUTS.lock().unwrap().clear();
             *super::NOW.lock().unwrap() = None;
+            *super::CHANGED_SINCE_PLACEMENT.lock().unwrap() = None;
         };
         write(&bd.join("h.h"), "v1");
         write(&bd.join("data/x.txt"), "one");
-        write(&bd.join("conf.h"), "placed");
+        write(&bd.join("conf.h"), "placed over configure's");
         write(&bd.join("gone.h"), "source");
-        write(&bd.join("placed.h"), "a pass-1 output");
+        write(&bd.join("gen.h"), "a pass-1 output");
         reset();
         super::begin_pass(&bd, true, "v").unwrap();
-        super::note_task(
-            &out("a.o"),
-            "/nix/store/aaa-a.drv",
-            vec!["h.h".into(), "conf.h".into()],
-        );
-        super::note_task(&out("d.o"), "/nix/store/ddd-d.drv", vec!["data".into()]);
-        super::note_task(&out("e.o"), "/nix/store/eee-e.drv", vec!["conf.h".into()]);
-        super::note_task(&out("f.o"), "/nix/store/fff-f.drv", vec!["gone.h".into()]);
-        super::note_task(&out("g.o"), "/nix/store/ggg-g.drv", vec!["placed.h".into()]);
+        let edges = [
+            ("a.o", "aaa", "h.h"),
+            ("d.o", "ddd", "data"),
+            ("e.o", "eee", "conf.h"),
+            ("f.o", "fff", "gone.h"),
+            ("g.o", "ggg", "gen.h"),
+        ];
+        for (o, d, input) in edges {
+            super::note_task(
+                &out(o),
+                &format!("/nix/store/{d}-x.drv"),
+                vec![input.into()],
+            );
+        }
         super::pass_report().unwrap();
         save_in(&state, &bd, &ConfigureState::default()).expect("saved");
-        // conf.h was placed over configure's file; a later pass reads
-        // configure's version there.
-        super::write_lines(
-            &state.join("placed.v1"),
-            &bd,
-            &[
-                "O 1.0 6 conf.h".to_string(),
-                "F 1.0 15 placed.h".to_string(),
-            ],
-            false,
-        )
-        .unwrap();
-        // A hook removes a source; the rewind sets a placed output aside.
-        std::fs::remove_file(bd.join("gone.h")).unwrap();
-        std::fs::remove_file(bd.join("placed.h")).unwrap();
-        write(&bd.join("conf.h"), "configure's");
+        // Between phases: a hook changes a source and a file in a directory
+        // input, removes a source, and edits a generated file.
         write(&bd.join("h.h"), "v2");
         write(&bd.join("data/x.txt"), "two");
-        // Pass 2: a.o and d.o are stale; c.o is derived fresh, reading v2.
+        std::fs::remove_file(bd.join("gone.h")).unwrap();
+        // Pass 2: the rewind finds gen.h edited since placement; placement
+        // writes the reused output back by exit. c.o is derived fresh.
         reset();
         super::begin_pass(&bd, true, "v").unwrap();
-        assert!(super::reuse(&out("a.o"), |_| true).is_some());
-        assert!(super::reuse(&out("d.o"), |_| true).is_some());
-        assert!(
-            super::reuse(&out("e.o"), |_| true).is_some(),
-            "conf.h holds configure's version here, as placed over: not stale"
-        );
-        assert!(super::reuse(&out("f.o"), |_| true).is_some());
-        assert!(super::reuse(&out("g.o"), |_| true).is_some());
+        super::note_changed_since_placement("gen.h");
+        for (o, _, _) in edges {
+            assert!(super::reuse(&out(o), |_| true).is_some());
+        }
         super::note_task(&out("c.o"), "/nix/store/ccc-c.drv", vec!["h.h".into()]);
         let line = super::pass_report().unwrap().unwrap();
-        assert!(line.contains(", 3 stale: "), "{line}");
-        // Pass 3, nothing changed since: a.o and d.o still differ from what
-        // they read, c.o does not.
+        assert!(line.contains(", 4 stale: "), "{line}");
+        assert!(!line.contains("eee-x.drv"), "{line}");
+        // Pass 3, nothing changed since.
         reset();
         super::begin_pass(&bd, true, "v").unwrap();
         for o in ["a.o", "c.o", "d.o", "e.o", "f.o", "g.o"] {
@@ -2530,13 +2515,33 @@ mod tests {
         let line = super::pass_report().unwrap().unwrap();
         assert!(line.contains(", 3 stale: "), "{line}");
         assert!(!line.contains("ccc-c.drv"), "{line}");
-        assert!(
-            !line.contains("ggg-g.drv"),
-            "a placed output set aside: {line}"
-        );
         *super::PASS.lock().unwrap() = None;
         super::STRICT.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(&state);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A TREE HASH SEES WHAT AN UPLOAD KEEPS: a script's executable bit,
+    /// and a symlink's text inside a directory input.
+    #[test]
+    fn a_tree_hash_sees_the_mode_and_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("treehash");
+        write(&d.join("s.sh"), "echo");
+        let plain = super::tree_hash(&d.join("s.sh"));
+        std::fs::set_permissions(d.join("s.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_ne!(super::tree_hash(&d.join("s.sh")), plain, "chmod +x");
+        write(&d.join("dir/a"), "a");
+        write(&d.join("dir/b"), "b");
+        std::os::unix::fs::symlink("a", d.join("dir/l")).unwrap();
+        let before = super::tree_hash(&d.join("dir"));
+        std::fs::remove_file(d.join("dir/l")).unwrap();
+        std::os::unix::fs::symlink("b", d.join("dir/l")).unwrap();
+        assert_ne!(
+            super::tree_hash(&d.join("dir")),
+            before,
+            "a link retargeted"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
