@@ -312,8 +312,8 @@ pub fn note_task(outputs: &[PathBuf], drv: &str, inputs: Vec<String>) {
 /// nothing). A removal is not noted: placement puts back what was there,
 /// or the exit reads it missing. Placement may write
 /// the reused output over the edit before the pass ends, so the exit
-/// comparison cannot see it; a reused edge that read one where the hook
-/// left other content than the pass leaves is counted stale.
+/// comparison cannot see it; every recorded edge that read one where the
+/// hook left other content than the pass leaves is counted stale.
 static CHANGED_SINCE_PLACEMENT: std::sync::Mutex<
     Option<std::collections::HashMap<String, Option<String>>>,
 > = std::sync::Mutex::new(None);
@@ -548,18 +548,23 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
             })
         };
         // The journal spells a file by its resolved directory and its name,
-        // as the canonical path does below the canonical build dir.
+        // as the canonical path does below the canonical build dir; one that
+        // a link takes out of the tree it spells as written (`written_at`).
         let build_dir_c = std::fs::canonicalize(&pass.build_dir).ok();
         let placement_holds = |p: &str| {
             let Some(c) = std::fs::canonicalize(pass.build_dir.join(p)).ok() else {
                 return false;
             };
-            let Some(rel) = build_dir_c.as_ref().and_then(|b| c.strip_prefix(b).ok()) else {
+            let Some(rel) = build_dir_c
+                .as_ref()
+                .and_then(|b| c.strip_prefix(b).ok())
+                .map(|r| r.to_string_lossy().into_owned())
+                .or_else(|| written_at(&pass.build_dir, Path::new(p)))
+            else {
                 return false;
             };
-            std::fs::symlink_metadata(&c).is_ok_and(|m| {
-                m.is_file() && placements().get(rel.to_string_lossy().as_ref()) == Some(&stamp(&m))
-            })
+            std::fs::symlink_metadata(&c)
+                .is_ok_and(|m| m.is_file() && placements().get(&rel) == Some(&stamp(&m)))
         };
         let unknown: std::collections::BTreeSet<usize> = edges
             .values()
@@ -640,8 +645,9 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
         .iter()
         // A removal placement undid left the bytes every reader read, as a
         // rewrite of the same bytes does; one left standing reads as missing
-        // at exit.
-        .filter(|(e, h)| h.is_some() && **h != now_hash(&pass.build_dir, e))
+        // at exit. Hashed as the note was, so an unreadable edit left
+        // standing is not one written over.
+        .filter(|(e, h)| h.is_some() && **h != left_hash(&pass.build_dir.join(e)))
         .filter_map(|(e, _)| canon(e))
         .collect();
     let overwritten_under: std::collections::HashSet<usize> = if overwritten.is_empty() {
@@ -668,16 +674,23 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
         .map(|(_, d)| d.clone())
         .collect();
     // AN EDIT WRITTEN OVER IS GONE AFTER THIS PASS: every recorded reader
-    // counts now, reused here or not, with or without a baseline (a pass whose target is the generated
-    // file itself reuses only its generator), since a later pass that
-    // reuses it finds placement's bytes and nothing to compare.
+    // counts now, reused here or not (a pass whose target is the generated
+    // file itself reuses only its generator), with or without a baseline,
+    // since a later pass that reuses it finds placement's bytes and nothing
+    // to compare. An edge this pass derived again is named by what it wrote.
     if !overwritten_under.is_empty() {
-        let earlier = pass.earlier.clone().unwrap_or_default();
         stale.extend(
             pass.edge_inputs
                 .iter()
                 .filter(|(_, ix)| ix.iter().any(|i| overwritten_under.contains(i)))
-                .filter_map(|(k, _)| earlier.get(k).cloned()),
+                .filter_map(|(k, _)| {
+                    if pass.replaced.contains(k) {
+                        emitted.get(k)
+                    } else {
+                        earlier.get(k)
+                    }
+                    .cloned()
+                }),
         );
     }
     stale.extend(pass.unresolved.iter().cloned());
@@ -2744,7 +2757,8 @@ mod tests {
         };
         for (o, drv, inputs) in edges {
             let out = [PathBuf::from(o)];
-            if super::reuse(&out, |_| true).is_none() {
+            let missing = MISSING.lock().unwrap().clone();
+            if super::reuse(&out, |d| missing.as_deref() != Some(d)).is_none() {
                 super::note_task(&out, drv, inputs.iter().map(|s| s.to_string()).collect());
             }
         }
@@ -2794,6 +2808,9 @@ mod tests {
         }
         super::pass_report().unwrap()
     }
+
+    /// A recorded task derivation gone from the store: its edge falls back.
+    static MISSING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
     /// The next `drive_pass` dies between journaling and finishing: its
     /// rewind puts back on drop.
@@ -3470,6 +3487,140 @@ mod tests {
         let line = drive_pass(&bd, &r, &edges, &[]).unwrap();
         assert!(line.contains(", 0 stale: "), "{line}");
         assert!(bd.join("out/a").is_file(), "the directory came back");
+        end_passes(&d, &bd);
+    }
+
+    /// AN EDIT WRITTEN OVER COUNTS EACH READER ONCE, through every input
+    /// shape: a link, a directory, an absolute spelling, a `./` spelling,
+    /// and an edge reading several of them.
+    #[test]
+    fn an_edit_written_over_counts_every_shape_once() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let (d, bd) = pass_dir("nnr-k-shapes");
+        let r = ConfigureState::default();
+        let abs = bd.join("lib.so.1").to_string_lossy().into_owned();
+        let a = [abs.as_str()];
+        let edges: [Edge; 5] = [
+            ("l.o", "/nix/store/lll-l.drv", &["lib.so"]),
+            ("d.o", "/nix/store/ddd-d.drv", &["pkg"]),
+            ("a.o", "/nix/store/aaa-a.drv", &a),
+            ("c.o", "/nix/store/ccc-c.drv", &["./lib.so.1"]),
+            (
+                "m.o",
+                "/nix/store/mmm-m.drv",
+                &["lib.so", "lib.so.1", "pkg/m.h"],
+            ),
+        ];
+        let place = [
+            ("lib.so.1", "old:the library"),
+            ("lib.so", "->lib.so.1"),
+            ("pkg", "<dir>"),
+            ("pkg/m.h", "a header"),
+        ];
+        drive_pass(&bd, &r, &edges, &place);
+        let line = drive_pass(&bd, &r, &edges, &place).unwrap();
+        assert!(line.contains(", 0 stale: "), "clean: {line}");
+        write(&bd.join("lib.so.1"), "a hook's edit");
+        write(&bd.join("pkg/m.h"), "a hook's edit");
+        let line = drive_pass(&bd, &r, &edges, &place).unwrap();
+        assert!(
+            line.contains("reused 5 task(s)") && line.contains(", 5 stale: "),
+            "{line}"
+        );
+        let line = drive_pass(&bd, &r, &edges, &place).unwrap();
+        assert!(line.contains(", 0 stale: "), "after: {line}");
+        end_passes(&d, &bd);
+    }
+
+    /// AN EDIT WRITTEN OVER COUNTS READERS WITH NO BASELINE (pass 1 placed
+    /// nothing): a directory input and a file inside it.
+    #[test]
+    fn an_edit_written_over_counts_unknown_baselines() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let (d, bd) = pass_dir("nnr-k-unknown");
+        let r = ConfigureState::default();
+        let edges: [Edge; 2] = [
+            ("d.o", "/nix/store/ddd-d.drv", &["pkg"]),
+            ("g.o", "/nix/store/ggg-g.drv", &["pkg/g.h"]),
+        ];
+        let place = [("pkg", "<dir>"), ("pkg/g.h", "a header")];
+        drive_pass(&bd, &r, &edges, &[]);
+        let line = drive_pass(&bd, &r, &edges, &place).unwrap();
+        assert!(line.contains(", 0 stale: "), "placed: {line}");
+        write(&bd.join("pkg/g.h"), "a hook's edit");
+        let line = drive_pass(&bd, &r, &edges, &place).unwrap();
+        assert!(line.contains(", 2 stale: "), "{line}");
+        end_passes(&d, &bd);
+    }
+
+    /// AN UNREADABLE EDIT LEFT STANDING is no edit written over: it counts
+    /// for a reader reused over it, as any edit left standing does, and for
+    /// none on a pass that reuses no reader; written over, it counts.
+    #[test]
+    fn an_unreadable_edit_left_standing_is_not_written_over() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        let (d, bd) = pass_dir("unreadable-standing");
+        let r = ConfigureState::default();
+        write(&bd.join("t.c"), "a test");
+        let x: Edge = ("x.o", "/nix/store/xxx-x.drv", &["g.h"]);
+        let t: Edge = ("t.o", "/nix/store/ttt-t.drv", &["t.c"]);
+        drive_pass(&bd, &r, &[x, t], &[("g.h", "AAAA")]);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write(&bd.join("g.h"), "a hook's edit");
+        std::fs::set_permissions(bd.join("g.h"), std::fs::Permissions::from_mode(0o200)).unwrap();
+        let line = drive_pass(&bd, &r, &[t], &[]).unwrap();
+        assert!(line.contains(", 0 stale: "), "no reader: {line}");
+        let line = drive_pass(&bd, &r, &[x, t], &[]).unwrap();
+        assert!(line.contains(", 1 stale: "), "reader reused: {line}");
+        let line = drive_pass(&bd, &r, &[x, t], &[("g.h", "new:AAAA")]).unwrap();
+        assert!(line.contains(", 1 stale: "), "written over: {line}");
+        let line = drive_pass(&bd, &r, &[x, t], &[]).unwrap();
+        assert!(line.contains(", 0 stale: "), "after: {line}");
+        end_passes(&d, &bd);
+    }
+
+    /// A FILE PLACED THROUGH A LINK THAT LEAVES THE TREE fills an unknown
+    /// input: the journal spells it as written, and a later edit counts.
+    #[test]
+    fn a_file_placed_through_a_link_out_of_the_tree_fills() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let (d, bd) = pass_dir("out-of-tree");
+        std::fs::create_dir_all(d.join("outside")).unwrap();
+        std::os::unix::fs::symlink(d.join("outside"), bd.join("ext")).unwrap();
+        let r = ConfigureState::default();
+        let edges: [Edge; 1] = [("x.o", "/nix/store/xxx-x.drv", &["ext/g.h"])];
+        let place = [("ext/g.h", "a pass-2 output")];
+        drive_pass(&bd, &r, &edges, &[]);
+        let line = drive_pass(&bd, &r, &edges, &place).unwrap();
+        assert!(line.contains(", 0 stale: "), "placed: {line}");
+        write(&bd.join("ext/g.h"), "a hook's edit of it");
+        let line = drive_pass(&bd, &r, &edges, &[]).unwrap();
+        assert!(line.contains(", 1 stale: "), "edited: {line}");
+        end_passes(&d, &bd);
+    }
+
+    /// AN EDGE DERIVED AGAIN (its recorded task gone) whose input a hook
+    /// edited and placement wrote over is named by what this pass wrote.
+    #[test]
+    fn a_replaced_edge_is_named_by_its_replacement() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let (d, bd) = pass_dir("replaced-name");
+        let r = ConfigureState::default();
+        let place = [("g.h", "AAAA")];
+        let x: Edge = ("x.o", "/nix/store/xxx-x.drv", &["g.h"]);
+        drive_pass(&bd, &r, &[x], &place);
+        write(&bd.join("g.h"), "a hook's edit of it");
+        *MISSING.lock().unwrap() = Some("/nix/store/xxx-x.drv".into());
+        let again: Edge = ("x.o", "/nix/store/x22-x.drv", &["g.h"]);
+        let line = drive_pass(&bd, &r, &[again], &place).unwrap();
+        *MISSING.lock().unwrap() = None;
+        assert!(
+            line.contains(
+                "1 fallback, 1 stale: /nix/store/xxx-x.drv; stale: /nix/store/x22-x.drv;"
+            ),
+            "{line}"
+        );
         end_passes(&d, &bd);
     }
 
