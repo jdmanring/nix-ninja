@@ -379,7 +379,7 @@ fn refresh_placed_mtimes(
             continue;
         }
         if !dest.is_symlink() {
-            touch_placed_copy(&dest, &src)?;
+            touch_placed_copy(prefix, &dest, &src)?;
             continue;
         }
         // A SYMLINK IS SOMETIMES A NAME RATHER THAN A PRODUCT, and replacing
@@ -447,8 +447,6 @@ fn refresh_tree_mtimes(src: &Path, dest: &Path) -> std::io::Result<()> {
             refresh_tree_mtimes(&from, &to)?;
         } else if to.is_symlink() && placement_is_ours(&to, &from) {
             refresh_one(&to, &from)?;
-        } else if !to.is_symlink() {
-            touch_placed_copy(&to, &from)?;
         }
     }
     Ok(())
@@ -460,15 +458,46 @@ fn refresh_tree_mtimes(src: &Path, dest: &Path) -> std::io::Result<()> {
 /// which reads as older than every source to real ninja here. A regular file
 /// still at its source's exact mtime is such a copy; it is stamped now, its
 /// bytes untouched. A file the build wrote has a time of its own.
-fn touch_placed_copy(dest: &Path, src: &Path) -> std::io::Result<()> {
+///
+/// File inputs only: `link_tree` places a tree's files as links, so a
+/// regular file inside a placed tree is the build tree's own and keeps its
+/// time (`refresh_tree_mtimes`). A destination resolving outside the build
+/// tree (a directory linked into the store) is left alone, as in
+/// `ninja_state`. The stamp is the kernel's `UTIME_NOW`, the clock
+/// `refresh_one` and `mark_start` read; it needs ownership, not write
+/// access, so the file is opened read-only.
+fn touch_placed_copy(prefix: &Path, dest: &Path, src: &Path) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
     let at = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     if !dest.is_file() || at(dest).is_none() || at(dest) != at(src) {
         return Ok(());
     }
-    std::fs::File::options()
-        .write(true)
-        .open(dest)
-        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+    let inside = std::fs::canonicalize(dest)
+        .ok()
+        .zip(std::fs::canonicalize(prefix).ok())
+        .is_some_and(|(d, p)| d.starts_with(p));
+    if !inside {
+        return Ok(());
+    }
+    let stamp = |f: std::fs::File| {
+        let now = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_NOW,
+            },
+        ];
+        // SAFETY: a valid open fd and a two-element timespec array.
+        match unsafe { libc::futimens(f.as_raw_fd(), now.as_ptr()) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    };
+    std::fs::File::open(dest)
+        .and_then(stamp)
         .map_err(|e| std::io::Error::other(format!("stamping {}: {e}", dest.display())))
 }
 
@@ -942,8 +971,10 @@ mod refresh_tree_mtimes_tests {
         // product: `placement_is_ours` must refuse it.
         std::fs::write(build.join("kept.cpp"), b"the build tree's").unwrap();
         std::os::unix::fs::symlink("kept.cpp", build.join("alias.cpp")).unwrap();
-        // A header the copy arm placed: a regular file at the store's time,
-        // in the tree and as a file input of its own.
+        // A header the copy arm placed as a file input of its own: a regular
+        // file at the store's time. And the build tree's own 0444 file at
+        // mtime 1 inside the placed tree (cmake `file(COPY)` keeps both),
+        // which placement never wrote and must neither stamp nor fail on.
         let one = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
         let stamp = |p: &std::path::Path| {
             std::fs::File::options()
@@ -961,6 +992,11 @@ mod refresh_tree_mtimes_tests {
             stamp(&p);
         }
         stamp(&d.join("build/h.h"));
+        std::fs::set_permissions(
+            build.join("ui_c.h"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o444),
+        )
+        .unwrap();
 
         let store_dir = StoreDir::new(&store_root).unwrap();
         let df =
@@ -968,13 +1004,22 @@ mod refresh_tree_mtimes_tests {
         let hf =
             DerivedFile::from_encoded(&store_dir, &format!("{}:h.h:", hstore.display())).unwrap();
         refresh_placed_mtimes(&d.join("build"), &store_dir, &[df, hf]).expect("refreshed");
-        for copy in [build.join("ui_c.h"), d.join("build/h.h")] {
-            assert!(
-                std::fs::metadata(&copy).unwrap().modified().unwrap() > one,
-                "{} was placed as a copy at the store's time and must read as new",
-                copy.display()
-            );
-        }
+        assert!(
+            std::fs::metadata(d.join("build/h.h"))
+                .unwrap()
+                .modified()
+                .unwrap()
+                > one,
+            "h.h was placed as a copy at the store's time and must read as new"
+        );
+        assert_eq!(
+            std::fs::metadata(build.join("ui_c.h"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            one,
+            "a file the build tree held inside a placed tree keeps its time"
+        );
 
         for placed in ["moc_a.cpp", "sub/moc_b.cpp"] {
             assert!(
