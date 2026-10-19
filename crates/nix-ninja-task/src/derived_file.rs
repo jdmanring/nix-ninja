@@ -559,6 +559,18 @@ pub fn create_symlinks_with(
         // eleven, and `.inl`, `.inc`, `.ipp` and `.tcc` failed this class
         // while `.h` built.
         //
+        // A SHADER AND AN ICON JOIN FOR THE SAME REASON WITH TWO MORE
+        // CONSUMERS. qsb's glslang includer resolves `#include
+        // "../effectlib/x.glsllib"` against the shader's RESOLVED directory,
+        // so a linked shader looks for its include in the store and every
+        // qtquick3d shader with an include failed `Failed to find include
+        // file` (a replay of the kept task: linked exit 1, copied exit 0).
+        // The suffixes are the six stages qsb deduces from a file's
+        // extension plus the two include spellings. breeze-icons' tools ask
+        // `os.path.islink` and `QFileInfo::isSymLink` of each icon and treat
+        // a link as an alias, so with every `.svg` placed as a link they
+        // processed none.
+        //
         // AN EXECUTABLE WITH AN `$ORIGIN` SEARCH PATH IS THE SAME CLASS ONE
         // LEVEL DOWN, and it is asked LAST because it costs a read of the
         // file rather than a test on its name. Those arms exist because a
@@ -575,6 +587,21 @@ pub fn create_symlinks_with(
                 .extension()
                 .is_some_and(|e| e == "py" || e == "mjs" || e == "js" || e == "cjs")
                 || header_like(&input.build_path)
+                || matches!(
+                    input.build_path.extension().and_then(|e| e.to_str()),
+                    Some(
+                        "vert"
+                            | "tesc"
+                            | "tese"
+                            | "geom"
+                            | "frag"
+                            | "comp"
+                            | "glsl"
+                            | "glsllib"
+                            | "svg"
+                            | "svgz"
+                    )
+                )
                 || input
                     .build_path
                     .components()

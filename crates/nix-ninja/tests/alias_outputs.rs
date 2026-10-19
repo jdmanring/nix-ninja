@@ -797,3 +797,59 @@ fn a_copied_header_is_writable_at_its_destination() {
     );
     std::fs::write(&placed, b"#define M 2\n").expect("a placed header must be writable");
 }
+
+/// A SHADER OR AN ICON IS PLACED AS A COPY, AND NOTHING ELSE JOINS WITH IT.
+/// qsb resolves a shader's `#include` against the shader's resolved
+/// directory and breeze-icons' tools read a linked icon as an alias, so each
+/// suffix below failed or did nothing while placed as a link into the store.
+/// The controls share no suffix with the arm and must still arrive as links:
+/// `.qsb` is the shader's own output, `.svgx` and `.fragment` sit one
+/// character off a member, `.png` is the other icon format.
+#[test]
+fn a_shader_or_an_icon_is_a_copy_and_its_neighbours_stay_links() {
+    use harmonia_store_path::StoreDir;
+    use nix_ninja_task::derived_file::{create_symlinks, DerivedFile};
+
+    let d = dir("shader-icon-suffixes");
+    let store_root = d.join("store");
+    let build = d.join("build");
+    std::fs::create_dir_all(&build).unwrap();
+
+    let store_dir = StoreDir::new(&store_root).unwrap();
+    let copied = [
+        "vert", "tesc", "tese", "geom", "frag", "comp", "glsl", "glsllib", "svg", "svgz",
+    ];
+    let linked = ["qsb", "png", "svgx", "fragment", "c", "txt"];
+    let mut inputs = Vec::new();
+    for (i, ext) in copied.iter().chain(linked.iter()).enumerate() {
+        let hash = format!("{:0>32}", format!("{i}aaaaaaaa"));
+        let name = format!("ninja-build-res-x.{ext}");
+        let sp = store_root.join(format!("{hash}-{name}"));
+        std::fs::create_dir_all(sp.join("res")).unwrap();
+        std::fs::write(sp.join(format!("res/x.{ext}")), b"x\n").unwrap();
+        let rel = format!("res/x.{ext}");
+        inputs.push(
+            DerivedFile::from_encoded(
+                &store_dir,
+                &format!("{}/{hash}-{name}:{rel}:{rel}", store_root.display()),
+            )
+            .unwrap(),
+        );
+    }
+
+    create_symlinks(&build, &store_dir, inputs, false).expect("inputs place");
+
+    for ext in copied {
+        let placed = build.join(format!("res/x.{ext}"));
+        assert!(
+            !placed.is_symlink() && placed.is_file(),
+            ".{ext} was placed as a link, so its consumer resolves it in the store"
+        );
+    }
+    for ext in linked {
+        assert!(
+            build.join(format!("res/x.{ext}")).is_symlink(),
+            ".{ext} is not a member of the arm and must still be placed as a link"
+        );
+    }
+}
