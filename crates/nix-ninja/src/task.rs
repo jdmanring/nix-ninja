@@ -11744,22 +11744,17 @@ fn valac_referenced_paths(
 /// or None if the command is not a swig run. Kept separate from the reader so
 /// the trigger is testable without a filesystem.
 ///
-/// Both `-I` spellings, as in `protoc_invocation`: the separated value must be
-/// consumed here or a directory ending in `.i` would read as a file. `-I-` is
-/// swig's "do not search the current directory" switch, not a root.
+/// Joined `-I` only: swig 4.4.1 rejects `-I dir` ("Unrecognized option
+/// dir") and reads a bare `-I` as an empty root, so the argument after it is
+/// still the interface file. `-I-` is swig's "do not search the current
+/// directory" switch, not a root.
 fn swig_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
     if !args.iter().any(|a| a.rsplit('/').next() == Some("swig")) {
         return None;
     }
     let (mut files, mut incs) = (Vec::new(), Vec::new());
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        let inc = if a == "-I" {
-            it.next().map(String::as_str)
-        } else {
-            a.strip_prefix("-I")
-        };
-        if let Some(v) = inc {
+    for a in args {
+        if let Some(v) = a.strip_prefix("-I") {
             if !v.is_empty() && v != "-" {
                 incs.push(v.to_string());
             }
@@ -12250,8 +12245,8 @@ mod its_and_swig_reader_tests {
         assert_eq!(swig_invocation(&b), Some((vec![], vec![])));
     }
 
-    /// The `-I` roots in argv order, joined and separated, and a separated
-    /// value is consumed rather than read as a positional `.i`. `-I-` is a
+    /// The joined `-I` roots in argv order. A bare `-I` is an empty root, so
+    /// the `.i` after it is still a file, as swig reads it. `-I-` is a
     /// switch, not a root.
     #[test]
     fn swig_takes_every_include_spelling_in_order() {
@@ -12263,8 +12258,8 @@ mod its_and_swig_reader_tests {
         assert_eq!(
             swig_invocation(&a),
             Some((
-                vec!["x.i".to_string()],
-                vec!["/s/a".to_string(), "rel.i".to_string(), "b".to_string()]
+                vec!["rel.i".to_string(), "x.i".to_string()],
+                vec!["/s/a".to_string(), "b".to_string()]
             ))
         );
     }
