@@ -13,7 +13,9 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use harmonia_protocol::daemon_wire::types2::{BuildMode, BuildResultInner, SuccessStatus};
+use harmonia_protocol::daemon_wire::types2::{
+    BuildMode, BuildResultInner, FailureStatus, SuccessStatus,
+};
 use harmonia_protocol::store_path::StoreDir;
 use harmonia_protocol::types::{DaemonError, DaemonErrorKind, DaemonStore};
 use harmonia_store_content_address::ContentAddressMethodAlgorithm;
@@ -65,8 +67,14 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
+    /// `transient`: the daemon called the failure possibly transient (or did
+    /// not say), so a later request may build it.
     #[error("build of {path} failed: {error_msg}")]
-    BuildFailed { path: String, error_msg: String },
+    BuildFailed {
+        path: String,
+        error_msg: String,
+        transient: bool,
+    },
     #[error("daemon returned no build result for {0}")]
     MissingBuildResult(String),
     // The variant name leads the Display text deliberately: the shell
@@ -572,6 +580,14 @@ pub struct BuilderRpcClient {
     /// hit, which made it O(paths asked) rather than O(paths).
     realised: Mutex<HashMap<String, (StorePath, bool)>>,
 
+    /// Derivation -> the build failure the daemon reported for it in this
+    /// process. The daemon keeps no record of a failure, so without this
+    /// every consumer that realises a failed producer builds it again: one
+    /// qttools iteration built five failing tasks 23 times each. Only a
+    /// `BuildFailed` is kept; a transport or daemon error is retried as
+    /// before.
+    failed: Mutex<HashMap<String, String>>,
+
     /// Canonical path -> (size, mtime_ns, store path) for NAR uploads.
     ///
     /// Dependency discovery uploads a store object per discovered include,
@@ -696,6 +712,66 @@ pub fn for_each_bounded<T: Send>(
         }
     }
     Ok(out)
+}
+
+/// The error for the first of `misses` whose derivation already failed in
+/// this run, if any.
+fn failed_earlier(
+    failed: &HashMap<String, String>,
+    store_dir: &StoreDir,
+    misses: &[SingleDerivedPath],
+) -> Option<Error> {
+    misses.iter().find_map(|m| {
+        let drv = built_drv(store_dir, m)?;
+        let why = failed.get(&drv)?;
+        Some(Error::BuildFailed {
+            error_msg: format!("failed earlier in this run, not built again: {why}"),
+            path: drv,
+            transient: false,
+        })
+    })
+}
+
+/// Records every derivation of `subset` as failed when `e` is a build
+/// failure the daemon did not call transient.
+fn note_build_failure(
+    failed: &mut HashMap<String, String>,
+    store_dir: &StoreDir,
+    subset: &[SingleDerivedPath],
+    e: &Error,
+) {
+    if let Error::BuildFailed {
+        error_msg,
+        transient: false,
+        ..
+    } = e
+    {
+        for m in subset {
+            if let Some(drv) = built_drv(store_dir, m) {
+                failed.entry(drv).or_insert_with(|| error_msg.clone());
+            }
+        }
+    }
+}
+
+/// Whether a build failure with this status may pass on a later request:
+/// the daemon's own "possibly transient", a timeout, or a failure it does
+/// not classify.
+fn failure_may_pass(status: &FailureStatus) -> bool {
+    matches!(
+        status,
+        FailureStatus::TransientFailure | FailureStatus::TimedOut | FailureStatus::MiscFailure
+    )
+}
+
+/// The derivation a derived path is built by, as the daemon names it.
+fn built_drv(store_dir: &StoreDir, p: &SingleDerivedPath) -> Option<String> {
+    match p {
+        SingleDerivedPath::Built { drv_path, .. } => {
+            Some(store_dir.display(drv_path.as_ref()).to_string())
+        }
+        SingleDerivedPath::Opaque(_) => None,
+    }
 }
 
 fn split_by_derivation(store_dir: &StoreDir, paths: &[SingleDerivedPath]) -> Vec<Vec<usize>> {
@@ -979,6 +1055,7 @@ impl BuilderRpcClient {
             in_drv,
             uploaded_drvs: Default::default(),
             realised: Default::default(),
+            failed: Default::default(),
             nar_uploads: Default::default(),
         })
     }
@@ -1429,9 +1506,18 @@ impl BuilderRpcClient {
         // for those. The cost is one round trip per derivation at the sites
         // that ask for several at once, which are the placement passes at
         // the end of a run; the per-task realise path asks for one.
+        // A DERIVATION THAT ALREADY FAILED IN THIS RUN IS NOT BUILT AGAIN:
+        // the same request fails with the same error, at once.
+        if let Some(e) = failed_earlier(&self.failed.lock().unwrap(), store_dir, &misses) {
+            return Err(e);
+        }
+        let note_failure = |subset: &[SingleDerivedPath], e: &Error| {
+            note_build_failure(&mut self.failed.lock().unwrap(), store_dir, subset, e)
+        };
         let groups = split_by_derivation(store_dir, &misses);
         let built = if groups.len() <= 1 {
-            self.build_paths_uncached(store_dir, &misses, patience)?
+            self.build_paths_uncached(store_dir, &misses, patience)
+                .inspect_err(|e| note_failure(&misses, e))?
         } else {
             // THE GROUPS RUN CONCURRENTLY, ONE REQUEST EACH. Serial, the
             // end-of-run placement of a restarted round asked the daemon for
@@ -1445,6 +1531,7 @@ impl BuilderRpcClient {
                 let subset: Vec<SingleDerivedPath> =
                     groups[g].iter().map(|&i| misses[i].clone()).collect();
                 self.build_paths_uncached(store_dir, &subset, patience)
+                    .inspect_err(|e| note_failure(&subset, e))
             })?;
             let mut by_slot: Vec<Option<StorePath>> = vec![None; misses.len()];
             for (group, got) in groups.iter().zip(results) {
@@ -1911,16 +1998,18 @@ impl BuilderRpcClient {
                         // no-op; failures still surface below.
                         match by_key.get(&key) {
                             Some(result) if result.success().is_none() => {
-                                let own = match &result.inner {
-                                    BuildResultInner::Failure(f) => {
-                                        String::from_utf8_lossy(&f.error_msg).into_owned()
-                                    }
-                                    _ => String::new(),
+                                let (own, transient) = match &result.inner {
+                                    BuildResultInner::Failure(f) => (
+                                        String::from_utf8_lossy(&f.error_msg).into_owned(),
+                                        failure_may_pass(&f.status),
+                                    ),
+                                    _ => (String::new(), true),
                                 };
                                 let extra = others(&display);
                                 Err(Error::BuildFailed {
                                     path: display,
                                     error_msg: format!("{own}{extra}"),
+                                    transient,
                                 })
                             }
                             _ => Ok(path.clone()),
@@ -1942,16 +2031,18 @@ impl BuilderRpcClient {
                         }
                         if let Some(result) = by_key.get(&key) {
                             if result.success().is_none() {
-                                let own = match &result.inner {
-                                    BuildResultInner::Failure(f) => {
-                                        String::from_utf8_lossy(&f.error_msg).into_owned()
-                                    }
-                                    _ => String::new(),
+                                let (own, transient) = match &result.inner {
+                                    BuildResultInner::Failure(f) => (
+                                        String::from_utf8_lossy(&f.error_msg).into_owned(),
+                                        failure_may_pass(&f.status),
+                                    ),
+                                    _ => (String::new(), true),
                                 };
                                 let extra = others(&display);
                                 return Err(Error::BuildFailed {
                                     path: display,
                                     error_msg: format!("{own}{extra}"),
+                                    transient,
                                 });
                             }
                         }
@@ -1970,6 +2061,7 @@ impl BuilderRpcClient {
                                 Error::BuildFailed {
                                     path: display.clone(),
                                     error_msg: failures.join("; "),
+                                    transient: true,
                                 }
                             }
                         })
@@ -2170,6 +2262,55 @@ mod realise_timer_tests {
     #[test]
     fn slow_threshold_stays_loud_enough_to_catch_a_stalled_round() {
         assert_eq!(SLOW_REALISE_MS, 30_000);
+    }
+}
+
+#[cfg(test)]
+mod failure_memo_tests {
+    use super::*;
+    use harmonia_store_derivation::derived_path::OutputName;
+
+    fn built(store_dir: &StoreDir, drv: &str) -> SingleDerivedPath {
+        SingleDerivedPath::Built {
+            drv_path: std::sync::Arc::new(SingleDerivedPath::Opaque(store_dir.parse(drv).unwrap())),
+            output: OutputName::default(),
+        }
+    }
+
+    fn failure(transient: bool) -> Error {
+        Error::BuildFailed {
+            path: String::new(),
+            error_msg: "builder failed with exit code 1".into(),
+            transient,
+        }
+    }
+
+    /// A build failure is answered from the memo for the same derivation and
+    /// no other; a transient one, or a transport error, is not kept.
+    #[test]
+    fn a_failed_derivation_is_not_built_again() {
+        let sd = StoreDir::default();
+        let a = built(&sd, "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv");
+        let b = built(&sd, "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
+        let mut failed = HashMap::new();
+        note_build_failure(&mut failed, &sd, &[a.clone()], &failure(true));
+        note_build_failure(&mut failed, &sd, &[a.clone()], &Error::NoDaemon);
+        assert!(failed_earlier(&failed, &sd, &[a.clone()]).is_none());
+        note_build_failure(&mut failed, &sd, &[a.clone()], &failure(false));
+        let e = failed_earlier(&failed, &sd, &[b.clone(), a.clone()]).expect("a failed");
+        assert!(
+            matches!(&e, Error::BuildFailed { path, transient: false, .. } if path.ends_with("-a.drv")),
+            "{e}"
+        );
+        assert!(failed_earlier(&failed, &sd, &[b]).is_none());
+    }
+
+    #[test]
+    fn only_a_possibly_passing_status_is_transient() {
+        assert!(failure_may_pass(&FailureStatus::TransientFailure));
+        assert!(failure_may_pass(&FailureStatus::TimedOut));
+        assert!(!failure_may_pass(&FailureStatus::PermanentFailure));
+        assert!(!failure_may_pass(&FailureStatus::DependencyFailed));
     }
 }
 
