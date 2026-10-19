@@ -2206,6 +2206,7 @@ impl Runner {
         // holds nothing) lost `| src/moc_X.cpp` that way on all 22 units.
         let direct: rustc_hash::FxHashSet<FileId> = build.ordering_ins().iter().copied().collect();
         let mut seen: rustc_hash::FxHashSet<FileId> = rustc_hash::FxHashSet::default();
+        let mut source_aliases: Vec<(String, String)> = Vec::new();
         while let Some((fid, via_phony)) = worklist.pop() {
             if !seen.insert(fid) {
                 continue;
@@ -2300,6 +2301,35 @@ impl Runner {
                 &tu_includes,
             ) {
                 continue;
+            }
+            // ASKED BEFORE THE MEMO: another route may already hold the link
+            // as content, and this edge still wants the link.
+            if files.by_id[fid].input.is_none() {
+                if let Some((links, target)) = declared_source_alias(
+                    &self.config.build_dir,
+                    &files.by_id[fid].name,
+                    direct.contains(&fid),
+                    is_gcc_task,
+                ) {
+                    let uploaded = upload_referenced_file(
+                        &self.rpc_client,
+                        &self.config.build_dir,
+                        target.clone(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "target {} of declared link {}",
+                            target.display(),
+                            files.by_id[fid].name
+                        )
+                    })?;
+                    for df in uploaded {
+                        self.add_derived_file(files, df.clone());
+                        input_set.insert(df.build_path.clone(), df);
+                    }
+                    source_aliases.extend(links);
+                    continue;
+                }
             }
             let input = match self.derived_files.get(&fid) {
                 Some(df) => df.to_owned(),
@@ -3747,6 +3777,14 @@ impl Runner {
         }
         inputs.sort();
         inputs.dedup();
+        // A LINK CARRIED AS TEXT IS NOT ALSO CARRIED AS CONTENT. A command
+        // that names the link (`cat ../icons/a-symbolic.svg`) uploads it again
+        // through the argv scan, and the task places inputs before it makes
+        // aliases, so the copy would hold the path and the link never appear.
+        if !source_aliases.is_empty() {
+            let links: HashSet<&Path> = source_aliases.iter().map(|(l, _)| Path::new(l)).collect();
+            inputs.retain(|df| !links.contains(df.build_path.as_path()));
+        }
 
         // Extract store paths from cmdline and add pre-extracted wrapper store paths
         lap(&NT_GRD_MS);
@@ -3880,7 +3918,17 @@ impl Runner {
             emit_only: self.config.emit_only,
             outputs,
             outer_stage_outputs,
-            alias_symlinks: self.alias_symlinks.clone(),
+            // The walk's set is sorted and deduped already, so an edge with
+            // no declared link carries it byte for byte.
+            alias_symlinks: if source_aliases.is_empty() {
+                self.alias_symlinks.clone()
+            } else {
+                let mut all = self.alias_symlinks.clone();
+                all.extend(source_aliases);
+                all.sort();
+                all.dedup();
+                all
+            },
             make_dirs,
             is_gcc_task,
             local_mode: !self.config.is_output_derivation,
@@ -10836,6 +10884,84 @@ fn alias_target_climbs_out(build_dir: &Path, link_abs: &Path) -> bool {
         .chain(resolved)
         .collect();
     !abs.starts_with(build_dir)
+}
+
+/// A DECLARED INPUT THAT IS A RELATIVE LINK TO ANOTHER FILE IN THE PROJECT
+/// TREE, as the `link=target` pairs that recreate it (every hop of a chain)
+/// and the build-dir spelling of the regular file the chain ends at, which is
+/// carried as content in the link's place. `None` keeps the input on the
+/// content upload it always had.
+///
+/// Uploading the link copies THROUGH it, so the task sees two independent
+/// files where the tree holds one file and a name for it. breeze-icons
+/// 6.30.0's qrc edge declares 14,026 `../icons/**` files, 8,391 of them
+/// links such as `accept_signal-symbolic.svg -> accept_signal.svg`, and its
+/// `qrcAlias` tool reads each link to emit a qrc alias; given copies it finds
+/// duplicate content and aborts. `NIX_NINJA_ALIASES` already recreates a
+/// relative link at any relative build path once inputs are placed, so the
+/// pairs ride there and the task binary needs nothing new.
+///
+/// GATED TO A DECLARED INPUT OF A NON-COMPILE EDGE, and the gate is the
+/// emission argument. Over the 6,643 task derivations kept from one round's
+/// trees, three carried a link of this shape as an upload: the two breeze
+/// qrc edges, which never built, and obs-browser's autogen edge, which built
+/// and reaches its one link (`build-aux/run-clang-format`) through a
+/// directory walk rather than a declaration. A link found by a walk or a
+/// reader stays content, and a compile never sees this path.
+pub fn declared_source_alias(
+    build_dir: &Path,
+    name: &str,
+    declared: bool,
+    is_gcc_task: bool,
+) -> Option<(Vec<(String, String)>, PathBuf)> {
+    if !declared || is_gcc_task {
+        return None;
+    }
+    let spelled = relative_from(Path::new(name), build_dir).unwrap_or_else(|| PathBuf::from(name));
+    let mut at = spelled.to_str()?.to_owned();
+    canon::canonicalize_path(&mut at);
+    let mut links = Vec::new();
+    // SYMLOOP_MAX's usual value: a cycle ends here rather than in the task.
+    for _ in 0..40 {
+        let on_disk = build_dir.join(&at);
+        if !fs::symlink_metadata(&on_disk)
+            .ok()?
+            .file_type()
+            .is_symlink()
+        {
+            break;
+        }
+        let text = fs::read_link(&on_disk).ok()?;
+        let t = text.to_str()?;
+        // An absolute target is a host path the sandbox does not have, and a
+        // newline or `=` in either half cannot ride the encoded list.
+        if text.is_absolute() || at.contains(['\n', '=']) || t.contains(['\n', '=']) {
+            return None;
+        }
+        let mut next = parent_dir_or_here(Path::new(&at))
+            .join(&text)
+            .to_str()?
+            .to_owned();
+        canon::canonicalize_path(&mut next);
+        links.push((at, t.to_owned()));
+        at = next;
+    }
+    if links.is_empty() {
+        return None;
+    }
+    // THE LEXICAL END MUST BE WHERE THE KERNEL LANDS. A directory link on the
+    // way makes `..` mean something else on disk than in the text, and the
+    // task resolves the text; so does a chain the loop above gave up on.
+    let end = build_dir.join(&at);
+    let landed = fs::canonicalize(&end).ok()?;
+    let md = fs::symlink_metadata(&end).ok()?;
+    if !md.is_file()
+        || landed != fs::canonicalize(build_dir.join(&spelled)).ok()?
+        || !same_project_tree(build_dir, &landed)
+    {
+        return None;
+    }
+    Some((links, PathBuf::from(at)))
 }
 
 fn alias_symlink_entry(build_dir: &Path, link_abs: &Path) -> Option<(String, String)> {
@@ -27394,5 +27520,174 @@ mod compile_filter_tests {
             "one the unit names is kept"
         );
         assert!(!drops(true, false, Path::new("src/x.h"), &none));
+    }
+}
+
+#[cfg(test)]
+mod declared_source_alias_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// breeze-icons 6.30.0's shape: the build dir sits inside the source
+    /// tree, the qrc edge declares icons by absolute path, and a link names
+    /// a sibling, a sibling link, or a file one size directory over.
+    fn icons(tag: &str) -> (Scratch, PathBuf, PathBuf) {
+        let root = Scratch::new(format!("nn-declared-alias-{tag}-{}", std::process::id()));
+        let src = root.join("breeze-icons-6.30.0");
+        let build = src.join("build");
+        let a16 = src.join("icons/actions/16");
+        let a22 = src.join("icons/actions/22");
+        for d in [&build, &a16, &a22] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(a16.join("accept_signal.svg"), "<svg/>\n").unwrap();
+        symlink("accept_signal.svg", a16.join("accept_signal-symbolic.svg")).unwrap();
+        fs::write(a22.join("system-run.svg"), "<svg run/>\n").unwrap();
+        symlink("../22/system-run.svg", a16.join("open-link.svg")).unwrap();
+        symlink("open-link.svg", a16.join("open-link-symbolic.svg")).unwrap();
+        (root, src, build)
+    }
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(l, t)| (l.to_string(), t.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_declared_link_is_carried_as_its_text_and_the_file_it_names_as_content() {
+        let (_root, src, build) = icons("subject");
+        let name = |rel: &str| src.join(rel).to_string_lossy().into_owned();
+
+        assert_eq!(
+            declared_source_alias(
+                &build,
+                &name("icons/actions/16/accept_signal-symbolic.svg"),
+                true,
+                false
+            ),
+            Some((
+                pairs(&[(
+                    "../icons/actions/16/accept_signal-symbolic.svg",
+                    "accept_signal.svg"
+                )]),
+                PathBuf::from("../icons/actions/16/accept_signal.svg"),
+            ))
+        );
+        // Every hop of a chain is carried, a climbing target included, and
+        // the content is the file the last hop names.
+        assert_eq!(
+            declared_source_alias(
+                &build,
+                &name("icons/actions/16/open-link-symbolic.svg"),
+                true,
+                false
+            ),
+            Some((
+                pairs(&[
+                    (
+                        "../icons/actions/16/open-link-symbolic.svg",
+                        "open-link.svg"
+                    ),
+                    ("../icons/actions/16/open-link.svg", "../22/system-run.svg"),
+                ]),
+                PathBuf::from("../icons/actions/22/system-run.svg"),
+            ))
+        );
+        // A build-dir-relative spelling answers the same.
+        assert_eq!(
+            declared_source_alias(
+                &build,
+                "../icons/actions/16/accept_signal-symbolic.svg",
+                true,
+                false
+            )
+            .map(|(_, t)| t),
+            Some(PathBuf::from("../icons/actions/16/accept_signal.svg"))
+        );
+    }
+
+    /// Each case differs from a carried link in one property, so only the
+    /// guard for that property can refuse it.
+    #[test]
+    fn an_undeclared_compiled_absolute_escaping_or_dangling_link_stays_content() {
+        let (_root, src, build) = icons("control");
+        let a16 = src.join("icons/actions/16");
+        let at = |n: &str| a16.join(n).to_string_lossy().into_owned();
+        let link = at("accept_signal-symbolic.svg");
+        assert!(
+            declared_source_alias(&build, &link, true, false).is_some(),
+            "control: carried"
+        );
+        assert_eq!(
+            declared_source_alias(&build, &link, false, false),
+            None,
+            "undeclared"
+        );
+        assert_eq!(
+            declared_source_alias(&build, &link, true, true),
+            None,
+            "a compile"
+        );
+        let file = at("accept_signal.svg");
+        assert_eq!(
+            declared_source_alias(&build, &file, true, false),
+            None,
+            "a regular file"
+        );
+
+        symlink(a16.join("accept_signal.svg"), a16.join("abs.svg")).unwrap();
+        assert_eq!(
+            declared_source_alias(&build, &at("abs.svg"), true, false),
+            None,
+            "absolute text"
+        );
+
+        // Relative text that climbs out of the project to a host file.
+        let depth = a16.components().count();
+        symlink(
+            format!("{}etc/passwd", "../".repeat(depth)),
+            a16.join("host.svg"),
+        )
+        .unwrap();
+        assert!(a16.join("host.svg").is_file(), "premise: the climb lands");
+        assert_eq!(
+            declared_source_alias(&build, &at("host.svg"), true, false),
+            None,
+            "outside the project"
+        );
+
+        symlink("missing.svg", a16.join("gone.svg")).unwrap();
+        assert_eq!(
+            declared_source_alias(&build, &at("gone.svg"), true, false),
+            None,
+            "dangling"
+        );
+
+        symlink("../22", a16.join("dir.svg")).unwrap();
+        assert_eq!(
+            declared_source_alias(&build, &at("dir.svg"), true, false),
+            None,
+            "a directory"
+        );
+
+        // A directory link on the way: `sub/../x` is `16/x` in the text and
+        // `actions/x` on disk, and the task would resolve the text.
+        symlink("../22", a16.join("sub")).unwrap();
+        fs::write(a16.join("only16.svg"), "<svg 16/>\n").unwrap();
+        fs::write(src.join("icons/actions/only16.svg"), "<svg up/>\n").unwrap();
+        symlink("sub/../only16.svg", a16.join("through.svg")).unwrap();
+        assert_eq!(
+            declared_source_alias(&build, &at("through.svg"), true, false),
+            None,
+            "lexical miss"
+        );
+
+        symlink("cycle.svg", a16.join("cycle.svg")).unwrap();
+        assert_eq!(
+            declared_source_alias(&build, &at("cycle.svg"), true, false),
+            None,
+            "a cycle"
+        );
     }
 }
