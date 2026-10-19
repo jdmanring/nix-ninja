@@ -14289,9 +14289,10 @@ mod qrc_copy_sourcedir_tests {
 
     #[test]
     fn a_climbing_entry_reaches_the_producer_spelling() {
-        // The gate twin's geometry: the qrc entry climbs out of its own
-        // directory (`../icons/gen.dat` from `.qt/rcc`), and the producing
-        // edge outputs the normalized spelling (`icons/gen.dat`). The
+        // The only place the climbing spelling is covered: the gate twin
+        // uses a non-climbing entry (so aaefd48 isolates the deferral),
+        // so this test pins the normalized join (`../icons/gen.dat` from
+        // `.qt/rcc` reaching the producer spelling `icons/gen.dat`). The
         // lexical join (`.qt/rcc/../icons/gen.dat`) never matches a graph
         // node; only the normalized one binds or defers.
         let build = Path::new("/build/x/build");
