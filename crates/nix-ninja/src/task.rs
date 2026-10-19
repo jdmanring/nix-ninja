@@ -3072,8 +3072,8 @@ impl Runner {
             }
             // A SWIG RUN RESOLVES ITS OWN `%include` TARGETS. Same family and
             // same reader placement as the ones around it.
-            if let Some(files) = &swig_i {
-                for p in swig_referenced_paths(&self.config.build_dir, &cd_dir, files) {
+            if let Some((files, incs)) = &swig_i {
+                for p in swig_referenced_paths(&self.config.build_dir, &cd_dir, files, incs) {
                     referenced.push(p);
                 }
             }
@@ -11740,19 +11740,34 @@ fn valac_referenced_paths(
     out
 }
 
-/// The `.i` files a swig invocation names, or None if the command is not a
-/// swig run. Kept separate from the reader so the trigger is testable without
-/// a filesystem.
-fn swig_invocation(args: &[String]) -> Option<Vec<String>> {
+/// The `.i` files a swig invocation names and its `-I` roots in argv order,
+/// or None if the command is not a swig run. Kept separate from the reader so
+/// the trigger is testable without a filesystem.
+///
+/// Both `-I` spellings, as in `protoc_invocation`: the separated value must be
+/// consumed here or a directory ending in `.i` would read as a file. `-I-` is
+/// swig's "do not search the current directory" switch, not a root.
+fn swig_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
     if !args.iter().any(|a| a.rsplit('/').next() == Some("swig")) {
         return None;
     }
-    Some(
-        args.iter()
-            .filter(|a| !a.starts_with('-') && a.ends_with(".i"))
-            .cloned()
-            .collect(),
-    )
+    let (mut files, mut incs) = (Vec::new(), Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let inc = if a == "-I" {
+            it.next().map(String::as_str)
+        } else {
+            a.strip_prefix("-I")
+        };
+        if let Some(v) = inc {
+            if !v.is_empty() && v != "-" {
+                incs.push(v.to_string());
+            }
+        } else if !a.starts_with('-') && a.ends_with(".i") {
+            files.push(a.clone());
+        }
+    }
+    Some((files, incs))
 }
 
 /// A `g-ir-scanner` RUN READS ITS SOURCES FROM A FILE IT NAMES ON THE COMMAND
@@ -12229,10 +12244,29 @@ mod its_and_swig_reader_tests {
         ];
         assert_eq!(
             swig_invocation(&a),
-            Some(vec!["../libnvme/nvme.i".to_string()])
+            Some((vec!["../libnvme/nvme.i".to_string()], vec![]))
         );
         let b = vec!["swig".into(), "--out=x.i".into()];
-        assert_eq!(swig_invocation(&b), Some(vec![]));
+        assert_eq!(swig_invocation(&b), Some((vec![], vec![])));
+    }
+
+    /// The `-I` roots in argv order, joined and separated, and a separated
+    /// value is consumed rather than read as a positional `.i`. `-I-` is a
+    /// switch, not a root.
+    #[test]
+    fn swig_takes_every_include_spelling_in_order() {
+        let a: Vec<String> = [
+            "swig", "-python", "-I/s/a", "-I", "rel.i", "-I-", "-Ib", "-o", "w.c", "x.i",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            swig_invocation(&a),
+            Some((
+                vec!["x.i".to_string()],
+                vec!["/s/a".to_string(), "rel.i".to_string(), "b".to_string()]
+            ))
+        );
     }
 
     /// THE EMITTED SPELLING, which the trigger tests above cannot see. A reader
@@ -12259,7 +12293,7 @@ mod its_and_swig_reader_tests {
             "%module nvme\n%include \"../src/nvme/types.h\"\n",
         )
         .unwrap();
-        let got = swig_referenced_paths(&bd, Path::new(""), &["../libnvme/nvme.i".into()]);
+        let got = swig_referenced_paths(&bd, Path::new(""), &["../libnvme/nvme.i".into()], &[]);
         assert_eq!(
             got,
             vec!["../libnvme/../src/nvme/types.h".to_string()],
@@ -12284,8 +12318,112 @@ mod its_and_swig_reader_tests {
         let bd = d.join("build");
         std::fs::create_dir_all(&bd).unwrap();
         std::fs::write(bd.join("x.i"), "%include \"nowhere/nope.h\"\n").unwrap();
-        let got = swig_referenced_paths(&bd, Path::new(""), &["x.i".into()]);
+        let got = swig_referenced_paths(&bd, Path::new(""), &["x.i".into()], &[]);
         assert!(got.is_empty(), "carried {got:?}");
+    }
+
+    /// obs-studio's wrapper edge, driven through the production path: the
+    /// build.ninja command (absolute `cd` prologue, absolute `-I` roots, an
+    /// absolute `.i`) goes through `rewrite_cmdline`, the trigger, the reader
+    /// and `referenced_file_rel`, so the assertion is on the build path the
+    /// task receives. `graphics/graphics.h` exists only under the libobs root;
+    /// `local.h` sits beside the `.i` and keeps its old spelling.
+    #[test]
+    fn a_swig_include_only_a_root_holds_is_carried_through_the_cd() {
+        use super::{referenced_file_rel, rewrite_cmdline, rewritten_cd_dir, Scratch, StoreDir};
+        let d = Scratch::new(format!("nn-swig-roots-{}", std::process::id()));
+        let src = d.join("source");
+        let bd = src.join("build");
+        let i_dir = src.join("shared/obs-scripting/obspython");
+        std::fs::create_dir_all(bd.join("shared/obs-scripting/obspython")).unwrap();
+        std::fs::create_dir_all(src.join("libobs/graphics")).unwrap();
+        std::fs::create_dir_all(&i_dir).unwrap();
+        std::fs::write(src.join("libobs/graphics/graphics.h"), "int g;\n").unwrap();
+        std::fs::write(src.join("libobs/angle.h"), "int a;\n").unwrap();
+        std::fs::write(i_dir.join("local.h"), "int l;\n").unwrap();
+        std::fs::write(
+            i_dir.join("obspython.i"),
+            "%module obspython\n%include \"graphics/graphics.h\"\n\
+             %include \"local.h\"\n%include <angle.h>\n%include <std_string.i>\n",
+        )
+        .unwrap();
+        let (s, b) = (src.display(), bd.display());
+        let cmd = format!(
+            "cd {b}/shared/obs-scripting/obspython && /store/bin/swig -python \
+             -I{s}/shared/obs-scripting -I{b}/config -I{s}/libobs -I/nix/store/x-simde/include \
+             -outdir {b}/shared/obs-scripting/obspython -o {b}/w.c \
+             {s}/shared/obs-scripting/obspython/obspython.i"
+        );
+        let args = shell_words::split(&rewrite_cmdline(&cmd, &bd)).unwrap();
+        let cd_dir = rewritten_cd_dir(&args);
+        assert_eq!(cd_dir, Path::new("shared/obs-scripting/obspython"));
+        let (files, incs) = swig_invocation(&args).unwrap();
+        let store = StoreDir::new(Path::new("/nix/store")).unwrap();
+        let wired = |incs: &[String]| -> Vec<String> {
+            swig_referenced_paths(&bd, &cd_dir, &files, incs)
+                .iter()
+                .filter_map(|c| referenced_file_rel(&bd, &store, &cd_dir, c))
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            wired(&incs),
+            vec![
+                "../libobs/graphics/graphics.h".to_string(),
+                "../shared/obs-scripting/obspython/local.h".to_string(),
+                "../libobs/angle.h".to_string(),
+            ]
+        );
+        // The control: without the roots only the `.i`-dir target is carried,
+        // the reading this edge had before the roots were parsed.
+        assert_eq!(
+            wired(&[]),
+            vec!["../shared/obs-scripting/obspython/local.h".to_string()]
+        );
+
+        // An ABSOLUTE in-tree root under a `cd` must not be spelled from the
+        // build dir: the wiring would rebase that under the `cd` again.
+        let abs_root = vec![src.join("libobs").to_string_lossy().into_owned()];
+        let got: Vec<_> = swig_referenced_paths(&bd, &cd_dir, &files, &abs_root)
+            .iter()
+            .filter_map(|c| referenced_file_rel(&bd, &store, &cd_dir, c))
+            .collect();
+        assert!(
+            got.contains(&Path::new("../libobs/graphics/graphics.h").to_path_buf()),
+            "got {got:?}"
+        );
+    }
+
+    /// A target the `.i`'s directory or the cwd already resolves is emitted
+    /// byte for byte as it was, whatever the roots hold: libnvme's geometry
+    /// with a root that also carries the same relative name.
+    #[test]
+    fn a_swig_include_that_resolves_today_ignores_the_roots() {
+        use super::Scratch;
+        let d = Scratch::new(format!("nn-swig-ctl-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::create_dir_all(d.join("libnvme")).unwrap();
+        std::fs::create_dir_all(d.join("src/nvme")).unwrap();
+        std::fs::create_dir_all(d.join("other/x")).unwrap();
+        std::fs::create_dir_all(d.join("other/src/nvme")).unwrap();
+        std::fs::write(d.join("src/nvme/types.h"), "int x;\n").unwrap();
+        std::fs::write(d.join("other/src/nvme/types.h"), "int y;\n").unwrap();
+        std::fs::write(
+            d.join("libnvme/nvme.i"),
+            "%module nvme\n%include \"../src/nvme/types.h\"\n",
+        )
+        .unwrap();
+        let files = vec!["../libnvme/nvme.i".to_string()];
+        let before = swig_referenced_paths(&bd, Path::new(""), &files, &[]);
+        // `../other/x/../src/nvme/types.h` is a real file, so a reader that
+        // asked the roots first would spell the target differently.
+        let roots = vec!["../other/x".to_string()];
+        assert_eq!(
+            swig_referenced_paths(&bd, Path::new(""), &files, &roots),
+            before
+        );
+        assert_eq!(before, vec!["../libnvme/../src/nvme/types.h".to_string()]);
     }
 
     /// The `.loc` and the `.its` it names, both relative to the build dir and
@@ -12741,7 +12879,21 @@ mod its_and_swig_reader_tests {
 /// why only `%include` is read: an `#include` inside a preamble is text for
 /// whatever COMPILES the generated wrapper, a different edge with its own
 /// inputs, and reading it here would declare the wrong task's inputs.
-fn swig_referenced_paths(build_dir: &Path, cd_dir: &Path, files: &[String]) -> Vec<String> {
+///
+/// THE `-I` ROOTS ARE A FALLBACK, tried in argv order only for a target that
+/// neither the `.i`'s directory nor the cwd holds. obs-studio's `obspython.i`
+/// names `%include "graphics/graphics.h"`, which exists only under
+/// `-I<src>/libobs`, and both of its wrapper tasks died `Unable to find
+/// 'graphics/graphics.h'`. A target the first two places resolve is emitted
+/// exactly as before. An angle `%include <x>` goes through the roots only:
+/// it was never carried before, and swig's own library sits in a store root
+/// the wiring drops.
+fn swig_referenced_paths(
+    build_dir: &Path,
+    cd_dir: &Path,
+    files: &[String],
+    incs: &[String],
+) -> Vec<String> {
     // THE TRIGGER IS NOT REPEATED HERE. This function receives the FILES the
     // trigger found, not the argv, so testing for the program name against
     // them answered no for every real invocation and the reader returned
@@ -12768,11 +12920,13 @@ fn swig_referenced_paths(build_dir: &Path, cd_dir: &Path, files: &[String]) -> V
             };
             let rest = rest.trim_start();
             let quote = rest.chars().next().unwrap_or('"');
-            if quote != '"' && quote != '\'' {
-                continue;
-            }
+            let close = match quote {
+                '"' | '\'' => quote,
+                '<' => '>',
+                _ => continue,
+            };
             let rest = &rest[quote.len_utf8()..];
-            let Some(j) = rest.find(quote) else { continue };
+            let Some(j) = rest.find(close) else { continue };
             let target = &rest[..j];
             if target.is_empty() {
                 continue;
@@ -12782,14 +12936,32 @@ fn swig_referenced_paths(build_dir: &Path, cd_dir: &Path, files: &[String]) -> V
             // reference is dropped, so the worst case is an input nobody
             // needed and never a path that fails a read.
             let candidate = i_dir.join(target);
-            let exists_here = root.join(&candidate).is_file() || root.join(target).is_file();
-            if !exists_here {
-                continue;
-            }
-            let spelled = Path::new(a)
-                .parent()
-                .map(|d| d.join(target))
-                .unwrap_or_else(|| PathBuf::from(target));
+            let exists_here =
+                quote != '<' && (root.join(&candidate).is_file() || root.join(target).is_file());
+            let spelled = if exists_here {
+                Path::new(a)
+                    .parent()
+                    .map(|d| d.join(target))
+                    .unwrap_or_else(|| PathBuf::from(target))
+            } else {
+                // The first root holding the target, as swig searches them.
+                // A relative root is spelled from the cwd like the arm above,
+                // and the wiring rebases it. An absolute one stays absolute:
+                // the wiring drops a store or foreign root and relativises
+                // an in-tree one against the build dir, where a build-dir
+                // relative spelling would be rebased under the `cd` a second
+                // time.
+                let Some(p) = incs.iter().map(|d| Path::new(d).join(target)).find(|p| {
+                    if p.is_absolute() {
+                        p.is_file()
+                    } else {
+                        root.join(p).is_file()
+                    }
+                }) else {
+                    continue;
+                };
+                p
+            };
             let s = spelled.to_string_lossy().into_owned();
             if !out.contains(&s) {
                 out.push(s);
