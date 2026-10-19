@@ -10372,6 +10372,20 @@ mod gir_included_girs_tests {
 /// and this filter gates what CORRECTNESS needs rather than what a build
 /// merely carries. The extension set below is the shapes a compile edge
 /// produces beside its object and never includes.
+fn compile_artifact_shaped(p: &Path) -> bool {
+    matches!(
+        p.extension().and_then(|e| e.to_str()),
+        Some(
+            // objects, archives, shared objects
+            "o" | "obj" | "lo" | "a" | "so" | "lib" | "dll" | "dylib"
+            // C and C++ translation units
+            | "c" | "cc" | "cpp" | "cxx" | "c++" | "C"
+            // assembler
+            | "s" | "S" | "asm"
+        )
+    )
+}
+
 /// Whether a compile drops `p`, reached through a phony expansion
 /// (`expanded`), as a generated object or source it merely sits beside. A
 /// file the edge declares itself (`declared`) is never dropped.
@@ -10396,20 +10410,6 @@ fn compile_filter_drops(
         && !is_tree_path(p)
         && !named_by_tu
         && compile_artifact_shaped(p)
-}
-
-fn compile_artifact_shaped(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|e| e.to_str()),
-        Some(
-            // objects, archives, shared objects
-            "o" | "obj" | "lo" | "a" | "so" | "lib" | "dll" | "dylib"
-            // C and C++ translation units
-            | "c" | "cc" | "cpp" | "cxx" | "c++" | "C"
-            // assembler
-            | "s" | "S" | "asm"
-        )
-    )
 }
 
 /// The file names a set of translation units `#include`, by directive text
