@@ -326,6 +326,30 @@ pub(crate) fn load_file(build_filename: &str) -> Result<load::Loader> {
     Ok(loader)
 }
 
+/// Every file `bid` transitively orders after: its ordering inputs, those of
+/// their producers, and so on. A local edge's command reads all of them from
+/// the build dir.
+fn input_closure(graph: &Graph, bid: BuildId) -> Vec<FileId> {
+    let mut seen_builds: HashSet<BuildId> = HashSet::from([bid]);
+    let mut seen_files: HashSet<FileId> = HashSet::new();
+    let mut out = Vec::new();
+    let mut queue = vec![bid];
+    while let Some(b) = queue.pop() {
+        for &fid in graph.builds[b].ordering_ins() {
+            if !seen_files.insert(fid) {
+                continue;
+            }
+            out.push(fid);
+            if let Some(producer) = graph.files.by_id[fid].input {
+                if seen_builds.insert(producer) {
+                    queue.push(producer);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Build steps go through this sequence of states.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BuildState {
@@ -709,7 +733,20 @@ impl<'a> Scheduler<'a> {
             while let Some(bid) = self.build_states.pop_ready() {
                 let build = &self.graph.builds[bid];
                 self.build_states.set(bid, BuildState::Running);
-                self.runner.start(&mut self.graph.files, bid, build)?;
+                // Ready means every ordering input is Done, order-only
+                // included; the runner realises them before the edge runs.
+                if let Some(member) = self.runner.local_edge_member(build) {
+                    let closure = input_closure(self.graph, bid);
+                    self.runner.start_local_edge(
+                        &mut self.graph.files,
+                        bid,
+                        build,
+                        member,
+                        &closure,
+                    )?;
+                } else {
+                    self.runner.start(&mut self.graph.files, bid, build)?;
+                }
                 running += 1;
                 made_progress = true;
             }

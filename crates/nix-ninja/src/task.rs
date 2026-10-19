@@ -1049,6 +1049,14 @@ pub struct Runner {
     /// One semaphore per declared ninja pool, by name. Absent name or depth 0
     /// means unbounded, matching ninja.
     pool_permits: HashMap<String, JobPermits>,
+    /// `ninja` on PATH, canonical, when `NN_NIX_NINJA` marks it as the
+    /// consumer's drop-in (`local_edge`); `None` turns the nested-ninja
+    /// member off.
+    drop_in_ninja: Option<PathBuf>,
+    /// `NIX_NINJA_NO_LOCAL_EDGES`: both members off.
+    local_edges_off: bool,
+    /// The edges this run ran itself, whose failure ends the run.
+    local_edges: HashSet<BuildId>,
 }
 
 impl Runner {
@@ -1146,6 +1154,12 @@ impl Runner {
             runtime_lib_deps: HashMap::new(),
             permits,
             pool_permits,
+            drop_in_ninja: std::env::var_os("NN_NIX_NINJA")
+                .filter(|v| !v.is_empty())
+                .and_then(|_| which("ninja").ok())
+                .and_then(|p| fs::canonicalize(p).ok()),
+            local_edges_off: std::env::var_os(crate::local_edge::DISABLE_VAR).is_some(),
+            local_edges: HashSet::new(),
             tx,
             rx,
             tools,
@@ -1226,6 +1240,150 @@ impl Runner {
             }
             None => crate::configure_state::save(&self.config.build_dir, &plan.seen)?,
         }
+        Ok(())
+    }
+
+    /// The local-edge member `build` is, if any (`local_edge`).
+    pub fn local_edge_member(&self, build: &Build) -> Option<crate::local_edge::Member> {
+        if self.local_edges_off {
+            return None;
+        }
+        let cmdline = build.cmdline.as_deref()?;
+        crate::local_edge::local_edge(cmdline, self.drop_in_ninja.is_some(), |program| {
+            let found = if program.starts_with('/') {
+                fs::canonicalize(program).ok()
+            } else if !program.contains('/') {
+                which(program).ok().and_then(|p| fs::canonicalize(p).ok())
+            } else {
+                None
+            };
+            found.is_some_and(|p| self.drop_in_ninja.as_ref() == Some(&p))
+        })
+    }
+
+    /// Run a local edge here, in the build dir, instead of emitting a task
+    /// derivation for it.
+    ///
+    /// `closure` is every file the edge transitively orders after. Their
+    /// task outputs are realised and placed first, because the command reads
+    /// the build dir the way real ninja would have left it. The edge holds
+    /// every job permit while it runs, so the run stays at `-j` with the
+    /// nested driver's tasks counted, and that driver is told the width
+    /// through `local_edge::JOBS_VAR`. Each declared output it leaves is
+    /// uploaded and registered as the edge's own, so consumers bind to it.
+    pub fn start_local_edge(
+        &mut self,
+        files: &mut graph::GraphFiles,
+        bid: BuildId,
+        build: &Build,
+        member: crate::local_edge::Member,
+        closure: &[FileId],
+    ) -> Result<()> {
+        let label = build
+            .outs()
+            .first()
+            .map(|fid| files.by_id[*fid].name.clone())
+            .unwrap_or_else(|| format!("{bid:?}"));
+        // A derivation has no build dir to run in, and a query about the
+        // graph must not run anything.
+        if self.config.is_output_derivation || self.config.emit_only {
+            anyhow::bail!(
+                "local edge {label} ({member}) runs in the package sandbox, and this \
+                 invocation emits derivations only; refusing rather than emitting a \
+                 task derivation that cannot succeed"
+            );
+        }
+        if build.outs().len() > 1 {
+            let outs: Vec<FileId> = build.outs().to_vec();
+            for fid in build.outs() {
+                self.co_outputs.insert(*fid, outs.clone());
+            }
+        }
+        let mut seen = HashSet::new();
+        let place: Vec<DerivedFile> = closure
+            .iter()
+            .flat_map(|fid| self.resolve_target(*fid))
+            .filter(|df| matches!(df.derived_path, SingleDerivedPath::Built { .. }))
+            .filter(|df| seen.insert(df.build_path.clone()))
+            .collect();
+        let all: HashMap<PathBuf, DerivedFile> = self
+            .derived_files
+            .values()
+            .map(|df| (df.build_path.clone(), df.clone()))
+            .collect();
+        let outs: Vec<PathBuf> = build
+            .outs()
+            .iter()
+            .map(|fid| PathBuf::from(&files.by_id[*fid].name))
+            .collect();
+        let cmdline = build.cmdline.clone().unwrap_or_default();
+        self.local_edges.insert(bid);
+
+        let width = self.permits.cap;
+        let permit = self.permits.acquire_weighted(width);
+        let pool_permit = build
+            .pool
+            .as_ref()
+            .and_then(|name| self.pool_permits.get(name))
+            .map(|p| p.acquire_weighted(1));
+        let tx = self.tx.clone();
+        let rpc_client = self.rpc_client.clone();
+        let config = self.config.clone();
+        std::thread::spawn(move || {
+            let _permit = permit;
+            let _pool_permit = pool_permit;
+            let run = || -> Result<Vec<DerivedFile>> {
+                local::symlink_derived_files(
+                    &rpc_client,
+                    &config.store_dir,
+                    &config.build_dir,
+                    &place,
+                    &all,
+                )
+                .context("placing the outputs the edge orders after")?;
+                // stdout carries data in this driver; the command's chatter
+                // goes to stderr.
+                let status = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmdline)
+                    .current_dir(&config.build_dir)
+                    .env(crate::local_edge::JOBS_VAR, width.to_string())
+                    .stdout(std::process::Stdio::from(std::io::stderr()))
+                    .status()
+                    .context("spawning sh")?;
+                if !status.success() {
+                    anyhow::bail!("the command exited with {status}");
+                }
+                // A declared output the command did not write is skipped, as
+                // ninja does: qtwebengine declares the nested target's NAME
+                // as an output. A consumer of one fails at its own
+                // resolution, naming the file.
+                outs.into_iter()
+                    .filter(|out| config.build_dir.join(out).exists())
+                    .map(|out| new_opaque_file(&rpc_client, &config.build_dir, out))
+                    .collect()
+            };
+            let (derived_files, err) = match run() {
+                Ok(d) => {
+                    eprintln!("nix-ninja: ran local edge {label} ({member})");
+                    (d, None)
+                }
+                Err(e) => (
+                    Vec::new(),
+                    Some(e.context(format!("local edge {label} ({member})"))),
+                ),
+            };
+            let _ = tx.send(BuildResult {
+                bid,
+                label,
+                derived_path: None,
+                derived_files,
+                undeclared_dirs: Vec::new(),
+                undeclared_files: Vec::new(),
+                defer: None,
+                err,
+            });
+        });
         Ok(())
     }
 
@@ -1774,6 +1932,11 @@ impl Runner {
     ) -> Result<(BuildId, bool, Option<DeferMiss>)> {
         let result = self.rx.recv().unwrap();
         if let Some(err) = result.err {
+            // The edge ran a whole build here; under keep-going there is no
+            // independent subtree left that it did not feed.
+            if self.local_edges.contains(&result.bid) {
+                return Err(err);
+            }
             // PREFIXED, because the failure path was the one part of the
             // driver that was not: grepping `nix-ninja:` out of a 200k-line
             // build log dropped exactly the lines saying a build failed.
@@ -4877,6 +5040,9 @@ fn forwarded_to_tasks(key: &str) -> bool {
 fn command_scoped(key: &str) -> Option<&'static [&'static str]> {
     match key {
         "GETTEXTDATADIRS" => Some(&["msgfmt"]),
+        // Chromium's node.py runs `NODEJS_EXECUTABLE`, which qtwebengine's
+        // nested ninja edge sets with `cmake -E env` and nothing else does.
+        "NODEJS_EXECUTABLE" => Some(&["node.py"]),
         _ => None,
     }
 }
@@ -4977,6 +5143,17 @@ mod forwarded_to_tasks_tests {
     fn the_gettext_data_dirs_are_forwarded() {
         assert!(forwarded_to_tasks("GETTEXTDATADIRS"));
         assert!(!forwarded_to_tasks("GETTEXTDATADIRS_FOR_BUILD"));
+    }
+
+    /// node.py's interpreter, scoped to the commands that run node.py: every
+    /// other task under qtwebengine's nested ninja keys as it did without it.
+    #[test]
+    fn the_node_executable_reaches_node_py_alone() {
+        assert!(forwarded_to_tasks("NODEJS_EXECUTABLE"));
+        assert_eq!(
+            super::command_scoped("NODEJS_EXECUTABLE"),
+            Some(&["node.py"][..])
+        );
     }
 
     /// The silent half, and the reason it is not a NIX_ PREFIX like the
@@ -21564,16 +21741,32 @@ fn names_named_toolchain_needs_path(cmdline: &str) -> bool {
 }
 
 fn command_program(cmdline: &str) -> Option<&str> {
-    let mut toks = cmdline.split_whitespace();
+    command_argv(cmdline)?
+        .next()
+        .map(|tok| tok.trim_matches(|c| c == '"' || c == '\''))
+}
+
+/// The command's words from the program on, the prologue `command_program`
+/// steps over already consumed: the next word is the program, unquoted by
+/// the caller.
+pub(crate) fn command_argv(
+    cmdline: &str,
+) -> Option<std::iter::Peekable<std::str::SplitWhitespace<'_>>> {
+    let mut toks = cmdline.split_whitespace().peekable();
     loop {
-        match toks.next()? {
-            ":" | "&&" => continue,
+        match *toks.peek()? {
+            ":" | "&&" => {
+                toks.next();
+            }
             "cd" => {
+                toks.next();
                 toks.next();
             }
             // `env VAR=value prog`: env is coreutils and always on the
             // sandbox PATH; the program it execs is what needs resolving.
-            "env" => continue,
+            "env" => {
+                toks.next();
+            }
             // gyp opens every shared-library link with a test, so the
             // program sits after `then`:
             //   if [ ! -e $lib -o ! -e $lib.TOC ]; then $ld -shared ...
@@ -21584,20 +21777,23 @@ fn command_program(cmdline: &str) -> Option<&str> {
             // pair for the same reason. Only the `then` branch is reachable
             // in a sandbox, where the library cannot already exist.
             "if" => {
+                toks.next();
                 for t in toks.by_ref() {
                     if t == "then" {
                         break;
                     }
                 }
             }
-            tok if is_shell_assignment(tok) => continue,
-            tok => return Some(tok.trim_matches(|c| c == '"' || c == '\'')),
+            tok if is_shell_assignment(tok) => {
+                toks.next();
+            }
+            _ => return Some(toks),
         }
     }
 }
 
 /// `NAME=...` where NAME is a shell variable name.
-fn is_shell_assignment(tok: &str) -> bool {
+pub(crate) fn is_shell_assignment(tok: &str) -> bool {
     match tok.split_once('=') {
         Some((name, _)) => {
             !name.is_empty()

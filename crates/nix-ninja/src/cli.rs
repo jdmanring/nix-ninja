@@ -187,7 +187,29 @@ fn warn_ignored_flags(cli: &Cli) {
 }
 
 fn resolved_jobs(cli: &Cli) -> usize {
-    jobs_from(cli.jobs, std::env::var_os("NIX_BUILD_CORES"))
+    jobs_for(
+        cli.jobs,
+        std::env::var_os(crate::local_edge::JOBS_VAR),
+        std::env::var_os("NIX_BUILD_CORES"),
+    )
+}
+
+/// The width an outer driver's local edge hands this one, then `jobs_from`.
+///
+/// Under a local edge (`local_edge::JOBS_VAR`) the width is the job permits
+/// the outer runner holds for the edge, and it wins over `-j`: qtwebengine's
+/// nested command carries the configure machine's `-j3`. Nothing else sets
+/// the variable, so every other invocation resolves as before.
+fn jobs_for(
+    dash_j: usize,
+    local_edge_width: Option<std::ffi::OsString>,
+    env_cores: Option<std::ffi::OsString>,
+) -> usize {
+    local_edge_width
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| jobs_from(dash_j, env_cores))
 }
 
 /// `-j`, then `NIX_BUILD_CORES`, then the machine.
@@ -845,6 +867,13 @@ fn build(
         load_limit: cli.load_average,
         verbose: cli.verbose,
     };
+    // Once per nested driver, and only there: the width the outer edge holds.
+    if std::env::var_os(crate::local_edge::JOBS_VAR).is_some() {
+        eprintln!(
+            "nix-ninja: local edge width {} (-j {} on the command line)",
+            config.jobs, cli.jobs
+        );
+    }
 
     build::build(
         cli.build_filename
@@ -1101,6 +1130,19 @@ mod tests {
         // And never zero, whatever the input: a runner with no slots stalls.
         for v in [None, os("0"), os("x")] {
             assert!(jobs_from(0, v) > 0);
+        }
+    }
+
+    /// A local edge's width beats the command's own `-j`; absent or unusable,
+    /// the ladder above answers unchanged.
+    #[test]
+    fn a_local_edge_width_beats_dash_j() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(jobs_for(3, os("8"), os("2")), 8);
+        assert_eq!(jobs_for(3, None, os("2")), 3);
+        assert_eq!(jobs_for(0, None, os("2")), 2);
+        for bad in [os("0"), os(""), os("x")] {
+            assert_eq!(jobs_for(3, bad, None), 3);
         }
     }
 }

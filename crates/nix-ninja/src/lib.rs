@@ -3,6 +3,7 @@ pub mod cli;
 mod configure_state;
 mod dyndep;
 pub mod local;
+pub(crate) mod local_edge;
 mod ninja_state;
 mod relative_from;
 mod resolve_cache;
