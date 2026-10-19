@@ -17485,7 +17485,14 @@ fn upload_python_closure_uncached(
     start_dir: &Path,
     out: &mut Vec<DerivedFile>,
 ) -> Result<()> {
-    const CLOSURE_DIR_CAP: usize = 64;
+    // 256, raised from 64: qtwebengine 6.11.2's largest Chromium closure is
+    // the one below `src/3rdparty/chromium/testing`, 142 directories and
+    // 33,464 files (mojo bindings generator); below `build` it is 66
+    // directories and 22,276 files, and every generator edge under `build/`
+    // refused at 64. Measured uncapped over the mojo, grit and torque edges
+    // of the configured tree. The refusal stays: past the cap a partial
+    // closure is never declared.
+    const CLOSURE_DIR_CAP: usize = 256;
     let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut queue: Vec<PathBuf> = vec![start_dir.to_path_buf()];
     let upload_dir = |dir: &Path, cap: usize, out: &mut Vec<DerivedFile>| -> Result<bool> {
