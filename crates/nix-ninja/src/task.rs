@@ -2195,6 +2195,16 @@ impl Runner {
                 }
             }
         }
+        // A FILE THE EDGE DECLARES ITSELF IS NEVER FILTERED, AND `seen` WAS
+        // BREAKING THAT. The worklist is a stack: a phony's expansion is
+        // popped before the direct inputs pushed under it, so a declared
+        // input also reached through `cmake_object_order_depends_*` met the
+        // compile filter below first, was dropped as a generated SOURCE, and
+        // its own direct visit was then skipped as seen. bluez-qt 6.30.0's
+        // `#include "moc_X.cpp"` from a qdbusxml2cpp-generated unit (whose
+        // includes cannot be read before it is written, so `tu_includes`
+        // holds nothing) lost `| src/moc_X.cpp` that way on all 22 units.
+        let direct: rustc_hash::FxHashSet<FileId> = build.ordering_ins().iter().copied().collect();
         let mut seen: rustc_hash::FxHashSet<FileId> = rustc_hash::FxHashSet::default();
         while let Some((fid, via_phony)) = worklist.pop() {
             if !seen.insert(fid) {
@@ -2283,24 +2293,13 @@ impl Runner {
             // SOURCES (perfetto's entire .gen.o world, measured) into one
             // TU's closure. Directly declared order-only deps (a generated
             // buildflags header on the edge itself) are never filtered.
-            if via_phony && is_gcc_task {
-                let name = &files.by_id[fid].name;
-                // A MODULE INCLUDE TREE IS HEADERS BY CONSTRUCTION and has
-                // no suffix to say so: syncqt's `include/<Module>` rides
-                // its real outputs as a co-output (wait(), above), arrives
-                // here via_phony, and this filter dropped it from every
-                // compile task - so `cmake_pch.hxx`'s `#include
-                // <QtSvg/QtSvg>`, the undeclared master header the tree
-                // exists to carry, was absent from the SvgWidgets PCH
-                // task while the Svg syncqt task's log listed it among
-                // the tree's eight files (qtsvg, 2026-08-23). Same
-                // predicate wait() uses to recognise the tree.
-                let tree_like = is_tree_path(Path::new(name.as_str()));
-                let p = Path::new(name.as_str());
-                let named_by_tu = p.file_name().is_some_and(|n| tu_includes.contains(n));
-                if !header_like(p) && !tree_like && !named_by_tu && compile_artifact_shaped(p) {
-                    continue;
-                }
+            if compile_filter_drops(
+                via_phony && is_gcc_task,
+                direct.contains(&fid),
+                Path::new(files.by_id[fid].name.as_str()),
+                &tu_includes,
+            ) {
+                continue;
             }
             let input = match self.derived_files.get(&fid) {
                 Some(df) => df.to_owned(),
@@ -10353,6 +10352,32 @@ mod gir_included_girs_tests {
 /// and this filter gates what CORRECTNESS needs rather than what a build
 /// merely carries. The extension set below is the shapes a compile edge
 /// produces beside its object and never includes.
+/// Whether a compile drops `p`, reached through a phony expansion
+/// (`expanded`), as a generated object or source it merely sits beside. A
+/// file the edge declares itself (`declared`) is never dropped.
+/// A MODULE INCLUDE TREE IS HEADERS BY CONSTRUCTION and has no suffix to say
+/// so: syncqt's `include/<Module>` rides its real outputs as a co-output
+/// (wait(), above), arrives here via_phony, and this filter dropped it from
+/// every compile task - so `cmake_pch.hxx`'s `#include <QtSvg/QtSvg>`, the
+/// undeclared master header the tree exists to carry, was absent from the
+/// SvgWidgets PCH task while the Svg syncqt task's log listed it among the
+/// tree's eight files (qtsvg, 2026-08-23). Same predicate wait() uses to
+/// recognise the tree.
+fn compile_filter_drops(
+    expanded: bool,
+    declared: bool,
+    p: &Path,
+    tu_includes: &rustc_hash::FxHashSet<std::ffi::OsString>,
+) -> bool {
+    let named_by_tu = p.file_name().is_some_and(|n| tu_includes.contains(n));
+    expanded
+        && !declared
+        && !header_like(p)
+        && !is_tree_path(p)
+        && !named_by_tu
+        && compile_artifact_shaped(p)
+}
+
 fn compile_artifact_shaped(p: &Path) -> bool {
     matches!(
         p.extension().and_then(|e| e.to_str()),
@@ -26653,5 +26678,33 @@ mod reference_surviving_inputs_tests {
             0
         );
         assert_eq!(drv.inputs, before);
+    }
+}
+
+#[cfg(test)]
+mod compile_filter_tests {
+    use super::compile_filter_drops as drops;
+    use std::path::Path;
+
+    /// A generated `.cpp` reached through a phony is dropped from a compile
+    /// unless the unit names it or the edge declares it: bluez-qt's units are
+    /// generated (nothing to read), and each declares `| src/moc_X.cpp`.
+    #[test]
+    fn a_declared_generated_source_survives_the_compile_filter() {
+        let none = Default::default();
+        let moc = Path::new("src/moc_dbusobjectmanager.cpp");
+        assert!(
+            drops(true, false, moc, &none),
+            "an undeclared one is dropped"
+        );
+        assert!(!drops(true, true, moc, &none), "a declared one is kept");
+        assert!(!drops(false, false, moc, &none), "a direct visit is kept");
+        let mut named = rustc_hash::FxHashSet::default();
+        named.insert(std::ffi::OsString::from("moc_dbusobjectmanager.cpp"));
+        assert!(
+            !drops(true, false, moc, &named),
+            "one the unit names is kept"
+        );
+        assert!(!drops(true, false, Path::new("src/x.h"), &none));
     }
 }
