@@ -958,6 +958,25 @@ mod tests {
         assert_eq!(f.run(true, &[]), Vec::<PathBuf>::new());
     }
 
+    /// A quoted name answers per includer directory: `"a.h"` from the tree's
+    /// `x/` is the project's `a.h`, from its `y/` the tree's own, which
+    /// reaches the project's `y_only.h`. One answer for both loses one.
+    #[test]
+    fn a_quoted_name_resolves_per_includer_directory() {
+        let f = TreeFixture::new("", "#include \"x/ui_1.h\"\n#include \"y/ui_2.h\"\n");
+        for d in ["x", "y"] {
+            fs::create_dir_all(f.tree.join("include").join(d)).unwrap();
+        }
+        fs::write(f.tree.join("include/x/ui_1.h"), "#include \"a.h\"\n").unwrap();
+        fs::write(f.tree.join("include/y/ui_2.h"), "#include \"a.h\"\n").unwrap();
+        fs::write(f.tree.join("include/y/a.h"), "#include \"y_only.h\"\n").unwrap();
+        fs::write(f.src.join("a.h"), "").unwrap();
+        fs::write(f.src.join("y_only.h"), "").unwrap();
+        let mut got = f.run(true, &[]);
+        got.sort();
+        assert_eq!(got, vec![f.src.join("a.h"), f.src.join("y_only.h")]);
+    }
+
     /// CONTROL (iv): the positive case's tree and headers under a command
     /// that is not a compile add nothing.
     #[test]
