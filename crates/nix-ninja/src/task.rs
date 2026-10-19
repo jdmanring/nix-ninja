@@ -14644,6 +14644,50 @@ mod qrc_copy_sourcedir_tests {
         assert_eq!(got, vec![PathBuf::from("../src/gn")]);
     }
 
+    /// The build and install steps' real commands (build.ninja of the
+    /// configured qtwebengine 6.11.2 tree): `cmake --build` re-checks the
+    /// configure inputs, so both carry the source tree too.
+    const GN_BUILD: &str = "cd /build/qtwebengine-everywhere-src-6.11.2/build/src/gn && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake --build . && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -E touch /build/qtwebengine-everywhere-src-6.11.2/build/src/gn/src/gn-stamp/gn-build";
+    const GN_INSTALL: &str = "cd /build/qtwebengine-everywhere-src-6.11.2/build/src/gn && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake --build . --target install && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -E touch /build/qtwebengine-everywhere-src-6.11.2/build/src/gn/src/gn-stamp/gn-install";
+
+    #[test]
+    fn the_gn_build_and_install_steps_carry_the_tree_and_install_declares_its_dir() {
+        let root = Scratch::new(format!("nn-ep-buildstep-{}", std::process::id()));
+        let stamp = root.join("build/src/gn/src/gn-stamp");
+        std::fs::create_dir_all(&stamp).unwrap();
+        std::fs::create_dir_all(root.join("build/src/gn/tmp")).unwrap();
+        std::fs::create_dir_all(root.join("src/gn")).unwrap();
+        let r = root.to_str().unwrap();
+        let fix = |s: &str| s.replace("/build/qtwebengine-everywhere-src-6.11.2", r);
+        std::fs::write(stamp.join("gn-source_dirinfo.txt"), fix(GN_SOURCE_DIRINFO)).unwrap();
+        std::fs::write(
+            root.join("build/src/gn/tmp/gn-mkdirs.cmake"),
+            fix("file(MAKE_DIRECTORY\n  \"/build/qtwebengine-everywhere-src-6.11.2/build/src/gn\"\n  \"/build/qtwebengine-everywhere-src-6.11.2/build/install\"\n  \"/build/qtwebengine-everywhere-src-6.11.2/build/src/gn/tmp\"\n)\n"),
+        )
+        .unwrap();
+        let build = root.join("build");
+        for (cmd, out) in [(GN_BUILD, "gn-build"), (GN_INSTALL, "gn-install")] {
+            let decl = format!("src/gn/src/gn-stamp/{out}");
+            let got = ep_source_dir_trees(&build, Some(&fix(cmd)), [decl.as_str()].into_iter());
+            assert_eq!(got, vec![PathBuf::from("../src/gn")], "{out}");
+        }
+        let trees = undeclared_outputs(
+            &[PathBuf::from("src/gn/src/gn-stamp/gn-install")],
+            Some(&fix(GN_INSTALL)),
+            &build,
+        );
+        assert!(trees.contains(&PathBuf::from("install")), "{trees:?}");
+        let build_trees = undeclared_outputs(
+            &[PathBuf::from("src/gn/src/gn-stamp/gn-build")],
+            Some(&fix(GN_BUILD)),
+            &build,
+        );
+        assert!(
+            !build_trees.contains(&PathBuf::from("install")),
+            "{build_trees:?}"
+        );
+    }
+
     #[test]
     fn source_dirinfo_gates_hold() {
         let build = Path::new("/build/x/build");
