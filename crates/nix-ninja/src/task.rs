@@ -19107,6 +19107,83 @@ mod forced_include_wiring_tests {
 }
 
 #[cfg(test)]
+mod bom_first_line_tests {
+    //! THE WIRING THROUGH `scan_c_includes`, the walk `discover_c_includes`
+    //! runs: a unit opening with a byte order mark declares the header its
+    //! first line names and that header's own includes, and a unit without
+    //! one gets the walk's answer unchanged.
+    use super::{scan_c_includes, Scratch};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const BOM: &[u8] = b"\xEF\xBB\xBF";
+
+    /// `src/<unit>` with `first` as its first line, and `inc/h.h` (reached
+    /// only through an absolute `-I`) including `inc/g.h`, the qttools
+    /// litehtml shape.
+    fn fixture(d: &Path, unit: &str, first: &[u8]) -> (String, PathBuf) {
+        let src = d.join("src");
+        let inc = d.join("inc");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&inc).unwrap();
+        fs::write(inc.join("h.h"), "#include \"g.h\"\n").unwrap();
+        fs::write(inc.join("g.h"), "#define G 1\n").unwrap();
+        let mut body = first.to_vec();
+        body.extend_from_slice(b"\nint a(void){return G;}\n");
+        fs::write(src.join(unit), body).unwrap();
+        let cmd = format!("g++ -I{} -c {}", inc.display(), src.join(unit).display());
+        (cmd, src.join(unit))
+    }
+
+    fn walks(cmd: &str, unit: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let fixed = scan_c_includes(cmd, vec![unit.into()], None, None, Path::new("/nix/store"))
+            .unwrap()
+            .includes;
+        let unfixed =
+            deps_infer::c_include_parser::retrieve_c_includes_checked(cmd, vec![unit.into()], None)
+                .unwrap()
+                .includes;
+        (fixed, unfixed)
+    }
+
+    #[test]
+    fn a_byte_order_mark_first_line_include_is_declared_with_its_closure() {
+        let d = Scratch::new(format!("nn-bom-hit-{}", std::process::id()));
+        let line = [BOM, b"#include \"h.h\""].concat();
+        let (cmd, unit) = fixture(&d, "num_cvt.cpp", &line);
+        let (fixed, unfixed) = walks(&cmd, &unit);
+        // The fixture reaches the defect: the scanner alone misses the line.
+        assert!(
+            !unfixed.iter().any(|p| p.ends_with("h.h")),
+            "the scanner already reads the marked line: {unfixed:?}"
+        );
+        let inc = d.join("inc");
+        for h in ["h.h", "g.h"] {
+            assert!(
+                fixed.contains(&inc.join(h)),
+                "{h} must be declared: {fixed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_unit_without_a_marked_include_line_keeps_the_walks_answer() {
+        let d = Scratch::new(format!("nn-bom-ctl-{}", std::process::id()));
+        // No mark: the scanner reads the line itself.
+        let (cmd, unit) = fixture(&d, "plain.cpp", b"#include \"h.h\"");
+        let (fixed, unfixed) = walks(&cmd, &unit);
+        assert_eq!(fixed, unfixed);
+        assert!(fixed.iter().any(|p| p.ends_with("g.h")), "{fixed:?}");
+        // A mark over a line that is no include: nothing to add.
+        let line = [BOM, b"// comment"].concat();
+        let (cmd, unit) = fixture(&d, "comment.cpp", &line);
+        let (fixed, unfixed) = walks(&cmd, &unit);
+        assert_eq!(fixed, unfixed);
+        assert_eq!(fixed, vec![unit]);
+    }
+}
+
+#[cfg(test)]
 mod generated_not_yet_written_tests {
     use super::generated_not_yet_written;
     use std::collections::HashMap;
@@ -19941,6 +20018,132 @@ fn find_unresolved_miss(
     out
 }
 
+/// The `#include`/`#embed` on a file's FIRST LINE when the file opens with a
+/// UTF-8 byte order mark, as `(quoted, name)`.
+///
+/// The scanner never sees that line: its directive pattern is anchored on
+/// `^\s*#`, and U+FEFF is not whitespace. qttools 6.11.2's litehtml
+/// `num_cvt.cpp` opens `EF BB BF #include "num_cvt.h"`, the header (reached
+/// only through an absolute `-I`) went undeclared, and the sandbox compile
+/// died `num_cvt.h: No such file or directory`. gcc skips the mark, so the
+/// directive is real. Read here in the driver because the scanner is in the
+/// task binary's fileset.
+///
+/// Memoized on SUCCESSFUL reads only: a generated header read before its
+/// edge writes it is asked again.
+fn bom_first_line_directive(read: &Path) -> Option<(bool, PathBuf)> {
+    use std::io::Read;
+    type BomCache = LazyLock<Mutex<HashMap<PathBuf, Option<(bool, PathBuf)>>>>;
+    static CACHE: BomCache = LazyLock::new(Default::default);
+    if let Some(hit) = CACHE.lock().unwrap().get(read) {
+        return hit.clone();
+    }
+    let mut head = Vec::new();
+    fs::File::open(read)
+        .ok()?
+        .take(4096)
+        .read_to_end(&mut head)
+        .ok()?;
+    let parsed = head.strip_prefix(b"\xEF\xBB\xBF").and_then(|rest| {
+        let line = rest.split(|&b| b == b'\n').next()?;
+        let line = String::from_utf8_lossy(line);
+        let s = line.trim_start().strip_prefix('#')?.trim_start();
+        let s = s
+            .strip_prefix("include")
+            .or_else(|| s.strip_prefix("embed"))?
+            .trim_start();
+        let quoted = match s.chars().next()? {
+            '"' => true,
+            '<' => false,
+            _ => return None,
+        };
+        let body = &s[1..];
+        let end = body.find(['"', '>'])?;
+        Some((quoted, PathBuf::from(&body[..end])))
+    });
+    CACHE
+        .lock()
+        .unwrap()
+        .insert(read.to_path_buf(), parsed.clone());
+    parsed
+}
+
+/// The include walk `discover_c_includes` runs, plus the first-line
+/// directive of every in-tree file that opens with a byte order mark (see
+/// `bom_first_line_directive`), resolved and walked with the scanner's own
+/// machinery so the header's closure joins.
+///
+/// Resolution follows the compiler's search order as `find_unresolved_miss`
+/// asks it: a quoted name tries the includer's directory and then the
+/// include directories in argv order, an angle name the include directories
+/// only. A hit is added at the spelling the scanner gives a resolved
+/// directive (as spelled, then canonical). Where no file in the walk opens
+/// with a mark, or the line resolves to nothing new, the walk's answer is
+/// returned unchanged.
+///
+/// `declared` is the same map as `virtual_paths`, by reference: the walk
+/// consumes the owned one, and cloning it for every translation unit would
+/// charge every compile for a case few carry.
+pub fn scan_c_includes(
+    cmdline: &str,
+    files: Vec<PathBuf>,
+    virtual_paths: Option<HashMap<PathBuf, PathBuf>>,
+    declared: Option<&HashMap<PathBuf, PathBuf>>,
+    store_dir: &Path,
+) -> Result<c_include_parser::Scan> {
+    let mut scan =
+        c_include_parser::retrieve_c_includes_checked(cmdline, files.clone(), virtual_paths)?;
+    let dirs = include_dirs_as_given(cmdline);
+    let mut checked: HashSet<PathBuf> = HashSet::new();
+    let mut pending: Vec<PathBuf> = files.into_iter().chain(scan.includes.clone()).collect();
+    while let Some(file) = pending.pop() {
+        if file.starts_with(store_dir) || !checked.insert(file.clone()) {
+            continue;
+        }
+        let read = declared
+            .and_then(|v| v.get(&file))
+            .cloned()
+            .unwrap_or_else(|| file.clone());
+        let Some((quoted, name)) = bom_first_line_directive(&read) else {
+            continue;
+        };
+        let includer_dir = file.parent().unwrap_or(Path::new(""));
+        let hit = quoted
+            .then_some(includer_dir)
+            .into_iter()
+            .chain(dirs.iter().map(Path::new))
+            .find_map(|base| {
+                c_include_parser::canonicalize_cached(base.join(&name), declared)
+                    .ok()
+                    .flatten()
+                    .map(|p| (base, p))
+            });
+        let Some((base, canonical)) = hit else {
+            continue;
+        };
+        let spelled = lexical_join(Path::new(""), &base.join(&name));
+        let mut seeds = Vec::new();
+        if spelled != canonical && !spelled.starts_with(store_dir) {
+            seeds.push(spelled);
+        }
+        seeds.push(canonical);
+        seeds.retain(|s| !scan.includes.contains(s));
+        if seeds.is_empty() {
+            continue;
+        }
+        let more =
+            c_include_parser::retrieve_c_includes_checked(cmdline, seeds, declared.cloned())?;
+        scan.incomplete |= more.incomplete;
+        for p in more.includes {
+            if !scan.includes.contains(&p) {
+                scan.includes.push(p.clone());
+                pending.push(p);
+            }
+        }
+    }
+    Ok(scan)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn discover_c_includes(
     rpc_client: &Arc<BuilderRpcClient>,
@@ -20069,10 +20272,12 @@ pub fn discover_c_includes(
                 includes: scanned,
                 incomplete,
                 ..
-            } = c_include_parser::retrieve_c_includes_checked(
+            } = scan_c_includes(
                 cmdline,
                 files.clone(),
                 virtual_paths,
+                virtual_declared.as_ref(),
+                store_dir.to_path(),
             )?;
             // THE SCAN NOW SAYS WHEN IT CANNOT ANSWER, AND THIS IS WHAT
             // ACTS ON IT. A computed include through a function-like macro
