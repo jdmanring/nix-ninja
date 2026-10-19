@@ -20758,6 +20758,7 @@ pub(crate) fn tree_reached_headers(
         .iter()
         .map(|(b, _)| lexical_join(build_dir, b))
         .collect();
+    #[derive(Clone)]
     enum Hit {
         Tree(PathBuf, PathBuf),
         Stop,
@@ -20797,6 +20798,10 @@ pub(crate) fn tree_reached_headers(
         .collect();
     let mut queued: HashSet<PathBuf> = pending.iter().map(|(s, _, _)| s.clone()).collect();
     let mut out: Vec<PathBuf> = Vec::new();
+    // One answer per (includer dir for a quoted name, name): an angle name
+    // resolves the same from every includer, and qtbase compiles carry
+    // ~860 files whose directives repeat the same few hundred names.
+    let mut memo: HashMap<(Option<PathBuf>, PathBuf), Option<Hit>> = HashMap::new();
     while let Some((spelled, content, through_tree)) = pending.pop() {
         let mut directives: Vec<(bool, PathBuf)> = c_include_parser::scan_directives(&content)
             .map(|s| {
@@ -20809,11 +20814,28 @@ pub(crate) fn tree_reached_headers(
         directives.extend(bom_first_line_directive(&content));
         let includer_dir = spelled.parent().unwrap_or(Path::new("")).to_path_buf();
         for (quoted, name) in directives {
-            let bases = quoted
-                .then_some(includer_dir.as_path())
-                .into_iter()
-                .chain(dirs.iter().map(Path::new));
-            let Some(hit) = bases.into_iter().find_map(|b| resolve(&b.join(&name))) else {
+            let bases = || {
+                quoted
+                    .then_some(includer_dir.as_path())
+                    .into_iter()
+                    .chain(dirs.iter().map(Path::new))
+            };
+            // Outside a tree only a tree hit continues the walk, so a name no
+            // base can place under a tree root is skipped without a stat.
+            if !through_tree
+                && !bases().any(|b| {
+                    let abs = lexical_join(build_dir, &b.join(&name));
+                    trees.iter().any(|(root, _)| abs.starts_with(root))
+                })
+            {
+                continue;
+            }
+            let key = (quoted.then(|| includer_dir.clone()), name.clone());
+            let found = memo
+                .entry(key)
+                .or_insert_with(|| bases().find_map(|b| resolve(&b.join(&name))))
+                .clone();
+            let Some(hit) = found else {
                 continue;
             };
             let (s, c, add) = match hit {
