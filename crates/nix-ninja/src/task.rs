@@ -231,12 +231,15 @@ struct Task {
     /// header. A non-compile edge misses nothing this way and pays no
     /// index lookups.
     is_gcc_task: bool,
-    /// A qrc entry (or the qrc itself) naming a file a graph edge produces
-    /// whose derivation is not registered yet: the consumer resolved before
-    /// its producer, which no declaration orders after it (an undeclared
-    /// generated member, a validation-only producer). `build_task_derivation`
-    /// returns it as `Deferred` before writing anything, and the scheduler
-    /// re-queues the edge with the producer as an implicit input.
+    /// A qrc entry naming a file a graph edge produces whose derivation is
+    /// not registered yet: the consumer resolved before its producer, which
+    /// no declaration orders after it (an undeclared generated member of an
+    /// on-disk qrc). `build_task_derivation` returns it as `Deferred`
+    /// before writing anything, and the scheduler re-queues the edge with
+    /// the producer as an implicit input. BOUNDARY: the members of a
+    /// GENERATED qrc stay invisible at (re-)resolution (the qrc is
+    /// unreadable until it is built and placed), so deferring on one binds
+    /// the qrc but carries no members single-pass. That shape is open.
     qrc_defer: Option<DeferMiss>,
     /// Local mode (configurations A and B), where discovery may realise a
     /// carried tree to show the confirming preprocessor what the task sees.
@@ -2699,7 +2702,7 @@ impl Runner {
             let cmake_copies = build
                 .cmdline
                 .as_deref()
-                .and_then(|c| cmake_e_copy_dirs(c, &self.config.build_dir));
+                .and_then(|c| cmake_e_copy_dirs(c, &self.config.build_dir, &self.config.store_dir));
             let kdwsdl_imports = kdwsdl2cpp_invocation(&args);
             let autogen_info = cmake_autogen_info_arg(&args).map(str::to_string);
             // CMake custom commands open with `cd <subdir> &&`; every
@@ -3426,20 +3429,29 @@ impl Runner {
                 // A GENERATED QRC FILE ITSELF: the qrc is produced by
                 // another edge and does not exist at scan time, so the
                 // read above skipped it silently. Push its build-relative
-                // path as a candidate so the routing loop below defers
-                // on the producer, the same shape as a generated member.
+                // path as a candidate so the routing loop below binds it
+                // once the producer registers (or defers until it does),
+                // the same shape as a generated member. BOUNDARY: this
+                // binds the qrc only; its members stay unread until the
+                // qrc exists on disk, so a generated qrc's undeclared
+                // generated members are NOT carried by this pass. The
+                // proven shape is an on-disk qrc with a late member
+                // producer; the generated-qrc shape is open.
+                let own = own_output_rels(build, files, &self.config.build_dir);
                 for q in qrcs {
-                    let qrc_abs = if Path::new(q).is_absolute() {
-                        PathBuf::from(q)
-                    } else {
-                        self.config.build_dir.join(rebase_post_cd(&cd_dir, q))
+                    let Some(rel) = qrc_file_candidate_rel(&self.config.build_dir, &cd_dir, q)
+                    else {
+                        continue;
                     };
-                    if !qrc_abs.is_file() {
-                        if let Some(rel) = relative_from(&qrc_abs, &self.config.build_dir) {
-                            if !rel.is_absolute() && !qrc_candidates.contains(&rel) {
-                                qrc_candidates.push(rel);
-                            }
-                        }
+                    // The edge's own output is never its input: `rcc
+                    // -project -o gen.qrc` names the file it writes, which
+                    // is absent at scan time and would otherwise defer on
+                    // itself and abort on the cycle.
+                    if own.contains(&rel) {
+                        continue;
+                    }
+                    if !qrc_candidates.contains(&rel) {
+                        qrc_candidates.push(rel);
                     }
                 }
             }
@@ -3997,8 +4009,15 @@ impl Runner {
         // names a graph node routes as a Built input with its co-outputs,
         // the same shape as the grd candidates above.
         let mut qrc_defer_out: Option<DeferMiss> = None;
+        // The edge's own outputs, for the self-output guard below.
+        let own = own_output_rels(build, files, &self.config.build_dir);
         for cand in &qrc_candidates {
             if input_set.contains_key(cand) {
+                continue;
+            }
+            // Same self-output guard as the qrc-file push above: a member
+            // spelling that names what this edge writes is not an input.
+            if own.contains(cand) {
                 continue;
             }
             let Some(gfid) = files.lookup(&cand.to_string_lossy()) else {
@@ -4020,8 +4039,9 @@ impl Runner {
             }
             // A PRODUCED NODE WITH NO REGISTERED DERIVED FILE: the
             // consumer resolved before its producer, which no declared
-            // input orders after it (an undeclared generated member, a
-            // validation-only producer, or the qrc file itself). Defer
+            // input orders after it (an undeclared generated member of
+            // an on-disk qrc, or the generated qrc file itself, which
+            // binds the qrc but carries no members this pass). Defer
             // through the same machinery as the c-include miss: the
             // scheduler re-queues the edge with the producer as an
             // implicit input, and the second resolution finds the
@@ -13818,6 +13838,44 @@ fn qrc_referenced_paths(
     out
 }
 
+/// A qrc the command names, as a build-relative candidate: the join is
+/// lexical (a climbing entry never matches a graph node), so normalize
+/// before relativizing, the same normalization the member candidates get.
+/// An existing file is None (the reader above already carried it); a
+/// spelling outside the tree is None. Pure so the spelling the producer's
+/// edge outputs is testable without a Runner.
+fn qrc_file_candidate_rel(build_dir: &Path, cd_dir: &Path, q: &str) -> Option<PathBuf> {
+    let joined = if Path::new(q).is_absolute() {
+        PathBuf::from(q)
+    } else {
+        build_dir.join(rebase_post_cd(cd_dir, q))
+    };
+    let norm = normalize_build_path_lexical(&joined);
+    if norm.is_file() {
+        return None;
+    }
+    let rel = relative_from(&norm, build_dir)?;
+    if rel.is_absolute() {
+        return None;
+    }
+    Some(rel)
+}
+
+/// The edge's own outputs as normalized build-relative paths. A qrc
+/// candidate naming one is the edge naming what it writes (`rcc -project
+/// -o gen.qrc`): absent at scan time, so without this guard it would defer
+/// on itself and abort on the cycle. Both qrc candidate sites consult it.
+fn own_output_rels(build: &Build, files: &graph::GraphFiles, build_dir: &Path) -> Vec<PathBuf> {
+    build
+        .outs()
+        .iter()
+        .filter_map(|fid| {
+            let abs = normalize_build_path_lexical(&build_dir.join(&files.by_id[*fid].name));
+            relative_from(&abs, build_dir)
+        })
+        .collect()
+}
+
 /// The build-relative spellings under which one `.qrc` entry can name a
 /// graph node: itself where absolute, the qrc-directory join and the
 /// command-directory join where relative. Pure so the producer-index
@@ -13902,7 +13960,15 @@ fn push_climb_prefixes(build_dir: &Path, raw: &Path, dirs: &mut Vec<String>) {
 /// project root itself"). Only the witnessed plain form is read: a `-t`
 /// destination names its sources positionally and stays unwitnessed until
 /// a package carries it.
-fn cmake_e_copy_dirs(cmdline: &str, build_dir: &Path) -> Option<Vec<PathBuf>> {
+///
+/// Store and foreign roots are refused the way the sibling directory
+/// readers refuse them: a store tree needs no upload, and a host tree must
+/// never be walked into a task.
+fn cmake_e_copy_dirs(
+    cmdline: &str,
+    build_dir: &Path,
+    store_dir: &StoreDir,
+) -> Option<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut base = build_dir.to_path_buf();
     for seg in cmdline.split("&&") {
@@ -13931,6 +13997,15 @@ fn cmake_e_copy_dirs(cmdline: &str, build_dir: &Path) -> Option<Vec<PathBuf>> {
                     } else {
                         base.join(p)
                     };
+                    // A store tree needs no upload and a foreign tree must
+                    // never be walked, the same gate the sibling directory
+                    // readers carry. The tree gate alone would refuse both
+                    // today (no project tree shares the store's first
+                    // component); the store arm pins that property rather
+                    // than assuming it.
+                    if abs.starts_with(store_dir) || !same_project_tree(build_dir, &abs) {
+                        continue;
+                    }
                     // Directories only: an absolute file rides the generic
                     // absolute-file route, and a relative one the generic
                     // relative branches, so files need no reader. The
@@ -14220,6 +14295,28 @@ mod qrc_copy_sourcedir_tests {
     }
 
     #[test]
+    fn a_dotdot_spelled_qrc_binds_the_producer_spelling() {
+        // The qrc-file push normalizes before relativizing: without it
+        // the join keeps its `..` (`icons/../.qt/rcc/app.qrc`), which
+        // `files.lookup` never matches, and the edge silently carries
+        // nothing. Nonexistent paths proceed (only an existing file
+        // returns None, and the reader carried that one).
+        let build = Path::new("/build/x/build");
+        assert_eq!(
+            qrc_file_candidate_rel(build, Path::new("icons"), "../.qt/rcc/app.qrc",),
+            Some(PathBuf::from(".qt/rcc/app.qrc"))
+        );
+        assert_eq!(
+            qrc_file_candidate_rel(
+                build,
+                Path::new("icons"),
+                "/build/x/build/icons/../.qt/rcc/app.qrc",
+            ),
+            Some(PathBuf::from(".qt/rcc/app.qrc"))
+        );
+    }
+
+    #[test]
     fn climb_prefixes_skip_what_placement_creates() {
         let build = Path::new("/build/qttools-everywhere-src-6.11.2/build");
         let mut dirs = Vec::new();
@@ -14265,20 +14362,49 @@ mod qrc_copy_sourcedir_tests {
         let cmd = OBS_COPIES.replace("/build/source/build", root.join("build").to_str().unwrap());
         let cmd = cmd.replace("/build/cef", root.join("cef").to_str().unwrap());
         let build = root.join("build");
-        let got = cmake_e_copy_dirs(&cmd, &build).unwrap();
+        let store = StoreDir::new(Path::new("/nix/store")).unwrap();
+        let got = cmake_e_copy_dirs(&cmd, &build, &store).unwrap();
         assert_eq!(got, vec![root.join("cef/Resources/locales")]);
     }
 
     #[test]
     fn copy_without_cmake_or_with_dash_t_is_not() {
+        let store = StoreDir::new(Path::new("/nix/store")).unwrap();
         assert_eq!(
-            cmake_e_copy_dirs("cp /build/a /build/b", Path::new("/build")),
+            cmake_e_copy_dirs("cp /build/a /build/b", Path::new("/build"), &store),
             None
         );
         assert_eq!(
             cmake_e_copy_dirs(
                 "/nix/store/c-cmake/bin/cmake -E copy -t /build/dst /build/a /build/b",
-                Path::new("/build")
+                Path::new("/build"),
+                &store
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn copy_dirs_refuse_store_and_host_roots() {
+        let store = StoreDir::new(Path::new("/nix/store")).unwrap();
+        let build = Path::new("/build/x/build");
+        // A store tree needs no upload (/nix/store itself is the
+        // existing-dir case, so only the store gate can refuse it); a host
+        // tree must never be walked. Both spellings reach the reader (the
+        // command names them), and both must contribute nothing.
+        assert_eq!(
+            cmake_e_copy_dirs(
+                "cd /build/x && /nix/store/c-cmake/bin/cmake -E copy_directory /nix/store /build/x/build/out",
+                build,
+                &store
+            ),
+            None
+        );
+        assert_eq!(
+            cmake_e_copy_dirs(
+                "cd /build/x && /nix/store/c-cmake/bin/cmake -E copy_directory /etc /build/x/build/out",
+                build,
+                &store
             ),
             None
         );
