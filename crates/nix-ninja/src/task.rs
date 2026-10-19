@@ -7902,7 +7902,7 @@ fn wl_file_candidates(group: &str) -> Vec<&str> {
 /// shebang sites for the race a pid-only name loses.
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn new_opaque_files(
+pub(crate) fn new_opaque_files(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &std::path::Path,
     paths: Vec<PathBuf>,
@@ -20386,6 +20386,149 @@ pub fn scan_c_includes(
         }
     }
     Ok(scan)
+}
+
+/// Project headers reached only THROUGH a carried directory tree, which no
+/// other walk declares.
+///
+/// The include walk seeds from the realised Built inputs, and the static walk
+/// that ran at emission saw the tree as one unrealised key, so neither reads
+/// a tree file that a declared or statically discovered file includes.
+/// qttools 6.11.2: `qtgradientviewdialog_p.h` includes the uic header
+/// `ui_qtgradientviewdialog.h` from the `Designer_autogen` tree (through an
+/// absolute `-I`, which no build-path key of the expanded map can answer),
+/// that header includes `"qtgradientview_p.h"`, a checked-in source header,
+/// and the sandbox compile died on it.
+///
+/// Walks from every file the task already carries, follows only spellings
+/// that land on a file inside a carried tree, and from tree files onward
+/// returns each file that is outside the store, outside every tree and not
+/// already an input, with its own closure under the same rule. A store path
+/// or a carried input ends the walk; nothing reached only through a tree is
+/// added unless it qualifies, so a task whose trees reach nothing new is
+/// emitted exactly as before. Resolution follows the compiler's search
+/// order as `scan_c_includes` asks it: a quoted name tries the includer's
+/// directory, then the include directories in argv order.
+///
+/// `inputs` is the task's `NIX_NINJA_INPUTS`; `built` maps a build path to
+/// its realised location, tree directories included.
+///
+/// ponytail: plain and byte-order-marked `#include` directives only; a
+/// computed include inside a tree file is not followed. Read the macro
+/// uses here if a tree header ever names its include through a macro.
+pub(crate) fn tree_reached_headers(
+    cmdline: &str,
+    build_dir: &Path,
+    store_dir: &Path,
+    inputs: &str,
+    built: &HashMap<PathBuf, PathBuf>,
+) -> Vec<PathBuf> {
+    let content_of = |e: &str| -> Option<(PathBuf, PathBuf)> {
+        let mut f = e.split(':');
+        let (src, build, rel) = (f.next()?, f.next()?, f.next().unwrap_or(""));
+        let content = if !Path::new(src).starts_with(store_dir) {
+            built.get(Path::new(build))?.clone()
+        } else if rel.is_empty() {
+            PathBuf::from(src)
+        } else {
+            Path::new(src).join(rel)
+        };
+        Some((PathBuf::from(build), content))
+    };
+    let carried: Vec<(PathBuf, PathBuf)> = nix_ninja_task::derived_file::split_encoded_list(inputs)
+        .filter_map(content_of)
+        .collect();
+    let trees: Vec<(PathBuf, &PathBuf)> = carried
+        .iter()
+        .map(|(b, c)| (b, c))
+        .chain(built.iter())
+        .filter(|(_, c)| c.is_dir())
+        .map(|(b, c)| (lexical_join(build_dir, b), c))
+        .collect();
+    if trees.is_empty() {
+        return Vec::new();
+    }
+    let known: HashSet<PathBuf> = carried
+        .iter()
+        .map(|(b, _)| lexical_join(build_dir, b))
+        .collect();
+    enum Hit {
+        Tree(PathBuf, PathBuf),
+        Stop,
+        New(PathBuf, PathBuf),
+    }
+    let resolve = |cand: &Path| -> Option<Hit> {
+        let abs = lexical_join(build_dir, cand);
+        for (root, dir) in &trees {
+            if let Ok(rest) = abs.strip_prefix(root) {
+                let c = dir.join(rest);
+                if c.is_file() {
+                    return Some(Hit::Tree(abs, c));
+                }
+            }
+        }
+        if known.contains(&abs) {
+            return Some(Hit::Stop);
+        }
+        if !abs.is_file() {
+            return None;
+        }
+        let canon = fs::canonicalize(&abs).ok()?;
+        if canon.starts_with(store_dir)
+            || known.contains(&canon)
+            || host_path_not_this_trees_to_carry(build_dir, &abs)
+        {
+            return Some(Hit::Stop);
+        }
+        Some(Hit::New(abs, canon))
+    };
+    let dirs = include_dirs_as_given(cmdline);
+    // (spelled, content, reached through a tree)
+    let mut pending: Vec<(PathBuf, PathBuf, bool)> = carried
+        .iter()
+        .filter(|(_, c)| c.is_file())
+        .map(|(b, c)| (lexical_join(build_dir, b), c.clone(), false))
+        .collect();
+    let mut queued: HashSet<PathBuf> = pending.iter().map(|(s, _, _)| s.clone()).collect();
+    let mut out: Vec<PathBuf> = Vec::new();
+    while let Some((spelled, content, through_tree)) = pending.pop() {
+        let mut directives: Vec<(bool, PathBuf)> = c_include_parser::scan_directives(&content)
+            .map(|s| {
+                s.directives
+                    .iter()
+                    .map(|d| (d.quoted, d.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        directives.extend(bom_first_line_directive(&content));
+        let includer_dir = spelled.parent().unwrap_or(Path::new("")).to_path_buf();
+        for (quoted, name) in directives {
+            let bases = quoted
+                .then_some(includer_dir.as_path())
+                .into_iter()
+                .chain(dirs.iter().map(Path::new));
+            let Some(hit) = bases.into_iter().find_map(|b| resolve(&b.join(&name))) else {
+                continue;
+            };
+            let (s, c, add) = match hit {
+                Hit::Stop => continue,
+                Hit::Tree(s, c) => (s, c, false),
+                Hit::New(_, _) if !through_tree => continue,
+                Hit::New(s, c) => (s, c, true),
+            };
+            if !queued.insert(s.clone()) {
+                continue;
+            }
+            if add {
+                out.push(s.clone());
+                if c != s && queued.insert(c.clone()) {
+                    out.push(c.clone());
+                }
+            }
+            pending.push((s, c, true));
+        }
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -11,7 +11,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::task::{discover_c_includes, encoded_build_path};
+use crate::task::{
+    discover_c_includes, encoded_build_path, new_opaque_files, tree_reached_headers,
+};
 
 pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
     let input_drv = targets
@@ -262,6 +264,31 @@ pub fn scan_inputs(
     (files, built_paths)
 }
 
+/// The headers `tree_reached_headers` finds for this task: its command, its
+/// carried inputs (`NIX_NINJA_INPUTS`, the static walk's results among them)
+/// and the realised map. The scan below seeds from the Built inputs alone,
+/// so a tree header that a carried source includes is read only here.
+pub fn through_tree_headers(
+    drv: &Derivation,
+    build_dir: &Path,
+    store_dir: &Path,
+    built_paths: &HashMap<PathBuf, PathBuf>,
+) -> Vec<PathBuf> {
+    let text = |key: &[u8]| {
+        drv.env
+            .iter()
+            .find(|(k, _)| k.as_ref() == key)
+            .and_then(|(_, v)| std::str::from_utf8(v).ok())
+    };
+    let cmdline = drv.args.first().and_then(|a| std::str::from_utf8(a).ok());
+    match (cmdline, text(b"NIX_NINJA_INPUTS")) {
+        (Some(cmdline), Some(inputs)) => {
+            tree_reached_headers(cmdline, build_dir, store_dir, inputs, built_paths)
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Stage 2: Discover dynamic dependencies by analyzing built files for includes
 #[allow(clippy::too_many_arguments)]
 pub fn discover_dynamic_dependencies(
@@ -281,8 +308,9 @@ pub fn discover_dynamic_dependencies(
     let cmdline = std::str::from_utf8(cmdline_bytes)?;
 
     let (files, built_paths) = scan_inputs(built_paths);
+    let through_trees = through_tree_headers(drv, build_dir, store_dir.to_path(), &built_paths);
 
-    discover_c_includes(
+    let (mut found, defer) = discover_c_includes(
         rpc_client,
         store_dir,
         build_dir,
@@ -299,7 +327,13 @@ pub fn discover_dynamic_dependencies(
         // tree's producer could answer: it already ran.
         carried_trees,
         task_view,
-    )
+    )?;
+    if !through_trees.is_empty() {
+        found
+            .deps
+            .extend(new_opaque_files(rpc_client, build_dir, through_trees)?);
+    }
+    Ok((found, defer))
 }
 
 /// Stage 3: Update derivation with discovered dependencies and store paths
@@ -785,6 +819,202 @@ mod tests {
             scan.includes.contains(&src.join("plugin.h")),
             "the moc file's source header was not declared; includes: {:?}",
             scan.includes
+        );
+    }
+
+    /// The qttools 6.11.2 shape, built in a scratch dir with its own "store".
+    /// `dialog.cpp` and `dialog_p.h` are carried (static walk results, store
+    /// copies), `dialog_p.h` includes `ui_dialog.h`, which exists only inside
+    /// the realised `gen/ag` tree and is reached through an ABSOLUTE `-I`,
+    /// and the tree header's own includes are what `ui` writes. The build
+    /// path of the tree is not on disk, the state discovery runs in.
+    struct TreeFixture {
+        root: PathBuf,
+        store: PathBuf,
+        build: PathBuf,
+        src: PathBuf,
+        tree: PathBuf,
+    }
+
+    impl TreeFixture {
+        fn new(ui_body: &str, dialog_p_body: &str) -> Self {
+            let root = automoc_scratch();
+            let (store, build, src) = (
+                root.join("store"),
+                root.join("q/build"),
+                root.join("q/src/a"),
+            );
+            let tree = store.join("aaaa-ninja-build-gen-ag");
+            for d in [
+                &build,
+                &src,
+                &tree.join("include"),
+                &store.join("qtbase/include/QtCore"),
+            ] {
+                fs::create_dir_all(d).unwrap();
+            }
+            fs::write(store.join("qtbase/include/QtCore/QVariant"), "").unwrap();
+            fs::write(tree.join("include/ui_dialog.h"), ui_body).unwrap();
+            fs::write(
+                tree.join("include/other_ui.h"),
+                "#include <QtCore/QVariant>\n",
+            )
+            .unwrap();
+            fs::write(
+                src.join("view_p.h"),
+                "#include \"view_more.h\"\n#include <QtCore/QVariant>\n",
+            )
+            .unwrap();
+            fs::write(src.join("view_more.h"), "").unwrap();
+            fs::write(src.join("loose.h"), "").unwrap();
+            fs::write(store.join("cccc-dialog.cpp"), "#include \"dialog_p.h\"\n").unwrap();
+            fs::write(store.join("dddd-dialog_p.h"), dialog_p_body).unwrap();
+            TreeFixture {
+                root,
+                store,
+                build,
+                src,
+                tree,
+            }
+        }
+
+        fn cmdline(&self) -> String {
+            format!(
+                "g++ -I{}/gen/ag/include -I{} -isystem {}/qtbase/include -c {}/dialog.cpp",
+                self.build.display(),
+                self.src.display(),
+                self.store.display(),
+                self.src.display()
+            )
+        }
+
+        /// `NIX_NINJA_INPUTS` and the realised map; `with_tree` false drops
+        /// the tree from both, `extra` adds carried entries.
+        fn inputs(&self, with_tree: bool, extra: &[String]) -> (String, HashMap<PathBuf, PathBuf>) {
+            let mut lines = vec![
+                format!(
+                    "{}/cccc-dialog.cpp:../src/a/dialog.cpp:",
+                    self.store.display()
+                ),
+                format!(
+                    "{}/dddd-dialog_p.h:../src/a/dialog_p.h:",
+                    self.store.display()
+                ),
+            ];
+            let mut built = HashMap::new();
+            if with_tree {
+                lines.push("/1fake9placeholder:gen/ag:gen/ag".to_string());
+                built.insert(PathBuf::from("gen/ag"), self.tree.clone());
+            }
+            lines.extend(extra.iter().cloned());
+            (lines.join("\n"), built)
+        }
+
+        fn run(&self, with_tree: bool, extra: &[String]) -> Vec<PathBuf> {
+            let (inputs, built) = self.inputs(with_tree, extra);
+            crate::task::tree_reached_headers(
+                &self.cmdline(),
+                &self.build,
+                &self.store,
+                &inputs,
+                &built,
+            )
+        }
+    }
+
+    impl Drop for TreeFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    const UI_REACHES_PROJECT: &str = "#include <QtCore/QVariant>\n#include \"view_p.h\"\n";
+
+    /// A project header a tree header includes becomes an input, with its own
+    /// project closure; the store header both include does not.
+    #[test]
+    fn a_project_header_reached_through_a_tree_header_is_declared() {
+        let f = TreeFixture::new(UI_REACHES_PROJECT, "#include \"ui_dialog.h\"\n");
+        let got = f.run(true, &[]);
+        assert_eq!(
+            got,
+            vec![f.src.join("view_p.h"), f.src.join("view_more.h")],
+            "the tree header's project include and its closure, nothing else"
+        );
+    }
+
+    /// CONTROL (i): a tree header including only a store header adds nothing.
+    #[test]
+    fn a_tree_header_reaching_only_the_store_adds_nothing() {
+        let f = TreeFixture::new("#include <QtCore/QVariant>\n", "#include \"ui_dialog.h\"\n");
+        assert_eq!(f.run(true, &[]), Vec::<PathBuf>::new());
+    }
+
+    /// CONTROL (ii): a tree header including another tree header adds
+    /// neither; tree files are carried by the tree.
+    #[test]
+    fn a_tree_header_reaching_another_tree_header_adds_nothing() {
+        let f = TreeFixture::new("#include \"other_ui.h\"\n", "#include \"ui_dialog.h\"\n");
+        assert_eq!(f.run(true, &[]), Vec::<PathBuf>::new());
+    }
+
+    /// CONTROL (iii): without a carried tree the answer is empty, the
+    /// emission of before, though the tree header's content is unchanged.
+    #[test]
+    fn no_carried_tree_adds_nothing() {
+        let f = TreeFixture::new(UI_REACHES_PROJECT, "#include \"ui_dialog.h\"\n");
+        assert_eq!(f.run(false, &[]), Vec::<PathBuf>::new());
+    }
+
+    /// Two more halves of the rule: a header already carried is not added
+    /// again (by its build-path spelling), and an undeclared project header
+    /// a CARRIED file includes directly is not this walk's to add; only
+    /// what is reached through a tree file is.
+    #[test]
+    fn only_uncarried_headers_reached_through_a_tree_are_declared() {
+        let f = TreeFixture::new(UI_REACHES_PROJECT, "#include \"ui_dialog.h\"\n");
+        let carried = format!("{}/eeee-view_p.h:../src/a/view_p.h:", f.store.display());
+        assert_eq!(f.run(true, &[carried]), Vec::<PathBuf>::new());
+
+        let g = TreeFixture::new(
+            "#include <QtCore/QVariant>\n",
+            "#include \"loose.h\"\n#include \"ui_dialog.h\"\n",
+        );
+        assert_eq!(g.run(true, &[]), Vec::<PathBuf>::new());
+
+        // A carried Built header that is NOT ON DISK still answers its
+        // spelling: the compiler finds it in the sandbox, so the search ends
+        // there and never reaches the same-named source header further down
+        // the include path.
+        let h = TreeFixture::new(UI_REACHES_PROJECT, "#include \"ui_dialog.h\"\n");
+        let realised = h.store.join("ffff-view_p.h");
+        fs::write(&realised, "").unwrap();
+        let (mut inputs, mut built) = h.inputs(true, &[]);
+        inputs.push_str("\n/1fake2placeholder:gen/ag/include/view_p.h:");
+        built.insert(PathBuf::from("gen/ag/include/view_p.h"), realised);
+        assert_eq!(
+            crate::task::tree_reached_headers(&h.cmdline(), &h.build, &h.store, &inputs, &built),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// THE WIRING: `through_tree_headers` reads the command and the carried
+    /// inputs off the derivation `discover_dynamic_dependencies` is handed.
+    #[test]
+    fn the_derivation_carries_what_the_tree_walk_reads() {
+        let f = TreeFixture::new(UI_REACHES_PROJECT, "#include \"ui_dialog.h\"\n");
+        let (inputs, built) = f.inputs(true, &[]);
+        let mut drv = Derivation::new(
+            "ninja-build".parse().unwrap(),
+            b"x86_64-linux"[..].into(),
+            b"/nn-task/bin/nix-ninja-task"[..].into(),
+        );
+        drv.args.push(f.cmdline().into_bytes().into());
+        drv.env
+            .insert(b"NIX_NINJA_INPUTS"[..].into(), inputs.into_bytes().into());
+        assert_eq!(
+            through_tree_headers(&drv, &f.build, &f.store, &built),
+            vec![f.src.join("view_p.h"), f.src.join("view_more.h")]
         );
     }
 }
