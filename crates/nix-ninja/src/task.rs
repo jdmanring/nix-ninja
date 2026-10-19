@@ -2483,6 +2483,7 @@ impl Runner {
             let vapigen = vapigen_invocation(&args);
             let valac = valac_invocation(&args);
             let mkenums = glib_mkenums_invocation(&args);
+            let kdwsdl_imports = kdwsdl2cpp_invocation(&args);
             let autogen_info = cmake_autogen_info_arg(&args).map(str::to_string);
             // CMake custom commands open with `cd <subdir> &&`; every
             // relative path the command or an rsp file resolves after that
@@ -3047,6 +3048,25 @@ impl Runner {
                         }
                     } else {
                         referenced.push(p.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            // A KDWSDL2CPP RUN OPENS ITS SCHEMA IMPORTS UNDER `-import-path`,
+            // named by URL inside the `.wsdl`, so the whole root is carried
+            // through the same directory upload. The spelling stays relative
+            // to the build dir, which is the driver's cwd.
+            if let Some(dirs) = &kdwsdl_imports {
+                for p in kdwsdl2cpp_import_dirs(
+                    &self.config.build_dir,
+                    self.config.store_dir.to_path(),
+                    &cd_dir,
+                    dirs,
+                ) {
+                    for input in
+                        upload_referenced_dir(&self.rpc_client, &self.config.build_dir, &p)?
+                    {
+                        self.add_derived_file(files, input.clone());
+                        input_set.insert(input.build_path.clone(), input);
                     }
                 }
             }
@@ -11454,6 +11474,58 @@ pub fn nasm_referenced_paths(
             if !out.contains(&s) {
                 out.push(s);
             }
+        }
+    }
+    out
+}
+
+/// A `kdwsdl2cpp` run: its `-import-path` values. kdwsdl2cpp maps each
+/// schema import URL `http://<host>/<path>` to `<import-path>/<host>/<path>`
+/// and opens it itself, so the edge declares the `.wsdl` alone:
+/// kdsoap-ws-discovery-client 0.4.0's task got none of the imported `.xsd`
+/// files, logged `ERROR`, exited 0 and wrote an empty header. Only the
+/// separated spelling exists: `-import-path=<dir>` is refused with the usage
+/// text (kdsoap 2.2.0).
+pub fn kdwsdl2cpp_invocation(args: &[String]) -> Option<Vec<String>> {
+    let at = args.iter().position(|a| {
+        Path::new(a)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|b| b.starts_with("kdwsdl2cpp"))
+    })?;
+    let mut dirs = Vec::new();
+    let mut it = args[at + 1..].iter();
+    while let Some(a) = it.next() {
+        if a == "&&" || a == ";" || a == "|" {
+            break;
+        }
+        if a == "-import-path" {
+            dirs.extend(it.next().cloned());
+        }
+    }
+    (!dirs.is_empty()).then_some(dirs)
+}
+
+/// The import roots of a `kdwsdl2cpp` run to upload whole, build-dir
+/// relative. `rewrite_cmdline` has already turned an in-tree absolute root
+/// into a climb from the command's own directory (`../../wsdl` after `cd
+/// src`), which the generic directory argument arm tests against the build
+/// dir without rebasing and so never finds. A root left absolute is kept only
+/// inside this project's tree and outside the store.
+pub fn kdwsdl2cpp_import_dirs(
+    build_dir: &Path,
+    store_dir: &Path,
+    cd_dir: &Path,
+    dirs: &[String],
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for d in dirs {
+        let p = rebase_post_cd(cd_dir, d);
+        if p.is_absolute() && (p.starts_with(store_dir) || !same_project_tree(build_dir, &p)) {
+            continue;
+        }
+        if build_dir.join(&p).is_dir() && !out.contains(&p) {
+            out.push(p);
         }
     }
     out
@@ -25124,6 +25196,99 @@ mod nasm_reader_tests {
             nasm_referenced_paths(&build, Path::new(""), &[], &["../gst/x86/yadif.asm".into()]);
         assert!(bare.is_empty(), "{bare:?}");
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod kdwsdl2cpp_reader_tests {
+    use super::*;
+
+    /// kdsoap-ws-discovery-client 0.4.0's generator edge, with its source
+    /// root moved under a scratch dir: a `cd` into a build subdir, an
+    /// absolute `-import-path`, and the imports nested by URL host and path
+    /// (one of them, `addressing`, a FILE named like a directory).
+    #[test]
+    fn the_import_root_is_carried_from_behind_the_cd() {
+        let root = Scratch::new(format!("nn-kdwsdl-{}", std::process::id()));
+        let src = root.join("kdsoap-ws-discovery-client-0.4.0");
+        let build = src.join("build");
+        let wsdl = src.join("wsdl");
+        let disc = wsdl.join("schemas.xmlsoap.org/ws/2005/04/discovery");
+        let addr = wsdl.join("schemas.xmlsoap.org/ws/2004/08");
+        let oasis = wsdl.join("docs.oasis-open.org/ws-dd/discovery/1.1/os");
+        for d in [&build.join("src"), &disc, &addr, &oasis] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(disc.join("ws-discovery.wsdl"), "<definitions/>\n").unwrap();
+        fs::write(disc.join("ws-discovery.xsd"), "<schema/>\n").unwrap();
+        fs::write(addr.join("addressing"), "<schema/>\n").unwrap();
+        fs::write(
+            oasis.join("wsdd-discovery-1.1-schema-os.xsd"),
+            "<schema/>\n",
+        )
+        .unwrap();
+
+        let cmdline = format!(
+            "cd {b}/src && /nix/store/x-kdsoap-2.2.0-dev/bin/kdwsdl2cpp-qt6 \
+             -namespace WSDiscovery200504 -import-path {w} -use-local-files-only \
+             {w}/schemas.xmlsoap.org/ws/2005/04/discovery/ws-discovery.wsdl \
+             -o {b}/src/wsdl_ws-discovery.h",
+            b = build.display(),
+            w = wsdl.display(),
+        );
+        let args = shell_words::split(&rewrite_cmdline(&cmdline, &build)).unwrap();
+        let cd_dir = rewritten_cd_dir(&args);
+        let dirs = kdwsdl2cpp_invocation(&args).expect("a kdwsdl2cpp edge");
+
+        // THE PREMISE: the rewrite spells the root from the cd target, and
+        // the generic directory arm, which asks the build dir (the driver's
+        // cwd) without rebasing, finds nothing there. That is the defect.
+        assert_eq!(cd_dir, Path::new("src"));
+        assert_eq!(dirs, vec!["../../wsdl"]);
+        assert!(!build.join(&dirs[0]).is_dir());
+
+        let got = kdwsdl2cpp_import_dirs(&build, Path::new("/nix/store"), &cd_dir, &dirs);
+        assert_eq!(got, vec![PathBuf::from("../wsdl")]);
+        let carried = |rel: &str| build.join(&got[0]).join(rel).is_file();
+        assert!(carried(
+            "schemas.xmlsoap.org/ws/2005/04/discovery/ws-discovery.xsd"
+        ));
+        assert!(carried("schemas.xmlsoap.org/ws/2004/08/addressing"));
+        assert!(carried(
+            "docs.oasis-open.org/ws-dd/discovery/1.1/os/wsdd-discovery-1.1-schema-os.xsd"
+        ));
+    }
+
+    /// Each root EXISTS, so only its guard can drop it: the store root shares
+    /// the build dir's first component, and `/etc` is outside the project.
+    #[test]
+    fn a_store_or_host_root_and_another_program_are_not_carried() {
+        let root = Scratch::new(format!("nn-kdwsdl-guard-{}", std::process::id()));
+        let (build, store) = (root.join("build"), root.join("store"));
+        fs::create_dir_all(&build).unwrap();
+        fs::create_dir_all(store.join("x-wsdl")).unwrap();
+        let in_store = store.join("x-wsdl").to_string_lossy().into_owned();
+        assert_eq!(
+            kdwsdl2cpp_import_dirs(
+                &build,
+                Path::new("/nix/store"),
+                Path::new(""),
+                std::slice::from_ref(&in_store)
+            ),
+            vec![PathBuf::from(&in_store)],
+            "control: the same root is carried when it is not the store"
+        );
+        let roots = vec![in_store, "/etc".to_string()];
+        assert!(kdwsdl2cpp_import_dirs(&build, &store, Path::new(""), &roots).is_empty());
+        let argv = |s: &str| -> Vec<String> { s.split(' ').map(String::from).collect() };
+        assert_eq!(
+            kdwsdl2cpp_invocation(&argv("kdwsdl2cpp -o a.h -import-path=../wsdl a.wsdl")),
+            None
+        );
+        assert_eq!(
+            kdwsdl2cpp_invocation(&argv("cp -import-path ../wsdl x")),
+            None
+        );
     }
 }
 
