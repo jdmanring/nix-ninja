@@ -564,8 +564,8 @@ The daemon (nix 2.36.0pre, `builder-rpc-v0`) needs `dynamic-derivations`,
 `ca-derivations`, `recursive-nix` in ITS nix.conf as well as the client's
 (the error blames the client). Three nix versions are independent: the
 daemon pinned by literal store path in `/etc/s6/sv/nix-daemon-srv/run`
-(`2.36.0pre20260825_3aef07e`, GC-rooted; a daemon bump is a third moving
-part at a boundary, root edit plus restart), this tree's client (gates),
+(read the version THERE, never from this file; GC-rooted; a daemon bump
+is a third moving part at a boundary, root edit plus restart), this tree's client (gates),
 the consumer's client (rounds). A gate proves one client/daemon pair; say
 which. Compatibility is only established empirically (newest pair:
 `bea853d2` client, `3aef07e` daemon, corpus green at `df55697`).
