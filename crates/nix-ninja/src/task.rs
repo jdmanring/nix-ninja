@@ -231,6 +231,13 @@ struct Task {
     /// header. A non-compile edge misses nothing this way and pays no
     /// index lookups.
     is_gcc_task: bool,
+    /// A qrc entry (or the qrc itself) naming a file a graph edge produces
+    /// whose derivation is not registered yet: the consumer resolved before
+    /// its producer, which no declaration orders after it (an undeclared
+    /// generated member, a validation-only producer). `build_task_derivation`
+    /// returns it as `Deferred` before writing anything, and the scheduler
+    /// re-queues the edge with the producer as an implicit input.
+    qrc_defer: Option<DeferMiss>,
     /// Local mode (configurations A and B), where discovery may realise a
     /// carried tree to show the confirming preprocessor what the task sees.
     local_mode: bool,
@@ -1600,6 +1607,7 @@ impl Runner {
         };
         if self.no_defer.contains(&bid) {
             task.producer_index = None;
+            task.qrc_defer = None;
         }
         let resolve_ms = t0.elapsed().as_millis() as u64;
         RESOLVE_MS.fetch_add(resolve_ms, Ordering::Relaxed);
@@ -2196,6 +2204,7 @@ impl Runner {
             make_dirs: Vec::new(),
             producer_index: None,
             is_gcc_task: false,
+            qrc_defer: None,
             local_mode: !self.config.is_output_derivation,
             unresolved: Some(format!("{why:#}")),
         })
@@ -3414,6 +3423,25 @@ impl Runner {
                         }
                     }
                 }
+                // A GENERATED QRC FILE ITSELF: the qrc is produced by
+                // another edge and does not exist at scan time, so the
+                // read above skipped it silently. Push its build-relative
+                // path as a candidate so the routing loop below defers
+                // on the producer, the same shape as a generated member.
+                for q in qrcs {
+                    let qrc_abs = if Path::new(q).is_absolute() {
+                        PathBuf::from(q)
+                    } else {
+                        self.config.build_dir.join(rebase_post_cd(&cd_dir, q))
+                    };
+                    if !qrc_abs.is_file() {
+                        if let Some(rel) = relative_from(&qrc_abs, &self.config.build_dir) {
+                            if !rel.is_absolute() && !qrc_candidates.contains(&rel) {
+                                qrc_candidates.push(rel);
+                            }
+                        }
+                    }
+                }
             }
             // A `cmake -E copy` RUN READS ITS SOURCE DIRECTORIES, and on a
             // link edge no edge declares them (obs-studio 32.2.2's
@@ -3446,7 +3474,12 @@ impl Runner {
                 build.cmdline.as_deref(),
                 build.outs().iter().map(|f| files.by_id[*f].name.as_str()),
             ) {
-                for input in upload_referenced_dir(&self.rpc_client, &self.config.build_dir, &dir)?
+                // Absolute at the call: the walk reads the directory itself,
+                // and a relative path would resolve against the driver
+                // process cwd rather than the build dir. The function above
+                // already verified this join is a directory.
+                let abs = self.config.build_dir.join(&dir);
+                for input in upload_referenced_dir(&self.rpc_client, &self.config.build_dir, &abs)?
                 {
                     self.add_derived_file(files, input.clone());
                     input_set.insert(input.build_path.clone(), input);
@@ -3963,16 +3996,19 @@ impl Runner {
         // `.qsbc`), which exists nowhere at scan time. The candidate that
         // names a graph node routes as a Built input with its co-outputs,
         // the same shape as the grd candidates above.
-        for cand in qrc_candidates {
-            if input_set.contains_key(&cand) {
+        let mut qrc_defer_out: Option<DeferMiss> = None;
+        for cand in &qrc_candidates {
+            if input_set.contains_key(cand) {
                 continue;
             }
             let Some(gfid) = files.lookup(&cand.to_string_lossy()) else {
                 continue;
             };
             let mut expand = vec![gfid];
+            let mut found = false;
             while let Some(nfid) = expand.pop() {
                 if let Some(df) = self.derived_files.get(&nfid) {
+                    found = true;
                     if input_set.contains_key(&df.build_path) {
                         continue;
                     }
@@ -3981,6 +4017,25 @@ impl Runner {
                         expand.extend(sibs.iter().filter(|s| **s != nfid));
                     }
                 }
+            }
+            // A PRODUCED NODE WITH NO REGISTERED DERIVED FILE: the
+            // consumer resolved before its producer, which no declared
+            // input orders after it (an undeclared generated member, a
+            // validation-only producer, or the qrc file itself). Defer
+            // through the same machinery as the c-include miss: the
+            // scheduler re-queues the edge with the producer as an
+            // implicit input, and the second resolution finds the
+            // DerivedFile. Restricted to nodes with a producing edge
+            // (`input.is_some()`), never any graph name, so a source
+            // file that happens to share a spelling cannot invent a
+            // false dependency.
+            if !found && files.by_id[gfid].input.is_some() {
+                qrc_defer_out = Some(DeferMiss {
+                    fids: vec![gfid],
+                    header: cand.to_string_lossy().into_owned(),
+                    at: cand.clone(),
+                });
+                break;
             }
         }
 
@@ -4196,6 +4251,7 @@ impl Runner {
             },
             make_dirs,
             is_gcc_task,
+            qrc_defer: qrc_defer_out,
             local_mode: !self.config.is_output_derivation,
             unresolved: None,
         })
@@ -5453,6 +5509,14 @@ fn build_task_derivation(
             return Err(anyhow!("Phony tasks not yet supported"));
         }
     };
+
+    // A QRC DEFER: the consumer resolved before a producer its qrc
+    // names, and no declared input ordered it after that producer.
+    // Return before any store write; the spawn site downcasts this
+    // back into the deferral and the scheduler re-queues the edge.
+    if let Some(d) = &task.qrc_defer {
+        return Err(anyhow::Error::new(Deferred(d.clone())));
+    }
 
     let mut drv = Derivation::new(
         "ninja-build".parse()?,
@@ -13773,8 +13837,14 @@ fn qrc_candidate_rels(
     };
     let mut out = Vec::new();
     for raw in &raws {
-        if same_project_tree(build_dir, raw) {
-            if let Some(rel) = relative_from(raw, build_dir) {
+        // NORMALIZED BEFORE RELATIVIZING: a climbing entry
+        // (`../icons/gen.dat`) joins lexically (`.qt/rcc/../icons/gen.dat`),
+        // which never matches the producing edge's output spelling
+        // (`icons/gen.dat`), so the candidate silently binds nothing. The
+        // normalized join is the spelling the graph holds.
+        let raw = normalize_build_path_lexical(raw);
+        if same_project_tree(build_dir, &raw) {
+            if let Some(rel) = relative_from(&raw, build_dir) {
                 if !rel.is_absolute() && !out.contains(&rel) {
                     out.push(rel);
                 }
@@ -14119,6 +14189,34 @@ mod qrc_copy_sourcedir_tests {
             "/etc/passwd",
         )
         .is_empty());
+    }
+
+    #[test]
+    fn a_climbing_entry_reaches_the_producer_spelling() {
+        // The gate twin's geometry: the qrc entry climbs out of its own
+        // directory (`../icons/gen.dat` from `.qt/rcc`), and the producing
+        // edge outputs the normalized spelling (`icons/gen.dat`). The
+        // lexical join (`.qt/rcc/../icons/gen.dat`) never matches a graph
+        // node; only the normalized one binds or defers.
+        let build = Path::new("/build/x/build");
+        let mut got = qrc_candidate_rels(
+            build,
+            &build.join(".qt/rcc"),
+            &build.join("icons"),
+            "../icons/gen.dat",
+        );
+        got.sort();
+        // Both bases join and normalize; the producer spelling (the
+        // command-dir join) is among them, which is the property the
+        // routing loop needs. The qrc-dir join normalizes to its own
+        // spelling, harmless: it matches no node and is skipped.
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from(".qt/icons/gen.dat"),
+                PathBuf::from("icons/gen.dat"),
+            ]
+        );
     }
 
     #[test]
