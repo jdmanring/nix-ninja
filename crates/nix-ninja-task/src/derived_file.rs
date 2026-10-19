@@ -645,6 +645,19 @@ pub fn create_symlinks_with(
             perms.set_readonly(false);
             fs::set_permissions(&dest_path, perms)
                 .map_err(|e| anyhow!("set_permissions({}): {e}", dest_path.display()))?;
+            // `fs::copy` DOES NOT CARRY THE MTIME, and a link stats through
+            // to the store's. rcc embeds each resource's modification time,
+            // so an svg placed as a copy at the wall clock made every
+            // resource task write different bytes on each run. The copy
+            // takes the source's time and stats as the link did.
+            let modified = fs::metadata(&source_path)
+                .and_then(|m| m.modified())
+                .map_err(|e| anyhow!("mtime({:?}): {e}", source_path))?;
+            fs::File::options()
+                .write(true)
+                .open(&dest_path)
+                .and_then(|f| f.set_modified(modified))
+                .map_err(|e| anyhow!("set_modified({}): {e}", dest_path.display()))?;
             continue;
         }
 

@@ -820,6 +820,8 @@ fn a_shader_or_an_icon_is_a_copy_and_its_neighbours_stay_links() {
         "vert", "tesc", "tese", "geom", "frag", "comp", "glsl", "glsllib", "svg", "svgz",
     ];
     let linked = ["qsb", "png", "svgx", "fragment", "c", "txt"];
+    // The store's own mtime: rcc embeds what the placed file stats as.
+    let store_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
     let mut inputs = Vec::new();
     for (i, ext) in copied.iter().chain(linked.iter()).enumerate() {
         let hash = format!("{:0>32}", format!("{i}aaaaaaaa"));
@@ -827,6 +829,11 @@ fn a_shader_or_an_icon_is_a_copy_and_its_neighbours_stay_links() {
         let sp = store_root.join(format!("{hash}-{name}"));
         std::fs::create_dir_all(sp.join("res")).unwrap();
         std::fs::write(sp.join(format!("res/x.{ext}")), b"x\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(sp.join(format!("res/x.{ext}")))
+            .and_then(|f| f.set_modified(store_mtime))
+            .unwrap();
         let rel = format!("res/x.{ext}");
         inputs.push(
             DerivedFile::from_encoded(
@@ -844,6 +851,11 @@ fn a_shader_or_an_icon_is_a_copy_and_its_neighbours_stay_links() {
         assert!(
             !placed.is_symlink() && placed.is_file(),
             ".{ext} was placed as a link, so its consumer resolves it in the store"
+        );
+        assert_eq!(
+            std::fs::metadata(&placed).unwrap().modified().unwrap(),
+            store_mtime,
+            ".{ext} was copied at the wall clock, so rcc embeds the placement time"
         );
     }
     for ext in linked {
