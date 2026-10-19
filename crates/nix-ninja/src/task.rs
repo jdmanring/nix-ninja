@@ -2370,6 +2370,16 @@ impl Runner {
         let direct: rustc_hash::FxHashSet<FileId> = build.ordering_ins().iter().copied().collect();
         let mut seen: rustc_hash::FxHashSet<FileId> = rustc_hash::FxHashSet::default();
         let mut source_aliases: Vec<(String, String)> = Vec::new();
+        // A `.qrc` entry can name a file no edge has produced yet (a
+        // compiled shader), which exists nowhere at scan time. Collected in
+        // the readers below, routed as Built inputs beside the grd
+        // candidates. The two live at function scope because the routing
+        // runs after the command-line block closes.
+        let mut qrc_candidates: Vec<PathBuf> = Vec::new();
+        // A `.qrc` entry can climb through directories nothing declares
+        // (an un-normalized absolute path), whose prefixes must exist for
+        // the kernel to resolve the climb. Merged into make_dirs below.
+        let mut qrc_make_dirs: Vec<String> = Vec::new();
         while let Some((fid, via_phony)) = worklist.pop() {
             if !seen.insert(fid) {
                 continue;
@@ -2676,6 +2686,11 @@ impl Runner {
             let vapigen = vapigen_invocation(&args);
             let valac = valac_invocation(&args);
             let mkenums = glib_mkenums_invocation(&args);
+            let rcc = rcc_invocation(&args);
+            let cmake_copies = build
+                .cmdline
+                .as_deref()
+                .and_then(|c| cmake_e_copy_dirs(c, &self.config.build_dir));
             let kdwsdl_imports = kdwsdl2cpp_invocation(&args);
             let autogen_info = cmake_autogen_info_arg(&args).map(str::to_string);
             // CMake custom commands open with `cd <subdir> &&`; every
@@ -3383,6 +3398,60 @@ impl Runner {
                     referenced.push(p);
                 }
             }
+            // A QT `rcc` RUN OPENS ITS `.qrc` AND EVERY FILE IT LISTS, and no
+            // edge declares either (breeze-icons 6.30.0, qttools 6.11.2,
+            // qtquick3d 6.11.2, KDE round 2026-10-18). Same undeclared-read
+            // family as the readers around it; same placement.
+            if let Some(qrcs) = &rcc {
+                for (uploads, cands, dirs) in
+                    qrc_referenced_paths(&self.config.build_dir, &cmd_cwd, &cd_dir, qrcs)
+                {
+                    referenced.extend(uploads);
+                    qrc_candidates.extend(cands);
+                    for d in dirs {
+                        if !qrc_make_dirs.contains(&d) {
+                            qrc_make_dirs.push(d);
+                        }
+                    }
+                }
+            }
+            // A `cmake -E copy` RUN READS ITS SOURCE DIRECTORIES, and on a
+            // link edge no edge declares them (obs-studio 32.2.2's
+            // `copy_directory` of the CEF tree inside the obs-browser link;
+            // the absolute files beside it already ride the generic
+            // absolute-file route, and an absolute DIR is refused there by
+            // construction). Directories ride the dir upload the way the
+            // kdwsdl roots do.
+            if let Some(copies) = &cmake_copies {
+                for src in copies {
+                    for input in
+                        upload_referenced_dir(&self.rpc_client, &self.config.build_dir, src)?
+                    {
+                        self.add_derived_file(files, input.clone());
+                        input_set.insert(input.build_path.clone(), input);
+                    }
+                }
+            }
+            // AN EXTERNALPROJECT CONFIGURE STEP READS ITS WHOLE SOURCE TREE,
+            // and where the tree comes from the outer checkout
+            // (`method=source_dir`, no download, no extract step) nothing
+            // declares it (qtwebengine 6.11.2's gn configure, KDE round
+            // 2026-10-18: `cmake -S <src>/src/gn` died on the absent dir).
+            // The stamp sibling `<name>-source_dirinfo.txt` names it, the
+            // way `extract-<name>.cmake` names the download tree. Gated on
+            // the stamp shape AND a cmake configure command, so ordinary
+            // cmake tasks and non-configure steps move nothing.
+            for dir in ep_source_dir_trees(
+                &self.config.build_dir,
+                build.cmdline.as_deref(),
+                build.outs().iter().map(|f| files.by_id[*f].name.as_str()),
+            ) {
+                for input in upload_referenced_dir(&self.rpc_client, &self.config.build_dir, &dir)?
+                {
+                    self.add_derived_file(files, input.clone());
+                    input_set.insert(input.build_path.clone(), input);
+                }
+            }
             let mut gtest_discovery = runs_gtest_discovery(cmdline, None);
             if let Some(script) = &cmake_p_script {
                 // THE `-P` PATH IS SPELLED RELATIVE TO THE cd TARGET, NOT TO
@@ -3890,6 +3959,31 @@ impl Runner {
             }
         }
 
+        // A `.qrc` entry can name a GENERATED file (qtquick3d's compiled
+        // `.qsbc`), which exists nowhere at scan time. The candidate that
+        // names a graph node routes as a Built input with its co-outputs,
+        // the same shape as the grd candidates above.
+        for cand in qrc_candidates {
+            if input_set.contains_key(&cand) {
+                continue;
+            }
+            let Some(gfid) = files.lookup(&cand.to_string_lossy()) else {
+                continue;
+            };
+            let mut expand = vec![gfid];
+            while let Some(nfid) = expand.pop() {
+                if let Some(df) = self.derived_files.get(&nfid) {
+                    if input_set.contains_key(&df.build_path) {
+                        continue;
+                    }
+                    input_set.insert(df.build_path.clone(), df.clone());
+                    if let Some(sibs) = self.co_outputs.get(&nfid) {
+                        expand.extend(sibs.iter().filter(|s| **s != nfid));
+                    }
+                }
+            }
+        }
+
         // A FILE THE COMMAND OVERWRITES IS NOT AN INPUT. gcr's gdbus header
         // edge depends on the source edge and reruns the same command,
         // which writes both; placed read-only, the `.c` failed the write.
@@ -4017,6 +4111,14 @@ impl Runner {
                 .map(|c| gtkdoc_make_dirs(&self.config.build_dir, c))
                 .unwrap_or_default()
             {
+                if !dirs.contains(&d) {
+                    dirs.push(d);
+                }
+            }
+            // The climb prefixes a `.qrc` entry traverses (qttools'
+            // `src/designer/src/designer/../../../shared/...`): the kernel
+            // needs each level to exist, and nothing else creates them.
+            for d in qrc_make_dirs {
                 if !dirs.contains(&d) {
                     dirs.push(d);
                 }
@@ -6448,8 +6550,19 @@ fn build_task_derivation(
             }
             Ok(None) => {}
             Err(e) => {
-                let rel = relative_from(Path::new(cmdline_binary), &task.build_dir)
-                    .unwrap_or_else(|| PathBuf::from(cmdline_binary));
+                // The program is read where the command RUNS, not where the
+                // driver does: a command opening with `cd <dir>` names a
+                // relative tool against that directory (the rewrite respells
+                // an absolute tool the same way), while `which` resolved it
+                // against the driver's own cwd. The upload path already used
+                // the rebased spelling, so the input-match below compares
+                // that spelling too - otherwise a tool the task carries
+                // reads as missing and the edge dies at emission. Absolute
+                // programs keep today's reading, and a command with no cd
+                // keeps its spelling, so every edge that resolves today
+                // resolves identically; only an Err can become a tolerate,
+                // never an input or a PATH entry.
+                let rel = program_build_path(cmdline, &task.build_dir, cmdline_binary);
                 let is_task_input = task
                     .inputs
                     .iter()
@@ -9719,6 +9832,204 @@ pub fn gdbus_c_code_writes(cmdline: &str, outputs: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+/// One `TAG = value` line of a Doxyfile: the first binding wins, quotes
+/// stripped, `+=` folded the way `doxyfile_tag_values` folds it.
+fn doxyfile_tag_value(text: &str, tag: &str) -> Option<String> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim_end_matches('+').trim() != tag {
+            continue;
+        }
+        let v = value.trim().trim_matches('"').trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// The HTML tree a `doxygen` stamp edge writes but declares only its stamp.
+/// kdsoap-ws-discovery-client 0.4.0 (KDE round 2026-10-18): `doxygen_add_docs
+/// (docs ... ALL USE_STAMP_FILE)` runs `cmake -E make_directory <out> &&
+/// doxygen <Doxyfile> && cmake -E touch docs.stamp` with the source dir as
+/// its working directory; the task runs rc=0, the stamp is stored, the html
+/// tree is an undeclared write and stays in the sandbox, and install dies
+/// `file INSTALL cannot find <build>/docs/html`. Same undeclared-side-product
+/// family as the copy reader's openblas header and the stamp script's
+/// freerdp man pages; the Doxyfile names the tree the way their scripts do.
+///
+/// GATED ON A STAMP OUTPUT AND A RESOLVABLE DOXYFILE, so an ordinary cmake
+/// task moves nothing: `GENERATE_HTML=NO` and an unresolvable config refuse,
+/// and a directory at or above the build root is refused with them. Only the
+/// stamp shape is read; a `doxygen_add_docs` without `USE_STAMP_FILE` has no
+/// declared output to ride and stays unwitnessed until a package carries it.
+fn doxygen_html_output(declared: &[PathBuf], cmdline: &str, build_dir: &Path) -> Option<PathBuf> {
+    if declared.is_empty()
+        || !declared
+            .iter()
+            .any(|o| o.extension().is_some_and(|e| e == "stamp"))
+    {
+        return None;
+    }
+    let mut base = build_dir.to_path_buf();
+    let mut doxyfile: Option<PathBuf> = None;
+    for seg in cmdline.split("&&") {
+        let Ok(toks) = shell_words::split(seg) else {
+            continue;
+        };
+        let mut toks = toks.iter().peekable();
+        let Some(first) = toks.next() else {
+            continue;
+        };
+        if first == "cd" {
+            if let Some(dir) = toks.next() {
+                base = cd_into(&base, Path::new(dir.trim_matches('"')));
+            }
+            continue;
+        }
+        if Path::new(first).file_name().is_none_or(|n| n != "doxygen") {
+            continue;
+        }
+        for t in toks {
+            if t == ";" {
+                break;
+            }
+            if t.starts_with('-') {
+                continue;
+            }
+            let p = Path::new(t.trim_matches('"'));
+            let abs = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                base.join(p)
+            };
+            if abs.is_file() {
+                doxyfile = Some(abs);
+            }
+            break;
+        }
+    }
+    let doxyfile = doxyfile?;
+    let text = std::fs::read_to_string(&doxyfile).ok()?;
+    if text.is_empty() {
+        return None;
+    }
+    if doxyfile_tag_value(&text, "GENERATE_HTML").is_some_and(|v| v == "NO") {
+        return None;
+    }
+    let outdir = doxyfile_tag_value(&text, "OUTPUT_DIRECTORY")?;
+    let outdir = PathBuf::from(outdir);
+    // CMake absolutizes a relative OUTPUT_DIRECTORY against the target's
+    // binary dir, which is the stamp's own directory.
+    let abs = if outdir.is_absolute() {
+        outdir
+    } else {
+        let stamp_dir = declared.iter().find_map(|o| {
+            o.extension()
+                .is_some_and(|e| e == "stamp")
+                .then(|| o.parent())
+                .flatten()
+        })?;
+        build_dir.join(stamp_dir).join(&outdir)
+    };
+    let html = doxyfile_tag_value(&text, "HTML_OUTPUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("html"));
+    let abs = abs.join(html);
+    let rel = relative_from(&abs, build_dir)?;
+    // Outputs stay under the build dir: a climb (`../src`-style) or an
+    // escape is refused, whatever the same-tree gate said.
+    if !matches!(
+        rel.components().next(),
+        Some(std::path::Component::Normal(_))
+    ) {
+        return None;
+    }
+    if !same_project_tree(build_dir, &abs) {
+        return None;
+    }
+    Some(normalize_build_path_lexical(&rel))
+}
+
+#[cfg(test)]
+mod doxygen_output_tests {
+    use super::*;
+
+    /// kdsoap-ws-discovery-client 0.4.0's docs edge, in the shape cmake's
+    /// `doxygen_add_docs(docs ... ALL USE_STAMP_FILE)` writes it: the stamp
+    /// is the declared output, the source dir is the working directory, and
+    /// the generated Doxyfile carries an absolute OUTPUT_DIRECTORY with the
+    /// HTML_OUTPUT default.
+    const DOCS_CMD: &str = "cd /build/kdsoap-ws-discovery-client-0.4.0/docs && /nix/store/x-cmake-4.4.3/bin/cmake -E make_directory /build/kdsoap-ws-discovery-client-0.4.0/build/docs/html && /nix/store/x-doxygen-1.17.0/bin/doxygen /build/kdsoap-ws-discovery-client-0.4.0/build/docs/Doxyfile.docs && /nix/store/x-cmake-4.4.3/bin/cmake -E touch /build/kdsoap-ws-discovery-client-0.4.0/build/docs/docs.stamp";
+
+    const DOCS_DOXYFILE: &str = "PROJECT_NAME = kdsoap\nOUTPUT_DIRECTORY = /build/kdsoap-ws-discovery-client-0.4.0/build/docs\nGENERATE_HTML = YES\nINPUT = /build/kdsoap-ws-discovery-client-0.4.0/src\n";
+
+    fn docs_tree(tag: &str, doxyfile: &str) -> (Scratch, PathBuf) {
+        let root = Scratch::new(format!("nn-doxy-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("build/docs")).unwrap();
+        std::fs::create_dir_all(root.join("src/docs")).unwrap();
+        std::fs::write(
+            root.join("build/docs/Doxyfile.docs"),
+            doxyfile.replace(
+                "/build/kdsoap-ws-discovery-client-0.4.0",
+                root.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        let cmd = DOCS_CMD.replace(
+            "/build/kdsoap-ws-discovery-client-0.4.0",
+            root.to_str().unwrap(),
+        );
+        let build = root.join("build");
+        let got = doxygen_html_output(&[PathBuf::from("docs/docs.stamp")], &cmd, &build);
+        (root, got.unwrap_or_default())
+    }
+
+    #[test]
+    fn stamp_edge_html_tree_is_declared() {
+        let (_root, got) = docs_tree("subject", DOCS_DOXYFILE);
+        assert_eq!(got, PathBuf::from("docs/html"));
+    }
+
+    #[test]
+    fn html_off_and_unresolvable_config_refuse() {
+        let (_root, got) = docs_tree(
+            "nohtml",
+            "OUTPUT_DIRECTORY = /build/kdsoap-ws-discovery-client-0.4.0/build/docs\nGENERATE_HTML = NO\n",
+        );
+        assert!(got.as_os_str().is_empty());
+        let build = Path::new("/build/x/build");
+        assert!(doxygen_html_output(
+            &[PathBuf::from("docs/docs.stamp")],
+            "cd /build/x/src/docs && /bin/doxygen /build/x/build/docs/Doxyfile.docs",
+            build,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn non_stamp_and_escaping_outputs_refuse() {
+        let build = Path::new("/build/x/build");
+        assert!(doxygen_html_output(
+            &[PathBuf::from("docs/manual.pdf")],
+            "cd /build/x/src/docs && /bin/doxygen /build/x/build/docs/Doxyfile",
+            build,
+        )
+        .is_none());
+        let (_root, got) = docs_tree(
+            "escape",
+            "OUTPUT_DIRECTORY = /other/docs\nGENERATE_HTML = YES\n",
+        );
+        assert!(got.as_os_str().is_empty());
+    }
+}
+
 fn undeclared_outputs(
     declared: &[PathBuf],
     cmdline: Option<&str>,
@@ -9774,6 +10085,11 @@ fn undeclared_outputs(
         for w in cmake_p_stamp_edge_writes(declared, c, build_dir) {
             if !v.contains(&w) {
                 v.push(w);
+            }
+        }
+        if let Some(dir) = doxygen_html_output(declared, c, build_dir) {
+            if !v.contains(&dir) {
+                v.push(dir);
             }
         }
         // AN EXTERNALPROJECT DOWNLOAD EXTRACTS INTO `SOURCE_DIR` AND
@@ -13292,6 +13608,663 @@ fn msgfmt_invocation(args: &[String]) -> Option<Vec<String>> {
         }
     }
     Some(out)
+}
+
+/// A QT `rcc` RUN NAMES ITS `.qrc` FILES ON THE COMMAND LINE, and the files
+/// they list are read by no other route (breeze-icons 6.30.0's
+/// `icons/breeze-icons.qrc`, qttools 6.11.2's `.qt/rcc/*.qrc`, qtquick3d
+/// 6.11.2's generated `.qrc`, KDE round 2026-10-18: every one died
+/// `RCC: Error ... Cannot find file`). Same undeclared-read family as the
+/// swig `%include` and protoc import readers; the trigger returns the `.qrc`
+/// spellings the way the filelist trigger returns its file.
+fn rcc_invocation(args: &[String]) -> Option<Vec<String>> {
+    let mut at_program = true;
+    let mut found = false;
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if i == 0 || ["&&", ";", "|", "||"].contains(&args[i - 1].as_str()) {
+            at_program = true;
+        }
+        if at_program {
+            at_program = false;
+            if Path::new(a).file_name().is_some_and(|n| {
+                n.to_string_lossy().trim_matches(|c| c == '"' || c == '\'') == "rcc"
+            }) {
+                found = true;
+            }
+            continue;
+        }
+        let t = a.trim_matches(|c| c == '"' || c == '\'');
+        if found && !t.starts_with('-') && t.ends_with(".qrc") {
+            out.push(t.to_string());
+        }
+    }
+    if found && !out.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// The `<file>` entries of a `.qrc` document. The alias attribute, when
+/// present, names the resource, never the file: the content is the path.
+/// Scanned as text rather than parsed as XML: the witnessed documents are
+/// flat single-line entries, and a scanner degrades to no entries where a
+/// parser would abort the whole task.
+fn qrc_file_entries(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<file") {
+        let after_tag = &rest[start + "<file".len()..];
+        let Some(gt) = after_tag.find('>') else {
+            break;
+        };
+        let after_gt = &after_tag[gt + 1..];
+        let Some(end) = after_gt.find("</file>") else {
+            break;
+        };
+        let entry = after_gt[..end].trim();
+        if !entry.is_empty() {
+            out.push(entry.to_string());
+        }
+        rest = &after_gt[end + "</file>".len()..];
+    }
+    out
+}
+
+/// Resolve a `.qrc`'s entries the way `rcc` opens them: a relative entry
+/// against the command's own directory (the `cd` its edge carries, the way
+/// the glib-mkenums names resolve), an absolute one as given. Returns, per
+/// qrc, the files to upload, the build-relative candidates for the
+/// producer-index routing below (a generated member exists nowhere at scan
+/// time), and the climb prefixes to create.
+///
+/// THE PREFIXES ARE THE WHOLE FIX FOR ONE MEMBER. qttools' generated qrc
+/// spells its images `/build/.../src/designer/src/designer/../../../shared/
+/// ...`: the kernel resolves each `..` against a directory that must EXIST,
+/// and `src/designer/src/designer` is declared by nothing, so the open dies
+/// ENOENT although the normalized target is materialized (measured
+/// 2026-10-18 on the kept task sandbox: the un-normalized path resolves
+/// false, the normalized one true). The clean leading prefixes of a
+/// climbing entry ride `make_dirs`, whose task-side creation admits climbs
+/// confined to the tree. Prefixes the normalized file path already carries
+/// are skipped: placement creates those.
+#[allow(clippy::type_complexity)]
+fn qrc_referenced_paths(
+    build_dir: &Path,
+    cmd_cwd: &Path,
+    cd_dir: &Path,
+    qrcs: &[String],
+) -> Vec<(Vec<String>, Vec<PathBuf>, Vec<String>)> {
+    let mut out = Vec::new();
+    for q in qrcs {
+        let qrc_abs = if Path::new(q).is_absolute() {
+            PathBuf::from(q)
+        } else {
+            build_dir.join(rebase_post_cd(cd_dir, q))
+        };
+        let Ok(text) = std::fs::read_to_string(&qrc_abs) else {
+            continue;
+        };
+        let qrc_dir = qrc_abs.parent().unwrap_or(Path::new(""));
+        let mut files = vec![qrc_abs.to_string_lossy().into_owned()];
+        let mut cands = Vec::new();
+        let mut dirs = Vec::new();
+        for e in qrc_file_entries(&text) {
+            let ep = Path::new(&e);
+            // Both joins: rcc resolves a relative entry against the
+            // command's directory, and the qrc's own directory is the
+            // other spelling production has needed. `cmd_cwd` is always
+            // absolute, so every candidate below is absolute too.
+            let raws: Vec<PathBuf> = if ep.is_absolute() {
+                vec![ep.to_path_buf()]
+            } else {
+                vec![qrc_dir.join(ep), cmd_cwd.join(ep)]
+            };
+            let mut placed = false;
+            for raw in &raws {
+                if !same_project_tree(build_dir, raw) {
+                    continue;
+                }
+                if raw.is_file() {
+                    files.push(raw.to_string_lossy().into_owned());
+                    placed = true;
+                    push_climb_prefixes(build_dir, raw, &mut dirs);
+                } else {
+                    let norm = normalize_build_path_lexical(raw);
+                    if norm != *raw && norm.is_file() {
+                        files.push(norm.to_string_lossy().into_owned());
+                        placed = true;
+                        push_climb_prefixes(build_dir, raw, &mut dirs);
+                    }
+                }
+            }
+            if !placed {
+                for rel in qrc_candidate_rels(build_dir, qrc_dir, cmd_cwd, &e) {
+                    if !cands.contains(&rel) {
+                        cands.push(rel);
+                    }
+                }
+            }
+        }
+        files.sort();
+        files.dedup();
+        out.push((files, cands, dirs));
+    }
+    out
+}
+
+/// The build-relative spellings under which one `.qrc` entry can name a
+/// graph node: itself where absolute, the qrc-directory join and the
+/// command-directory join where relative. Pure so the producer-index
+/// routing the merge does is testable without a Runner: a spelling that
+/// does not match the producing edge's output build path binds nothing.
+fn qrc_candidate_rels(
+    build_dir: &Path,
+    qrc_dir: &Path,
+    cmd_cwd: &Path,
+    entry: &str,
+) -> Vec<PathBuf> {
+    let ep = Path::new(entry);
+    let raws: Vec<PathBuf> = if ep.is_absolute() {
+        vec![ep.to_path_buf()]
+    } else {
+        vec![qrc_dir.join(ep), cmd_cwd.join(ep)]
+    };
+    let mut out = Vec::new();
+    for raw in &raws {
+        if same_project_tree(build_dir, raw) {
+            if let Some(rel) = relative_from(raw, build_dir) {
+                if !rel.is_absolute() && !out.contains(&rel) {
+                    out.push(rel);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The clean leading prefixes of a climbing path, build-relative, minus the
+/// ones the normalized file's own placement already creates. qttools'
+/// `.../src/designer/src/designer/../../../shared/.../back.png` yields
+/// `../src/designer`, `../src/designer/src` and
+/// `../src/designer/src/designer` (`../src` is the file's own parent and is
+/// skipped).
+fn push_climb_prefixes(build_dir: &Path, raw: &Path, dirs: &mut Vec<String>) {
+    if !raw
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return;
+    }
+    let norm = normalize_build_path_lexical(raw);
+    let mut prefix = PathBuf::new();
+    for c in raw.components() {
+        if matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        ) {
+            break;
+        }
+        prefix.push(c);
+        if prefix == norm || norm.starts_with(&prefix) {
+            continue;
+        }
+        let rel = relative_from(&prefix, build_dir);
+        if let Some(rel) = rel {
+            if rel.is_absolute() {
+                continue;
+            }
+            let s = rel.to_string_lossy().into_owned();
+            if !s.is_empty() && !dirs.contains(&s) {
+                dirs.push(s);
+            }
+        }
+    }
+}
+
+/// The DIRECTORIES of a `cmake -E copy | copy_if_different |
+/// copy_directory` step, absolutized against the `cd` in effect where each
+/// runs. obs-studio 32.2.2's obs-browser link copies its CEF siblings from
+/// `/build/cef/...`, which no edge declares - and the absolute files among
+/// them already ride the generic absolute-file route, while an absolute DIR
+/// is refused there by construction ("an absolute DIR here is usually the
+/// project root itself"). Only the witnessed plain form is read: a `-t`
+/// destination names its sources positionally and stays unwitnessed until
+/// a package carries it.
+fn cmake_e_copy_dirs(cmdline: &str, build_dir: &Path) -> Option<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut base = build_dir.to_path_buf();
+    for seg in cmdline.split("&&") {
+        let Ok(toks) = shell_words::split(seg) else {
+            continue;
+        };
+        match toks.as_slice() {
+            [c, dir] if c == "cd" => {
+                base = cd_into(&base, Path::new(dir.trim_matches('"')));
+            }
+            [prog, e, op, rest @ ..]
+                if Path::new(prog).file_name().is_some_and(|n| n == "cmake")
+                    && e == "-E"
+                    && (op == "copy" || op == "copy_if_different" || op == "copy_directory")
+                    && rest.len() >= 2
+                    && rest[0] != "-t" =>
+            {
+                let (srcs, _) = rest.split_at(rest.len() - 1);
+                for src in srcs {
+                    if src == "-t" {
+                        continue;
+                    }
+                    let p = Path::new(src.trim_matches('"'));
+                    let abs = if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        base.join(p)
+                    };
+                    // Directories only: an absolute file rides the generic
+                    // absolute-file route, and a relative one the generic
+                    // relative branches, so files need no reader. The
+                    // existence gate keeps a generated-or-absent dir from
+                    // aborting the drive the way an unguarded directory
+                    // upload does.
+                    if abs.is_dir() && !out.contains(&abs) {
+                        out.push(abs);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// The SOURCE_DIR an ExternalProject configure step reads, taken from the
+/// stamp sibling `<name>-source_dirinfo.txt` the way
+/// `external_project_extract_dirs` takes the download tree from
+/// `extract-<name>.cmake`. Only the `method=source_dir` shape is read: a
+/// downloaded tree is written by its extract step and already rides it.
+/// Gated on the stamp shape AND a cmake configure command, so a passing
+/// non-configure step gains no input.
+fn ep_source_dir_trees<'a>(
+    build_dir: &Path,
+    cmdline: Option<&str>,
+    outs: impl Iterator<Item = &'a str>,
+) -> Vec<PathBuf> {
+    let names: Vec<&str> = outs.collect();
+    if !external_project_step(names.iter().copied()) {
+        return Vec::new();
+    }
+    let Some(c) = cmdline else {
+        return Vec::new();
+    };
+    let is_cmake =
+        command_program(c).is_some_and(|p| Path::new(p).file_name().is_some_and(|n| n == "cmake"));
+    let toks: Vec<&str> = c.split_whitespace().collect();
+    let has_source = toks
+        .iter()
+        .any(|t| *t == "-S" || (t.starts_with("-S") && t.len() > 2));
+    if !is_cmake || !has_source {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for name in &names {
+        let p = Path::new(name);
+        let (Some(stamp_dir), Some(file)) = (p.parent(), p.file_name().and_then(|f| f.to_str()))
+        else {
+            continue;
+        };
+        let Some(step) = stamp_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix("-stamp"))
+        else {
+            continue;
+        };
+        if !file.starts_with(&format!("{step}-")) {
+            continue;
+        }
+        let info = build_dir
+            .join(stamp_dir)
+            .join(format!("{step}-source_dirinfo.txt"));
+        let Ok(text) = std::fs::read_to_string(&info) else {
+            continue;
+        };
+        let mut method = String::new();
+        let mut source_dir = String::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("method=") {
+                method = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("source_dir=") {
+                source_dir = v.trim().to_string();
+            }
+        }
+        if method != "source_dir" || source_dir.is_empty() {
+            continue;
+        }
+        let abs = PathBuf::from(&source_dir);
+        if !abs.is_absolute() || !same_project_tree(build_dir, &abs) {
+            continue;
+        }
+        let Some(rel) = relative_from(&abs, build_dir) else {
+            continue;
+        };
+        if rel.is_absolute() || !build_dir.join(&rel).is_dir() {
+            continue;
+        }
+        if !out.contains(&rel) {
+            out.push(rel);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod qrc_copy_sourcedir_tests {
+    use super::*;
+
+    fn words(cmdline: &str) -> Vec<String> {
+        shell_words::split(cmdline).unwrap()
+    }
+
+    /// breeze-icons 6.30.0's rcc pass 1, verbatim from task
+    /// `1baa85s8g7i7d1i5bsvz9k3wbv2h4ccp-ninja-build.drv` (KDE round
+    /// 2026-10-18): the qrc is the only file-typed non-flag argument.
+    const BREEZE_RCC: &str = "cd /build/breeze-icons-6.30.0/build/icons && /nix/store/rzc3mabwyhph6f7fqdc9h1z7ydpnbdg9-qtbase-6.11.2/libexec/rcc --root /icons/breeze --name breeze-icons --pass 1 --output /build/breeze-icons-6.30.0/build/icons/qrc_breeze-iconstmp.cpp /build/breeze-icons-6.30.0/build/icons/breeze-icons.qrc";
+
+    /// qttools 6.11.2's designer rcc, verbatim from task
+    /// `kjfa9zlgnrbn8nx0bbwk4nkmwq81ydzj-ninja-build.drv`.
+    const DESIGNER_RCC: &str = "cd /build/qttools-everywhere-src-6.11.2/build/src/designer/src/designer && /nix/store/rzc3mabwyhph6f7fqdc9h1z7ydpnbdg9-qtbase-6.11.2/libexec/rcc --output /build/qttools-everywhere-src-6.11.2/build/src/designer/src/designer/.qt/rcc/qrc_qttoolbardialog.cpp --name qttoolbardialog /build/qttools-everywhere-src-6.11.2/build/src/designer/src/designer/.qt/rcc/qttoolbardialog.qrc";
+
+    /// qtquick3d 6.11.2's particles rcc, verbatim from task
+    /// `m2vvcf9kkln0v3l3y9zk0bn00v81bhcv-ninja-build.drv`.
+    const PARTICLES_RCC: &str = "cd /build/qtquick3d-everywhere-src-6.11.2/build/src/quick3dparticles && /nix/store/rzc3mabwyhph6f7fqdc9h1z7ydpnbdg9-qtbase-6.11.2/libexec/rcc --name res_particle_shaders --output /build/qtquick3d-everywhere-src-6.11.2/build/src/quick3dparticles/.rcc/qrc_res_particle_shaders.cpp /build/qtquick3d-everywhere-src-6.11.2/build/src/quick3dparticles/.rcc/generated_res_particle_shaders.qrc";
+
+    #[test]
+    fn rcc_names_its_qrc_in_production_spellings() {
+        for (cmd, qrc) in [
+            (
+                BREEZE_RCC,
+                "/build/breeze-icons-6.30.0/build/icons/breeze-icons.qrc",
+            ),
+            (
+                DESIGNER_RCC,
+                "/build/qttools-everywhere-src-6.11.2/build/src/designer/src/designer/.qt/rcc/qttoolbardialog.qrc",
+            ),
+            (
+                PARTICLES_RCC,
+                "/build/qtquick3d-everywhere-src-6.11.2/build/src/quick3dparticles/.rcc/generated_res_particle_shaders.qrc",
+            ),
+        ] {
+            assert_eq!(rcc_invocation(&words(cmd)), Some(vec![qrc.to_string()]), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn rcc_without_a_qrc_or_without_rcc_is_not() {
+        assert_eq!(
+            rcc_invocation(&words(
+                "cd /build/x && /nix/store/r-rcc/bin/rcc --output a.cpp --name n"
+            )),
+            None
+        );
+        assert_eq!(
+            rcc_invocation(&words("cd /build/x && /nix/store/r-g++/bin/g++ -c a.cpp")),
+            None
+        );
+    }
+
+    /// The qttoolbardialog entries, verbatim from the kept task sandbox
+    /// (alias attribute, un-normalized absolute climb, plain entry).
+    const TOOLBAR_QRC: &str = "<RCC>\n  <qresource prefix=\"/x\">\n    <file alias=\"images/back.png\">/build/qttools-everywhere-src-6.11.2/src/designer/src/designer/../../../shared/qttoolbardialog/images/back.png</file>\n    <file>res/rhishaders/qtparticleshaders.qsbc</file>\n  </qresource>\n</RCC>\n";
+
+    #[test]
+    fn qrc_entries_cover_alias_and_climb_spellings() {
+        assert_eq!(
+            qrc_file_entries(TOOLBAR_QRC),
+            vec![
+                "/build/qttools-everywhere-src-6.11.2/src/designer/src/designer/../../../shared/qttoolbardialog/images/back.png".to_string(),
+                "res/rhishaders/qtparticleshaders.qsbc".to_string(),
+            ]
+        );
+        assert!(qrc_file_entries("<RCC></RCC>\n").is_empty());
+    }
+
+    #[test]
+    fn rewritten_relative_qrc_resolves_through_the_cd() {
+        // The shape `rewrite_cmdline` produces for an in-tree qrc: the
+        // command cds below the build root, so the qrc arrives as a climb
+        // and the rebase root is the rewritten cd, not the build dir. A
+        // reader that joined the climb onto the build dir would resolve
+        // one level too high and carry nothing, the mkenums failure again.
+        // The intermediate chain is three deep with three `..`, the
+        // production geometry (`src/designer/src/designer/../../../shared`):
+        // two of either and the normalized target lands somewhere else.
+        let root = Scratch::new(format!("nn-qrc-rebase-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("build/icons")).unwrap();
+        std::fs::create_dir_all(root.join("src/shared/img")).unwrap();
+        std::fs::write(
+            root.join("build/icons/app.qrc"),
+            format!(
+                "<RCC><qresource prefix=\"/\"><file alias=\"images/back.png\">{0}/src/c/icons/sub/../../../shared/img/back.png</file><file>res.dat</file></qresource></RCC>\n",
+                root.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("src/shared/img/back.png"), "<svg/>\n").unwrap();
+        std::fs::write(root.join("build/icons/res.dat"), "data\n").unwrap();
+        let build = root.join("build");
+        let got = qrc_referenced_paths(
+            &build,
+            &build.join("icons"),
+            Path::new("icons"),
+            &["../icons/app.qrc".to_string()],
+        );
+        assert_eq!(got.len(), 1);
+        let (files, cands, dirs) = &got[0];
+        assert!(
+            files.iter().any(|f| f.ends_with("shared/img/back.png")),
+            "climbed file carried: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.ends_with("icons/res.dat")),
+            "cwd-relative file carried: {files:?}"
+        );
+        assert!(cands.is_empty(), "nothing generated here: {cands:?}");
+        for want in ["../src/c", "../src/c/icons", "../src/c/icons/sub"] {
+            assert!(dirs.contains(&want.to_string()), "make-dirs {dirs:?}");
+        }
+    }
+
+    #[test]
+    fn candidate_spellings_match_the_producer_output() {
+        let build = Path::new("/build/qtquick3d-everywhere-src-6.11.2/build");
+        // The generated `.qsbc`: relative in the qrc, joined at both bases
+        // so the spelling that matches the producing edge's output is
+        // among them. The qrc-dir join is first, the command-dir join
+        // second; the test asserts both spellings, not an order.
+        let mut got = qrc_candidate_rels(
+            build,
+            &build.join("src/quick3dparticles/.rcc"),
+            &build.join("src/quick3dparticles"),
+            "res/rhishaders/qtparticleshaders.qsbc",
+        );
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("src/quick3dparticles/.rcc/res/rhishaders/qtparticleshaders.qsbc"),
+                PathBuf::from("src/quick3dparticles/res/rhishaders/qtparticleshaders.qsbc"),
+            ]
+        );
+        // An absolute entry has exactly one spelling, build-relative.
+        assert_eq!(
+            qrc_candidate_rels(
+                Path::new("/build/breeze-icons-6.30.0/build"),
+                Path::new("/build/breeze-icons-6.30.0/build/icons"),
+                Path::new("/build/breeze-icons-6.30.0/build/icons"),
+                "/build/breeze-icons-6.30.0/icons/actions/12/open-link.svg",
+            ),
+            vec![PathBuf::from("../icons/actions/12/open-link.svg")]
+        );
+        // Outside the project tree there is no spelling worth routing.
+        assert!(qrc_candidate_rels(
+            build,
+            &build.join("src/quick3dparticles/.rcc"),
+            &build.join("src/quick3dparticles"),
+            "/etc/passwd",
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn climb_prefixes_skip_what_placement_creates() {
+        let build = Path::new("/build/qttools-everywhere-src-6.11.2/build");
+        let mut dirs = Vec::new();
+        push_climb_prefixes(
+            build,
+            Path::new("/build/qttools-everywhere-src-6.11.2/src/designer/src/designer/../../../shared/qttoolbardialog/images/back.png"),
+            &mut dirs,
+        );
+        // `../src` is the normalized file's own parent and is skipped;
+        // the three intermediate levels are what the kernel needs.
+        assert_eq!(
+            dirs,
+            vec![
+                "../src/designer".to_string(),
+                "../src/designer/src".to_string(),
+                "../src/designer/src/designer".to_string(),
+            ]
+        );
+        let mut none = Vec::new();
+        push_climb_prefixes(
+            build,
+            Path::new("/build/qttools-everywhere-src-6.11.2/src/shared/x.png"),
+            &mut none,
+        );
+        assert!(none.is_empty());
+    }
+
+    /// obs-studio 32.2.2's obs-browser link tail, verbatim from the kept
+    /// round log (KDE round 2026-10-18): the `copy_directory` source is a
+    /// CEF tree no edge declares, and the `touch` sibling must not read as
+    /// one. Files are NOT the subject: an absolute file rides the generic
+    /// absolute-file route (the pin carries it), while an absolute DIR is
+    /// refused there by construction - which is why only the directory
+    /// comes back.
+    const OBS_COPIES: &str = "cd /build/source/build/plugins/obs-browser && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -E make_directory /build/source/build/rundir/Release/x/lib/obs-plugins && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -E copy_if_different /build/cef/Release/libcef.so /build/cef/Release/chrome-sandbox /build/source/build/rundir/Release/x/lib/obs-plugins && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -E copy_directory /build/cef/Resources/locales /build/source/build/rundir/Release/x/lib/obs-plugins/locales";
+
+    #[test]
+    fn copy_dirs_cover_the_obs_link_while_files_stay_generic() {
+        let root = Scratch::new(format!("nn-copy-dirs-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("build/plugins/obs-browser")).unwrap();
+        std::fs::create_dir_all(root.join("cef/Resources/locales")).unwrap();
+        std::fs::write(root.join("cef/Resources/locales/en.pak"), "loc\n").unwrap();
+        let cmd = OBS_COPIES.replace("/build/source/build", root.join("build").to_str().unwrap());
+        let cmd = cmd.replace("/build/cef", root.join("cef").to_str().unwrap());
+        let build = root.join("build");
+        let got = cmake_e_copy_dirs(&cmd, &build).unwrap();
+        assert_eq!(got, vec![root.join("cef/Resources/locales")]);
+    }
+
+    #[test]
+    fn copy_without_cmake_or_with_dash_t_is_not() {
+        assert_eq!(
+            cmake_e_copy_dirs("cp /build/a /build/b", Path::new("/build")),
+            None
+        );
+        assert_eq!(
+            cmake_e_copy_dirs(
+                "/nix/store/c-cmake/bin/cmake -E copy -t /build/dst /build/a /build/b",
+                Path::new("/build")
+            ),
+            None
+        );
+    }
+
+    /// qtwebengine 6.11.2's gn configure, verbatim from task
+    /// `6q476jql51mcyw4r9w7mybmcbh6q130v-ninja-build.drv`, and the stamp
+    /// sibling's content verbatim from the store.
+    const GN_CONFIGURE: &str = "cd /build/qtwebengine-everywhere-src-6.11.2/build/src/gn && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -DCMAKE_BUILD_TYPE=Release -GNinja -S /build/qtwebengine-everywhere-src-6.11.2/src/gn -B /build/qtwebengine-everywhere-src-6.11.2/build/src/gn && /nix/store/7yy1d055r9sdx22r02bqbpb0x66ms3m4-cmake-4.4.3/bin/cmake -E touch /build/qtwebengine-everywhere-src-6.11.2/build/src/gn/src/gn-stamp/gn-configure";
+
+    const GN_SOURCE_DIRINFO: &str = "# generated\nmethod=source_dir\ncommand=\nsource_dir=/build/qtwebengine-everywhere-src-6.11.2/src/gn\nwork_dir=\n";
+
+    #[test]
+    fn source_dirinfo_declares_the_gn_tree() {
+        let root = Scratch::new(format!("nn-ep-sourcedir-{}", std::process::id()));
+        let stamp = root.join("build/src/gn/src/gn-stamp");
+        std::fs::create_dir_all(&stamp).unwrap();
+        std::fs::create_dir_all(root.join("build/src/gn")).unwrap();
+        std::fs::create_dir_all(root.join("src/gn")).unwrap();
+        std::fs::write(stamp.join("gn-source_dirinfo.txt"), GN_SOURCE_DIRINFO).unwrap();
+        let build = root.join("build");
+        // The fixture mirrors the production layout above `src/`: the real
+        // tree is `/build`, so the source_dirinfo text is rewritten to the
+        // scratch root before the drive.
+        let text = GN_SOURCE_DIRINFO.replace(
+            "/build/qtwebengine-everywhere-src-6.11.2",
+            root.to_str().unwrap(),
+        );
+        std::fs::write(stamp.join("gn-source_dirinfo.txt"), text).unwrap();
+        let cmd = GN_CONFIGURE.replace(
+            "/build/qtwebengine-everywhere-src-6.11.2",
+            root.to_str().unwrap(),
+        );
+        let got = ep_source_dir_trees(
+            &build,
+            Some(&cmd),
+            ["src/gn/src/gn-stamp/gn-configure"].into_iter(),
+        );
+        assert_eq!(got, vec![PathBuf::from("../src/gn")]);
+    }
+
+    #[test]
+    fn source_dirinfo_gates_hold() {
+        let build = Path::new("/build/x/build");
+        // Not a stamp edge: no tree whatever the command names.
+        assert!(ep_source_dir_trees(
+            build,
+            Some(GN_CONFIGURE),
+            ["src/gn/CMakeFiles/x"].into_iter(),
+        )
+        .is_empty());
+        // Not a cmake configure: a touch-only step carries no source.
+        assert!(ep_source_dir_trees(
+            build,
+            Some("cd /build/x && /bin/sh -c true"),
+            ["src/gn/src/gn-stamp/gn-configure"].into_iter(),
+        )
+        .is_empty());
+        // A downloaded tree rides its extract step, never this reader: the
+        // method gate is what keeps the two from double-declaring it. The
+        // source_dir below is real and in-tree, so only the gate refuses it.
+        let root = Scratch::new(format!("nn-ep-method-{}", std::process::id()));
+        let stamp = root.join("build/src/gn/src/gn-stamp");
+        std::fs::create_dir_all(&stamp).unwrap();
+        std::fs::create_dir_all(root.join("build/src/gn")).unwrap();
+        std::fs::create_dir_all(root.join("src/gn")).unwrap();
+        std::fs::write(
+            stamp.join("gn-source_dirinfo.txt"),
+            format!(
+                "method=download\nsource_dir={}/src/gn\n",
+                root.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        assert!(ep_source_dir_trees(
+            &root.join("build"),
+            Some(&GN_CONFIGURE.replace(
+                "/build/qtwebengine-everywhere-src-6.11.2",
+                root.to_str().unwrap()
+            )),
+            ["src/gn/src/gn-stamp/gn-configure"].into_iter(),
+        )
+        .is_empty());
+    }
 }
 
 fn msgfmt_its_referenced_paths(build_dir: &Path, cd_dir: &Path, dirs: &[String]) -> Vec<String> {
@@ -21766,6 +22739,79 @@ fn command_program(cmdline: &str) -> Option<&str> {
     command_argv(cmdline)?
         .next()
         .map(|tok| tok.trim_matches(|c| c == '"' || c == '\''))
+}
+
+/// The program's build-root-relative spelling: absolute programs relativised
+/// against the build dir, relative ones resolved against the command's own
+/// `cd` target first. The upload path rebases the same way, so this is the
+/// spelling an input carrying the program holds. A command with no `cd`
+/// keeps the old reading exactly.
+fn program_build_path(cmdline: &str, build_dir: &Path, program: &str) -> PathBuf {
+    let prog = Path::new(program);
+    if prog.is_absolute() {
+        return relative_from(prog, build_dir).unwrap_or_else(|| prog.to_path_buf());
+    }
+    let Ok(toks) = shell_words::split(cmdline) else {
+        return PathBuf::from(program);
+    };
+    let mut it = toks.iter().peekable();
+    let mut cd = PathBuf::new();
+    loop {
+        match it.next().map(|s| s.as_str()) {
+            Some(":") | Some("&&") | Some(";") => {}
+            Some("cd") => {
+                cd = it.next().map(PathBuf::from).unwrap_or_default();
+            }
+            _ => break,
+        }
+    }
+    if cd.as_os_str().is_empty() {
+        return PathBuf::from(program);
+    }
+    if cd.is_absolute() {
+        return relative_from(&cd.join(prog), build_dir).unwrap_or_else(|| PathBuf::from(program));
+    }
+    rebase_post_cd(&cd, program)
+}
+
+#[cfg(test)]
+mod program_build_path_tests {
+    use super::*;
+
+    /// The arm-21 shape: `cd` below the build root, tool named absolute,
+    /// rewrite respelling it as a climb. The match spelling is the rebased
+    /// one the upload path used, not the climb the error named.
+    #[test]
+    fn a_rewritten_climb_matches_the_uploaded_spelling() {
+        let build = Path::new("/tmp/nn-x/build");
+        assert_eq!(
+            program_build_path(
+                "cd bindings/vala && /tmp/nn-x/build/tools/vapigen --library=x",
+                build,
+                "../../tools/vapigen"
+            ),
+            PathBuf::from("tools/vapigen")
+        );
+    }
+
+    #[test]
+    fn absolute_programs_and_cd_less_commands_keep_the_old_reading() {
+        let build = Path::new("/build/x/build");
+        // Absolute: identical to the relative_from call this replaced.
+        assert_eq!(
+            program_build_path(
+                "cd /build/x/src && /nix/store/h-cmake/bin/cmake -S /build/x/src",
+                build,
+                "/nix/store/h-cmake/bin/cmake"
+            ),
+            relative_from(Path::new("/nix/store/h-cmake/bin/cmake"), build).unwrap()
+        );
+        // No cd: the spelling stands as given, as before.
+        assert_eq!(
+            program_build_path("gcc -c a.c", build, "gcc"),
+            PathBuf::from("gcc")
+        );
+    }
 }
 
 /// The command's words from the program on, the prologue `command_program`
