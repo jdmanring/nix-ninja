@@ -379,6 +379,7 @@ fn refresh_placed_mtimes(
             continue;
         }
         if !dest.is_symlink() {
+            touch_placed_copy(&dest, &src)?;
             continue;
         }
         // A SYMLINK IS SOMETIMES A NAME RATHER THAN A PRODUCT, and replacing
@@ -446,9 +447,29 @@ fn refresh_tree_mtimes(src: &Path, dest: &Path) -> std::io::Result<()> {
             refresh_tree_mtimes(&from, &to)?;
         } else if to.is_symlink() && placement_is_ours(&to, &from) {
             refresh_one(&to, &from)?;
+        } else if !to.is_symlink() {
+            touch_placed_copy(&to, &from)?;
         }
     }
     Ok(())
+}
+
+/// A COPY PLACEMENT CARRIES THE STORE'S MTIME TOO. `create_symlinks` places
+/// the `copy_not_link` suffixes (headers, `.py`, `.svg`, shaders) as regular
+/// files stamped with their source's time, which rcc needs inside a task and
+/// which reads as older than every source to real ninja here. A regular file
+/// still at its source's exact mtime is such a copy; it is stamped now, its
+/// bytes untouched. A file the build wrote has a time of its own.
+fn touch_placed_copy(dest: &Path, src: &Path) -> std::io::Result<()> {
+    let at = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    if !dest.is_file() || at(dest).is_none() || at(dest) != at(src) {
+        return Ok(());
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(dest)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+        .map_err(|e| std::io::Error::other(format!("stamping {}: {e}", dest.display())))
 }
 
 /// This symlink is the one this placement created, rather than a name the
@@ -921,11 +942,39 @@ mod refresh_tree_mtimes_tests {
         // product: `placement_is_ours` must refuse it.
         std::fs::write(build.join("kept.cpp"), b"the build tree's").unwrap();
         std::os::unix::fs::symlink("kept.cpp", build.join("alias.cpp")).unwrap();
+        // A header the copy arm placed: a regular file at the store's time,
+        // in the tree and as a file input of its own.
+        let one = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let stamp = |p: &std::path::Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .and_then(|f| f.set_modified(one))
+                .unwrap()
+        };
+        std::fs::write(store.join("ui_c.h"), b"uic").unwrap();
+        std::fs::write(build.join("ui_c.h"), b"uic").unwrap();
+        let hstore = store_root.join(format!("{hash}-ninja-build-h.h"));
+        std::fs::write(&hstore, b"h").unwrap();
+        std::fs::write(d.join("build/h.h"), b"h").unwrap();
+        for p in [store.join("ui_c.h"), build.join("ui_c.h"), hstore.clone()] {
+            stamp(&p);
+        }
+        stamp(&d.join("build/h.h"));
 
         let store_dir = StoreDir::new(&store_root).unwrap();
         let df =
             DerivedFile::from_encoded(&store_dir, &format!("{}:gen:", store.display())).unwrap();
-        refresh_placed_mtimes(&d.join("build"), &store_dir, &[df]).expect("refreshed");
+        let hf =
+            DerivedFile::from_encoded(&store_dir, &format!("{}:h.h:", hstore.display())).unwrap();
+        refresh_placed_mtimes(&d.join("build"), &store_dir, &[df, hf]).expect("refreshed");
+        for copy in [build.join("ui_c.h"), d.join("build/h.h")] {
+            assert!(
+                std::fs::metadata(&copy).unwrap().modified().unwrap() > one,
+                "{} was placed as a copy at the store's time and must read as new",
+                copy.display()
+            );
+        }
 
         for placed in ["moc_a.cpp", "sub/moc_b.cpp"] {
             assert!(
