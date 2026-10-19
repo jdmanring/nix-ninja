@@ -1606,7 +1606,21 @@ impl Runner {
             // A LATER PASS DOES NOT NEED TO RESOLVE AN EDGE IT REUSES: the
             // tree hooks and placement changed can fail a resolution that
             // pass 1 completed, and the derivation pass 1 wrote stands.
-            Err(e) => self.reused_task(files, build, &e).ok_or(e)?,
+            // Named, because `-t drv` resolves a target's whole closure and a
+            // refusal deep in it otherwise names no edge.
+            Err(e) => self
+                .reused_task(files, build, &e)
+                .ok_or(e)
+                .with_context(|| {
+                    format!(
+                        "resolving the edge producing {}",
+                        build
+                            .outs()
+                            .first()
+                            .map(|f| files.by_id[*f].name.as_str())
+                            .unwrap_or("?")
+                    )
+                })?,
         };
         if self.no_defer.contains(&bid) {
             task.producer_index = None;
@@ -1855,6 +1869,9 @@ impl Runner {
                     undeclared_files = cl2cpp_header(c, &config.build_dir)
                         .into_iter()
                         .chain(vapigen_vapi(c, &config.build_dir))
+                        .chain(bison_side_headers(c, &config.build_dir))
+                        .chain(particleshadergen_writes(c, &config.build_dir))
+                        .chain(docbookl10nhelper_writes(c, &config.build_dir))
                         .chain(cmake_p_stamp_edge_writes(&paths, c, &config.build_dir))
                         .chain(copy_writes_not_inputs(
                             &paths,
@@ -1873,6 +1890,8 @@ impl Runner {
                         .into_iter()
                         .chain(external_project_binary_dir(c, &config.build_dir))
                         .chain(external_project_install_dir(&paths, &config.build_dir))
+                        .chain(qrcalias_trees(c, &config.build_dir))
+                        .chain(katehighlightingindexer_trees(c, &config.build_dir))
                         .collect();
                 }
                 // UPSTREAM #17: record this task's depfile output. NOT
@@ -2665,6 +2684,9 @@ impl Runner {
         // through the command's own PYTHONPATH; merged into the sibling
         // seeding below, which otherwise keys only on `.py` inputs.
         let mut py_module_dirs: Vec<PathBuf> = Vec::new();
+        // Store paths a reader found inside the files it carries; they join
+        // the task's `input_srcs` beside the command line's own.
+        let mut reader_store_paths: Vec<StorePath> = Vec::new();
         if let Some(cmdline) = &cmdline {
             let args = shell_words::split(cmdline)?;
             // Read before the loop consumes `args`: see the `cmake -P` pass
@@ -2695,11 +2717,18 @@ impl Runner {
             // as the `--filelist` arm and the glib-mkenums reader.
             let gir_positional = gir_positional_sources_invocation(&args);
             let protoc = protoc_invocation(&args);
+            // Import roots the protoc reader resolves through; never carried
+            // whole by the directory arm below.
+            let proto_roots = match protoc {
+                Some(_) => protoc_wrapper_roots(&args).1,
+                None => Vec::new(),
+            };
             let nasm = nasm_invocation(&args);
             let vapigen = vapigen_invocation(&args);
             let valac = valac_invocation(&args);
             let mkenums = glib_mkenums_invocation(&args);
             let rcc = rcc_invocation(&args);
+            let meinproc_dir = meinproc_srcdir(&args);
             let cmake_copies = build
                 .cmdline
                 .as_deref()
@@ -2768,6 +2797,7 @@ impl Runner {
             // only itself. The right discriminator is the TOOL, not the
             // extension: any schema arg to compiler.py implies its schema
             // directory.
+            let pdl_refs = pdl_baselines(&self.config.build_dir, &cd_dir, &args);
             let schema_tool = cmdline.contains("json_schema_compiler/compiler.py");
             let argc = args.len();
             for (arg_i, arg) in args.into_iter().enumerate() {
@@ -2833,7 +2863,9 @@ impl Runner {
                                 let mut _rsp_files = 0usize;
                                 let is_syncqt = cmdline.contains("syncqt");
                                 let mut syncqt_headers: Vec<FileId> = Vec::new();
+                                let mut prev_tok = "";
                                 for tok in root_view.split_whitespace() {
+                                    let flag = std::mem::replace(&mut prev_tok, tok);
                                     // BUILD-DIR-RELATIVE TOKENS COUNT TOO.
                                     // The `../` requirement admits only paths
                                     // that climb OUT of the build dir, which
@@ -2861,6 +2893,19 @@ impl Runner {
                                     if !p
                                         .components()
                                         .any(|c| matches!(c, std::path::Component::Normal(_)))
+                                    {
+                                        continue;
+                                    }
+                                    // WHERE SYNCQT WRITES, NOT WHAT IT READS.
+                                    // `-binaryDir` is the module's build dir,
+                                    // and QtPdf's holds the nested pdf GN tree
+                                    // (over the dir cap, so every QtPdf edge
+                                    // was refused). Passed over only when too
+                                    // large to carry, so an edge that resolves
+                                    // today emits what it did.
+                                    if is_syncqt
+                                        && SYNCQT_OUTPUT_DIR_FLAGS.contains(&flag)
+                                        && dir_exceeds_files(p, DATA_DIR_CAP)
                                     {
                                         continue;
                                     }
@@ -3051,16 +3096,35 @@ impl Runner {
                         }
                     } else if !arg.starts_with('-')
                         && !arg.starts_with('/')
-                        && arg.starts_with("../")
+                        && !proto_roots.contains(&arg)
+                        // REBASED ONTO THE `cd`, as the file arm above is.
+                        // qmlcachegen's `-I <build>/bin/` after `cd
+                        // src/qmlcontrols/graphicaleffects` arrives as
+                        // `../../../bin/`; read against the build dir it is
+                        // the HOST's /bin, the round carried `/bin/sh` and
+                        // deepened the task one level, and every source
+                        // input then landed one name too deep (kdeclarative
+                        // 6.30.0, KDE round 2026-10-19, task jmvma7pp).
+                        && rebase_post_cd(&cd_dir, &arg).starts_with("..")
                         // A pure ../ chain names a ROOT, not a directory of
                         // interest: GN passes the source root itself as an
                         // argument (round 35's ../../../.. hit the upload
                         // cap, which is the cap doing its job). Require a
                         // named component after the climb.
-                        && Path::new(&arg)
+                        && rebase_post_cd(&cd_dir, &arg)
                             .components()
                             .any(|c| matches!(c, std::path::Component::Normal(_)))
-                        && Path::new(&arg).is_dir()
+                        && same_project_tree(
+                            &self.config.build_dir,
+                            &normalize_build_path_lexical(
+                                &self.config.build_dir.join(rebase_post_cd(&cd_dir, &arg)),
+                            ),
+                        )
+                        && self
+                            .config
+                            .build_dir
+                            .join(rebase_post_cd(&cd_dir, &arg))
+                            .is_dir()
                     {
                         // A relative arg naming a real SOURCE-TREE directory
                         // is the command asking for that directory's
@@ -3076,7 +3140,7 @@ impl Runner {
                         for input in upload_referenced_dir(
                             &self.rpc_client,
                             &self.config.build_dir,
-                            Path::new(&arg),
+                            &self.config.build_dir.join(rebase_post_cd(&cd_dir, &arg)),
                         )? {
                             self.add_derived_file(files, input.clone());
                             input_set.insert(input.build_path.clone(), input);
@@ -3276,6 +3340,39 @@ impl Runner {
             // named by URL inside the `.wsdl`, so the whole root is carried
             // through the same directory upload. The spelling stays relative
             // to the build dir, which is the driver's cwd.
+            // A MEINPROC RUN READS ITS CATALOGS UNDER `--srcdir`:
+            // `<srcdir>/customization` (catalog.xml, dtd/, the language
+            // dirs), written by configure and declared by no edge.
+            // kdoctools 6.30.0's man-page edges died `Could not find
+            // kdoctools catalogs` (KDE round 2026-10-19, replica of
+            // lvf1k5zl). 965 files, carried by the capped dir upload.
+            if let Some(dir) = &meinproc_dir {
+                let abs = if Path::new(dir).is_absolute() {
+                    PathBuf::from(dir)
+                } else {
+                    self.config.build_dir.join(rebase_post_cd(&cd_dir, dir))
+                };
+                let tree = abs.join("customization");
+                if same_project_tree(&self.config.build_dir, &tree) && tree.is_dir() {
+                    for input in
+                        upload_referenced_dir(&self.rpc_client, &self.config.build_dir, &tree)?
+                    {
+                        self.add_derived_file(files, input.clone());
+                        input_set.insert(input.build_path.clone(), input);
+                    }
+                    // Configure writes STORE PATHS into that tree:
+                    // `dtd/kdedbx45.dtd` loads docbook-xml's `docbookx.dtd`
+                    // by absolute path, which the package sandbox mounts and
+                    // a task's does not. Without it the DTD fails to load and
+                    // every man page dies `Entity 'kde' not defined`
+                    // (kdoctools 6.30.0, task fhqk9vmh).
+                    reader_store_paths.extend(store_paths_named_below(
+                        &self.config.store_dir,
+                        &self.store_regex,
+                        &tree,
+                    )?);
+                }
+            }
             if let Some(dirs) = &kdwsdl_imports {
                 for p in kdwsdl2cpp_import_dirs(
                     &self.config.build_dir,
@@ -3323,6 +3420,13 @@ impl Runner {
                     referenced.push(p);
                 }
             }
+            // inspector_protocol's compatibility check opens a BASELINE beside
+            // every protocol it is handed, `<name>-<major>.<minor>.json`, by
+            // convention, and skips a missing one in silence: v8's
+            // `js_protocol-1.3.json` was not carried, the Runtime types went
+            // unresolved and the check failed (qtwebengine 6.11.2, task
+            // `m9yqpy10`).
+            referenced.extend(pdl_refs);
             if let Some((incs, protos)) = &protoc {
                 let got = protoc_referenced_paths(&self.config.build_dir, &cd_dir, incs, protos);
                 for p in got {
@@ -3890,7 +3994,26 @@ impl Runner {
         > = std::sync::OnceLock::new();
         let filled = PY_SIB_FILLED.get_or_init(|| std::sync::Mutex::new(Default::default()));
         for dir in py_dirs {
-            let sibs = python_closure_cached(&self.rpc_client, &self.config.build_dir, &dir)?;
+            // A module carried from an oversized sys.path root has the ROOT as
+            // its directory, and the root's closure is the walk the closure
+            // cap refuses. Only that case is passed over, and remembered so
+            // it is not re-walked per task; a closure that succeeds is used
+            // whatever the directory's size.
+            static UNCARRIED_ROOTS: std::sync::OnceLock<
+                std::sync::Mutex<rustc_hash::FxHashSet<PathBuf>>,
+            > = std::sync::OnceLock::new();
+            let uncarried = UNCARRIED_ROOTS.get_or_init(Default::default);
+            if uncarried.lock().unwrap().contains(&dir) {
+                continue;
+            }
+            let sibs = match python_closure_cached(&self.rpc_client, &self.config.build_dir, &dir) {
+                Ok(s) => s,
+                Err(_) if dir_exceeds_files(&dir, PYTHON_DEP_DIR_CAP) => {
+                    uncarried.lock().unwrap().insert(dir);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let first_fill = filled.lock().unwrap().insert(dir);
             for sib in sibs.iter() {
                 if first_fill {
@@ -4267,6 +4390,11 @@ impl Runner {
             let found_store_paths =
                 extract_store_paths(&self.config.store_dir, &self.store_regex, cmdline)?;
             input_srcs.extend(found_store_paths);
+        }
+        for sp in reader_store_paths {
+            if !input_srcs.contains(&sp) {
+                input_srcs.push(sp);
+            }
         }
 
         Ok(Task {
@@ -7236,6 +7364,102 @@ fn report_progress(n_tasks: u64) {
     );
 }
 
+/// A PRODUCED QRC IS READ FROM ITS REALISED COPY, and the source files it
+/// lists become inputs. On disk the qrc does not exist yet when its rcc
+/// consumer resolves, so the reader in `new_task` binds the qrc and reads
+/// none of it: breeze-icons 6.30.0's rcc passes got the qrc and none of the
+/// 14,026 source icons it lists (KDE round 2026-10-19, resolved task
+/// zrq04828: 44 inputs, no svg; `Cannot find file .../open-link.svg`).
+/// Local mode only, beside the `deps = gcc` arm's realise below: the
+/// producer must be built before the consumer runs either way. Members the
+/// producer generated ride its own trees (`qrcalias_trees`); only files on
+/// disk are carried here.
+fn add_produced_qrc_members(
+    rpc_client: &Arc<BuilderRpcClient>,
+    store_dir: &StoreDir,
+    build_dir: &Path,
+    cmdline: &str,
+    inputs: &[DerivedFile],
+    drv: &mut Derivation,
+) -> Result<()> {
+    let Ok(args) = shell_words::split(cmdline) else {
+        return Ok(());
+    };
+    if rcc_invocation(&args).is_none() {
+        return Ok(());
+    }
+    let qrcs: Vec<DerivedFile> = inputs
+        .iter()
+        .filter(|i| {
+            matches!(i.derived_path, SingleDerivedPath::Built { .. })
+                && i.build_path.extension().is_some_and(|e| e == "qrc")
+        })
+        .cloned()
+        .collect();
+    if qrcs.is_empty() {
+        return Ok(());
+    }
+    let cmd_cwd = match args.as_slice() {
+        [cd, dir, amp, ..] if cd == "cd" && amp == "&&" => {
+            let d = Path::new(dir);
+            if d.is_absolute() {
+                d.to_path_buf()
+            } else {
+                build_dir.join(d)
+            }
+        }
+        _ => build_dir.to_path_buf(),
+    };
+    let realised = local::build_derived_files(rpc_client, store_dir, &qrcs)?;
+    let mut members: Vec<PathBuf> = Vec::new();
+    for q in &qrcs {
+        let Some(host) = realised.get(&q.build_path) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(host) else {
+            continue;
+        };
+        let qrc_abs = normalize_build_path_lexical(&build_dir.join(&q.build_path));
+        // A member that lands in the store rides as the store object it is
+        // (qrcAlias resolves its input links: `../../../../../nix/store/
+        // <h>-index.theme`); the sandbox mounts it at that path.
+        let store_root = AsRef::<Path>::as_ref(store_dir);
+        let qrc_dir = qrc_abs.parent().unwrap_or(build_dir);
+        for e in qrc_file_entries(&text) {
+            let ep = Path::new(&e);
+            for raw in [qrc_dir.join(ep), cmd_cwd.join(ep)] {
+                let n = normalize_build_path_lexical(&raw);
+                let Some(root) = n
+                    .strip_prefix(store_root)
+                    .ok()
+                    .and_then(|r| r.components().next())
+                else {
+                    continue;
+                };
+                if let Some(s) = store_root.join(root.as_os_str()).to_str() {
+                    if let Ok(sp) = store_dir.parse(s) {
+                        drv.inputs.insert(SingleDerivedPath::Opaque(sp));
+                    }
+                }
+            }
+        }
+        let (files, _, _) = qrc_members(build_dir, &cmd_cwd, &qrc_abs, &text);
+        for f in files {
+            let p = PathBuf::from(f);
+            if !p.starts_with(AsRef::<Path>::as_ref(store_dir)) && !members.contains(&p) {
+                members.push(p);
+            }
+        }
+    }
+    if members.is_empty() {
+        return Ok(());
+    }
+    let deps = new_opaque_files(rpc_client, build_dir, members)
+        .context("uploading the files a produced qrc lists")?;
+    dynamic_task::update_derivation_with_discoveries(drv, deps, Vec::new(), store_dir)?;
+    Ok(())
+}
+
 fn handle_derivation_result(
     tools: Tools,
     rpc_client: &Arc<BuilderRpcClient>,
@@ -7251,6 +7475,18 @@ fn handle_derivation_result(
     // Timed with a Drop guard for the same reason build_paths is: several
     // early returns, and an untimed one hides the case worth catching.
     let _dyn_timer = DynDiscoveryTimer(std::time::Instant::now());
+    if !config.is_output_derivation {
+        if let Some(c) = task.cmdline.as_deref() {
+            add_produced_qrc_members(
+                rpc_client,
+                &config.store_dir,
+                &config.build_dir,
+                c,
+                &task.inputs,
+                &mut drv,
+            )?;
+        }
+    }
     // Collect built inputs when deps == "gcc" for dynamic dependency discovery
     let built_inputs: Vec<DerivedFile> = if wants_dependency_discovery(&task) {
         task.inputs
@@ -7647,6 +7883,47 @@ fn which_store_path_opt(store_dir: &StoreDir, binary_name: &str) -> Result<Optio
         .parse(store_path_dir)
         .context("Failed to parse store path")
         .map(Some)
+}
+
+/// Every store path named in the text files below DIR, memoized per
+/// directory: a reader that carries a configured tree carries the store
+/// paths that tree loads by absolute path too.
+fn store_paths_named_below(
+    store_dir: &StoreDir,
+    store_regex: &Regex,
+    dir: &Path,
+) -> Result<Vec<StorePath>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Vec<StorePath>>>> =
+        std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(hit) = memo.lock().unwrap().get(dir) {
+        return Ok(hit.clone());
+    }
+    let mut found: Vec<StorePath> = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let mut entries: Vec<_> = fs::read_dir(&d)
+            .map_err(|e| anyhow!("read_dir({}) for store paths: {e}", d.display()))?
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Ok(text) = fs::read_to_string(&p) {
+                for sp in extract_store_paths(store_dir, store_regex, &text)? {
+                    if !found.contains(&sp) {
+                        found.push(sp);
+                    }
+                }
+            }
+        }
+    }
+    memo.lock()
+        .unwrap()
+        .insert(dir.to_path_buf(), found.clone());
+    Ok(found)
 }
 
 fn extract_store_paths(
@@ -9506,6 +9783,347 @@ fn cl2cpp_header(cmdline: &str, build_dir: &Path) -> Option<PathBuf> {
     (rel.is_relative() && !rel.starts_with("..")).then_some(rel)
 }
 
+/// The directory syntax-highlighting's `katehighlightingindexer <index>
+/// <xsd> <xml qrc> <dir>` writes its compressed syntax files into. The edge
+/// declares the index alone; `syntax-data.qrc` (configure-time) lists the
+/// files under `<dir>`, and the rcc edge, which depends on the index, found
+/// none of them (syntax-highlighting 6.30.0, KDE round 2026-10-19, task
+/// hkr2k8zp). Declared as a tree it rides the index's co-outputs.
+pub fn katehighlightingindexer_trees(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let Some(at) = (0..toks.len()).find(|&i| {
+        (i == 0 || matches!(toks[i - 1], "&&" | ";"))
+            && Path::new(toks[i].trim_matches('"'))
+                .file_name()
+                .and_then(|n| n.to_str())
+                == Some("katehighlightingindexer")
+    }) else {
+        return Vec::new();
+    };
+    let args: Vec<&str> = toks[at + 1..]
+        .iter()
+        .take_while(|t| !matches!(**t, "&&" | ";" | "|"))
+        .copied()
+        .collect();
+    let [_, _, _, dir] = args.as_slice() else {
+        return Vec::new();
+    };
+    let cwd = match toks.as_slice() {
+        ["cd", d, "&&", ..] if d.starts_with('/') => PathBuf::from(d),
+        ["cd", d, "&&", ..] => build_dir.join(d),
+        _ => build_dir.to_path_buf(),
+    };
+    relative_from(
+        &normalize_build_path_lexical(&cwd.join(dir.trim_matches('"'))),
+        build_dir,
+    )
+    .filter(|rel| {
+        rel.components()
+            .next()
+            .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
+    })
+    .into_iter()
+    .collect()
+}
+
+/// The `--srcdir` a `meinproc6`/`meinproc5` run is given, joined or
+/// separated spelling.
+fn meinproc_srcdir(args: &[String]) -> Option<String> {
+    // In COMMAND position: the `cd` target before it can end in the same
+    // name (`cd po/nl/docs/meinproc6 && ../../../../bin/meinproc6 ...`).
+    let at = (0..args.len()).find(|&i| {
+        (i == 0 || matches!(args[i - 1].as_str(), "&&" | ";"))
+            && Path::new(args[i].trim_matches('"'))
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == "meinproc6" || n == "meinproc5")
+    })?;
+    let mut it = args[at + 1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "&&" | ";" | "|" => break,
+            "--srcdir" => return it.next().map(|v| v.trim_matches('"').to_string()),
+            _ => {
+                if let Some(v) = a.strip_prefix("--srcdir=") {
+                    return Some(v.trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The file kdoctools' `docbookl10nhelper <docbook> <custom> <dest>` writes:
+/// `<dest>/all-l10n.xml` (`docbookl10nhelper.cpp`, `destDir +
+/// "all-l10n.xml"`). It runs as the POST_BUILD of its own link edge, which
+/// declares the executable alone, so the task died `Could not write
+/// .../src/customization/xsl/all-l10n.xml` (kdoctools 6.30.0, KDE round
+/// 2026-10-19, task ssjpy476) and, written, the file would have stayed in
+/// the sandbox.
+pub fn docbookl10nhelper_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    // In COMMAND position: the link before it names the same file as `-o`.
+    let Some(at) = (0..toks.len()).find(|&i| {
+        (i == 0 || matches!(toks[i - 1], "&&" | ";"))
+            && Path::new(toks[i].trim_matches('"'))
+                .file_name()
+                .and_then(|n| n.to_str())
+                == Some("docbookl10nhelper")
+    }) else {
+        return Vec::new();
+    };
+    let args: Vec<&str> = toks[at + 1..]
+        .iter()
+        .take_while(|t| !matches!(**t, "&&" | ";" | "|"))
+        .copied()
+        .collect();
+    let [_, _, dest] = args.as_slice() else {
+        return Vec::new();
+    };
+    let cwd = match toks.as_slice() {
+        ["cd", d, "&&", ..] if d.starts_with('/') => PathBuf::from(d),
+        ["cd", d, "&&", ..] => build_dir.join(d),
+        _ => build_dir.to_path_buf(),
+    };
+    let file = normalize_build_path_lexical(&cwd.join(dest.trim_matches('"')).join("all-l10n.xml"));
+    relative_from(&file, build_dir)
+        .filter(|rel| rel.is_relative() && !rel.starts_with(".."))
+        .into_iter()
+        .collect()
+}
+
+/// The build-tree directories a breeze-icons `qrcAlias -o <qrc> <dir>...`
+/// run lists into its qrc. The same command writes them first
+/// (`generate-24px-versions.py <src> <build>/breeze/icons`,
+/// `generate-symbolic-dark ... <build>/breeze/icons-dark`) and declares only
+/// the qrc, so the generated icons the qrc names stayed in the producer's
+/// sandbox (breeze-icons 6.30.0, KDE round 2026-10-19). Declared as trees
+/// they ride the qrc's co-outputs into the rcc passes. Source dirs (outside
+/// the build dir) are not outputs and are skipped.
+pub fn qrcalias_trees(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let mut out = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        if Path::new(t.trim_matches('"'))
+            .file_name()
+            .and_then(|n| n.to_str())
+            != Some("qrcAlias")
+        {
+            continue;
+        }
+        let mut it = toks[i + 1..].iter();
+        while let Some(a) = it.next() {
+            let a = a.trim_matches('"');
+            match a {
+                "&&" | ";" | "|" => break,
+                "-o" => {
+                    it.next();
+                }
+                _ if a.starts_with('-') => {}
+                _ => {
+                    let p = Path::new(a);
+                    let Some(rel) = (if p.is_absolute() {
+                        relative_from(p, build_dir)
+                    } else {
+                        Some(p.to_path_buf())
+                    }) else {
+                        continue;
+                    };
+                    if rel
+                        .components()
+                        .next()
+                        .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
+                        && !out.contains(&rel)
+                    {
+                        out.push(rel);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The shader collection qtquick3d's `particleshadergen -o <dir> -r <qrc>`
+/// writes beside the qrc it declares. `_qt_internal_gen_particle_shaders`
+/// declares only `<dir>/<qrc>`; `genshaders.cpp` writes
+/// `<dir>/res/rhishaders/qtparticleshaders.qsbc` (`resourceFolder()` minus
+/// its `:/`, then `particleShaderCollectionFile()`), the qrc lists it, and
+/// the rcc consumer died `Cannot find file 'res/rhishaders//qtparticle
+/// shaders.qsbc'` (qtquick3d 6.11.2, KDE round 2026-10-19, task m2vvcf9k):
+/// the producer's store output held the qrc alone. Declared here it rides
+/// the qrc's co-outputs into the consumer.
+pub fn particleshadergen_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let Some(at) = toks.iter().position(|t| {
+        Path::new(t.trim_matches('"'))
+            .file_name()
+            .and_then(|n| n.to_str())
+            == Some("particleshadergen")
+    }) else {
+        return Vec::new();
+    };
+    let mut it = toks[at + 1..].iter();
+    let mut out = None;
+    while let Some(t) = it.next() {
+        match t.trim_matches('"') {
+            "&&" | ";" | "|" => break,
+            "-o" | "--output-dir" => out = it.next().map(|v| v.trim_matches('"')),
+            _ => {}
+        }
+    }
+    let Some(out) = out else {
+        return Vec::new();
+    };
+    let cwd = match toks.as_slice() {
+        ["cd", d, "&&", ..] if d.starts_with('/') => PathBuf::from(d),
+        ["cd", d, "&&", ..] => build_dir.join(d),
+        _ => build_dir.to_path_buf(),
+    };
+    let file =
+        normalize_build_path_lexical(&cwd.join(out).join("res/rhishaders/qtparticleshaders.qsbc"));
+    relative_from(&file, build_dir)
+        .filter(|rel| rel.is_relative() && !rel.starts_with(".."))
+        .into_iter()
+        .collect()
+}
+
+/// The headers a C++ `bison` run writes beside its `-o` output and no edge
+/// declares. kholidays 6.30.0's `bison -d -o <build>/src/holidayparserplan.cpp
+/// holidayparserplan.ypp` (lalr1.cc, `%locations`) declares the `.cpp` and
+/// `.hpp`, and the parser header includes `location.hh`, which stayed in the
+/// generator's sandbox (KDE round 2026-10-19, task l6jm02rl). Measured on
+/// bison 3.8.2 over minimal grammars: with a header requested (`-d`,
+/// `--defines`, `--header`, `-H`, `%defines`, `%header`), lalr1.cc writes
+/// `stack.hh` unless `%require` is 3.2 or later; with `%locations` it writes
+/// `location.hh` unless `api.location.file` is `none` (a custom name is not
+/// declared here), and `position.hh` unless that is `none` or `%require` is
+/// 3.2 or later. Without a header request it writes the `.cpp` alone.
+// ponytail: lalr1.cc only (the measured skeleton); glr.cc and glr2.cc
+// declare nothing until a package carries one.
+pub fn bison_side_headers(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let Some(at) = toks
+        .iter()
+        .position(|t| Path::new(t).file_name().and_then(|n| n.to_str()) == Some("bison"))
+    else {
+        return Vec::new();
+    };
+    let (mut out, mut header, mut cpp_flag, mut skel_flag, mut grammar) =
+        (None, false, false, None, None);
+    let mut it = toks[at + 1..].iter();
+    while let Some(t) = it.next() {
+        let t = t.trim_matches('"');
+        match t {
+            "&&" | ";" | "|" => break,
+            "-o" | "--output" => out = it.next().map(|v| v.trim_matches('"')),
+            "-d" | "-H" | "--defines" | "--header" => header = true,
+            "-L" | "--language" => {
+                cpp_flag |= it.next().is_some_and(|v| v.trim_matches('"') == "c++")
+            }
+            "-S" | "--skeleton" => skel_flag = it.next().map(|v| v.trim_matches('"')),
+            _ => {
+                if let Some(v) = t.strip_prefix("--output=") {
+                    out = Some(v);
+                } else if t.starts_with("--defines=") || t.starts_with("--header=") {
+                    header = true;
+                } else if let Some(v) = t.strip_prefix("--language=") {
+                    cpp_flag |= v == "c++";
+                } else if let Some(v) = t.strip_prefix("--skeleton=") {
+                    skel_flag = Some(v);
+                } else if let Some(v) = t.strip_prefix("-o").filter(|v| !v.is_empty()) {
+                    out = Some(v);
+                } else if !t.starts_with('-') {
+                    grammar = Some(t);
+                }
+            }
+        }
+    }
+    let (Some(out), Some(grammar)) = (out, grammar) else {
+        return Vec::new();
+    };
+    // Relative spellings resolve against the leading `cd`, as rcc and
+    // vapigen do.
+    let cwd = match toks.as_slice() {
+        ["cd", d, "&&", ..] if d.starts_with('/') => PathBuf::from(d),
+        ["cd", d, "&&", ..] => build_dir.join(d),
+        _ => build_dir.to_path_buf(),
+    };
+    let Ok(text) = std::fs::read_to_string(cwd.join(grammar)) else {
+        return Vec::new();
+    };
+    let directive = |name: &str| -> Option<String> {
+        text.lines().find_map(|l| {
+            let l = l.trim_start();
+            let rest = l.strip_prefix(name)?;
+            (rest.is_empty() || rest.starts_with(char::is_whitespace))
+                .then(|| rest.trim().to_string())
+        })
+    };
+    let skeleton = skel_flag
+        .map(str::to_string)
+        .or_else(|| directive("%skeleton").map(|v| v.trim_matches('"').to_string()));
+    let cpp = match skeleton.as_deref() {
+        Some("lalr1.cc") => true,
+        Some(_) => false,
+        None => {
+            cpp_flag
+                || directive("%language")
+                    .is_some_and(|v| v.trim_matches('"').eq_ignore_ascii_case("c++"))
+        }
+    };
+    header |= directive("%defines").is_some() || directive("%header").is_some();
+    if !cpp || !header {
+        return Vec::new();
+    }
+    let modern = directive("%require").is_some_and(|v| {
+        let mut nums = v
+            .trim_matches('"')
+            .split('.')
+            .map(|n| n.parse::<u32>().unwrap_or(0));
+        let (major, minor) = (nums.next().unwrap_or(0), nums.next().unwrap_or(0));
+        (major, minor) >= (3, 2)
+    });
+    let loc_file = text.lines().find_map(|l| {
+        let l = l.trim_start().strip_prefix("%define")?.trim_start();
+        let v = l.strip_prefix("api.location.file")?.trim();
+        Some(
+            v.trim_matches(|c| c == '"' || c == '{' || c == '}')
+                .to_string(),
+        )
+    });
+    let locations = directive("%locations").is_some();
+    let mut names = Vec::new();
+    if !modern {
+        names.push("stack.hh");
+    }
+    if locations {
+        match loc_file.as_deref() {
+            None => {
+                names.push("location.hh");
+                if !modern {
+                    names.push("position.hh");
+                }
+            }
+            Some("none") => {}
+            Some(_) => {
+                if !modern {
+                    names.push("position.hh");
+                }
+            }
+        }
+    }
+    let out = cwd.join(out);
+    let Some(dir) = out.parent() else {
+        return Vec::new();
+    };
+    names
+        .into_iter()
+        .filter_map(|n| relative_from(&normalize_build_path_lexical(&dir.join(n)), build_dir))
+        .filter(|rel| rel.is_relative() && !rel.starts_with(".."))
+        .collect()
+}
+
 /// The `.vapi` a `vapigen --library=<name>` run writes, relative to the
 /// build dir: `<directory>/<name>.vapi`, where `--directory`/`-d` defaults
 /// to the directory the command runs in (a leading `cd`).
@@ -10259,6 +10877,15 @@ fn undeclared_outputs(
                 v.push(vapi);
             }
         }
+        for h in bison_side_headers(c, build_dir)
+            .into_iter()
+            .chain(particleshadergen_writes(c, build_dir))
+            .chain(docbookl10nhelper_writes(c, build_dir))
+        {
+            if !v.contains(&h) && !declared.contains(&h) {
+                v.push(h);
+            }
+        }
         for w in gtkdoc_written_outputs(c, build_dir) {
             if !v.contains(&w) && !declared.contains(&w) {
                 v.push(w);
@@ -10327,6 +10954,8 @@ fn undeclared_outputs(
                 Vec::new()
             })
             .chain(external_project_install_dir(declared, build_dir))
+            .chain(qrcalias_trees(c, build_dir))
+            .chain(katehighlightingindexer_trees(c, build_dir))
         {
             if !v.contains(&dir) {
                 v.push(dir);
@@ -12078,10 +12707,102 @@ fn protoc_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
             protos.push(a.clone());
         }
     }
+    // Chromium's protoc_wrapper.py hands protoc `--proto_path <proto-in-dir>`
+    // and every positional proto JOINED to that dir, so a positional name is
+    // relative to the root, not to the cwd.
+    let (in_dir, roots) = protoc_wrapper_roots(args);
+    incs.extend(roots);
+    if let Some(d) = in_dir {
+        for p in &mut protos {
+            if !Path::new(p.as_str()).is_absolute() {
+                *p = Path::new(&d).join(&*p).to_string_lossy().into_owned();
+            }
+        }
+    }
     if incs.is_empty() && protos.is_empty() {
         return None;
     }
     Some((incs, protos))
+}
+
+/// The baselines a `check_protocol_compatibility.py` run reads beside each
+/// positional `.pdl`: every sibling named `<stem>-<major>.<minor>.json`,
+/// spelled relative to the build dir. Empty for any other command.
+pub fn pdl_baselines(build_dir: &Path, cd_dir: &Path, args: &[String]) -> Vec<String> {
+    if !args
+        .iter()
+        .any(|a| a.ends_with("check_protocol_compatibility.py"))
+    {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for a in args
+        .iter()
+        .filter(|a| a.ends_with(".pdl") && !a.starts_with('-'))
+    {
+        let rel = rebase_post_cd(cd_dir, a);
+        let (Some(dir), Some(stem)) = (rel.parent(), rel.file_stem().and_then(|s| s.to_str()))
+        else {
+            continue;
+        };
+        let Ok(entries) = fs::read_dir(build_dir.join(dir)) else {
+            continue;
+        };
+        let mut found: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| {
+                n.strip_prefix(stem)
+                    .and_then(|r| r.strip_prefix('-'))
+                    .and_then(|r| r.strip_suffix(".json"))
+                    .is_some_and(|v| {
+                        let mut parts = v.split('.');
+                        parts.next().is_some_and(|p| p.parse::<u32>().is_ok())
+                            && parts.next().is_some_and(|p| p.parse::<u32>().is_ok())
+                            && parts.next().is_none()
+                    })
+            })
+            .map(|n| dir.join(n).to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        out.extend(found);
+    }
+    out
+}
+
+/// `protoc_wrapper.py`'s import roots, separated and `=` spellings: the
+/// `--proto-in-dir` (also the dir the positional protos are joined to) and
+/// every `--import-dir`, returned as (proto-in-dir, all roots).
+///
+/// A ROOT IS NOT A DATA DIRECTORY. Read as an ordinary directory argument,
+/// `--proto-in-dir ../../third_party/perfetto/` asked for all of perfetto
+/// (over 4096 files) and the edge was refused; what protoc reads below a root
+/// is the import closure `protoc_referenced_paths` resolves.
+fn protoc_wrapper_roots(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut in_dir = None;
+    let mut roots = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let (flag, value) = if let Some(v) = a.strip_prefix("--proto-in-dir=") {
+            ("in", Some(v.to_string()))
+        } else if a == "--proto-in-dir" {
+            ("in", it.next().cloned())
+        } else if let Some(v) = a.strip_prefix("--import-dir=") {
+            ("import", Some(v.to_string()))
+        } else if a == "--import-dir" {
+            ("import", it.next().cloned())
+        } else {
+            continue;
+        };
+        let Some(v) = value.filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        if flag == "in" {
+            in_dir = Some(v.clone());
+        }
+        roots.push(v);
+    }
+    (in_dir, roots)
 }
 
 /// The import targets inside a `.proto` file.
@@ -12903,8 +13624,8 @@ mod its_and_swig_reader_tests {
         gir_positional_referenced_paths, gir_positional_sources_invocation,
         glib_mkenums_invocation, glib_mkenums_referenced_paths, its_rule_targets,
         msgfmt_invocation, msgfmt_its_referenced_paths, proto_imports, protoc_invocation,
-        protoc_referenced_paths, swig_invocation, swig_referenced_paths, valac_invocation,
-        valac_referenced_paths,
+        protoc_referenced_paths, protoc_wrapper_roots, swig_invocation, swig_referenced_paths,
+        valac_invocation, valac_referenced_paths,
     };
     use std::path::Path;
 
@@ -13312,6 +14033,48 @@ mod its_and_swig_reader_tests {
         assert_eq!(protos, vec!["upb/util/def_to_proto_test.proto".to_string()]);
         let not: Vec<String> = ["gcc".into(), "x.proto".into()].to_vec();
         assert!(protoc_invocation(&not).is_none());
+    }
+
+    /// Chromium's protoc_wrapper.py, argv as qtwebengine 6.11.2's
+    /// toolchain.ninja passes it: `--proto-in-dir` and `--import-dir` are
+    /// roots, and each positional proto is relative to the proto-in-dir.
+    #[test]
+    fn protoc_wrapper_roots_are_include_roots_and_rebase_the_protos() {
+        let args: Vec<String> = [
+            "python3",
+            "../../tools/protoc_wrapper/protoc_wrapper.py",
+            "protos/perfetto/config/perfetto_config.proto",
+            "--protoc",
+            "./host/protoc",
+            "--proto-in-dir",
+            "../../third_party/perfetto/",
+            "--import-dir=../../third_party/protobuf/src",
+            "--ts-out-dir",
+            "gen/tsproto/third_party/perfetto/",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (incs, protos) = protoc_invocation(&args).expect("a protoc_wrapper run");
+        assert_eq!(
+            incs,
+            vec![
+                "../../third_party/perfetto/".to_string(),
+                "../../third_party/protobuf/src".to_string()
+            ]
+        );
+        assert_eq!(
+            protos,
+            vec![
+                "../../third_party/perfetto/protos/perfetto/config/perfetto_config.proto"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            protoc_wrapper_roots(&args).1,
+            incs,
+            "the directory arm skips exactly these"
+        );
     }
 
     /// THE DEFECT ITSELF: a sibling import resolves through `-I` and is
@@ -13910,11 +14673,33 @@ fn qrc_referenced_paths(
                 }
             }
         };
+        let (mut files, cands, dirs) = qrc_members(build_dir, cmd_cwd, &qrc_abs, &text);
+        files.insert(0, qrc_abs.to_string_lossy().into_owned());
+        files.sort();
+        files.dedup();
+        out.push((files, cands, dirs));
+    }
+    out
+}
+
+/// The members of one `.qrc` whose text is in hand, resolved the way `rcc`
+/// opens them (see `qrc_referenced_paths`): the files to upload, the
+/// build-relative candidates for the producer-index routing, and the climb
+/// prefixes to create. `qrc_abs` is the qrc's BUILD-TREE path, which the
+/// relative entries join onto, wherever the text was read from.
+#[allow(clippy::type_complexity)]
+fn qrc_members(
+    build_dir: &Path,
+    cmd_cwd: &Path,
+    qrc_abs: &Path,
+    text: &str,
+) -> (Vec<String>, Vec<PathBuf>, Vec<String>) {
+    {
         let qrc_dir = qrc_abs.parent().unwrap_or(Path::new(""));
-        let mut files = vec![qrc_abs.to_string_lossy().into_owned()];
+        let mut files: Vec<String> = Vec::new();
         let mut cands = Vec::new();
         let mut dirs = Vec::new();
-        for e in qrc_file_entries(&text) {
+        for e in qrc_file_entries(text) {
             let ep = Path::new(&e);
             // Both joins: rcc resolves a relative entry against the
             // command's directory, and the qrc's own directory is the
@@ -13927,7 +14712,11 @@ fn qrc_referenced_paths(
             };
             let mut placed = false;
             for raw in &raws {
-                if !same_project_tree(build_dir, raw) {
+                // Judged where the path LANDS: breeze-icons' qrcAlias writes
+                // `../../../../../nix/store/<h>-index.theme`, lexically in the
+                // tree and resolving into the store; uploaded, it took a
+                // climbing build path that collided with the store input.
+                if !same_project_tree(build_dir, &normalize_build_path_lexical(raw)) {
                     continue;
                 }
                 if raw.is_file() {
@@ -13951,11 +14740,8 @@ fn qrc_referenced_paths(
                 }
             }
         }
-        files.sort();
-        files.dedup();
-        out.push((files, cands, dirs));
+        (files, cands, dirs)
     }
-    out
 }
 
 /// A qrc the command names, as a build-relative candidate: the join is
@@ -14165,8 +14951,9 @@ fn ep_build_step(c: &str) -> bool {
 /// directory holding it and any directory inside it. qtwebengine's gn
 /// build step runs `${GN_SOURCE_DIR}/build/gen.py` over
 /// `set(GN_SOURCE_DIR ${WEBENGINE_ROOT_SOURCE_DIR}/src/3rdparty/gn)`, a tree
-/// no edge names (850 files); the root itself holds the build dir and is
-/// excluded, so the whole checkout is never offered.
+/// no edge names (850 files). Any directory holding the CMakeLists itself
+/// (its own dir, the source root it climbs to) is excluded too, so the
+/// checkout is never offered whether or not it holds the build dir.
 fn cmake_list_composed_dirs(
     lists: &Path,
     text: &str,
@@ -14177,14 +14964,14 @@ fn cmake_list_composed_dirs(
     let mut vars = definitions.clone();
     let mut sink = Vec::new();
     included_paths_walk(lists, text, &mut vars, &mut sink, 0, cwd);
-    let own = lists.parent();
+    let lists_norm = normalize_build_path_lexical(lists);
     let mut out: Vec<PathBuf> = vars
         .into_iter()
         .filter(|(k, _)| k != "CMAKE_MODULE_PATH" && k != "CMAKE_CURRENT_LIST_DIR")
         .map(|(_, v)| normalize_build_path_lexical(Path::new(&v)))
         .filter(|p| {
             p.is_absolute()
-                && Some(p.as_path()) != own
+                && !lists_norm.starts_with(p)
                 && !build_dir.starts_with(p)
                 && !p.starts_with(build_dir)
                 && same_project_tree(build_dir, p)
@@ -14275,6 +15062,144 @@ fn ep_source_dir_trees<'a>(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod round_leaf_side_output_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("nn-leaf-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("build/src")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        root
+    }
+
+    /// kholidays 6.30.0's bison edge, with the grammar's own directives;
+    /// the expected files are what bison 3.8.2 wrote for them, measured.
+    #[test]
+    fn a_cpp_bison_run_declares_the_headers_it_writes_beside_its_output() {
+        let root = scratch("bison");
+        let b = root.join("build");
+        let gram = root.join("src/p.ypp");
+        let cmd = |g: &Path| {
+            format!(
+                "cd {b}/src && /bin/cmake -E make_directory {b}/src && /bin/bison -d -o {b}/src/p.cpp {g}",
+                b = b.display(),
+                g = g.display()
+            )
+        };
+        let run = |text: &str| {
+            std::fs::write(&gram, text).unwrap();
+            let mut got = bison_side_headers(&cmd(&gram), &b);
+            got.sort();
+            got
+        };
+        let p = |n: &str| PathBuf::from(format!("src/{n}"));
+        let base = "%defines\n%skeleton \"lalr1.cc\"\n%locations\n";
+        assert_eq!(
+            run(base),
+            vec![p("location.hh"), p("position.hh"), p("stack.hh")]
+        );
+        std::fs::write(&gram, "%skeleton \"lalr1.cc\"\n%locations\n").unwrap();
+        assert!(
+            bison_side_headers(&cmd(&gram).replace(" -d ", " "), &b).is_empty(),
+            "no header asked for"
+        );
+        assert_eq!(
+            run("%defines\n%skeleton \"lalr1.cc\"\n"),
+            vec![p("stack.hh")]
+        );
+        assert_eq!(
+            run("%require \"3.2\"\n%defines\n%skeleton \"lalr1.cc\"\n%locations\n"),
+            vec![p("location.hh")]
+        );
+        assert_eq!(
+            run("%defines\n%skeleton \"lalr1.cc\"\n%locations\n%define api.location.file none\n"),
+            vec![p("stack.hh")]
+        );
+        assert_eq!(
+            run("%defines\n%locations\n"),
+            Vec::<PathBuf>::new(),
+            "a C grammar"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn particleshadergen_declares_its_collection_and_other_tools_nothing() {
+        let b = Path::new("/build/q/build");
+        let cmd = "cd /build/q/build/src/quick3dparticles && /build/q/build/libexec/qt-cmake-private-tool-wrapper /build/q/build/bin/particleshadergen -o /build/q/build/src/quick3dparticles/.rcc -r generated_res_particle_shaders.qrc";
+        assert_eq!(
+            particleshadergen_writes(cmd, b),
+            vec![PathBuf::from(
+                "src/quick3dparticles/.rcc/res/rhishaders/qtparticleshaders.qsbc"
+            )]
+        );
+        assert!(
+            particleshadergen_writes("cd /build/q/build && /bin/rcc -o x.cpp x.qrc", b).is_empty()
+        );
+    }
+
+    /// breeze-icons 6.30.0's qrc producer, verbatim shape: only the build
+    /// tree directories qrcAlias lists are trees; the source dir is not.
+    #[test]
+    fn qrcalias_declares_the_build_tree_dirs_it_lists() {
+        let b = Path::new("/build/breeze-icons-6.30.0/build");
+        let cmd = "cd /build/breeze-icons-6.30.0/build/icons && /build/breeze-icons-6.30.0/build/bin/qrcAlias -o /build/breeze-icons-6.30.0/build/icons/breeze-icons.qrc /build/breeze-icons-6.30.0/icons /build/breeze-icons-6.30.0/build/breeze/icons && /build/breeze-icons-6.30.0/build/bin/qrcAlias -o /build/breeze-icons-6.30.0/build/icons/breeze-icons.qrc.dark.dummy /build/breeze-icons-6.30.0/icons /build/breeze-icons-6.30.0/build/breeze/icons /build/breeze-icons-6.30.0/build/breeze/icons-dark";
+        assert_eq!(
+            qrcalias_trees(cmd, b),
+            vec![
+                PathBuf::from("breeze/icons"),
+                PathBuf::from("breeze/icons-dark")
+            ]
+        );
+        assert!(qrcalias_trees("cd /x && /bin/rcc --binary -o a.rcc a.qrc", b).is_empty());
+    }
+
+    /// plasma-activities 6.7.5: a generated header reached by the scan
+    /// climbs through a source include dir no input lives in. The climb is
+    /// added; an ordinary `../x.h` out of a dir an input already supplies is
+    /// not, so a compile that builds today keeps its emission.
+    #[test]
+    fn a_reached_header_climbing_through_an_empty_source_dir_adds_that_dir() {
+        let root = scratch("climb");
+        let b = root.join("build");
+        std::fs::create_dir_all(b.join("src/lib")).unwrap();
+        std::fs::create_dir_all(root.join("src/lib")).unwrap();
+        std::fs::create_dir_all(root.join("src/common/dbus")).unwrap();
+        std::fs::write(root.join("src/common/dbus/A.h"), "").unwrap();
+        std::fs::write(b.join("src/lib/gen.h"), "#include \"../common/dbus/A.h\"\n").unwrap();
+        let cmd = "g++ -I../build/src/lib -I../src/lib -c gen.cpp";
+        let seeds = vec![PathBuf::from("src/lib/gen.h")];
+        let got = with_transitive_climbs(
+            cmd,
+            &b,
+            Path::new("/nix/store"),
+            &seeds,
+            &[root.join("src/common/dbus/A.h")],
+            None,
+            Vec::new(),
+        );
+        assert_eq!(got, vec![root.join("src/lib")]);
+        // An input under the dir: the sandbox already has it.
+        std::fs::write(root.join("src/lib/held.h"), "").unwrap();
+        let held = with_transitive_climbs(
+            cmd,
+            &b,
+            Path::new("/nix/store"),
+            &seeds,
+            &[
+                root.join("src/common/dbus/A.h"),
+                root.join("src/lib/held.h"),
+            ],
+            None,
+            Vec::new(),
+        );
+        assert!(held.is_empty(), "{held:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]
@@ -16151,7 +17076,8 @@ fn upload_referenced_file(
     let main = new_opaque_file(rpc_client, build_dir, path.clone())?;
     let mut out = vec![main];
     if is_py {
-        upload_python_closure(rpc_client, build_dir, &parent_dir_or_here(&path), &mut out)?;
+        upload_python_closure(rpc_client, build_dir, &parent_dir_or_here(&path), &mut out)
+            .with_context(|| format!("python closure of {}", path.display()))?;
     }
     Ok(out)
 }
@@ -16669,6 +17595,7 @@ find_package(Ninja 1.7.2 REQUIRED)
         let lists = root.join("src/gn/CMakeLists.txt");
         let text = format!(
             "get_filename_component(WEBENGINE_ROOT_SOURCE_DIR \"${{CMAKE_CURRENT_LIST_DIR}}/../..\" REALPATH)\n\
+             get_filename_component(PARENT_DIR \"${{CMAKE_CURRENT_LIST_DIR}}/..\" REALPATH)\n\
              set(GN_SOURCE_DIR ${{WEBENGINE_ROOT_SOURCE_DIR}}/src/3rdparty/gn)\n\
              set(GN_BINARY_DIR {})\n",
             root.join("build/src/gn").display()
@@ -17335,6 +18262,68 @@ fn upload_python_closure(
     Ok(())
 }
 
+/// The data-directory cap of `upload_referenced_dir`: a directory argument
+/// with no python package in it is carried whole up to this many files.
+///
+/// 8192, raised from 4096 for qtwebengine 6.11.2's Chromium: devtools'
+/// `collect-ui-strings.js --input-directories front_end` walks all of
+/// front_end (6,371 files, 148 MiB) while declaring 3 inputs, and perfetto's
+/// `gen_tp_table_headers.py --relative-input-dir` names
+/// `third_party/perfetto/` (4,569 files). Only an edge this refused carries
+/// more.
+const DATA_DIR_CAP: usize = 8192;
+
+/// syncqt flags naming a directory it WRITES into.
+const SYNCQT_OUTPUT_DIR_FLAGS: &[&str] = &[
+    "-binaryDir",
+    "-includeDir",
+    "-privateIncludeDir",
+    "-qpaIncludeDir",
+    "-rhiIncludeDir",
+    "-ssgIncludeDir",
+    "-installIncludeDir",
+];
+
+/// Whether DIR holds more than CAP files, counted without uploading and
+/// memoized per process. Asked where a directory too large to carry is
+/// passed over rather than refused: a `sys.path` root (Chromium's source
+/// root, reached through `build/PRESUBMIT_test.py`, whose modules have the
+/// ROOT as their directory) and a syncqt output dir.
+fn dir_exceeds_files(dir: &Path, cap: usize) -> bool {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<(PathBuf, usize), bool>>> =
+        std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    let key = (dir.to_path_buf(), cap);
+    if let Some(&hit) = memo.lock().unwrap().get(&key) {
+        return hit;
+    }
+    let mut n = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    'walk: while let Some(d) = stack.pop() {
+        for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                n += 1;
+                if n > cap {
+                    break 'walk;
+                }
+            }
+        }
+    }
+    let over = n > cap;
+    memo.lock().unwrap().insert(key, over);
+    over
+}
+
+/// One cap for every directory a python closure carries whole. A package
+/// dir used to have 512 and was SKIPPED over it, reported success, and left
+/// the import to fail inside the sandbox: catapult's `tracing/tracing`
+/// (1,180 files) and Chromium's `build` (1,191) were dropped from 93
+/// closures on qtwebengine 6.11.2's mojo and grit edges.
+const PYTHON_DEP_DIR_CAP: usize = 8192;
+
 /// The memoized closure behind upload_python_closure, shared by Arc so
 /// a caller that only needs to CHECK membership (the per-task python
 /// sibling pass) iterates the one canonical copy instead of cloning
@@ -17477,6 +18466,19 @@ mod closure_step_tests {
     fn a_duplicate_is_seen_even_when_the_set_is_over_the_cap() {
         assert_eq!(closure_step(false, 9_000, 64), ClosureStep::Seen);
     }
+
+    /// The pass-over predicate counts FILES at every depth, and a directory
+    /// exactly at the cap is carried, not passed over.
+    #[test]
+    fn dir_exceeds_files_counts_nested_files_against_the_cap() {
+        let d = super::Scratch::new(format!("nn-dir-exceeds-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        for f in ["x", "a/y", "a/b/z"] {
+            std::fs::write(d.join(f), b"").unwrap();
+        }
+        assert!(super::dir_exceeds_files(&d, 2));
+        assert!(!super::dir_exceeds_files(&d, 3));
+    }
 }
 
 fn upload_python_closure_uncached(
@@ -17495,20 +18497,22 @@ fn upload_python_closure_uncached(
     const CLOSURE_DIR_CAP: usize = 256;
     let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut queue: Vec<PathBuf> = vec![start_dir.to_path_buf()];
-    let upload_dir = |dir: &Path, cap: usize, out: &mut Vec<DerivedFile>| -> Result<bool> {
-        match walk_dir_capped(rpc_client, build_dir, dir, cap)? {
+    const DEP_DIR_CAP: usize = PYTHON_DEP_DIR_CAP;
+    // OVER THE CAP IS A REFUSAL, like the closure's own directory cap: a
+    // skipped dependency is a partial closure.
+    let upload_dir = |dir: &Path, out: &mut Vec<DerivedFile>| -> Result<bool> {
+        match walk_dir_capped(rpc_client, build_dir, dir, DEP_DIR_CAP)? {
             Some(files) => {
                 out.extend(files);
                 Ok(true)
             }
-            None => {
-                eprintln!(
-                    "nix-ninja: python dep dir {} exceeds {} files; skipped",
-                    dir.display(),
-                    cap
-                );
-                Ok(false)
-            }
+            None => Err(anyhow!(
+                "python dep dir {} below {} holds more than {} files; refusing \
+                 to declare a partial closure",
+                dir.display(),
+                start_dir.display(),
+                DEP_DIR_CAP
+            )),
         }
     };
     while let Some(dir) = queue.pop() {
@@ -17553,8 +18557,8 @@ fn upload_python_closure_uncached(
             if p.extension().is_some_and(|e| e == "py") && p.is_file() {
                 out.push(new_opaque_file(rpc_client, build_dir, p)?);
             } else if p.is_dir() && p.file_name().is_some_and(|n| n == "node_modules") {
-                upload_dir(&p, 8192, out)?;
-            } else if p.is_dir() && p.join("__init__.py").is_file() && upload_dir(&p, 512, out)? {
+                upload_dir(&p, out)?;
+            } else if p.is_dir() && p.join("__init__.py").is_file() && upload_dir(&p, out)? {
                 queue.push(p);
             }
         }
@@ -17586,7 +18590,7 @@ fn upload_python_closure_uncached(
                             || (uncle.file_name().is_some_and(|f| f == n.as_str())
                                 && uncle.join("__init__.py").is_file())
                     });
-                    if hit && upload_dir(&uncle, 512, out)? {
+                    if hit && upload_dir(&uncle, out)? {
                         queue.push(uncle);
                     }
                 }
@@ -17620,7 +18624,7 @@ fn upload_python_closure_uncached(
                             let module = cand.join(format!("{name}.py")).is_file();
                             let package = cand.join("__init__.py").is_file();
                             if module || package {
-                                if upload_dir(&cand, 8192, out)? && package {
+                                if upload_dir(&cand, out)? && package {
                                     queue.push(cand);
                                 }
                                 break 'levels;
@@ -17674,7 +18678,7 @@ fn upload_python_closure_uncached(
                         // tree.
                         cands.sort();
                         if let Some(pkg) = cands.into_iter().max_by_key(|p| score(p)) {
-                            if upload_dir(&pkg, 8192, out)? {
+                            if upload_dir(&pkg, out)? {
                                 queue.push(pkg);
                             }
                             break 'levels;
@@ -17691,7 +18695,7 @@ fn upload_python_closure_uncached(
                 // queues so its own imports (idl_lexer -> ply) get chased.
                 for name in &unsatisfied {
                     if let Some(holder) = find_module_below(&dir, name, 3) {
-                        if upload_dir(&holder, 512, out)? {
+                        if upload_dir(&holder, out)? {
                             queue.push(holder);
                         }
                     }
@@ -17700,8 +18704,28 @@ fn upload_python_closure_uncached(
             // sys.path splices readable on one line still help for the
             // shapes the structural probes miss.
             for sp in python_syspath_dirs(&dir)? {
-                if upload_dir(&sp, 8192, out)? {
+                if let Some(files) = walk_dir_capped(rpc_client, build_dir, &sp, DEP_DIR_CAP)? {
+                    out.extend(files);
                     queue.push(sp);
+                    continue;
+                }
+                // A sys.path ROOT TOO LARGE TO CARRY WHOLE (Chromium's
+                // `build/util/lastchange.py` splices the source root, 266,968
+                // files). Python reads from a root only the names imported
+                // through it, so resolve this directory's unsatisfied names
+                // there: a module file, or a package carried and queued.
+                // ponytail: a root-level MODULE's own imports are not chased,
+                // since the walk queues directories; add when a root module
+                // with imports turns up. `dir_exceeds_files` keeps the
+                // per-task sibling pass from walking the root.
+                for name in &unsatisfied {
+                    let module = sp.join(format!("{name}.py"));
+                    let package = sp.join(name);
+                    if module.is_file() {
+                        out.push(new_opaque_file(rpc_client, build_dir, module)?);
+                    } else if package.join("__init__.py").is_file() && upload_dir(&package, out)? {
+                        queue.push(package);
+                    }
                 }
             }
             // A *_project.py file is catapult's convention for a
@@ -17728,7 +18752,7 @@ fn upload_python_closure_uncached(
                     for base in &bases {
                         let cand = lexical_join(base, &seg_path);
                         if cand.is_dir() && cand != dir {
-                            if upload_dir(&cand, 8192, out)? {
+                            if upload_dir(&cand, out)? {
                                 queue.push(cand);
                             }
                             break;
@@ -18305,7 +19329,6 @@ fn upload_referenced_dir_uncached(
                 // above this bound, since every input is a store path in the
                 // task's closure and closure size is measured here as daemon
                 // lock time.
-                const DATA_DIR_CAP: usize = 4096;
                 return match walk_dir_capped(rpc_client, build_dir, dir, DATA_DIR_CAP)? {
                     Some(files) => {
                         eprintln!(
@@ -19232,6 +20255,20 @@ mod task_needs_cc_tests {
                 ["lib/x.bc"].into_iter()
             ),
             "an absolute toolchain path exec's itself and needs no lookup"
+        );
+        // appstream-qt 1.1.3's resource edge: `as` is the C name, not the
+        // assembler; the same word as a program still asks for the lookup.
+        assert!(
+            !cc_lookup_is_implied(
+                "/nix/store/x/bin/glib-compile-resources ../src/appstream.gresource.xml \
+                 --sourcedir ../data --c-name as --internal --generate --target src/as-resources.c",
+                ["src/as-resources.c"].into_iter()
+            ),
+            "a long option's value names no program"
+        );
+        assert!(
+            cc_lookup_is_implied("as -o x.o x.s", ["x.o"].into_iter()),
+            "the assembler by bare name still needs PATH"
         );
     }
 
@@ -22651,6 +23688,8 @@ pub fn discover_c_includes(
     // scan branch would fix run one and break run two, which is a shape this
     // project has shipped before.
     let dotdot_dirs = c_include_parser::seed_dotdot_dirs(cmdline, &files, virtual_paths.as_ref());
+    // The scan below takes the map; the transitive-climb pass reads it after.
+    let climb_paths = virtual_paths.clone();
     let c_includes = match depfile_read_back(
         build_dir,
         AsRef::<Path>::as_ref(store_dir),
@@ -22779,6 +23818,15 @@ pub fn discover_c_includes(
     // Gated on the arms being REACHABLE, which is the whole cost control: a
     // translation unit whose macros have one arm each pays a walk over its
     // already-declared headers and nothing else.
+    let dotdot_dirs = with_transitive_climbs(
+        cmdline,
+        build_dir,
+        store_dir.to_path(),
+        &files,
+        &c_includes,
+        climb_paths.as_ref(),
+        dotdot_dirs,
+    );
     let c_includes = {
         let mut v = c_includes;
         // THE TRANSLATION UNIT'S OWN TEXT IS A DEFINE SITE TOO, and it was
@@ -23135,6 +24183,118 @@ pub fn discover_c_includes(
     ))
 }
 
+/// The seeds' climb dirs plus those a project header the scan REACHED needs
+/// and no input supplies. plasma-activities 6.7.5's compile of the generated
+/// `activities_interface.cpp` reaches the generated `activities_interface.h`,
+/// whose `#include "../common/dbus/org.kde.ActivityManager.Activities.h"`
+/// resolves through `-I<src>/src/lib`; no input lives in `src/lib`, so the
+/// sandbox lacks it and the open fails ENOENT (KDE round 2026-10-19, task
+/// gy16q8l2). `seed_dotdot_dirs` reads only the seeds. Only a dir with no
+/// seed or include beneath it is added (an ordinary `"../x.h"` from a
+/// header climbs out of a dir that header already supplies), and never the
+/// build dir or above it, so a compile that builds today emits the same.
+fn with_transitive_climbs(
+    cmdline: &str,
+    build_dir: &Path,
+    store_dir: &Path,
+    seeds: &[PathBuf],
+    includes: &[PathBuf],
+    virtual_paths: Option<&HashMap<PathBuf, PathBuf>>,
+    mut dirs: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let abs = |p: &Path| {
+        normalize_build_path_lexical(&if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            build_dir.join(p)
+        })
+    };
+    // A generated file is read from its realised copy: its build path exists
+    // only in the map, and an unreadable file yields no climbs. Its quoted
+    // includes then miss beside the store copy and resolve through the
+    // include dirs, which is where the climb this pass is for happens.
+    let mut scanned: Vec<PathBuf> = Vec::new();
+    for p in seeds.iter().chain(includes) {
+        if p.starts_with(store_dir) {
+            continue;
+        }
+        let read = virtual_paths
+            .and_then(|v| v.get(p))
+            .cloned()
+            .unwrap_or_else(|| abs(p));
+        if !scanned.contains(&read) {
+            scanned.push(read);
+        }
+    }
+    if scanned.is_empty() {
+        return dirs;
+    }
+    // THE INCLUDE DIRS ABSOLUTE AND NORMALIZED. The command spells a source
+    // dir relative to the build dir (`../src/lib`), and a raw join that
+    // begins with `..` has no prefix `dotdot_prefix` will name; joined onto
+    // the build dir and normalized it is `<src>/src/lib`, whose climb is.
+    let cmd_abs = absolute_include_dirs(cmdline, build_dir);
+    let held: Vec<PathBuf> = seeds.iter().chain(includes).map(|p| abs(p)).collect();
+    for d in c_include_parser::seed_dotdot_dirs(&cmd_abs, &scanned, virtual_paths) {
+        let d = abs(&d);
+        // Only a dir no task creates today: outside the build dir (whose
+        // include dirs ride NIX_NINJA_MAKE_DIRS), inside the project, not
+        // the store, and holding no input.
+        if dirs.iter().any(|x| abs(x) == d)
+            || d.starts_with(build_dir)
+            || build_dir.starts_with(&d)
+            || d.starts_with(store_dir)
+            || !same_project_tree(build_dir, &d)
+            || held.iter().any(|h| h.starts_with(&d))
+        {
+            continue;
+        }
+        dirs.push(d);
+    }
+    dirs
+}
+
+/// `cmdline` with every relative `-I`/`-iquote`/`-isystem` directory joined
+/// onto `build_dir` and normalized, joined or separated spelling alike.
+fn absolute_include_dirs(cmdline: &str, build_dir: &Path) -> String {
+    let fix = |d: &str| -> String {
+        if d.is_empty() || d.starts_with('/') {
+            d.to_string()
+        } else {
+            normalize_build_path_lexical(&build_dir.join(d))
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut next_is_dir = false;
+    for t in cmdline.split_whitespace() {
+        if next_is_dir {
+            out.push(fix(t));
+            next_is_dir = false;
+            continue;
+        }
+        let mut done = false;
+        for flag in ["-iquote", "-isystem", "-I"] {
+            if t == flag {
+                out.push(t.to_string());
+                next_is_dir = true;
+                done = true;
+                break;
+            }
+            if let Some(d) = t.strip_prefix(flag) {
+                out.push(format!("{flag}{}", fix(d)));
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            out.push(t.to_string());
+        }
+    }
+    out.join(" ")
+}
+
 /// The build-path field of an encoded `store:build_path:rel` input.
 pub(crate) fn encoded_build_path(e: &str) -> &str {
     e.split(':').nth(1).unwrap_or(e)
@@ -23370,7 +24530,23 @@ pub fn script_bare_programs(cmdline: &str) -> Vec<String> {
             );
         (t.ends_with(".sh") && (i == 0 || shell_before || toks[i - 1] == "&&")).then_some(*t)
     });
-    let Some(text) = script.and_then(|p| fs::read_to_string(p.trim_matches('"')).ok()) else {
+    // A RELATIVE SCRIPT RESOLVES AGAINST THE COMMAND'S `cd`, not this
+    // process's cwd: kde-gtk-config 6.7.5 runs `cd <src>/kded/scss &&
+    // ./build_decorations_css.sh <out>`, the read missed, and its task died
+    // `sass: not found` with sass among the package's inputs (KDE round
+    // 2026-10-19, task zisa14gn).
+    let cd = match toks.as_slice() {
+        ["cd", d, "&&", ..] => Some(Path::new(d.trim_matches('"'))),
+        _ => None,
+    };
+    let Some(text) = script.and_then(|p| {
+        let p = Path::new(p.trim_matches('"'));
+        let p = match cd {
+            Some(d) if p.is_relative() => d.join(p),
+            _ => p.to_path_buf(),
+        };
+        fs::read_to_string(p).ok()
+    }) else {
         return Vec::new();
     };
     let mut out: Vec<String> = Vec::new();
@@ -23441,6 +24617,21 @@ fn generator_execs_cc_unnamed(cmdline: &str) -> bool {
 /// toolchain is named: that case is silent about a lookup and is decided by
 /// `cc_lookup_is_implied`'s output-shape arm instead.
 fn names_named_toolchain_needs_path(cmdline: &str) -> bool {
+    // A LONG OPTION'S VALUE NAMES NO PROGRAM. appstream-qt 1.1.3's
+    // `glib-compile-resources ... --c-name as ...` read as the assembler, the
+    // edge was refused for want of `cc` in every round since 2026-10-17
+    // (task pnq3krj6). Only the refusal reads this; emission's need for the
+    // compiler is `command_names_toolchain`'s, unchanged.
+    let mut kept: Vec<&str> = Vec::new();
+    let mut prev = "";
+    for t in cmdline.split_whitespace() {
+        let bare_value = prev.starts_with("--") && !prev.contains('=') && !t.contains('/');
+        if !(bare_value && TOOLCHAIN_TOOLS.contains(&t)) {
+            kept.push(t);
+        }
+        prev = t;
+    }
+    let cmdline = kept.join(" ");
     cmdline
         .split(|c: char| {
             c.is_whitespace()
@@ -27827,6 +29018,26 @@ mod script_bare_programs_tests {
             unrun.is_empty(),
             "a script that is only an argument runs nothing: {unrun:?}"
         );
+    }
+
+    /// kde-gtk-config 6.7.5's decorations edge: the script is spelled
+    /// relative to the command's `cd`, and `sass` is what its task lacked.
+    #[test]
+    fn a_script_beside_the_cd_target_is_read_there() {
+        let dir = std::env::temp_dir().join(format!("nn-scss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("build_decorations_css.sh"),
+            "#!/bin/sh\nbuild_sass() {\n  if command -v sassc >/dev/null 2>&1; then\n      \
+             sassc -I \"$3\" \"$1\" \"$2\"\n  else\n      sass -I \"$3\" \"$1\" \"$2\"\n  fi\n}\n",
+        )
+        .unwrap();
+        let got = script_bare_programs(&format!(
+            "cd {} && ./build_decorations_css.sh /build/k/build/kded/scss",
+            dir.display()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(got.iter().any(|w| w == "sass"), "{got:?}");
     }
 }
 
