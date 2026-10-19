@@ -4004,10 +4004,13 @@ impl Runner {
             }
         }
 
-        // A `.qrc` entry can name a GENERATED file (qtquick3d's compiled
-        // `.qsbc`), which exists nowhere at scan time. The candidate that
-        // names a graph node routes as a Built input with its co-outputs,
-        // the same shape as the grd candidates above.
+        // A `.qrc` entry can name a GENERATED file of an ON-DISK qrc
+        // (an undeclared member whose producer resolves late). The
+        // candidate that names a graph node routes as a Built input with
+        // its co-outputs, the same shape as the grd candidates above.
+        // Members of a GENERATED qrc are not covered here: the qrc is
+        // unreadable at (re-)resolution, so they never become candidates
+        // single-pass (open shape).
         let mut qrc_defer_out: Option<DeferMiss> = None;
         // The edge's own outputs, for the self-output guard below.
         let own = own_output_rels(build, files, &self.config.build_dir);
@@ -13787,8 +13790,24 @@ fn qrc_referenced_paths(
         } else {
             build_dir.join(rebase_post_cd(cd_dir, q))
         };
-        let Ok(text) = std::fs::read_to_string(&qrc_abs) else {
-            continue;
+        let (qrc_abs, text) = match std::fs::read_to_string(&qrc_abs) {
+            Ok(text) => (qrc_abs, text),
+            Err(_) => {
+                // Normalized fallback: the join is lexical, so a qrc
+                // spelled through a missing intermediate directory fails
+                // the open although the normalized path exists (the
+                // qttools climbs go through directories nothing declares).
+                // Without this the reader and the candidate push below
+                // both skip an existing qrc.
+                let norm = normalize_build_path_lexical(&qrc_abs);
+                if norm == qrc_abs {
+                    continue;
+                }
+                match std::fs::read_to_string(&norm) {
+                    Ok(text) => (norm, text),
+                    Err(_) => continue,
+                }
+            }
         };
         let qrc_dir = qrc_abs.parent().unwrap_or(Path::new(""));
         let mut files = vec![qrc_abs.to_string_lossy().into_owned()];
@@ -13841,9 +13860,11 @@ fn qrc_referenced_paths(
 /// A qrc the command names, as a build-relative candidate: the join is
 /// lexical (a climbing entry never matches a graph node), so normalize
 /// before relativizing, the same normalization the member candidates get.
-/// An existing file is None (the reader above already carried it); a
-/// spelling outside the tree is None. Pure so the spelling the producer's
-/// edge outputs is testable without a Runner.
+/// An existing file is None (the reader above tries the raw spelling and
+/// then the normalized one, so it already carried it); a spelling outside
+/// the tree yields a climbing rel that matches no graph node, and the
+/// routing loop's lookup is the filter. Pure so the spelling the
+/// producer's edge outputs is testable without a Runner.
 fn qrc_file_candidate_rel(build_dir: &Path, cd_dir: &Path, q: &str) -> Option<PathBuf> {
     let joined = if Path::new(q).is_absolute() {
         PathBuf::from(q)
@@ -14314,6 +14335,34 @@ mod qrc_copy_sourcedir_tests {
             ),
             Some(PathBuf::from(".qt/rcc/app.qrc"))
         );
+    }
+
+    #[test]
+    fn a_qrc_through_a_missing_intermediate_still_reads() {
+        // The reader opens the normalized fallback: with no `cd` prologue
+        // the join keeps the entry's `..` (`a/../icons/app.qrc`), so the
+        // raw open fails on the missing intermediate although the
+        // normalized path exists, and without the fallback the reader and
+        // the candidate push both skip an existing qrc.
+        let root = Scratch::new(format!("nn-qrc-missing-dir-{}", std::process::id()));
+        let build = root.join("build");
+        std::fs::create_dir_all(build.join("icons")).unwrap();
+        std::fs::write(build.join("icons/app.qrc"), "<RCC/>\n").unwrap();
+        // `a/` is never created. Empty cd: no prologue, so the join is
+        // lexical and keeps the climb.
+        let (files, cands, _) = qrc_referenced_paths(
+            &build,
+            &build,
+            Path::new(""),
+            &["a/../icons/app.qrc".to_string()],
+        )
+        .pop()
+        .unwrap();
+        assert!(
+            files.iter().any(|f| f.ends_with("icons/app.qrc")),
+            "{files:?}"
+        );
+        assert!(cands.is_empty(), "{cands:?}");
     }
 
     #[test]
