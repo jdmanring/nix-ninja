@@ -1872,6 +1872,7 @@ impl Runner {
                     undeclared_dirs = external_project_extract_dirs(c, &config.build_dir)
                         .into_iter()
                         .chain(external_project_binary_dir(c, &config.build_dir))
+                        .chain(external_project_install_dir(&paths, &config.build_dir))
                         .collect();
                 }
                 // UPSTREAM #17: record this task's depfile output. NOT
@@ -3495,6 +3496,43 @@ impl Runner {
                 {
                     self.add_derived_file(files, input.clone());
                     input_set.insert(input.build_path.clone(), input);
+                }
+                // AND WHAT ITS CMakeLists.txt READS OUTSIDE IT. qtwebengine's
+                // gn tree is that one file, which includes
+                // `<src root>/.cmake.conf` and finds `<src root>/cmake/
+                // FindNinja.cmake` (KDE round 2026-10-19, task h7h6s56r:
+                // `include could not find requested file`, then no
+                // FindNinja.cmake). Same walk and filters as a `cmake -P`
+                // script's includes.
+                let lists = abs.join("CMakeLists.txt");
+                if let Ok(text) = std::fs::read_to_string(&lists) {
+                    let cwd = self.config.build_dir.join(&cd_dir);
+                    referenced.extend(cmake_script_included_paths(
+                        &lists,
+                        &text,
+                        &cmake_p_defs,
+                        &cwd,
+                    ));
+                    // A BUILD STEP RUNS THE PROJECT'S CUSTOM COMMANDS, which
+                    // read the trees its CMakeLists composes (gn's
+                    // `gen.py` over `src/3rdparty/gn`). Configure reads
+                    // none of them, so only `cmake --build` carries them.
+                    if build.cmdline.as_deref().is_some_and(ep_build_step) {
+                        for d in cmake_list_composed_dirs(
+                            &lists,
+                            &text,
+                            &cmake_p_defs,
+                            &cwd,
+                            &self.config.build_dir,
+                        ) {
+                            for input in
+                                upload_referenced_dir(&self.rpc_client, &self.config.build_dir, &d)?
+                            {
+                                self.add_derived_file(files, input.clone());
+                                input_set.insert(input.build_path.clone(), input);
+                            }
+                        }
+                    }
                 }
             }
             let mut gtest_discovery = runs_gtest_discovery(cmdline, None);
@@ -9273,6 +9311,68 @@ fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf
 /// read - it does not create the directory the way `-B` does, and a
 /// configure-time variable is a different thing from the argument that tells
 /// cmake where to write.
+/// The INSTALL_DIR an ExternalProject install step writes and declares only
+/// its stamp for. qtwebengine 6.11.2's gn install step runs `cmake --build .
+/// --target install` into `<build>/install`, which `QtGnGen.cmake`'s
+/// `find_package(Gn ... EXACT)` searches and the package's own `install
+/// (PROGRAMS ${installDir}/bin/gn)` reads; as a task the tree stayed in the
+/// task's output (replica of KDE round 2026-10-19, `install/bin` absent
+/// after `gn-install`). The step's command does not name the directory;
+/// CMake's configure-time `<prefix>/tmp/<name>-mkdirs.cmake` does, as the
+/// second entry of its multi-path `file(MAKE_DIRECTORY ...)`
+/// (`mkdirs.cmake.in`: binary, install, tmp, stamp, download, log).
+/// Gated on a declared `<name>-stamp/<name>-install` output and an install
+/// dir inside the build dir, so no other task moves.
+fn external_project_install_dir(declared: &[PathBuf], build_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for d in declared {
+        let (Some(stamp_dir), Some(file)) = (d.parent(), d.file_name().and_then(|f| f.to_str()))
+        else {
+            continue;
+        };
+        let Some(name) = stamp_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix("-stamp"))
+        else {
+            continue;
+        };
+        if file != format!("{name}-install") {
+            continue;
+        }
+        let Some(prefix) = stamp_dir.parent().and_then(Path::parent) else {
+            continue;
+        };
+        let script = build_dir
+            .join(prefix)
+            .join(format!("tmp/{name}-mkdirs.cmake"));
+        let Ok(text) = std::fs::read_to_string(&script) else {
+            continue;
+        };
+        let Some(body) = cmake_call_bodies(&text, "file")
+            .into_iter()
+            .find(|b| b.trim_start().starts_with("MAKE_DIRECTORY") && b.matches('"').count() >= 4)
+        else {
+            continue;
+        };
+        let Some(install) = body.split('"').nth(3) else {
+            continue;
+        };
+        let Some(rel) = relative_from(Path::new(install), build_dir) else {
+            continue;
+        };
+        if rel
+            .components()
+            .next()
+            .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
+            && !out.contains(&rel)
+        {
+            out.push(rel);
+        }
+    }
+    out
+}
+
 fn external_project_binary_dir(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
     // THE COMMAND MUST NAME CMAKE, and this is the whole guard rather than a
@@ -10226,6 +10326,7 @@ fn undeclared_outputs(
             } else {
                 Vec::new()
             })
+            .chain(external_project_install_dir(declared, build_dir))
         {
             if !v.contains(&dir) {
                 v.push(dir);
@@ -14048,6 +14149,53 @@ fn cmake_e_copy_dirs(
     }
 }
 
+/// A cmake command line that configures (`-S <dir>`).
+fn ep_configure_step(c: &str) -> bool {
+    c.split_whitespace()
+        .any(|t| t == "-S" || (t.starts_with("-S") && t.len() > 2))
+}
+
+/// A cmake command line that builds a configured binary dir.
+fn ep_build_step(c: &str) -> bool {
+    c.split_whitespace().any(|t| t == "--build")
+}
+
+/// The in-tree directories a project's `CMakeLists.txt` composes with
+/// `set()` (and `get_filename_component`), other than the build dir, any
+/// directory holding it and any directory inside it. qtwebengine's gn
+/// build step runs `${GN_SOURCE_DIR}/build/gen.py` over
+/// `set(GN_SOURCE_DIR ${WEBENGINE_ROOT_SOURCE_DIR}/src/3rdparty/gn)`, a tree
+/// no edge names (850 files); the root itself holds the build dir and is
+/// excluded, so the whole checkout is never offered.
+fn cmake_list_composed_dirs(
+    lists: &Path,
+    text: &str,
+    definitions: &HashMap<String, String>,
+    cwd: &Path,
+    build_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut vars = definitions.clone();
+    let mut sink = Vec::new();
+    included_paths_walk(lists, text, &mut vars, &mut sink, 0, cwd);
+    let own = lists.parent();
+    let mut out: Vec<PathBuf> = vars
+        .into_iter()
+        .filter(|(k, _)| k != "CMAKE_MODULE_PATH" && k != "CMAKE_CURRENT_LIST_DIR")
+        .map(|(_, v)| normalize_build_path_lexical(Path::new(&v)))
+        .filter(|p| {
+            p.is_absolute()
+                && Some(p.as_path()) != own
+                && !build_dir.starts_with(p)
+                && !p.starts_with(build_dir)
+                && same_project_tree(build_dir, p)
+                && p.is_dir()
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// The SOURCE_DIR an ExternalProject configure step reads, taken from the
 /// stamp sibling `<name>-source_dirinfo.txt` the way
 /// `external_project_extract_dirs` takes the download tree from
@@ -14069,11 +14217,11 @@ fn ep_source_dir_trees<'a>(
     };
     let is_cmake =
         command_program(c).is_some_and(|p| Path::new(p).file_name().is_some_and(|n| n == "cmake"));
-    let toks: Vec<&str> = c.split_whitespace().collect();
-    let has_source = toks
-        .iter()
-        .any(|t| *t == "-S" || (t.starts_with("-S") && t.len() > 2));
-    if !is_cmake || !has_source {
+    // The configure step (`-S`) and every later step that drives the binary
+    // dir (`cmake --build`): its ninja re-checks the configure inputs and
+    // re-runs cmake against SOURCE_DIR when one is absent (qtwebengine's gn
+    // build step: `The source directory ".../src/gn" does not exist`).
+    if !is_cmake || !(ep_configure_step(c) || ep_build_step(c)) {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -15692,10 +15840,50 @@ fn included_paths_walk(
         vars.insert("CMAKE_CURRENT_LIST_DIR".into(), d.clone());
     }
     // ponytail: a file's sets are folded before its includes, not
-    // interleaved; exact order needs a real cmake evaluator
-    for (name, raw) in cmake_set_calls(text) {
-        if let Some(value) = expand_cmake_vars(&raw, vars) {
-            vars.insert(name, value);
+    // interleaved; exact order needs a real cmake evaluator. Two passes, so
+    // a set composed from a path component and a component composed from a
+    // set both land.
+    for _ in 0..2 {
+        for (name, raw) in cmake_set_calls(text) {
+            // The module path is a list, folded below; a set's first value
+            // (`${CMAKE_MODULE_PATH}` itself) would drop what it appends.
+            if name == "CMAKE_MODULE_PATH" {
+                continue;
+            }
+            if let Some(value) = expand_cmake_vars(&raw, vars) {
+                vars.insert(name, value);
+            }
+        }
+        fold_path_components(text, vars);
+    }
+    fold_module_path(text, vars);
+    let module_dirs: Vec<String> = vars
+        .get("CMAKE_MODULE_PATH")
+        .map(|v| {
+            v.split(';')
+                .filter(|d| !d.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // A FIND MODULE ON THE PROJECT'S MODULE PATH. qtwebengine 6.11.2's gn
+    // configure appends `${WEBENGINE_ROOT_SOURCE_DIR}/cmake` and then
+    // `find_package(Ninja 1.7.2 REQUIRED)`, which only `cmake/FindNinja.cmake`
+    // answers. The caller keeps only what exists, so a package found through
+    // its own config file costs nothing here.
+    for body in cmake_call_bodies(text, "find_package") {
+        let Some(name) = body.split_whitespace().next() else {
+            continue;
+        };
+        let name = name.trim_matches('"');
+        if name.is_empty() || name.contains('/') || name.contains("${") {
+            continue;
+        }
+        for d in &module_dirs {
+            let p = format!("{d}/Find{name}.cmake");
+            if !out.contains(&p) {
+                out.push(p);
+            }
         }
     }
     for body in cmake_call_bodies(text, "include") {
@@ -15704,6 +15892,20 @@ fn included_paths_walk(
         };
         let raw = raw.trim_matches('"');
         if !raw.contains("${") && !raw.contains('/') {
+            // A bare module name resolves on the module path too.
+            if !raw.is_empty() {
+                let module = if raw.ends_with(".cmake") {
+                    raw.to_string()
+                } else {
+                    format!("{raw}.cmake")
+                };
+                for d in &module_dirs {
+                    let p = format!("{d}/{module}");
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+            }
             continue;
         }
         let Some(path) = expand_cmake_vars(raw, vars) else {
@@ -15750,6 +15952,83 @@ fn included_paths_walk(
         Some(v) => vars.insert("CMAKE_CURRENT_LIST_DIR".into(), v),
         None => vars.remove("CMAKE_CURRENT_LIST_DIR"),
     };
+}
+
+/// `get_filename_component(<var> <path> <mode>)` folded into `vars` like a
+/// `set`. qtwebengine 6.11.2's gn `CMakeLists.txt` takes its source root as
+/// `${CMAKE_CURRENT_LIST_DIR}/../..` with `REALPATH` (the mode itself held
+/// in a variable) and composes `.cmake.conf` and its module dir from it.
+/// Lexical normalization stands in for REALPATH and ABSOLUTE: the walk
+/// names candidates, and the caller keeps only files that exist. A relative
+/// result names nothing and is skipped.
+fn fold_path_components(text: &str, vars: &mut HashMap<String, String>) {
+    for body in cmake_call_bodies(text, "get_filename_component") {
+        let mut toks = body.split_whitespace();
+        let (Some(name), Some(raw), Some(mode)) = (toks.next(), toks.next(), toks.next()) else {
+            continue;
+        };
+        let (Some(path), Some(mode)) = (
+            expand_cmake_vars(raw.trim_matches('"'), vars),
+            expand_cmake_vars(mode, vars),
+        ) else {
+            continue;
+        };
+        let path = Path::new(&path);
+        if !path.is_absolute() {
+            continue;
+        }
+        let value = match mode.as_str() {
+            "REALPATH" | "ABSOLUTE" => normalize_build_path_lexical(path),
+            "DIRECTORY" | "PATH" => match normalize_build_path_lexical(path).parent() {
+                Some(p) => p.to_path_buf(),
+                None => continue,
+            },
+            _ => continue,
+        };
+        vars.insert(name.to_string(), value.to_string_lossy().into_owned());
+    }
+}
+
+/// The directories `set(CMAKE_MODULE_PATH ...)` and `list(APPEND
+/// CMAKE_MODULE_PATH ...)` add, kept in `vars` as cmake's `;` list. Only
+/// absolute expansions are kept; the self-reference is the list so far.
+fn fold_module_path(text: &str, vars: &mut HashMap<String, String>) {
+    let mut dirs: Vec<String> = vars
+        .get("CMAKE_MODULE_PATH")
+        .map(|v| {
+            v.split(';')
+                .filter(|d| !d.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut values: Vec<String> = Vec::new();
+    for body in cmake_call_bodies(text, "set") {
+        let mut toks = body.split_whitespace();
+        if toks.next() == Some("CMAKE_MODULE_PATH") {
+            values.extend(toks.map(str::to_string));
+        }
+    }
+    for body in cmake_call_bodies(text, "list") {
+        let mut toks = body.split_whitespace();
+        if toks.next() == Some("APPEND") && toks.next() == Some("CMAKE_MODULE_PATH") {
+            values.extend(toks.map(str::to_string));
+        }
+    }
+    for v in values {
+        let v = v.trim_matches('"');
+        if v == "${CMAKE_MODULE_PATH}" {
+            continue;
+        }
+        if let Some(d) = expand_cmake_vars(v, vars) {
+            if d.starts_with('/') && !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    if !dirs.is_empty() {
+        vars.insert("CMAKE_MODULE_PATH".into(), dirs.join(";"));
+    }
 }
 
 /// The argument text of every `name(...)` call in file order, where the
@@ -15923,11 +16202,12 @@ fn sibling_dirs_of(dir: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod cmake_script_reference_tests {
     use super::{
-        cmake_definitions, cmake_dotted_stamp_outputs, cmake_p_references,
-        cmake_p_stamp_edge_writes, cmake_script_arg, cmake_script_included_modules,
-        cmake_script_included_paths, cmake_script_referenced_paths, expand_cmake_vars,
-        gtkdoc_dirs_to_carry, gtkdoc_make_dirs, gtkdoc_written_outputs, lexical_join,
-        referenced_file_rel, rewrite_cmdline, rewritten_cd_dir, undeclared_outputs, StoreDir,
+        cmake_definitions, cmake_dotted_stamp_outputs, cmake_list_composed_dirs,
+        cmake_p_references, cmake_p_stamp_edge_writes, cmake_script_arg,
+        cmake_script_included_modules, cmake_script_included_paths, cmake_script_referenced_paths,
+        expand_cmake_vars, external_project_install_dir, gtkdoc_dirs_to_carry, gtkdoc_make_dirs,
+        gtkdoc_written_outputs, lexical_join, referenced_file_rel, rewrite_cmdline,
+        rewritten_cd_dir, undeclared_outputs, StoreDir,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::path::{Path, PathBuf};
@@ -16282,6 +16562,123 @@ endforeach()
             got[2].ends_with("/cmake/vars/EnableModeVars.cmake"),
             "{got:?}"
         );
+    }
+
+    /// qtwebengine 6.11.2's gn ExternalProject configure (task `h7h6s56r`,
+    /// KDE round 2026-10-19): the source root comes from a REALPATH
+    /// component whose mode sits in a variable, `.cmake.conf` is included
+    /// from it and `FindNinja.cmake` is found on the module path it
+    /// appends. Text is the head of the real `src/gn/CMakeLists.txt`.
+    #[test]
+    fn the_gn_configure_reads_the_root_conf_and_its_find_module() {
+        let root = std::env::temp_dir().join(format!("nn-cmake-gn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src/gn")).unwrap();
+        std::fs::create_dir_all(root.join("cmake")).unwrap();
+        std::fs::create_dir_all(root.join("build/src/gn")).unwrap();
+        std::fs::write(
+            root.join(".cmake.conf"),
+            "set(QT_REPO_MODULE_VERSION \"6.11.2\")\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("cmake/FindNinja.cmake"),
+            "include(FindPackageHandleStandardArgs)\n",
+        )
+        .unwrap();
+        let lists = root.join("src/gn/CMakeLists.txt");
+        let text = r#"cmake_minimum_required(VERSION 3.19)
+project(Gn LANGUAGES CXX C)
+if(NOT DEFINED WEBENGINE_ROOT_SOURCE_DIR)
+    set(path_mode REALPATH)
+    if(APPLE AND QT_ALLOW_SYMLINK_IN_PATHS)
+        set(path_mode ABSOLUTE)
+    endif()
+    get_filename_component(WEBENGINE_ROOT_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/../.." ${path_mode})
+endif()
+include(${WEBENGINE_ROOT_SOURCE_DIR}/.cmake.conf)
+set(GN_SOURCE_DIR ${WEBENGINE_ROOT_SOURCE_DIR}/src/3rdparty/gn)
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${WEBENGINE_ROOT_SOURCE_DIR}/cmake")
+find_package(Python3 3.8 REQUIRED)
+find_package(Ninja 1.7.2 REQUIRED)
+"#;
+        std::fs::write(&lists, text).unwrap();
+        let got =
+            cmake_script_included_paths(&lists, text, &HashMap::new(), &root.join("build/src/gn"));
+        let _ = std::fs::remove_dir_all(&root);
+        let conf = root.join(".cmake.conf").display().to_string();
+        let find = root.join("cmake/FindNinja.cmake").display().to_string();
+        assert!(got.contains(&conf), "{got:?}");
+        assert!(got.contains(&find), "{got:?}");
+    }
+
+    /// The gn build step's tree is the one its CMakeLists composes
+    /// (`GN_SOURCE_DIR`), never the root that holds the build dir nor the
+    /// build dir itself (`GN_BINARY_DIR` under it).
+    #[test]
+    fn the_gn_build_step_carries_the_composed_source_tree_and_not_the_root() {
+        let root = std::env::temp_dir().join(format!("nn-cmake-gnb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src/gn")).unwrap();
+        std::fs::create_dir_all(root.join("src/3rdparty/gn/build")).unwrap();
+        std::fs::create_dir_all(root.join("build/src/gn")).unwrap();
+        let lists = root.join("src/gn/CMakeLists.txt");
+        let text = format!(
+            "get_filename_component(WEBENGINE_ROOT_SOURCE_DIR \"${{CMAKE_CURRENT_LIST_DIR}}/../..\" REALPATH)\n\
+             set(GN_SOURCE_DIR ${{WEBENGINE_ROOT_SOURCE_DIR}}/src/3rdparty/gn)\n\
+             set(GN_BINARY_DIR {})\n",
+            root.join("build/src/gn").display()
+        );
+        let build = root.join("build");
+        let got = cmake_list_composed_dirs(&lists, &text, &HashMap::new(), &build, &build);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got, vec![root.join("src/3rdparty/gn")], "{got:?}");
+    }
+
+    /// qtwebengine's gn `tmp/gn-mkdirs.cmake` as CMake 4.4.3 writes it: the
+    /// install step declares `<build>/install`, the second MAKE_DIRECTORY
+    /// entry; the build step and an install dir outside the tree declare
+    /// nothing.
+    #[test]
+    fn the_install_step_declares_the_install_dir_its_mkdirs_script_names() {
+        let root = std::env::temp_dir().join(format!("nn-ep-inst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let build = root.join("build");
+        std::fs::create_dir_all(build.join("src/gn/tmp")).unwrap();
+        let mkdirs = |install: &Path| {
+            format!(
+                "if(NOT EXISTS \"{r}/src/gn\")\n  file(MAKE_DIRECTORY \"{r}/src/gn\")\nendif()\n\
+                 file(MAKE_DIRECTORY\n  \"{b}/src/gn\"\n  \"{i}\"\n  \"{b}/src/gn/tmp\"\n  \
+                 \"{b}/src/gn/src/gn-stamp\"\n  \"{b}/src/gn/src\"\n  \"{b}/src/gn/src/gn-stamp\"\n)\n",
+                r = root.display(),
+                b = build.display(),
+                i = install.display()
+            )
+        };
+        let script = build.join("src/gn/tmp/gn-mkdirs.cmake");
+        std::fs::write(&script, mkdirs(&build.join("install"))).unwrap();
+        let install = [PathBuf::from("src/gn/src/gn-stamp/gn-install")];
+        let got = external_project_install_dir(&install, &build);
+        let build_step =
+            external_project_install_dir(&[PathBuf::from("src/gn/src/gn-stamp/gn-build")], &build);
+        std::fs::write(&script, mkdirs(Path::new("/opt/elsewhere"))).unwrap();
+        let outside = external_project_install_dir(&install, &build);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(got, vec![PathBuf::from("install")]);
+        assert!(build_step.is_empty(), "{build_step:?}");
+        assert!(outside.is_empty(), "{outside:?}");
+    }
+
+    /// Without a module path a `find_package` names nothing to stat.
+    #[test]
+    fn a_find_package_without_a_module_path_names_nothing() {
+        let got = cmake_script_included_paths(
+            Path::new("/src/CMakeLists.txt"),
+            "find_package(Ninja 1.7.2 REQUIRED)\n",
+            &HashMap::new(),
+            Path::new("/src/build"),
+        );
+        assert!(got.is_empty(), "{got:?}");
     }
 
     /// A value that is not path-shaped is not a candidate to stat.
