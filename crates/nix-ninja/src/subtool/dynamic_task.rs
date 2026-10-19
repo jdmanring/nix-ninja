@@ -958,6 +958,19 @@ mod tests {
         assert_eq!(f.run(true, &[]), Vec::<PathBuf>::new());
     }
 
+    /// CONTROL (iv): the positive case's tree and headers under a command
+    /// that is not a compile add nothing.
+    #[test]
+    fn a_tree_reached_header_is_not_declared_for_a_link() {
+        let f = TreeFixture::new(UI_REACHES_PROJECT, "#include \"ui_dialog.h\"\n");
+        let (inputs, built) = f.inputs(true, &[]);
+        let link = f.cmdline().replace(" -c ", " -o app ");
+        assert_eq!(
+            crate::task::tree_reached_headers(&link, &f.build, &f.store, &inputs, &built),
+            Vec::<PathBuf>::new()
+        );
+    }
+
     /// CONTROL (iii): without a carried tree the answer is empty, the
     /// emission of before, though the tree header's content is unchanged.
     #[test]

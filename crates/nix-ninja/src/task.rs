@@ -20413,9 +20413,14 @@ pub fn scan_c_includes(
 /// `inputs` is the task's `NIX_NINJA_INPUTS`; `built` maps a build path to
 /// its realised location, tree directories included.
 ///
-/// ponytail: plain and byte-order-marked `#include` directives only; a
-/// computed include inside a tree file is not followed. Read the macro
-/// uses here if a tree header ever names its include through a macro.
+/// Compiles only (`command_is_compile`): an install or link task carrying
+/// a tree would read every carried library in full for nothing, and the
+/// census that showed already-built tasks unchanged counted compiles.
+///
+/// ponytail: directives as `scan_directives` returns them, macro arms
+/// included, so a tree file's arms are followed like plain includes; a
+/// function-like computed include is not. Narrow to plain directives if a
+/// tree header's arm ever adds an input a compile does not open.
 pub(crate) fn tree_reached_headers(
     cmdline: &str,
     build_dir: &Path,
@@ -20423,6 +20428,9 @@ pub(crate) fn tree_reached_headers(
     inputs: &str,
     built: &HashMap<PathBuf, PathBuf>,
 ) -> Vec<PathBuf> {
+    if !command_is_compile(Some(cmdline)) {
+        return Vec::new();
+    }
     let content_of = |e: &str| -> Option<(PathBuf, PathBuf)> {
         let mut f = e.split(':');
         let (src, build, rel) = (f.next()?, f.next()?, f.next().unwrap_or(""));
