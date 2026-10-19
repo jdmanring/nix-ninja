@@ -2293,10 +2293,10 @@ mod failure_memo_tests {
         let a = built(&sd, "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv");
         let b = built(&sd, "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
         let mut failed = HashMap::new();
-        note_build_failure(&mut failed, &sd, &[a.clone()], &failure(true));
-        note_build_failure(&mut failed, &sd, &[a.clone()], &Error::NoDaemon);
-        assert!(failed_earlier(&failed, &sd, &[a.clone()]).is_none());
-        note_build_failure(&mut failed, &sd, &[a.clone()], &failure(false));
+        note_build_failure(&mut failed, &sd, std::slice::from_ref(&a), &failure(true));
+        note_build_failure(&mut failed, &sd, std::slice::from_ref(&a), &Error::NoDaemon);
+        assert!(failed_earlier(&failed, &sd, std::slice::from_ref(&a)).is_none());
+        note_build_failure(&mut failed, &sd, std::slice::from_ref(&a), &failure(false));
         let e = failed_earlier(&failed, &sd, &[b.clone(), a.clone()]).expect("a failed");
         assert!(
             matches!(&e, Error::BuildFailed { path, transient: false, .. } if path.ends_with("-a.drv")),
