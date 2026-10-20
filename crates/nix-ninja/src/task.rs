@@ -1203,6 +1203,22 @@ impl Runner {
         // bundle-tsconfig.json names platform-tsconfig.json; TS6053, task
         // 6h2dgzyi). Read here rather than when the producer resolves,
         // because a producer already up to date is never resolved again.
+        let mut undeclared_tsconfigs: HashMap<PathBuf, Vec<FileId>> = HashMap::new();
+        for bid in graph.builds.all_ids() {
+            let build = &graph.builds[bid];
+            let Some(c) = build.cmdline.as_deref() else {
+                continue;
+            };
+            if !c.contains("generate_css_js_files.js") {
+                continue;
+            }
+            for w in css_js_tsconfig_writes(c, &self.config.build_dir) {
+                undeclared_tsconfigs
+                    .entry(w)
+                    .or_default()
+                    .extend(build.outs().iter().copied());
+            }
+        }
         for bid in graph.builds.all_ids() {
             let build = &graph.builds[bid];
             let Some(c) = build.cmdline.as_deref() else {
@@ -1238,13 +1254,14 @@ impl Runner {
                 .chain(generated_file.clone())
                 .chain(copied.iter().map(|(_, f)| f.clone()))
             {
-                let Some(fid) = graph.files.lookup(&dep) else {
-                    continue;
-                };
-                for out in build.outs() {
-                    let entry = self.co_outputs.entry(*out).or_insert_with(|| vec![*out]);
-                    if !entry.contains(&fid) {
-                        entry.push(fid);
+                for fid in
+                    tsconfig_reference_nodes(&dep, |p| graph.files.lookup(p), &undeclared_tsconfigs)
+                {
+                    for out in build.outs() {
+                        let entry = self.co_outputs.entry(*out).or_insert_with(|| vec![*out]);
+                        if !entry.contains(&fid) {
+                            entry.push(fid);
+                        }
                     }
                 }
             }
@@ -13238,6 +13255,29 @@ pub fn generate_tsconfig_references(args: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The graph nodes standing for a tsconfig a ts project references. A
+/// declared tsconfig is its own node. One an edge writes without declaring
+/// it (devtools' `css_files-tsconfig.json`, from generate_css_js_files.js)
+/// has no node until that edge resolves, so the writer's declared outputs
+/// stand in: they are the `.css.js` files the tsconfig lists, and they carry
+/// the tsconfig as a co-output once it is registered. tsc follows a
+/// referenced bundle's references transitively, and a consumer two
+/// references away failed TS6053 (qtwebengine 6.11.2, tasks 4p9rsyz0,
+/// yrj0vpvd).
+pub fn tsconfig_reference_nodes(
+    dep: &str,
+    lookup: impl Fn(&str) -> Option<FileId>,
+    undeclared_writers: &HashMap<PathBuf, Vec<FileId>>,
+) -> Vec<FileId> {
+    match lookup(dep) {
+        Some(fid) => vec![fid],
+        None => undeclared_writers
+            .get(Path::new(dep))
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
 /// A `ts_library.py` run's `--deps` tsconfigs, spelled from the build dir:
 /// each value is relative to the directory of `--tsconfig_output_location`.
 pub fn ts_library_dep_tsconfigs(args: &[String]) -> Vec<String> {
@@ -19957,6 +19997,40 @@ mod closure_step_tests {
             vec![PathBuf::from("gen/fe/ui/input/css_files-tsconfig.json")]
         );
         assert!(super::css_js_tsconfig_writes("python3 node.py other.js a b c d e", b).is_empty());
+    }
+
+    /// A referenced tsconfig with a node is that node; one only a css edge
+    /// writes is that edge's declared outputs; an unknown one is nothing.
+    #[test]
+    fn an_undeclared_referenced_tsconfig_rides_its_writer() {
+        use n2::graph::FileId;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        let (declared, css_a, css_b) = (FileId::from(7), FileId::from(11), FileId::from(12));
+        let writers: HashMap<PathBuf, Vec<FileId>> = [(
+            PathBuf::from("gen/fe/ch/css_files-tsconfig.json"),
+            vec![css_a, css_b],
+        )]
+        .into_iter()
+        .collect();
+        let lookup =
+            |p: &str| (p == "gen/fe/ch/code_highlighter-tsconfig.json").then_some(declared);
+        assert_eq!(
+            super::tsconfig_reference_nodes(
+                "gen/fe/ch/code_highlighter-tsconfig.json",
+                lookup,
+                &writers
+            ),
+            vec![declared]
+        );
+        assert_eq!(
+            super::tsconfig_reference_nodes("gen/fe/ch/css_files-tsconfig.json", lookup, &writers),
+            vec![css_a, css_b]
+        );
+        assert!(
+            super::tsconfig_reference_nodes("gen/fe/ch/other-tsconfig.json", lookup, &writers)
+                .is_empty()
+        );
     }
 
     /// A file in node_modules carries its package, a scope dir is carried, a
