@@ -13309,17 +13309,32 @@ pub fn ts_library_imports(build_dir: &Path, cd_dir: &Path, args: &[String]) -> V
         let dir = f.parent().unwrap_or(Path::new("")).to_path_buf();
         for c in spec.captures_iter(&text) {
             let base = lexical_join(&dir, Path::new(&c[1]));
-            let stem = base.to_string_lossy();
-            let stem = stem
-                .strip_suffix(".js")
-                .or_else(|| stem.strip_suffix(".mjs"))
-                .unwrap_or(&stem)
-                .to_string();
-            for cand in [
-                PathBuf::from(format!("{stem}.ts")),
-                PathBuf::from(format!("{stem}.d.ts")),
-                base.clone(),
-            ] {
+            // tsc's own order per extension: `.mjs` resolves to `.mts`, then
+            // `.d.mts`, then the file, never `<stem>.d.ts`, which for acorn
+            // is the UMD declaration that leaves `Acorn.*` as `any`
+            // (Substitute.ts TS2833, task ajysiyqw); `.cjs` likewise.
+            let spelled = base.to_string_lossy();
+            let cands: Vec<PathBuf> = if let Some(s) = spelled.strip_suffix(".mjs") {
+                vec![
+                    format!("{s}.mts").into(),
+                    format!("{s}.d.mts").into(),
+                    base.clone(),
+                ]
+            } else if let Some(s) = spelled.strip_suffix(".cjs") {
+                vec![
+                    format!("{s}.cts").into(),
+                    format!("{s}.d.cts").into(),
+                    base.clone(),
+                ]
+            } else {
+                let stem = spelled.strip_suffix(".js").unwrap_or(&spelled);
+                vec![
+                    format!("{stem}.ts").into(),
+                    format!("{stem}.d.ts").into(),
+                    base.clone(),
+                ]
+            };
+            for cand in cands {
                 if at(&cand).is_file() {
                     if !seen.contains(&cand) {
                         seen.push(cand.clone());
@@ -19671,6 +19686,49 @@ mod closure_step_tests {
             .map(|s| s.to_string())
             .collect();
         assert!(super::ts_library_imports(&bd, Path::new(""), &not).is_empty());
+    }
+
+    /// devtools' acorn: `acorn.ts` imports `./package/dist/acorn.mjs`, beside
+    /// which sit `acorn.d.mts` (what tsc resolves) and the UMD `acorn.d.ts`
+    /// (reached only through `acorn.d.mts`). The `.d.mts` is carried and its
+    /// own import follows to the `.d.ts`.
+    #[test]
+    fn an_mjs_import_resolves_to_its_d_mts() {
+        use std::path::Path;
+        let d = super::Scratch::new(format!("nn-ts-mjs-{}", std::process::id()));
+        let bd = d.join("out");
+        std::fs::create_dir_all(d.join("fe/acorn/package/dist")).unwrap();
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(
+            d.join("fe/acorn/acorn.ts"),
+            "export * from './package/dist/acorn.mjs';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("fe/acorn/package/dist/acorn.d.mts"),
+            "export * from './acorn.js';\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("fe/acorn/package/dist/acorn.d.ts"), "").unwrap();
+        std::fs::write(d.join("fe/acorn/package/dist/acorn.mjs"), "").unwrap();
+        let args: Vec<String> = [
+            "python3",
+            "../s/ts_library.py",
+            "--sources",
+            "../fe/acorn/acorn.ts",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut got = super::ts_library_imports(&bd, Path::new(""), &args);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "../fe/acorn/package/dist/acorn.d.mts".to_string(),
+                "../fe/acorn/package/dist/acorn.d.ts".to_string()
+            ]
+        );
     }
 
     /// devtools_paths.py's own line: a name spliced onto sys.path through a
