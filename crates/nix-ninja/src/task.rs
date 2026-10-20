@@ -4367,11 +4367,21 @@ impl Runner {
         // A command-scoped variable (and the store paths its value names)
         // reaches only a task whose command runs its consumer; every other
         // task's emission is byte for byte what it was without the entry.
+        // A consumer CARRIED as an input counts as well as one on the command
+        // line: ts_library.py, minify_js.py and bundle_js.py run node through
+        // `import node`, so node.py is in their import closure and never in
+        // their command, and every such qtwebengine task died
+        // `NODEJS_EXECUTABLE must be set` (task `0wlx1f81`).
         let forwarded = |key: &str| {
             command_scoped(key).is_none_or(|programs| {
                 cmdline
                     .as_deref()
                     .is_some_and(|c| programs.iter().any(|p| c.contains(p)))
+                    || inputs.iter().any(|i| {
+                        Path::new(&i.build_path)
+                            .file_name()
+                            .is_some_and(|n| programs.iter().any(|p| n == *p))
+                    })
             })
         };
         let wrapper_vars: HashMap<String, String> = self
