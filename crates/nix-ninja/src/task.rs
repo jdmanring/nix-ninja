@@ -4301,6 +4301,25 @@ impl Runner {
             }
         }
 
+        // THE MANIFESTS A RESOURCE_IDS SPEC SIZES, and their parts. Only
+        // `.grd`/`.grdp`: the tool reads nothing a manifest includes.
+        if let Some(spec) = cmdline.as_deref().and_then(grit_resource_ids_spec) {
+            let mut todo = resource_ids_spec_grds(Path::new(&spec));
+            while let Some(m) = todo.pop() {
+                if input_set.contains_key(&m) || !self.config.build_dir.join(&m).is_file() {
+                    continue;
+                }
+                todo.extend(
+                    grd_references(&m)?
+                        .into_iter()
+                        .filter(|r| r.extension().is_some_and(|e| e == "grdp")),
+                );
+                let up = new_opaque_file(&self.rpc_client, &self.config.build_dir, m)?;
+                self.add_derived_file(files, up.clone());
+                input_set.insert(up.build_path.clone(), up);
+            }
+        }
+
         // A `.qrc` entry can name a GENERATED file of an ON-DISK qrc
         // (an undeclared member whose producer resolves late). The
         // candidate that names a graph node routes as a Built input with
@@ -19253,6 +19272,32 @@ mod closure_step_tests {
         );
     }
 
+    /// The resource_ids spec's own spellings (SRCDIR, a commented key, a
+    /// generated key) and the command GN writes for it.
+    #[test]
+    fn a_resource_ids_spec_names_its_source_manifests() {
+        let d = super::Scratch::new(format!("nn-rids-{}", std::process::id()));
+        let spec = d.join("tools/gritsettings/resource_ids.spec");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(
+            &spec,
+            "{\n  # \"SRCDIR\" is special: \"x.grd\"\n  \"SRCDIR\": \"../..\",\n  \"chrome/app/chromium_strings.grd\": {\n    \"messages\": [800],\n  },\n  \"<(SHARED_INTERMEDIATE_DIR)/a/resources.grd\": {\n    \"includes\": [900],\n  },\n}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            super::resource_ids_spec_grds(&spec),
+            vec![d.join("chrome/app/chromium_strings.grd")]
+        );
+        assert_eq!(
+            super::grit_resource_ids_spec("python3 ../s/tools/grit/grit.py update_resource_ids -o gen/x --add-header --input ../s/tools/gritsettings/resource_ids.spec").as_deref(),
+            Some("../s/tools/gritsettings/resource_ids.spec")
+        );
+        assert_eq!(
+            super::grit_resource_ids_spec("python3 grit.py build --input x.spec"),
+            None
+        );
+    }
+
     /// gen_ssl_error_assistant_proto.py's splatted join, copied from source.
     #[test]
     fn a_splatted_pardir_list_is_followed() {
@@ -20633,6 +20678,53 @@ fn root_src_dir_arg(cmdline: &str) -> Option<String> {
                     .flatten()
             })
     })
+}
+
+/// The `--input` spec of a `grit.py update_resource_ids` command.
+pub fn grit_resource_ids_spec(cmdline: &str) -> Option<String> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let tool = toks.iter().position(|t| t.ends_with("grit.py"))?;
+    if toks.get(tool + 1) != Some(&"update_resource_ids") {
+        return None;
+    }
+    toks.iter().enumerate().skip(tool).find_map(|(i, t)| {
+        t.strip_prefix("--input=").map(str::to_string).or_else(|| {
+            (*t == "--input")
+                .then(|| toks.get(i + 1).map(|v| v.to_string()))
+                .flatten()
+        })
+    })
+}
+
+/// The manifests a grit resource_ids spec names, joined onto its `SRCDIR`
+/// (relative to the spec's own directory). `update_resource_ids` opens each
+/// one, and every `.grdp` part it includes, to size its id range; GN
+/// declares none of them, and one absent from the task counts as empty, so
+/// the ranges came out compressed and the grit edges consuming them failed
+/// on `IdRangeOverlap`. A generated (`<(...)`) entry is skipped, as the
+/// tool skips one that does not exist.
+pub fn resource_ids_spec_grds(spec: &Path) -> Vec<PathBuf> {
+    let Ok(body) = fs::read_to_string(spec) else {
+        return Vec::new();
+    };
+    let mut srcdir = None;
+    let mut keys = Vec::new();
+    for line in body.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        let quoted: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+        match quoted.as_slice() {
+            ["SRCDIR", v, ..] => srcdir = Some(v.to_string()),
+            [k, ..] if k.ends_with(".grd") && !k.starts_with("<(") => keys.push(k.to_string()),
+            _ => {}
+        }
+    }
+    let base = spec
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join(srcdir.unwrap_or_default());
+    keys.iter()
+        .map(|k| normalize_build_path_lexical(&base.join(k)))
+        .collect()
 }
 
 /// The relative paths a python file joins onto its source root:
