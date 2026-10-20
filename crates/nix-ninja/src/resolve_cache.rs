@@ -38,16 +38,18 @@ pub(crate) const FILE_NAME: &str = ".nix-ninja-resolve-cache.v1";
 /// unpatched bytes and would otherwise replay forever.
 const HEADER_BASE: &str = "nix-ninja-resolve-cache v2 cap=1024";
 
-/// The full header also stamps the DRIVER BINARY's identity (size and
-/// mtime of the running executable), because a memo entry encodes what
-/// the scanner DISCOVERED, and the scanner is compiled into the driver.
-/// Measured 2026-08-23 iterating on the include scanner: a rebuilt
-/// driver with a fixed scanner replayed memos computed by the broken
-/// one, re-failing the same derivation until the file was deleted by
-/// hand. Any rebuild changes the mtime, so the stale file discards
-/// itself; the failure direction is recompute, never a wrong replay.
-/// If the executable cannot be introspected the stamp is "unknown",
-/// which still self-invalidates against any stamped file.
+/// The full header also stamps the DRIVER BINARY's identity, because a
+/// memo entry encodes what the scanner DISCOVERED, and the scanner is
+/// compiled into the driver. Measured 2026-08-23 iterating on the include
+/// scanner: a rebuilt driver with a fixed scanner replayed memos computed
+/// by the broken one, re-failing the same derivation until the file was
+/// deleted by hand. The identity is a digest of the executable's BYTES
+/// (`binary_stamp`). It was size and mtime, and every store path's mtime
+/// is 1, so two store drivers of equal size stamped alike: the resolve
+/// memo and the later-pass invocation record (`cli::invocation`) then
+/// took one driver's results as another's. If the executable cannot be
+/// read the stamp is "unknown", which still self-invalidates against any
+/// stamped file.
 /// This driver build's identity stamp (the `driver=` value of `header`).
 pub fn driver_stamp() -> &'static str {
     header()
@@ -60,19 +62,18 @@ fn header() -> &'static str {
     H.get_or_init(|| {
         let stamp = std::env::current_exe()
             .ok()
-            .and_then(|p| fs::metadata(p).ok())
-            .and_then(|md| {
-                let m = md
-                    .modified()
-                    .ok()?
-                    .duration_since(UNIX_EPOCH)
-                    .ok()?
-                    .as_nanos();
-                Some(format!("{}.{}", md.len(), m))
-            })
+            .and_then(|p| binary_stamp(&p))
             .unwrap_or_else(|| "unknown".to_string());
         format!("{HEADER_BASE} driver={stamp}")
     })
+}
+
+/// The first 128 bits of the SHA-256 of FILE's bytes, in hex, or None
+/// when it cannot be read. Read once per process, about 10 MB.
+pub fn binary_stamp(file: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(fs::read(file).ok()?);
+    Some(digest[..16].iter().map(|b| format!("{b:02x}")).collect())
 }
 /// Separates encoded DerivedFiles within one line; never appears in a
 /// store path or a build-relative path.
@@ -743,5 +744,43 @@ mod tests {
         assert!(h.contains(" driver="), "{h}");
         assert_ne!(h, HEADER_BASE, "a pre-stamp file must not match");
         assert_eq!(header(), h, "stamp must be stable within one process");
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(Some(driver_stamp().to_string()), binary_stamp(&exe));
+    }
+
+    /// Two drivers of one size and one mtime (every store path's is 1)
+    /// stamp apart when their bytes differ, and alike when they do not.
+    #[test]
+    fn equal_size_drivers_with_other_bytes_stamp_apart() {
+        let d = std::env::temp_dir().join(format!("nn-stamp-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let one_second = UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let write = |name: &str, bytes: &[u8]| {
+            let p = d.join(name);
+            fs::write(&p, bytes).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(one_second)
+                .unwrap();
+            p
+        };
+        let a = write("a", b"driver one");
+        let b = write("b", b"driver two");
+        let c = write("c", b"driver one");
+        assert_eq!(
+            fs::metadata(&a).unwrap().len(),
+            fs::metadata(&b).unwrap().len()
+        );
+        assert_ne!(binary_stamp(&a), binary_stamp(&b));
+        assert_eq!(binary_stamp(&a), binary_stamp(&c));
+        let stamp = binary_stamp(&a).unwrap();
+        assert!(
+            !stamp.contains(' '),
+            "the invocation record splits on spaces"
+        );
+        assert_eq!(binary_stamp(&d.join("absent")), None);
+        fs::remove_dir_all(&d).unwrap();
     }
 }
