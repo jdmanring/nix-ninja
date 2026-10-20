@@ -1300,6 +1300,13 @@ impl Runner {
                 self.configure_record = Some(r.clone());
                 crate::configure_state::answer_listings_from(r);
             }
+            // A DERIVATIONS-ONLY RUN RECORDS NOTHING. `-t drv` reaches this
+            // walk without `begin_pass`, so a record it wrote would hold a
+            // configure and no first pass, and the next real pass would read
+            // as a later one and stop ("a later pass found no record of how
+            // the first ran"): a preflight sweep's `-t drv` on qtwebengine's
+            // pdf graph aborted every build of it that way.
+            None if self.config.emit_only => {}
             None => crate::configure_state::save(&self.config.build_dir, &plan.seen)?,
         }
         Ok(())
@@ -4144,6 +4151,88 @@ impl Runner {
                     self.add_derived_file(files, up.clone());
                     input_set.insert(up.build_path.clone(), up);
                 }
+            }
+        }
+
+        // THE GENERATED MODULES A BINARY PROTO GENERATOR IMPORTS FROM ITS
+        // `-p` PATHS. Chromium's binary_proto_generator puts each `-p`
+        // directory on sys.path and the subclass imports a protoc `_pb2`
+        // module from it; the action reaches protoc's edge only through a
+        // static library's order-only deps, so the module is never an input
+        // (gen_ssl_error_assistant_proto.py, `No module named
+        // 'ssl_error_assistant_pb2'`, task scniddlz). Every `.py` the graph
+        // produces directly in such a directory routes as a Built input with
+        // its co-outputs.
+        // The flag first and the script's body only then: the script is the
+        // command's first `.py` token, read once, and only when it passed
+        // `-p`.
+        let mut proto_dirs = cmdline
+            .as_deref()
+            .map(binary_proto_paths)
+            .unwrap_or_default();
+        let script = cmdline
+            .as_deref()
+            .and_then(|c| c.split_whitespace().find(|t| t.ends_with(".py")));
+        if !proto_dirs.is_empty()
+            && !script.is_some_and(|s| {
+                fs::read_to_string(self.config.build_dir.join(s))
+                    .is_ok_and(|b| b.contains("binary_proto_generator"))
+            })
+        {
+            proto_dirs.clear();
+        }
+        if !proto_dirs.is_empty() {
+            // ponytail: one scan of every graph node per such edge (tens on
+            // Chromium); index produced nodes by parent dir if that grows.
+            for fid in files.by_id.all_ids() {
+                let node = &files.by_id[fid];
+                if node.input.is_none() || !node.name.ends_with(".py") {
+                    continue;
+                }
+                let parent = Path::new(&node.name).parent().unwrap_or(Path::new(""));
+                if !proto_dirs.iter().any(|d| Path::new(d) == parent) {
+                    continue;
+                }
+                let mut expand = vec![fid];
+                while let Some(nfid) = expand.pop() {
+                    if let Some(df) = self.derived_files.get(&nfid) {
+                        if input_set.contains_key(&df.build_path) {
+                            continue;
+                        }
+                        input_set.insert(df.build_path.clone(), df.clone());
+                        if let Some(sibs) = self.co_outputs.get(&nfid) {
+                            expand.extend(sibs.iter().filter(|s| **s != nfid));
+                        }
+                    }
+                }
+            }
+        }
+
+        // A PROGRAM IN A node_modules PACKAGE'S bin/ RUNS INSIDE ITS PACKAGE,
+        // whichever reader carried it: devtools' build_inspector_overlay.py
+        // execs `devtools_paths.rollup_path()` itself, so no node.py command
+        // line names the bin, it arrived alone, and node died `Cannot find
+        // module '../shared/rollup.js'` (task qcryzagj). The node.py arm
+        // carries the package for the program it names; this carries it for
+        // every bin an input set holds.
+        let mut bin_pkgs: Vec<PathBuf> = input_set
+            .keys()
+            .filter_map(|p| node_bin_package(p))
+            .filter(|pkg| self.config.build_dir.join(pkg).is_dir())
+            .collect();
+        bin_pkgs.sort();
+        bin_pkgs.dedup();
+        for pkg in &bin_pkgs {
+            for input in upload_referenced_dir(
+                &self.rpc_client,
+                &self.config.build_dir,
+                &self.config.build_dir.join(pkg),
+            )? {
+                if input_set.contains_key(&input.build_path) {
+                    continue;
+                }
+                self.add_derived_file(files, input.clone());
+                input_set.insert(input.build_path.clone(), input);
             }
         }
 
@@ -19272,6 +19361,58 @@ mod closure_step_tests {
         );
     }
 
+    /// The `-p` values gen_ssl_error_assistant_proto.py takes, as the
+    /// round's edge spells them (a trailing `/` on the second), in every
+    /// spelling optparse accepts.
+    #[test]
+    fn binary_proto_paths_read_every_spelling() {
+        assert_eq!(
+            super::binary_proto_paths(
+                "python3 ../s/gen_ssl_error_assistant_proto.py -w -i x.asciipb -d gen/c \
+                 -o x.pb -p pyproto -p pyproto/components/security_interstitials/content/"
+            ),
+            vec![
+                "pyproto",
+                "pyproto/components/security_interstitials/content"
+            ]
+        );
+        assert_eq!(
+            super::binary_proto_paths("python3 g.py --path a/b --path=c -p -w"),
+            vec!["a/b", "c"]
+        );
+        assert!(super::binary_proto_paths("python3 g.py -o x").is_empty());
+    }
+
+    /// The rollup bin the failing task carried alone gives its scoped
+    /// package; an unscoped bin its package; a file outside any `bin/`, a
+    /// package dir itself, and a path with no node_modules give None.
+    #[test]
+    fn a_node_modules_bin_names_its_package() {
+        let nm = "../s/devtools-frontend/src/node_modules";
+        assert_eq!(
+            super::node_bin_package(std::path::Path::new(&format!(
+                "{nm}/@rollup/wasm-node/dist/bin/rollup"
+            ))),
+            Some(std::path::PathBuf::from(format!("{nm}/@rollup/wasm-node")))
+        );
+        assert_eq!(
+            super::node_bin_package(std::path::Path::new(&format!("{nm}/typescript/bin/tsc"))),
+            Some(std::path::PathBuf::from(format!("{nm}/typescript")))
+        );
+        for p in [
+            format!("{nm}/typescript/lib/lib.d.ts"),
+            format!("{nm}/@rollup/wasm-node"),
+            format!("{nm}/bin"),
+            "scripts/bin/tool".to_string(),
+        ] {
+            assert_eq!(
+                super::node_bin_package(std::path::Path::new(&p)),
+                None,
+                "{p}"
+            );
+        }
+    }
+
     /// The resource_ids spec's own spellings (SRCDIR, a commented key, a
     /// generated key) and the command GN writes for it.
     #[test]
@@ -20701,6 +20842,41 @@ fn root_src_dir_arg(cmdline: &str) -> Option<String> {
                     .flatten()
             })
     })
+}
+
+/// The `node_modules` package a path sits in when it sits below a `bin/`
+/// directory of that package (`<..>/node_modules/@rollup/wasm-node/dist/bin/rollup`
+/// gives `<..>/node_modules/@rollup/wasm-node`), lexically; else None.
+pub fn node_bin_package(p: &Path) -> Option<PathBuf> {
+    let comps: Vec<_> = p.components().map(|c| c.as_os_str()).collect();
+    let k = comps.iter().rposition(|c| *c == "node_modules")?;
+    let scoped = comps.get(k + 1)?.to_string_lossy().starts_with('@');
+    let end = if scoped { k + 3 } else { k + 2 };
+    let below = comps.get(end..comps.len().checked_sub(1)?)?;
+    below
+        .contains(&std::ffi::OsStr::new("bin"))
+        .then(|| comps[..end].iter().collect())
+}
+
+/// Every `-p`/`--path` value on a command line (binary_proto_generator's
+/// `add_option('-p', '--path', action="append")`), canonicalized so a
+/// trailing `/` names the same directory a graph node's parent does.
+pub fn binary_proto_paths(cmdline: &str) -> Vec<String> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let mut out = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        let v = if *t == "-p" || *t == "--path" {
+            toks.get(i + 1).copied()
+        } else {
+            t.strip_prefix("--path=")
+        };
+        if let Some(v) = v.filter(|v| !v.is_empty() && !v.starts_with('-')) {
+            let mut c = v.trim_end_matches('/').to_string();
+            n2::canon::canonicalize_path(&mut c);
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// The `--input` spec of a `grit.py update_resource_ids` command.
