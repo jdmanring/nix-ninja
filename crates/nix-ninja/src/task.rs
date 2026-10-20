@@ -1213,6 +1213,7 @@ impl Runner {
             for dep in ts_library_dep_tsconfigs(&args)
                 .into_iter()
                 .chain(generate_tsconfig_references(&args))
+                .chain(generate_tsconfig_declaration(&args))
             {
                 let Some(fid) = graph.files.lookup(&dep) else {
                     continue;
@@ -4185,7 +4186,21 @@ impl Runner {
             if !Path::new(&grd).is_file() {
                 continue;
             }
-            for r in grd_references(&grd)? {
+            let mut refs = grd_references(&grd)?;
+            // A FLATTENED page opens what it links: grit's html_inline
+            // inlines each `src`/`href`, `<include src>` and css `url()`
+            // relative to the page, recursively (incognito_tab.html pulls
+            // incognito_tab.css and .js beside it).
+            let pages: Vec<PathBuf> = refs
+                .iter()
+                .filter(|r| {
+                    r.extension()
+                        .is_some_and(|e| e == "html" || e == "css" || e == "js")
+                })
+                .cloned()
+                .collect();
+            refs.extend(html_inline_closure(&pages));
+            for r in refs {
                 if input_set.contains_key(&r) {
                     continue;
                 }
@@ -12868,6 +12883,34 @@ fn protoc_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
     Some((incs, protos))
 }
 
+/// The `.d.ts` a devtools `generate-tsconfig.js` project promises: its one
+/// file `<stem>.ts` compiles to `<stem>.d.ts` beside the tsconfig, written
+/// by a separate generate-declaration edge. A project referencing it reads
+/// that file (TS6305 "has not been built from source", core/root, task
+/// d82agz60), so it rides the tsconfig as a co-output.
+pub fn generate_tsconfig_declaration(args: &[String]) -> Vec<String> {
+    let Some(i) = args
+        .iter()
+        .position(|a| a.ends_with("generate-tsconfig.js"))
+    else {
+        return Vec::new();
+    };
+    let (Some(out), Some(src)) = (args.get(i + 1), args.get(i + 2)) else {
+        return Vec::new();
+    };
+    let Some(stem) = Path::new(src)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+    else {
+        return Vec::new();
+    };
+    let base = Path::new(out).parent().unwrap_or(Path::new(""));
+    vec![base
+        .join(format!("{stem}.d.ts"))
+        .to_string_lossy()
+        .into_owned()]
+}
+
 /// The tsconfigs a devtools `generate-tsconfig.js` output REFERENCES, by
 /// the script's own rule: `<tsconfig> <file> <dep>...`, each dep `:foo`,
 /// `../path:foo` or `../path` (target = last component), resolved to
@@ -19271,6 +19314,34 @@ mod closure_step_tests {
         assert!(super::ts_library_dep_tsconfigs(&args[2..]).is_empty());
     }
 
+    /// grit's Windows separators, and what a flattened page inlines.
+    #[test]
+    fn a_grd_backslash_path_and_its_inlined_files_are_carried() {
+        let d = super::Scratch::new(format!("nn-grd-flat-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("resources/ntp")).unwrap();
+        std::fs::write(d.join("b.grd"), "<structure name=\"X\" file=\"resources\\ntp\\tab.html\" flattenhtml=\"true\" type=\"chrome_html\" />").unwrap();
+        std::fs::write(d.join("resources/ntp/tab.html"), "<link rel=\"stylesheet\" href=\"tab.css\"><script src=\"tab.js\"></script><img src=\"chrome://theme/x\"><a href=\"#top\">").unwrap();
+        std::fs::write(
+            d.join("resources/ntp/tab.css"),
+            "body{background:url(bg.png)}",
+        )
+        .unwrap();
+        std::fs::write(d.join("resources/ntp/tab.js"), "").unwrap();
+        std::fs::write(d.join("resources/ntp/bg.png"), "").unwrap();
+        let refs = super::grd_references(&d.join("b.grd")).unwrap();
+        assert_eq!(refs, vec![d.join("resources/ntp/tab.html")]);
+        let mut got = super::html_inline_closure(&refs);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                d.join("resources/ntp/bg.png"),
+                d.join("resources/ntp/tab.css"),
+                d.join("resources/ntp/tab.js")
+            ]
+        );
+    }
+
     /// generate-tsconfig.js's three dep spellings, from the script's rule.
     #[test]
     fn generated_tsconfig_references_follow_the_script_rule() {
@@ -19287,6 +19358,10 @@ mod closure_step_tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
+        assert_eq!(
+            super::generate_tsconfig_declaration(&args),
+            vec!["gen/fe/core/platform/platform.d.ts".to_string()]
+        );
         assert_eq!(
             super::generate_tsconfig_references(&args),
             vec![
@@ -19666,6 +19741,52 @@ fn upload_python_closure_uncached(
 /// lexically against the manifest's directory, EXISTENCE-BLIND: the
 /// caller matches these against graph nodes to catch generated
 /// references, which exist nowhere on disk at scan time.
+/// What grit's html_inline opens from the given pages: every relative
+/// `src="..."`, `href="..."` and css `url(...)`, resolved against the
+/// referencing file and kept where a file exists, followed through each
+/// html and css reached. Not the pages themselves.
+fn html_inline_closure(pages: &[PathBuf]) -> Vec<PathBuf> {
+    static REF: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = REF.get_or_init(|| {
+        Regex::new(
+            r#"(?:\b(?:src|href)\s*=\s*["']([^"'$#?]+)["']|url\(\s*["']?([^"'$#?)]+)["']?\s*\))"#,
+        )
+        .unwrap()
+    });
+    let mut seen: Vec<PathBuf> = pages.to_vec();
+    let mut queue: Vec<PathBuf> = pages.to_vec();
+    let mut out = Vec::new();
+    while let Some(f) = queue.pop() {
+        if seen.len() > 4000 {
+            break;
+        }
+        let Ok(text) = fs::read_to_string(&f) else {
+            continue;
+        };
+        let dir = f.parent().unwrap_or(Path::new("")).to_path_buf();
+        for c in re.captures_iter(&text) {
+            let v = c
+                .get(1)
+                .or_else(|| c.get(2))
+                .map_or("", |m| m.as_str())
+                .trim();
+            if v.is_empty() || v.contains(':') || v.starts_with('/') || v.starts_with("//") {
+                continue;
+            }
+            let p = lexical_join(&dir, Path::new(v));
+            if !p.is_file() || seen.contains(&p) {
+                continue;
+            }
+            seen.push(p.clone());
+            out.push(p.clone());
+            if p.extension().is_some_and(|e| e == "html" || e == "css") {
+                queue.push(p);
+            }
+        }
+    }
+    out
+}
+
 fn grd_reference_candidates(grd: &Path) -> Result<Vec<PathBuf>> {
     let body = fs::read_to_string(grd)
         .map_err(|e| anyhow!("read({}) for grd candidates: {e}", grd.display()))?;
@@ -19679,7 +19800,8 @@ fn grd_reference_candidates(grd: &Path) -> Result<Vec<PathBuf>> {
             if val.is_empty() || val.contains("://") {
                 continue;
             }
-            out.push(lexical_join(dir, Path::new(val)));
+            let val = val.replace('\\', "/");
+            out.push(lexical_join(dir, Path::new(&val)));
         }
     }
     Ok(out)
@@ -20644,6 +20766,12 @@ fn grd_references(grd: &Path) -> Result<Vec<PathBuf>> {
             if val.is_empty() || val.contains("://") {
                 continue;
             }
+            // grit reads a WINDOWS SEPARATOR as one: browser_resources.grd
+            // names `resources\new_tab_page_incognito_guest\incognito_tab.html`,
+            // which joined raw named no file and was never carried (task
+            // rl2p1p5r, `Failed to open ... incognito_tab.html`).
+            let val = val.replace('\\', "/");
+            let val = val.as_str();
             let p = dir.join(val);
             if p.is_file() {
                 out.push(p);

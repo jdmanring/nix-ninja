@@ -809,7 +809,7 @@ fn record_placement(
         }
     }
     match journal {
-        Some(placed) => crate::configure_state::journal_placed(build_dir, placed, held),
+        Some(placed) => crate::configure_state::journal_placed(build_dir, placed, held, start),
         None => Ok(()),
     }
 }

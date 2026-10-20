@@ -1274,6 +1274,7 @@ pub fn journal_placed<'a>(
     build_dir: &Path,
     placed: impl IntoIterator<Item = &'a Path>,
     held: bool,
+    start: Option<std::time::SystemTime>,
 ) -> std::io::Result<()> {
     let state = state_dir(build_dir);
     let _lock = if held { None } else { lock_blocking(&state) };
@@ -1283,7 +1284,7 @@ pub fn journal_placed<'a>(
             state.display()
         )));
     }
-    journal_in(&state, build_dir, placed)
+    journal_in(&state, build_dir, placed, start)
 }
 
 fn lock_blocking(state: &Path) -> Option<std::fs::File> {
@@ -1302,6 +1303,7 @@ fn journal_in<'a>(
     state: &Path,
     build_dir: &Path,
     placed: impl IntoIterator<Item = &'a Path>,
+    start: Option<std::time::SystemTime>,
 ) -> std::io::Result<()> {
     let Some(r) = load_in(state, build_dir)? else {
         return Ok(());
@@ -1336,9 +1338,19 @@ fn journal_in<'a>(
         // A FILE CONFIGURE LEFT, WRITTEN WITHOUT ITS COPY KEPT: placement
         // reached it through a link this pass placed, which did not exist
         // when the copies were taken. A later pass could not put it back.
+        //
+        // ONLY A FILE THIS PASS WROTE. The list names every output the run
+        // knows, placed or not, and an output left in the store leaves
+        // configure's file untouched: qtwebengine's empty
+        // `*_metatypes.json`, refused although nothing wrote it. Placement
+        // writes a link or a copy stamped at or after the pass start.
+        let written_now = |m: &std::fs::Metadata| {
+            start.is_none_or(|t| m.file_type().is_symlink() || m.modified().is_ok_and(|mt| mt >= t))
+        };
         if r.files.contains(&key)
             && std::fs::symlink_metadata(originals(state).join(&key)).is_err()
-            && std::fs::symlink_metadata(build_dir.join(&key)).is_ok_and(|m| !m.is_dir())
+            && std::fs::symlink_metadata(build_dir.join(&key))
+                .is_ok_and(|m| !m.is_dir() && written_now(&m))
         {
             return Err(std::io::Error::other(format!(
                 "placement wrote over configure's {key} through {} without keeping \
@@ -2044,6 +2056,39 @@ mod tests {
     /// hook's file and the edited one stay. Dropping the rewind puts back
     /// what this pass did not place again, keeps what it did, and recreates
     /// `emptyout`, which only the restore can bring back.
+    /// An output the run knows but did not place leaves configure's file as
+    /// configure wrote it, and is not refused (qtwebengine's empty
+    /// `*_metatypes.json`). The same file rewritten after the pass start
+    /// still is: the control carries the pair.
+    #[test]
+    fn a_configure_file_no_placement_wrote_is_not_refused() {
+        let d = scratch("journal-unplaced");
+        let bd = d.join("build");
+        let state = d.join("state");
+        write(&bd.join("build.ninja"), "default all\n");
+        write(&bd.join("meta/m_metatypes.json"), "");
+        save_in(
+            &state,
+            &bd,
+            &ConfigureState {
+                dirs: ["meta"].map(String::from).into(),
+                files: ["build.ninja", "meta/m_metatypes.json"]
+                    .map(String::from)
+                    .into(),
+                ..Default::default()
+            },
+        )
+        .expect("saved");
+        let start = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        let placed = [Path::new("meta/m_metatypes.json")];
+        journal_in(&state, &bd, placed, Some(start))
+            .expect("an untouched configure file is not refused");
+        assert!(
+            journal_in(&state, &bd, placed, None).is_err(),
+            "without a start the old reading refuses, so the start is what admits it"
+        );
+    }
+
     #[test]
     fn a_later_pass_sets_aside_exactly_what_placement_wrote() {
         let d = scratch("journal");
@@ -2079,7 +2124,7 @@ mod tests {
             "emptyout",
         ]
         .map(PathBuf::from);
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path), None).expect("journaled");
         write(&bd.join("docs/index.html"), "hook");
         std::thread::sleep(std::time::Duration::from_millis(10));
         write(&bd.join("include/Foo/b.h"), "HOOK-EDITED");
@@ -2223,7 +2268,7 @@ mod tests {
         write(&bd.join("tree/a.h"), "placed");
         write(&bd.join("again.h"), "placed again");
         let same_ino = std::fs::metadata(bd.join("same.h")).unwrap().ino();
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path), None).expect("journaled");
         let journal = std::fs::read_to_string(state.join("placed.v1")).unwrap();
         assert!(
             !journal.lines().any(|l| l.ends_with(" same.h")),
@@ -2379,12 +2424,12 @@ mod tests {
         let placed = [PathBuf::from("m.json")];
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("m.json"), "placed");
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path), None).expect("journaled");
         let read = || std::fs::read_to_string(bd.join("m.json")).unwrap();
         for pass in [2, 3] {
             let rewind = begin(&state, &bd);
             assert_eq!(read(), "", "pass {pass} reads configure's version");
-            journal_in(&state, &bd, std::iter::empty()).expect("journaled");
+            journal_in(&state, &bd, std::iter::empty(), None).expect("journaled");
             rewind.finish().expect("everything comes back");
             assert_eq!(read(), "placed", "after pass {pass}");
         }
@@ -2480,7 +2525,7 @@ mod tests {
         let placed = [PathBuf::from(spelled)];
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("D/m.json"), "placed");
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path), None).expect("journaled");
         (d, bd, state)
     }
 
@@ -2493,7 +2538,7 @@ mod tests {
         let read = || std::fs::read_to_string(bd.join("D/m.json")).unwrap();
         let rewind = begin(&state, &bd);
         assert_eq!(read(), "", "pass 2 reads configure's version");
-        journal_in(&state, &bd, [Path::new("D")]).expect("journaled");
+        journal_in(&state, &bd, [Path::new("D")], None).expect("journaled");
         rewind.finish().expect("everything comes back");
         let rewind = begin(&state, &bd);
         assert_eq!(read(), "", "and so does pass 3");
@@ -2572,7 +2617,7 @@ mod tests {
             keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path))
                 .expect("kept");
             write(&bd.join("alias/x.h"), "placed");
-            journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
+            journal_in(&state, &bd, placed.iter().map(PathBuf::as_path), None).expect("journaled");
             let rewind = begin(&state, &bd);
             assert_eq!(
                 std::fs::read_to_string(bd.join("real/x.h")).unwrap(),
@@ -2626,7 +2671,7 @@ mod tests {
         std::os::unix::fs::symlink("lib64", bd.join("lib")).unwrap();
         write(&bd.join("lib/foo.so"), "placed");
         let placed = [PathBuf::from("lib"), PathBuf::from("lib/foo.so")];
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path), None).expect("journaled");
         let rewind = begin(&state, &bd);
         assert!(!bd.join("lib64/foo.so").exists(), "the file is set aside");
         assert!(!bd.join("lib").is_symlink(), "and so is the link");
@@ -2808,7 +2853,7 @@ mod tests {
                 write(&at, v);
             }
         }
-        journal_in(&state, bd, placed.iter().copied()).expect("journaled");
+        journal_in(&state, bd, placed.iter().copied(), None).expect("journaled");
         // The driver's own work between journaling and putting back, past a
         // coarse clock's tick.
         std::thread::sleep(std::time::Duration::from_millis(15));
@@ -3718,7 +3763,7 @@ mod tests {
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("D/m.json"), "placed");
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let res = journal_in(&state, &bd, placed.iter().map(PathBuf::as_path));
+        let res = journal_in(&state, &bd, placed.iter().map(PathBuf::as_path), None);
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(res.is_err(), "the run stops");
         let _ = std::fs::remove_dir_all(&d);
@@ -3738,7 +3783,7 @@ mod tests {
         };
         save_in(&state, &bd, &record).expect("saved");
         write(&bd.join("gen.h"), "placed");
-        journal_in(&state, &bd, [Path::new("gen.h")]).expect("journaled");
+        journal_in(&state, &bd, [Path::new("gen.h")], None).expect("journaled");
         // Nothing can be made below a file.
         write(&state.join("aside"), "in the way");
         assert!(begin_result(&state, &bd).is_err());
@@ -3823,14 +3868,14 @@ mod tests {
         let placed = [PathBuf::from("m.json")];
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         write(&bd.join("m.json"), "placed");
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path), None).expect("journaled");
         std::thread::sleep(std::time::Duration::from_millis(10));
         write(&bd.join("m.json"), "HOOK");
         let read = || std::fs::read_to_string(bd.join("m.json")).unwrap();
         for pass in [2, 3] {
             let rewind = begin(&state, &bd);
             assert_eq!(read(), "HOOK", "pass {pass}");
-            journal_in(&state, &bd, std::iter::empty()).expect("journaled");
+            journal_in(&state, &bd, std::iter::empty(), None).expect("journaled");
             rewind.finish().expect("everything comes back");
         }
         let _ = std::fs::remove_dir_all(&d);
@@ -3855,7 +3900,7 @@ mod tests {
         keep_originals_in(&state, &bd, &record, placed.iter().map(PathBuf::as_path)).expect("kept");
         std::fs::remove_file(bd.join("x")).unwrap();
         std::fs::create_dir(bd.join("x")).unwrap();
-        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path)).expect("journaled");
+        journal_in(&state, &bd, placed.iter().map(PathBuf::as_path), None).expect("journaled");
         let rewind = begin(&state, &bd);
         assert_eq!(std::fs::read_to_string(bd.join("x")).unwrap(), "configure");
         // A record written now (a lost configure.v1) leaves the originals.
@@ -3866,7 +3911,7 @@ mod tests {
             "originals kept"
         );
         std::fs::remove_file(state.join("aside/.keep")).unwrap();
-        journal_in(&state, &bd, std::iter::empty()).expect("journaled");
+        journal_in(&state, &bd, std::iter::empty(), None).expect("journaled");
         rewind.finish().expect("everything comes back");
         assert!(bd.join("x").is_dir(), "the placed directory is back");
         let _ = std::fs::remove_dir_all(&d);
