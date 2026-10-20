@@ -485,8 +485,12 @@ Mechanisms, cited by symbol because line numbers rot:
   recorded inputs (`files.v1`, `inputs.v1`) at exit and counts every
   recorded reader of a hook's edit that placement wrote over. A missing,
   corrupt or other-configure record, or another invocation (`-v`, builder
-  knobs), is a hard error. Gate `install-pass-reuse-repro.sh`; open gaps in
-  the queue (2026-10-18 14:40).
+  knobs), is a hard error. The record names the driver; one differing ONLY
+  in `driver=` (or lacking it) reuses NOTHING and derives every edge
+  (`driver_moved`, one `later pass under another driver` line), because a
+  preflight sweep's kept tree is configured by an older driver and reuse
+  would sweep that driver's derivations. Gate
+  `install-pass-reuse-repro.sh`; open gaps in the queue (2026-10-18 14:40).
 - **Daemon exchanges** are bounded (`bounded`; ladder `300 << 2n` on
   `build_paths`); `BuilderRpcClient::pool` is a `BoundedPool` whose only
   acquire takes a deadline, so a bare acquire is a COMPILE error.
