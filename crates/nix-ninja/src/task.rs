@@ -969,7 +969,10 @@ pub struct Runner {
     /// carries edge-declared inputs; generate_grd names its static
     /// files (sadtab.svg) in cmdline manifests that appear on no edge,
     /// so the consumer needs what the producer actually resolved.
-    stamp_input_files: HashMap<FileId, Vec<DerivedFile>>,
+    stamp_input_files: HashMap<FileId, StampRecord>,
+    /// The stamp outputs whose records the last `new_task` merged, read
+    /// by the record step that follows it to work out `covers`.
+    stamp_records_merged: Vec<FileId>,
     /// Every output of a multi-output task, keyed by each of its outputs:
     /// a consumer depending on ONE of them gets the co-outputs too, since
     /// tools follow a declared output to files written beside it.
@@ -1157,6 +1160,7 @@ impl Runner {
             phony_aliases: HashMap::new(),
             stamp_inputs: HashMap::new(),
             stamp_input_files: HashMap::new(),
+            stamp_records_merged: Vec::new(),
             co_outputs: HashMap::new(),
             soname_links: HashMap::new(),
             gir_includes: HashMap::new(),
@@ -1750,8 +1754,18 @@ impl Runner {
                     record.push(up);
                 }
             }
+            let record: std::sync::Arc<[DerivedFile]> = record.into();
+            let covers = stamp_record_covers(
+                &record,
+                std::mem::take(&mut self.stamp_records_merged),
+                &self.stamp_input_files,
+            );
+            let rec = StampRecord {
+                files: record,
+                covers: std::sync::Arc::new(covers),
+            };
             for fid in build.outs() {
-                self.stamp_input_files.insert(*fid, record.clone());
+                self.stamp_input_files.insert(*fid, rec.clone());
             }
         }
 
@@ -2310,6 +2324,8 @@ impl Runner {
     }
 
     fn new_task(&mut self, files: &mut graph::GraphFiles, build: &Build) -> Result<Task> {
+        // An early return must not leave the previous task's list behind.
+        self.stamp_records_merged.clear();
         // Section clocks for the serial-resolution bottleneck, read by
         // the heartbeat in start(). Wall time between checkpoints lands
         // in the named section's bucket.
@@ -2488,6 +2504,8 @@ impl Runner {
         // (an un-normalized absolute path), whose prefixes must exist for
         // the kernel to resolve the climb. Merged into make_dirs below.
         let mut qrc_make_dirs: Vec<String> = Vec::new();
+        let mut stamp_covered: rustc_hash::FxHashSet<FileId> = Default::default();
+        let mut stamp_merged: Vec<FileId> = Vec::new();
         while let Some((fid, via_phony)) = worklist.pop() {
             if !seen.insert(fid) {
                 continue;
@@ -2508,17 +2526,10 @@ impl Runner {
             if let Some(extra) = self.stamp_inputs.get(&fid) {
                 worklist.extend(extra.iter().map(|f| (*f, true)));
             }
-            if let Some(extra) = self.stamp_input_files.get(&fid) {
-                for df in extra {
-                    if is_gcc_task {
-                        let n = df.build_path.to_string_lossy();
-                        if !header_like(Path::new(n.as_ref())) {
-                            continue;
-                        }
-                    }
-                    input_set
-                        .entry(df.build_path.clone())
-                        .or_insert_with(|| df.clone());
+            // A record a merged one covers would write nothing; see `StampRecord`.
+            if let Some(rec) = self.stamp_input_files.get(&fid) {
+                if merge_stamp_record(&mut input_set, &mut stamp_covered, fid, rec, is_gcc_task) {
+                    stamp_merged.push(fid);
                 }
             }
             // An input produced by a multi-output task pulls in its
@@ -2652,6 +2663,7 @@ impl Runner {
             };
             input_set.insert(input.build_path.clone(), input.clone());
         }
+        self.stamp_records_merged = stamp_merged;
 
         let mut outputs: Vec<PathBuf> = Vec::new();
         let mut outer_stage_outputs: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -21374,6 +21386,85 @@ fn computed_path_carry(p: &Path) -> Option<PathBuf> {
     p.is_file().then(|| p.to_path_buf())
 }
 
+/// One stamp edge's recorded inputs, shared by each of its outputs.
+///
+/// A stamp records its whole resolved input set, which normally holds the
+/// record of every stamp upstream of it, so records compound down a chain.
+/// Chromium's devtools ts_library stamps each carry `front_end` (6,371
+/// files), and a consumer re-reading every record it reached spent 26, 197
+/// and 686 s of worklist at 500, 1,000 and 1,500 tasks of one drive.
+///
+/// `covers` names the upstream stamp outputs whose every path this record
+/// holds. A consumer that merged this record skips theirs and ends with the
+/// same input set: a merge only fills absent paths, the header filter
+/// decides by path alone, and nothing leaves the set until the worklist has
+/// finished, so once this record is merged theirs would write nothing.
+/// Sound while a stamp's record is written once; a stamp started again
+/// after a consumer recorded it covered would need its record re-checked.
+#[derive(Clone)]
+pub struct StampRecord {
+    pub files: std::sync::Arc<[DerivedFile]>,
+    pub covers: std::sync::Arc<rustc_hash::FxHashSet<FileId>>,
+}
+
+/// The `covers` of a new stamp `record`, given the upstream stamp outputs
+/// whose records the task merged. One already covered by a checked one is
+/// contained transitively and is not checked again.
+pub fn stamp_record_covers(
+    record: &[DerivedFile],
+    merged: Vec<FileId>,
+    records: &HashMap<FileId, StampRecord>,
+) -> rustc_hash::FxHashSet<FileId> {
+    let paths: rustc_hash::FxHashSet<&Path> =
+        record.iter().map(|df| df.build_path.as_path()).collect();
+    let mut covers = rustc_hash::FxHashSet::default();
+    for u in merged {
+        if covers.contains(&u) {
+            continue;
+        }
+        let Some(up) = records.get(&u) else {
+            continue;
+        };
+        if up
+            .files
+            .iter()
+            .all(|df| paths.contains(df.build_path.as_path()))
+        {
+            covers.insert(u);
+            covers.extend(up.covers.iter().copied());
+        }
+    }
+    covers
+}
+
+/// Merge the record of stamp output `fid` into `input_set`, filling absent
+/// paths only (a compile takes its header-shaped entries alone), unless a
+/// record merged earlier in this task covers it. Returns whether it merged.
+pub fn merge_stamp_record(
+    input_set: &mut rustc_hash::FxHashMap<PathBuf, DerivedFile>,
+    covered: &mut rustc_hash::FxHashSet<FileId>,
+    fid: FileId,
+    rec: &StampRecord,
+    is_gcc_task: bool,
+) -> bool {
+    if covered.contains(&fid) {
+        return false;
+    }
+    covered.extend(rec.covers.iter().copied());
+    for df in rec.files.iter() {
+        if is_gcc_task {
+            let n = df.build_path.to_string_lossy();
+            if !header_like(Path::new(n.as_ref())) {
+                continue;
+            }
+        }
+        if !input_set.contains_key(&df.build_path) {
+            input_set.insert(df.build_path.clone(), df.clone());
+        }
+    }
+    true
+}
+
 /// Upload every regular file under a directory the command names as an
 /// argument (recursive), capped so a mistaken match cannot ingest a
 /// source tree: past the cap the walk STOPS AND FAILS rather than
@@ -33191,5 +33282,114 @@ mod declared_source_alias_tests {
             None,
             "a cycle"
         );
+    }
+}
+
+#[cfg(test)]
+mod stamp_record_covers_tests {
+    use super::*;
+    use harmonia_store_path::StorePath;
+
+    // `hash` tells two values for one build path apart.
+    fn df(hash: char, name: &str) -> DerivedFile {
+        DerivedFile {
+            derived_path: SingleDerivedPath::Opaque(
+                StorePath::from_bytes(format!("{}-{name}", hash.to_string().repeat(32)).as_bytes())
+                    .expect("fixture store path"),
+            ),
+            build_path: PathBuf::from(name),
+            rel_path: None,
+        }
+    }
+
+    fn rec(files: Vec<DerivedFile>, covers: &[usize]) -> StampRecord {
+        StampRecord {
+            files: files.into(),
+            covers: std::sync::Arc::new(covers.iter().map(|u| FileId::from(*u)).collect()),
+        }
+    }
+
+    fn ids(v: &[usize]) -> rustc_hash::FxHashSet<FileId> {
+        v.iter().map(|u| FileId::from(*u)).collect()
+    }
+
+    #[test]
+    fn a_contained_record_is_covered_with_what_it_covers() {
+        let mut records = HashMap::new();
+        records.insert(FileId::from(2), rec(vec![df('0', "a"), df('0', "b")], &[3]));
+        let record = vec![df('0', "b"), df('0', "c"), df('0', "a")];
+        let got = stamp_record_covers(&record, vec![FileId::from(2)], &records);
+        assert_eq!(got, ids(&[2, 3]));
+    }
+
+    #[test]
+    fn a_path_the_record_lacks_is_not_covered() {
+        let mut records = HashMap::new();
+        records.insert(FileId::from(2), rec(vec![df('0', "a"), df('0', "b")], &[]));
+        let got = stamp_record_covers(&[df('0', "a")], vec![FileId::from(2)], &records);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    // Paths decide: once the path is present a merge writes nothing for it,
+    // whichever value is there.
+    #[test]
+    fn a_different_value_for_a_held_path_still_covers() {
+        let mut records = HashMap::new();
+        records.insert(FileId::from(2), rec(vec![df('0', "a")], &[]));
+        let got = stamp_record_covers(&[df('1', "a")], vec![FileId::from(2)], &records);
+        assert_eq!(got, ids(&[2]));
+    }
+
+    #[test]
+    fn an_unrecorded_merge_is_skipped() {
+        let records = HashMap::new();
+        let got = stamp_record_covers(&[df('0', "a")], vec![FileId::from(9)], &records);
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    // A chain U (1) inside D (2), D covering U, and an unrelated S (3):
+    // skipping gives exactly the map a merge of every record gives.
+    #[test]
+    fn skipping_a_covered_record_leaves_the_input_set_unchanged() {
+        let u = rec(vec![df('0', "a.h"), df('0', "b.ts")], &[]);
+        let d = rec(vec![df('1', "a.h"), df('0', "b.ts"), df('0', "c.h")], &[1]);
+        let s = rec(vec![df('0', "d.js"), df('2', "a.h")], &[]);
+        for gcc in [false, true] {
+            let mut naive = rustc_hash::FxHashMap::default();
+            for r in [&d, &u, &s] {
+                for f in r.files.iter() {
+                    if gcc && !header_like(&f.build_path) {
+                        continue;
+                    }
+                    naive
+                        .entry(f.build_path.clone())
+                        .or_insert_with(|| f.clone());
+                }
+            }
+            let (mut set, mut covered) = (Default::default(), Default::default());
+            let merged: Vec<bool> = [(2, &d), (1, &u), (3, &s)]
+                .into_iter()
+                .map(|(id, r)| merge_stamp_record(&mut set, &mut covered, FileId::from(id), r, gcc))
+                .collect();
+            assert_eq!(merged, [true, false, true], "gcc={gcc}");
+            assert!(set == naive, "gcc={gcc}: the skip changed the input set");
+        }
+    }
+
+    // Placement control: D claims to cover a U holding a path D lacks, so
+    // the skip shows in the result only if it fires.
+    #[test]
+    fn the_skip_fires_only_after_the_covering_record() {
+        let u = rec(vec![df('0', "x.ts")], &[]);
+        let d = rec(vec![df('0', "y.ts")], &[1]);
+        let run = |order: [(usize, &StampRecord); 2]| {
+            let (mut set, mut covered) = (Default::default(), Default::default());
+            for (id, r) in order {
+                merge_stamp_record(&mut set, &mut covered, FileId::from(id), r, false);
+            }
+            set.contains_key(Path::new("x.ts"))
+        };
+        assert!(!run([(2, &d), (1, &u)]));
+        assert!(run([(1, &u), (2, &d)]));
     }
 }
