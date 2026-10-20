@@ -221,7 +221,17 @@ serves nothing (`nix store ping` answers, no `nixbld` processes, no
 orphaned `nix-daemon` with PPID 1): a mid-build restart orphans workers and
 `nix-daemon-srv`'s run script then refuses every NEW client until that
 build ends. Never argue for a pin bump against the no-global-rebuild order; report
-facts. Brief peers proactively and flag state changes at once.
+facts. Brief peers proactively and flag state changes at once. (g) A fix for a
+refused package goes back only after the consumer's
+`scripts/preflight-sweep.sh <kept-tree> <driver-dir> <outdir>` drives every
+edge class of its configured tree (outer graph and every nested ninja
+graph) with zero refusals and zero `; skipped` lines, counts in the
+message, plus a control aimed at each class that actually failed; one
+passing edge is not readiness, and a class is called apparatus only after
+a control run with the round's own environment (the outer edge's
+`cmake -E env`) still fails, never by inspection. Its launch gate
+(`refuse-unswept.py`) refuses a relaunch without a clean sweep for the
+mapped driver.
 
 Consumer files in `~/Projects/saxum/scripts`: `nn-cc-shim.sh` (cc drop-in,
 one-edge build.ninja per TU, `NIX_NINJA_NO_BUILD_DIR_SCAN=1`, `deps = gcc`;
@@ -339,8 +349,11 @@ Mechanisms, cited by symbol because line numbers rot:
   fixing one leaves the next fatal.
 - **Environment**: `forwarded_to_tasks` is an allowlist (`NIX_*`,
   `XML_CATALOG_FILES`, `PYTHONPATH`, `XDG_DATA_DIRS`,
-  `NIX_GOBJECT_INTROSPECTION_DEFAULT_FALLBACK_LIBPATH`, `PKG_CONFIG_PATH`);
-  values go through `outer_rewrite_map`, whose store paths become inputs;
+  `NIX_GOBJECT_INTROSPECTION_DEFAULT_FALLBACK_LIBPATH`, `PKG_CONFIG_PATH`),
+  plus `command_scoped` keys (`GETTEXTDATADIRS`, `NODEJS_EXECUTABLE`), which
+  reach a task whose COMMAND names the consumer or whose INPUTS carry it by
+  file name: Chromium's `node.py` is reached through an import closure,
+  never named on the command line; values go through `outer_rewrite_map`, whose store paths become inputs;
   forwarding everything bakes `$out` into every key. A task runs no stdenv
   setup hooks. Outer output names come from `outputs` or the
   `__structuredAttrs` file (`outer_output_names`); the self-rpath pair in
@@ -393,6 +406,15 @@ Mechanisms, cited by symbol because line numbers rot:
   path (`new_opaque_file`, `new_opaque_file_raw`); rewritten uploads are
   temp copies (`upload_temp_done`). Directory args: python packages under
   `DIR_UPLOAD_CAP`, data trees under `DATA_DIR_CAP`, else a named refusal.
+  Python import closures (`upload_python_closure_uncached`): one
+  `PYTHON_DEP_DIR_CAP` for every carried dir and `CLOSURE_DIR_CAP` on the
+  walk, both REFUSE when exceeded, never skip; a `sys.path` root too large
+  to carry resolves only the names imported through it. A reader passes
+  over an oversized dir (`dir_exceeds_files`) only where the dir is not
+  read (syncqt's `SYNCQT_OUTPUT_DIR_FLAGS`) and only when it would refuse,
+  so an edge that resolves today emits what it did. A reader carrying a
+  configured tree adds the store paths its files name
+  (`store_paths_named_below`, meinproc's customization).
 - **Output names** (`normalize_output`) are a LOSSY LABEL
   (`fold_long_output_name` digests over-cap names, others byte for byte);
   `Placeholder::standard_output` hashes the NAME alone; the collision guard
