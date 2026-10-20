@@ -174,8 +174,27 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
     STRICT.store(reuse_allowed, std::sync::atomic::Ordering::Relaxed);
     let later = reuse_allowed && read_lines(&state.join("configure.v1"), build_dir)?.is_some();
     let inv = state.join("invocation.v1");
+    let mut driver_moved = false;
     if reuse_allowed {
         match read_lines(&inv, build_dir)? {
+            // A DIFFERENT DRIVER ALONE derives every edge again rather than
+            // stop: a kept tree swept with a fixed driver must build what
+            // that driver emits, and reusing the recorded tasks would build
+            // the old driver's instead. A record written before the field
+            // existed has no driver and reads the same way.
+            Some(first)
+                if later
+                    && first.len() == 1
+                    && without_driver(&first[0]) == without_driver(invocation)
+                    && first[0] != invocation =>
+            {
+                eprintln!(
+                    "nix-ninja: later pass under another driver than the first (`{}`): \
+                     reusing none of its task derivations",
+                    first[0]
+                );
+                driver_moved = true;
+            }
             Some(first) if later && first != [invocation.to_string()] => {
                 return Err(std::io::Error::other(format!(
                     "this pass runs as `{invocation}` and the first ran as `{}`: its \
@@ -208,6 +227,9 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
             })?;
             m.insert(k.to_string(), d.to_string());
         }
+        if driver_moved {
+            m.clear();
+        }
         Some(m)
     } else {
         None
@@ -230,6 +252,15 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
         unresolved: Default::default(),
     });
     Ok(())
+}
+
+/// An invocation record without its `driver=` field.
+fn without_driver(invocation: &str) -> String {
+    invocation
+        .split(' ')
+        .filter(|t| !t.starts_with("driver="))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Whether configure's record exists for `build_dir` at all, whatever it
@@ -2770,6 +2801,13 @@ mod tests {
         assert_eq!(super::pass_report().unwrap(), None);
         // A later pass run another way (`-v`) stops.
         assert!(super::begin_pass(&bd, true, "v=true").is_err());
+        // Another driver alone (the record predates the field) reuses
+        // nothing and derives every edge; with another flag it still stops.
+        reset();
+        super::begin_pass(&bd, true, "v=false driver=1.2").unwrap();
+        assert!(super::later_pass());
+        assert_eq!(super::reuse(&out("a.o"), |_| true), None);
+        assert!(super::begin_pass(&bd, true, "v=true driver=1.2").is_err());
         // A later pass with no task record stops.
         std::fs::remove_file(state.join("emitted.v1")).unwrap();
         assert!(super::begin_pass(&bd, true, "v=false").is_err());
