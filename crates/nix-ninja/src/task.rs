@@ -1201,8 +1201,20 @@ impl Runner {
         // `--deps` tsconfigs ride its output as co-outputs, so a consumer's
         // expansion walks the whole reference chain (core/root's dep
         // bundle-tsconfig.json names platform-tsconfig.json; TS6053, task
-        // 6h2dgzyi). Read here rather than when the producer resolves,
-        // because a producer already up to date is never resolved again.
+        // 6h2dgzyi). Read from the graph here so every edge's references
+        // are known before any consumer resolves. A reference to a
+        // tsconfig no edge declares rides its writer's declared outputs
+        // (`tsconfig_reference_nodes`); the tsconfig itself joins them when
+        // the writer resolves, which precedes every consumer because the
+        // writer is a ninja ancestor of each (19,860 of 19,860 consumer
+        // and writer pairs in qtwebengine 6.11.2's graph).
+        let undeclared_tsconfigs = undeclared_tsconfig_writers(
+            graph.builds.all_ids().filter_map(|bid| {
+                let build = &graph.builds[bid];
+                Some((build.cmdline.as_deref()?, build.outs()))
+            }),
+            &self.config.build_dir,
+        );
         for bid in graph.builds.all_ids() {
             let build = &graph.builds[bid];
             let Some(c) = build.cmdline.as_deref() else {
@@ -1238,13 +1250,14 @@ impl Runner {
                 .chain(generated_file.clone())
                 .chain(copied.iter().map(|(_, f)| f.clone()))
             {
-                let Some(fid) = graph.files.lookup(&dep) else {
-                    continue;
-                };
-                for out in build.outs() {
-                    let entry = self.co_outputs.entry(*out).or_insert_with(|| vec![*out]);
-                    if !entry.contains(&fid) {
-                        entry.push(fid);
+                for fid in
+                    tsconfig_reference_nodes(&dep, |p| graph.files.lookup(p), &undeclared_tsconfigs)
+                {
+                    for out in build.outs() {
+                        let entry = self.co_outputs.entry(*out).or_insert_with(|| vec![*out]);
+                        if !entry.contains(&fid) {
+                            entry.push(fid);
+                        }
                     }
                 }
             }
@@ -13238,6 +13251,48 @@ pub fn generate_tsconfig_references(args: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Each tsconfig an edge writes without declaring it, keyed by its build-dir
+/// spelling, with that edge's declared outputs: devtools'
+/// `css_files-tsconfig.json` from generate_css_js_files.js, the only such
+/// write a tsconfig reference reaches in qtwebengine 6.11.2 (94 of 94).
+pub fn undeclared_tsconfig_writers<'a>(
+    builds: impl Iterator<Item = (&'a str, &'a [FileId])>,
+    build_dir: &Path,
+) -> HashMap<PathBuf, Vec<FileId>> {
+    let mut writers: HashMap<PathBuf, Vec<FileId>> = HashMap::new();
+    for (cmdline, outs) in builds {
+        if !cmdline.contains("generate_css_js_files.js") {
+            continue;
+        }
+        for w in css_js_tsconfig_writes(cmdline, build_dir) {
+            writers.entry(w).or_default().extend(outs.iter().copied());
+        }
+    }
+    writers
+}
+
+/// The graph nodes standing for a tsconfig a ts project references. A
+/// declared tsconfig is its own node. One an edge writes without declaring
+/// it has no node until that edge resolves, so the writer's declared
+/// outputs stand in: they are the `.css.js` files the tsconfig lists, and
+/// they carry the tsconfig as a co-output once it is registered. tsc
+/// follows a referenced bundle's references transitively, and a consumer
+/// two references away failed TS6053 (qtwebengine 6.11.2, tasks 4p9rsyz0,
+/// yrj0vpvd).
+pub fn tsconfig_reference_nodes(
+    dep: &str,
+    lookup: impl Fn(&str) -> Option<FileId>,
+    undeclared_writers: &HashMap<PathBuf, Vec<FileId>>,
+) -> Vec<FileId> {
+    match lookup(dep) {
+        Some(fid) => vec![fid],
+        None => undeclared_writers
+            .get(Path::new(dep))
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
 /// A `ts_library.py` run's `--deps` tsconfigs, spelled from the build dir:
 /// each value is relative to the directory of `--tsconfig_output_location`.
 pub fn ts_library_dep_tsconfigs(args: &[String]) -> Vec<String> {
@@ -19957,6 +20012,92 @@ mod closure_step_tests {
             vec![PathBuf::from("gen/fe/ui/input/css_files-tsconfig.json")]
         );
         assert!(super::css_js_tsconfig_writes("python3 node.py other.js a b c d e", b).is_empty());
+    }
+
+    /// qtwebengine 6.11.2's own command lines (ninja's `$:` unescaped, as n2
+    /// hands them over): the bundle references `:css_files` and
+    /// `../:css_files`, a ts_library names `./css_files-tsconfig.json`, and
+    /// each spelling finds the css edge that writes the tsconfig.
+    #[test]
+    fn every_css_tsconfig_spelling_finds_its_writer() {
+        use n2::graph::FileId;
+        use std::path::Path;
+        let b = Path::new("/build/qtwebengine-everywhere-src-6.11.2/build/src/core/Release/x86_64");
+        let node = "/nix/store/x-python3/bin/python3.14 ../../../../../src/3rdparty/chromium/third_party/node/node.py";
+        let fe = "../../../../../src/3rdparty/chromium/third_party/devtools-frontend/src";
+        let g = "gen/third_party/devtools-frontend/src/front_end";
+        let css = |dir: &str, files: &str| {
+            format!("{node} {fe}/scripts/build/generate_css_js_files.js 1757221200 false css_files {fe}/front_end/{dir} {g}/{dir} {files}")
+        };
+        let (ch_css, legacy_css) = (
+            css("ui/components/code_highlighter", "codeHighlighter.css"),
+            css("ui/legacy", "dialog.css,popover.css"),
+        );
+        let (ch, legacy) = ([FileId::from(1)], [FileId::from(2), FileId::from(3)]);
+        let writers = super::undeclared_tsconfig_writers(
+            [
+                (ch_css.as_str(), &ch[..]),
+                (legacy_css.as_str(), &legacy[..]),
+                ("python3 node.py other.js a b c d e", &[FileId::from(9)][..]),
+            ]
+            .into_iter(),
+            b,
+        );
+        assert_eq!(writers.len(), 2);
+        let words = |c: String| shell_words::split(&c).unwrap();
+        let refs = |args: Vec<String>| {
+            super::generate_tsconfig_references(&args)
+                .into_iter()
+                .chain(super::ts_library_dep_tsconfigs(&args))
+                .flat_map(|d| super::tsconfig_reference_nodes(&d, |_| None, &writers))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            refs(words(format!("{node} {fe}/scripts/build/ninja/generate-tsconfig.js {g}/ui/components/code_highlighter/bundle-tsconfig.json {fe}/front_end/ui/components/code_highlighter/code_highlighter.ts :code_highlighter :css_files"))),
+            ch.to_vec()
+        );
+        assert_eq!(
+            refs(words(format!("{node} {fe}/scripts/build/ninja/generate-tsconfig.js {g}/ui/legacy/theme_support/bundle-tsconfig.json {fe}/front_end/ui/legacy/theme_support/theme_support.ts :theme_support ../:css_files"))),
+            legacy.to_vec()
+        );
+        assert_eq!(
+            refs(words(format!("/nix/store/x-python3/bin/python3.14 {fe}/scripts/build/typescript/ts_library.py --tsconfig_output_location {g}/ui/legacy/legacy-tsconfig.json --deps ./css_files-tsconfig.json ./legacy-tsconfig.json --front_end_directory {g}/ui/legacy"))),
+            legacy.to_vec()
+        );
+    }
+
+    /// A referenced tsconfig with a node is that node; one only a css edge
+    /// writes is that edge's declared outputs; an unknown one is nothing.
+    #[test]
+    fn an_undeclared_referenced_tsconfig_rides_its_writer() {
+        use n2::graph::FileId;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        let (declared, css_a, css_b) = (FileId::from(7), FileId::from(11), FileId::from(12));
+        let writers: HashMap<PathBuf, Vec<FileId>> = [(
+            PathBuf::from("gen/fe/ch/css_files-tsconfig.json"),
+            vec![css_a, css_b],
+        )]
+        .into_iter()
+        .collect();
+        let lookup =
+            |p: &str| (p == "gen/fe/ch/code_highlighter-tsconfig.json").then_some(declared);
+        assert_eq!(
+            super::tsconfig_reference_nodes(
+                "gen/fe/ch/code_highlighter-tsconfig.json",
+                lookup,
+                &writers
+            ),
+            vec![declared]
+        );
+        assert_eq!(
+            super::tsconfig_reference_nodes("gen/fe/ch/css_files-tsconfig.json", lookup, &writers),
+            vec![css_a, css_b]
+        );
+        assert!(
+            super::tsconfig_reference_nodes("gen/fe/ch/other-tsconfig.json", lookup, &writers)
+                .is_empty()
+        );
     }
 
     /// A file in node_modules carries its package, a scope dir is carried, a
