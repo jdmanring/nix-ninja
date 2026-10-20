@@ -92,6 +92,8 @@ pub fn symlink_derived_files(
     let mut derived_files: Vec<DerivedFile> = derived_files.to_vec();
     let mut store_paths = Vec::new();
     let mut scanned = 0;
+    let keep_going = std::env::var("NIX_NINJA_KEEP_GOING").as_deref() == Ok("1");
+    let mut failed = 0usize;
     // A placed link needs its target beside it, and the target may be an
     // output nobody requested (openfec: `all` names the alias phony, the
     // installer copies through it, and the library it pointed at was never
@@ -102,11 +104,42 @@ pub fn symlink_derived_files(
             .iter()
             .map(|df| df.derived_path.clone())
             .collect();
-        store_paths.extend(rpc_client.build_paths(
-            store_dir,
-            &derived_paths,
-            Patience::Escalating,
-        )?);
+        match rpc_client.build_paths(store_dir, &derived_paths, Patience::Escalating) {
+            Ok(got) => store_paths.extend(got),
+            // UNDER KEEP-GOING ONE FAILED OUTPUT IS THAT OUTPUT'S FAILURE, not
+            // the run's. The batch realise is where a local build's tasks are
+            // actually built, so one failure there aborted the run and named
+            // only the batch: no FAILED line, no count, and every other
+            // requested target unreported (qtwebengine's devtools chain).
+            // Each path is realised on its own; a failure is reported and
+            // its output left unplaced.
+            Err(e) if keep_going => {
+                eprintln!("nix-ninja: batch realise failed under keep-going ({e}); realising each output alone");
+                let mut kept: Vec<DerivedFile> = derived_files[..scanned].to_vec();
+                for df in &derived_files[scanned..] {
+                    match rpc_client.build_paths(
+                        store_dir,
+                        std::slice::from_ref(&df.derived_path),
+                        Patience::Escalating,
+                    ) {
+                        Ok(mut one) if one.len() == 1 => {
+                            store_paths.push(one.remove(0));
+                            kept.push(df.clone());
+                        }
+                        Ok(_) => anyhow::bail!(
+                            "realising {} returned no single path",
+                            df.build_path.display()
+                        ),
+                        Err(e) => {
+                            failed += 1;
+                            eprintln!("nix-ninja: FAILED {}: {e}", df.build_path.display());
+                        }
+                    }
+                }
+                derived_files = kept;
+            }
+            Err(e) => return Err(e.into()),
+        }
         let have: std::collections::HashSet<PathBuf> = derived_files
             .iter()
             .map(|df| df.build_path.clone())
@@ -127,7 +160,13 @@ pub fn symlink_derived_files(
         );
         derived_files.extend(extra);
     }
-    place_realised(store_dir, prefix, &derived_files, &store_paths)
+    place_realised(store_dir, prefix, &derived_files, &store_paths)?;
+    if failed > 0 {
+        anyhow::bail!(
+            "{failed} output(s) failed to build under keep-going; each is reported above"
+        );
+    }
+    Ok(())
 }
 
 /// Place realised outputs: the half of `symlink_derived_files` after the

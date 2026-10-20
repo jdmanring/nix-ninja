@@ -1193,6 +1193,38 @@ impl Runner {
     /// byte-identity case - no task's discovery consults a table.
     pub fn build_producer_index(&mut self, graph: &graph::Graph) {
         self.producer_index = Some(Arc::new(producer_index_of(graph)));
+        // TS PROJECT REFERENCES, FROM THE GRAPH. A ts_library edge's
+        // `--deps` tsconfigs ride its output as co-outputs, so a consumer's
+        // expansion walks the whole reference chain (core/root's dep
+        // bundle-tsconfig.json names platform-tsconfig.json; TS6053, task
+        // 6h2dgzyi). Read here rather than when the producer resolves,
+        // because a producer already up to date is never resolved again.
+        for bid in graph.builds.all_ids() {
+            let build = &graph.builds[bid];
+            let Some(c) = build.cmdline.as_deref() else {
+                continue;
+            };
+            if !c.contains("ts_library.py") && !c.contains("generate-tsconfig.js") {
+                continue;
+            }
+            let Ok(args) = shell_words::split(c) else {
+                continue;
+            };
+            for dep in ts_library_dep_tsconfigs(&args)
+                .into_iter()
+                .chain(generate_tsconfig_references(&args))
+            {
+                let Some(fid) = graph.files.lookup(&dep) else {
+                    continue;
+                };
+                for out in build.outs() {
+                    let entry = self.co_outputs.entry(*out).or_insert_with(|| vec![*out]);
+                    if !entry.contains(&fid) {
+                        entry.push(fid);
+                    }
+                }
+            }
+        }
     }
 
     /// Build `bid` once more with no producer index (see `no_defer`).
@@ -1872,6 +1904,7 @@ impl Runner {
                         .chain(bison_side_headers(c, &config.build_dir))
                         .chain(particleshadergen_writes(c, &config.build_dir))
                         .chain(docbookl10nhelper_writes(c, &config.build_dir))
+                        .chain(css_js_tsconfig_writes(c, &config.build_dir))
                         .chain(cmake_p_stamp_edge_writes(&paths, c, &config.build_dir))
                         .chain(copy_writes_not_inputs(
                             &paths,
@@ -2800,6 +2833,20 @@ impl Runner {
             let pdl_refs = pdl_baselines(&self.config.build_dir, &cd_dir, &args);
             let (node_files, node_pkgs) =
                 node_script_requires(&self.config.build_dir, &cd_dir, &args);
+            let ts_refs = ts_library_imports(&self.config.build_dir, &cd_dir, &args);
+            // devtools' ts_library.py resolves `--deps ./x-tsconfig.json`
+            // against the OUTPUT tsconfig's directory, so the arg names a
+            // graph node no lookup of the raw spelling finds; tsc then reads
+            // that tsconfig and the files its producer wrote (TS6053, task
+            // khfkv2p6). Each becomes a node arg, which carries the
+            // producer's co-outputs below.
+            // A referenced project's own references follow through the
+            // co-outputs `build_producer_index` records.
+            for dep in ts_library_dep_tsconfigs(&args) {
+                if let Some(fid) = files.lookup(&dep) {
+                    node_args.push(fid);
+                }
+            }
             let schema_tool = cmdline.contains("json_schema_compiler/compiler.py");
             let argc = args.len();
             for (arg_i, arg) in args.into_iter().enumerate() {
@@ -3427,6 +3474,7 @@ impl Runner {
             // `m9yqpy10`).
             referenced.extend(pdl_refs);
             referenced.extend(node_files);
+            referenced.extend(ts_refs);
             for pkg in &node_pkgs {
                 for input in upload_referenced_dir(
                     &self.rpc_client,
@@ -10051,6 +10099,37 @@ pub fn particleshadergen_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf>
         .collect()
 }
 
+/// The tsconfig devtools' `generate_css_js_files.js` writes beside the
+/// `.css.js` files it declares: `<targetGenDir>/<targetName>-tsconfig.json`
+/// from its argv (`<ts> <debug> <target> <srcDir> <targetGenDir> <files>`).
+/// No edge declares it, and a ts_library edge reads it through `--deps`
+/// (TS6053, qtwebengine 6.11.2, task khfkv2p6).
+pub fn css_js_tsconfig_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let Some(at) = toks
+        .iter()
+        .position(|t| t.trim_matches('"').ends_with("generate_css_js_files.js"))
+    else {
+        return Vec::new();
+    };
+    let (Some(target), Some(gen_dir)) = (toks.get(at + 3), toks.get(at + 5)) else {
+        return Vec::new();
+    };
+    let cwd = match toks.as_slice() {
+        ["cd", d, "&&", ..] if d.starts_with('/') => PathBuf::from(d),
+        ["cd", d, "&&", ..] => build_dir.join(d),
+        _ => build_dir.to_path_buf(),
+    };
+    let file = normalize_build_path_lexical(
+        &cwd.join(gen_dir.trim_matches('"'))
+            .join(format!("{}-tsconfig.json", target.trim_matches('"'))),
+    );
+    relative_from(&file, build_dir)
+        .filter(|rel| rel.is_relative() && !rel.starts_with(".."))
+        .into_iter()
+        .collect()
+}
+
 /// The headers a C++ `bison` run writes beside its `-o` output and no edge
 /// declares. kholidays 6.30.0's `bison -d -o <build>/src/holidayparserplan.cpp
 /// holidayparserplan.ypp` (lalr1.cc, `%locations`) declares the `.cpp` and
@@ -10944,6 +11023,7 @@ fn undeclared_outputs(
             .into_iter()
             .chain(particleshadergen_writes(c, build_dir))
             .chain(docbookl10nhelper_writes(c, build_dir))
+            .chain(css_js_tsconfig_writes(c, build_dir))
         {
             if !v.contains(&h) && !declared.contains(&h) {
                 v.push(h);
@@ -12788,6 +12868,152 @@ fn protoc_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
     Some((incs, protos))
 }
 
+/// The tsconfigs a devtools `generate-tsconfig.js` output REFERENCES, by
+/// the script's own rule: `<tsconfig> <file> <dep>...`, each dep `:foo`,
+/// `../path:foo` or `../path` (target = last component), resolved to
+/// `<path>/<target>-tsconfig.json` beside the written tsconfig.
+pub fn generate_tsconfig_references(args: &[String]) -> Vec<String> {
+    let Some(i) = args
+        .iter()
+        .position(|a| a.ends_with("generate-tsconfig.js"))
+    else {
+        return Vec::new();
+    };
+    let Some(out) = args.get(i + 1) else {
+        return Vec::new();
+    };
+    let base = Path::new(out).parent().unwrap_or(Path::new(""));
+    args.iter()
+        .skip(i + 3)
+        .map(|dep| {
+            let (path_part, target) = match dep.split_once(':') {
+                Some((p, t)) => (if p.is_empty() { "." } else { p }, t.to_string()),
+                None => (
+                    dep.as_str(),
+                    Path::new(dep)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                ),
+            };
+            lexical_join(
+                base,
+                &Path::new(path_part).join(format!("{target}-tsconfig.json")),
+            )
+            .to_string_lossy()
+            .into_owned()
+        })
+        .collect()
+}
+
+/// A `ts_library.py` run's `--deps` tsconfigs, spelled from the build dir:
+/// each value is relative to the directory of `--tsconfig_output_location`.
+pub fn ts_library_dep_tsconfigs(args: &[String]) -> Vec<String> {
+    if !args.iter().any(|a| a.ends_with("ts_library.py")) {
+        return Vec::new();
+    }
+    let Some(out) = args
+        .iter()
+        .position(|a| a == "--tsconfig_output_location")
+        .and_then(|i| args.get(i + 1))
+    else {
+        return Vec::new();
+    };
+    let base = Path::new(out).parent().unwrap_or(Path::new(""));
+    let mut deps = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a != "--deps" {
+            continue;
+        }
+        for v in it.by_ref() {
+            if v.starts_with("--") {
+                break;
+            }
+            deps.push(
+                lexical_join(base, Path::new(v))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    deps
+}
+
+/// What tsc reads beside a `ts_library.py` edge's sources that no edge
+/// declares: each RELATIVE import, resolved the way tsc resolves it (a
+/// `.js` specifier to the `.ts`, then the `.d.ts`, then the `.js` itself),
+/// followed through every file reached. devtools' code_highlighter failed
+/// TS2792 on `../../../third_party/codemirror.next/codemirror.next.js`,
+/// whose `.d.ts` sits in the source tree (qtwebengine 6.11.2, task
+/// wcyrl24y). Sources come as `--sources` operands or a `--sources-list`
+/// file. Spelled relative to the build dir.
+pub fn ts_library_imports(build_dir: &Path, cd_dir: &Path, args: &[String]) -> Vec<String> {
+    if !args.iter().any(|a| a.ends_with("ts_library.py")) {
+        return Vec::new();
+    }
+    let at = |rel: &Path| build_dir.join(rel);
+    let mut srcs: Vec<PathBuf> = args
+        .iter()
+        .filter(|a| !a.starts_with('-') && a.ends_with(".ts"))
+        .map(|a| lexical_join(Path::new(""), &rebase_post_cd(cd_dir, a)))
+        .collect();
+    if let Some(list) = args
+        .iter()
+        .position(|a| a == "--sources-list")
+        .and_then(|i| args.get(i + 1))
+    {
+        if let Ok(body) = fs::read_to_string(at(&rebase_post_cd(cd_dir, list))) {
+            srcs.extend(
+                body.split_whitespace()
+                    .filter(|t| t.ends_with(".ts"))
+                    .map(|t| lexical_join(Path::new(""), &rebase_post_cd(cd_dir, t))),
+            );
+        }
+    }
+    static SPEC: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        Regex::new(r#"(?:\bfrom\s*|\bimport\s*\(?\s*|require\(\s*)['"](\.{1,2}/[^'"\n]+)['"]"#)
+            .unwrap()
+    });
+    let mut seen: Vec<PathBuf> = srcs.clone();
+    let mut queue = srcs;
+    let mut out = Vec::new();
+    while let Some(f) = queue.pop() {
+        if seen.len() > 5000 {
+            break;
+        }
+        let Ok(text) = fs::read_to_string(at(&f)) else {
+            continue;
+        };
+        let dir = f.parent().unwrap_or(Path::new("")).to_path_buf();
+        for c in spec.captures_iter(&text) {
+            let base = lexical_join(&dir, Path::new(&c[1]));
+            let stem = base.to_string_lossy();
+            let stem = stem
+                .strip_suffix(".js")
+                .or_else(|| stem.strip_suffix(".mjs"))
+                .unwrap_or(&stem)
+                .to_string();
+            for cand in [
+                PathBuf::from(format!("{stem}.ts")),
+                PathBuf::from(format!("{stem}.d.ts")),
+                base.clone(),
+            ] {
+                if at(&cand).is_file() {
+                    if !seen.contains(&cand) {
+                        seen.push(cand.clone());
+                        out.push(cand.to_string_lossy().into_owned());
+                        queue.push(cand);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// What a node script run through Chromium's `node.py` loads that no edge
 /// declares: its relative requires and imports (followed file by file) and
 /// the `node_modules` package each bare specifier resolves to by node's own
@@ -12833,11 +13059,20 @@ pub fn node_script_requires(
     else {
         return (Vec::new(), Vec::new());
     };
-    let Some(script) = args[i + 1..].iter().find(|a| {
-        !a.starts_with('-') && (a.ends_with(".js") || a.ends_with(".mjs") || a.ends_with(".cjs"))
-    }) else {
-        return (Vec::new(), Vec::new());
-    };
+    // The program node runs is the first operand after node.py, whatever
+    // its name (`node_modules/@rollup/wasm-node/dist/bin/rollup` has no
+    // extension); every other script operand (`--config rollup.config.mjs`)
+    // is a root too.
+    let is_js = |a: &str| a.ends_with(".js") || a.ends_with(".mjs") || a.ends_with(".cjs");
+    let mut roots: Vec<&String> = Vec::new();
+    if let Some(prog) = args[i + 1..].iter().find(|a| !a.starts_with('-')) {
+        roots.push(prog);
+    }
+    roots.extend(
+        args[i + 1..]
+            .iter()
+            .filter(|a| !a.starts_with('-') && is_js(a)),
+    );
     static SPEC: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let spec = SPEC.get_or_init(|| {
         Regex::new(r#"(?:require\(\s*|\bfrom\s*|\bimport\s*\(?\s*)['"]([^'"\n]+)['"]"#).unwrap()
@@ -12858,10 +13093,28 @@ pub fn node_script_requires(
     };
     let mut files: Vec<PathBuf> = Vec::new();
     let mut pkgs: Vec<PathBuf> = Vec::new();
-    let first = lexical_join(Path::new(""), &rebase_post_cd(cd_dir, script));
-    let mut queue = vec![first.clone()];
-    let mut seen = vec![first];
+    let mut queue: Vec<PathBuf> = Vec::new();
+    let mut seen: Vec<PathBuf> = Vec::new();
     let mut pkg_queue: Vec<PathBuf> = Vec::new();
+    for r in roots {
+        let f = lexical_join(Path::new(""), &rebase_post_cd(cd_dir, r));
+        if !at(&f).is_file() || seen.contains(&f) {
+            continue;
+        }
+        // A script inside node_modules runs inside its package: carry the
+        // package (rollup's bin requires `../shared/rollup.js`).
+        if let Some(rel) = computed_path_carry(&at(&f))
+            .filter(|p| p.is_dir())
+            .and_then(|p| relative_from(&p, build_dir))
+        {
+            if !pkgs.contains(&rel) {
+                pkgs.push(rel.clone());
+                pkg_queue.push(rel);
+            }
+        }
+        seen.push(f.clone());
+        queue.push(f);
+    }
     while let Some(f) = queue.pop() {
         if seen.len() > 2000 {
             break;
@@ -18893,6 +19146,31 @@ mod closure_step_tests {
                 PathBuf::from("../src/node_modules/uuid")
             ]
         );
+        // rollup's shape: an extensionless bin inside a scoped package.
+        std::fs::create_dir_all(src.join("node_modules/@rollup/wasm-node/dist/bin")).unwrap();
+        std::fs::write(
+            src.join("node_modules/@rollup/wasm-node/dist/bin/rollup"),
+            "require('../shared/rollup.js');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("node_modules/@rollup/wasm-node/package.json"),
+            "{}",
+        )
+        .unwrap();
+        let bin: Vec<String> = [
+            "python3",
+            "../src/third_party/node/node.py",
+            "../src/node_modules/@rollup/wasm-node/dist/bin/rollup",
+            "--silent",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            super::node_script_requires(&bd, Path::new(""), &bin).1,
+            vec![PathBuf::from("../src/node_modules/@rollup/wasm-node")]
+        );
         let other: Vec<String> = ["node", "../src/scripts/build/gen.js"]
             .iter()
             .map(|s| s.to_string())
@@ -18901,6 +19179,135 @@ mod closure_step_tests {
             super::node_script_requires(&bd, Path::new(""), &other),
             (Vec::new(), Vec::new())
         );
+    }
+
+    /// devtools' shape: a source imports a sibling module through `.js`, whose
+    /// declaration sits beside it as `.d.ts`; what that file imports follows.
+    #[test]
+    fn a_ts_library_source_carries_its_relative_imports() {
+        use std::path::Path;
+        let d = super::Scratch::new(format!("nn-ts-imp-{}", std::process::id()));
+        let bd = d.join("out");
+        std::fs::create_dir_all(d.join("fe/ui/ch")).unwrap();
+        std::fs::create_dir_all(d.join("fe/third_party/cm/chunk")).unwrap();
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(
+            d.join("fe/ui/ch/CodeHighlighter.ts"),
+            "import * as CM from '../../third_party/cm/cm.js';\nimport 'lit';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("fe/third_party/cm/cm.d.ts"),
+            "export * from './chunk/a.js';\n",
+        )
+        .unwrap();
+        std::fs::write(d.join("fe/third_party/cm/chunk/a.d.ts"), "").unwrap();
+        let args: Vec<String> = [
+            "python3",
+            "../scripts/ts_library.py",
+            "--sources",
+            "../fe/ui/ch/CodeHighlighter.ts",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut got = super::ts_library_imports(&bd, Path::new(""), &args);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "../fe/third_party/cm/chunk/a.d.ts".to_string(),
+                "../fe/third_party/cm/cm.d.ts".to_string()
+            ]
+        );
+        let not: Vec<String> = ["tsc", "../fe/ui/ch/CodeHighlighter.ts"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(super::ts_library_imports(&bd, Path::new(""), &not).is_empty());
+    }
+
+    /// devtools_paths.py's own line: a name spliced onto sys.path through a
+    /// runtime call is the script's to resolve; an evaluable splice and a
+    /// name nobody splices are not reported.
+    #[test]
+    fn a_name_the_script_splices_itself_is_not_guessed() {
+        let d = super::Scratch::new(format!("nn-self-splice-{}", std::process::id()));
+        std::fs::write(d.join("devtools_paths.py"), "def node_path():\n    try:\n        old_sys_path = sys.path[:]\n        sys.path.append(path.join(third_party_path(), 'node'))\n        import node\n    finally:\n        sys.path = old_sys_path\n").unwrap();
+        std::fs::write(d.join("other.py"), "sys.path.append(os.path.join(os.path.dirname(__file__), 'grit'))\nimport grit\nimport json5\n").unwrap();
+        std::fs::create_dir_all(d.join("grit")).unwrap();
+        let wanted = ["node".to_string(), "grit".to_string(), "json5".to_string()];
+        assert_eq!(
+            super::python_self_spliced_names(&d, &wanted),
+            vec!["node".to_string()]
+        );
+    }
+
+    /// devtools' argv: `--deps` values are relative to the output tsconfig's
+    /// directory, several may follow one flag, and a `--` flag ends them.
+    #[test]
+    fn ts_library_deps_resolve_from_the_output_tsconfig_dir() {
+        let args: Vec<String> = [
+            "python3",
+            "../s/ts_library.py",
+            "--tsconfig_output_location",
+            "gen/fe/ui/input/b-tsconfig.json",
+            "--deps",
+            "./css_files-tsconfig.json",
+            "../../core/x-tsconfig.json",
+            "--front_end_directory",
+            "../fe",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            super::ts_library_dep_tsconfigs(&args),
+            vec![
+                "gen/fe/ui/input/css_files-tsconfig.json".to_string(),
+                "gen/fe/core/x-tsconfig.json".to_string()
+            ]
+        );
+        assert!(super::ts_library_dep_tsconfigs(&args[2..]).is_empty());
+    }
+
+    /// generate-tsconfig.js's three dep spellings, from the script's rule.
+    #[test]
+    fn generated_tsconfig_references_follow_the_script_rule() {
+        let args: Vec<String> = [
+            "python3",
+            "node.py",
+            "../s/generate-tsconfig.js",
+            "gen/fe/core/platform/bundle-tsconfig.json",
+            "../fe/core/platform/platform.ts",
+            ":platform",
+            "../../core/i18n:bundle",
+            "../../panels/mobile_throttling",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            super::generate_tsconfig_references(&args),
+            vec![
+                "gen/fe/core/platform/platform-tsconfig.json".to_string(),
+                "gen/fe/core/i18n/bundle-tsconfig.json".to_string(),
+                "gen/fe/panels/mobile_throttling/mobile_throttling-tsconfig.json".to_string(),
+            ]
+        );
+    }
+
+    /// generate_css_js_files.js's argv as qtwebengine 6.11.2 passes it.
+    #[test]
+    fn css_js_generation_declares_the_tsconfig_it_writes() {
+        use std::path::{Path, PathBuf};
+        let b = Path::new("/build/q/build");
+        let c = "/nix/store/x-python3/bin/python3.14 ../src/third_party/node/node.py ../src/devtools/scripts/build/generate_css_js_files.js 1757221200 false css_files ../src/devtools/front_end/ui/input gen/fe/ui/input checkbox.css,textInput.css";
+        assert_eq!(
+            super::css_js_tsconfig_writes(c, b),
+            vec![PathBuf::from("gen/fe/ui/input/css_files-tsconfig.json")]
+        );
+        assert!(super::css_js_tsconfig_writes("python3 node.py other.js a b c d e", b).is_empty());
     }
 
     /// A file in node_modules carries its package, a scope dir is carried, a
@@ -19037,6 +19444,7 @@ fn upload_python_closure_uncached(
                     && !dir.join(name).is_dir()
             })
             .collect();
+        let self_spliced_names = python_self_spliced_names(&dir, &unsatisfied);
         {
             // A PLAIN SCOPE. This was `if let Some(parent) = dir.parent()`,
             // whose binding both halves below have stopped using: the sibling
@@ -19082,6 +19490,17 @@ fn upload_python_closure_uncached(
                     // repairing the read below it and is kept out
                     // deliberately; widening the probed set is its own change
                     // with its own measurement.
+                    // A NAME THE SCRIPT PUTS ON sys.path ITSELF, through a path
+                    // it builds at runtime (`sys.path.append(path.join(
+                    // third_party_path(), 'node'))` inside devtools_paths'
+                    // node_path), resolves where the script says, not where
+                    // this probe guesses. The guess carried devtools'
+                    // third_party/node, which the task's PYTHONPATH then put
+                    // ahead of Chromium's, and tsc ran a node binary that does
+                    // not exist (qtwebengine 6.11.2, task 1x771v29).
+                    if self_spliced_names.contains(name) {
+                        continue;
+                    }
                     let mut anc = dir.parent().unwrap_or(Path::new("")).to_path_buf();
                     'levels: for _ in 0..4 {
                         let Some(up) = anc.parent() else { break };
@@ -19772,6 +20191,42 @@ fn py_path_eval(expr: &str, file: &Path, names: &HashMap<String, PathBuf>) -> Ve
             V::S(_) => None,
         })
         .collect()
+}
+
+/// The NAMES among `wanted` that a .py file in `dir` splices onto sys.path
+/// itself: a `sys.path.append`/`insert` line whose last quoted literal is
+/// the name (`path.join(third_party_path(), 'node')`) and which the
+/// evaluator cannot place. The script decides where those resolve.
+fn python_self_spliced_names(dir: &Path, wanted: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "py") {
+            continue;
+        }
+        let Ok(body) = fs::read_to_string(&p) else {
+            continue;
+        };
+        let placed = py_computed_paths(&p, &body).1;
+        for line in py_logical_lines(&body) {
+            if !line.contains("sys.path.append(") && !line.contains("sys.path.insert(") {
+                continue;
+            }
+            for n in wanted {
+                let quoted = [format!("'{n}')"), format!("\"{n}\")")];
+                if quoted.iter().any(|q| line.contains(q.as_str()))
+                    && !placed.iter().any(|d| d.ends_with(n))
+                    && !out.contains(n)
+                {
+                    out.push(n.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A python file's logical lines: a line whose brackets do not balance is
