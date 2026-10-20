@@ -249,6 +249,44 @@ async fn bounded<T>(
     }
 }
 
+/// Milliseconds since this process first asked, for activity stamps.
+fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Runs FUT to completion unless no daemon frame arrives for ALLOWANCE:
+/// LAST holds the `now_ms` of the latest frame and the caller stamps it.
+/// `Err(())` is that silence. A realise is one call however large its
+/// closure, and the daemon reports each build it starts and finishes on the
+/// connection, so a wall-clock bound over the whole call dropped a working
+/// connection: qtwebengine's assert_grd realise built 128 derivations of
+/// its closure in the five minutes before its 300 s allowance ran out, the
+/// drop interrupted the rest, and the retry failed "1 dependency failed".
+async fn idle_timeout<T>(
+    allowance: std::time::Duration,
+    last: &std::sync::atomic::AtomicU64,
+    fut: impl std::future::Future<Output = T>,
+) -> std::result::Result<T, ()> {
+    tokio::pin!(fut);
+    let limit = allowance.as_millis() as u64;
+    let tick = std::time::Duration::from_millis((limit / 4).clamp(10, 5000));
+    loop {
+        tokio::select! {
+            out = &mut fut => return Ok(out),
+            _ = tokio::time::sleep(tick) => {
+                let quiet = now_ms().saturating_sub(last.load(std::sync::atomic::Ordering::Relaxed));
+                if quiet >= limit {
+                    return Err(());
+                }
+            }
+        }
+    }
+}
+
 /// The allowance every non-build exchange gets: the first rung of the
 /// build watchdog's ladder.
 fn upload_allowance() -> std::time::Duration {
@@ -490,6 +528,39 @@ mod bounded_exchange_tests {
 #[cfg(test)]
 mod watchdog_policy_tests {
     use super::stall_allowance_s;
+
+    /// A call that keeps reporting outlives its allowance; a silent one
+    /// does not. The first is the assert_grd realise the wall-clock bound
+    /// dropped.
+    #[test]
+    fn the_allowance_bounds_silence_not_the_call() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let allowance = Duration::from_millis(150);
+        let last = AtomicU64::new(super::now_ms());
+        let busy = rt.block_on(super::idle_timeout(allowance, &last, async {
+            for _ in 0..8 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                last.store(super::now_ms(), Ordering::Relaxed);
+            }
+            7
+        }));
+        assert_eq!(busy, Ok(7), "a call reporting every 50 ms ran 400 ms");
+        let last = AtomicU64::new(super::now_ms());
+        let silent = rt.block_on(super::idle_timeout(allowance, &last, async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            7
+        }));
+        assert_eq!(
+            silent,
+            Err(()),
+            "a call silent for 600 ms passed a 150 ms allowance"
+        );
+    }
 
     // The shell monitors grep the LOG for these substrings, and the log
     // only ever sees an error through Display - a pattern verified
@@ -1849,10 +1920,22 @@ impl BuilderRpcClient {
                     eprintln!("nix-ninja: [{}] WATCHDOG peak in-flight {in_now}", now_s());
                 }
                 let started_wall = now_s();
-                let outcome = tokio::time::timeout(
+                // THE ALLOWANCE IS FOR SILENCE, NOT FOR THE CALL: every frame
+                // the daemon sends while it builds (activity start, result,
+                // stop, log lines) restamps `last`, so a long closure that is
+                // building is never dropped, and a wedged daemon still is.
+                let last = std::sync::atomic::AtomicU64::new(now_ms());
+                let outcome = idle_timeout(
                     std::time::Duration::from_secs(allowance_s),
-                    guard.execute(|client| {
-                        client.build_paths_with_results(&merged, BuildMode::Normal)
+                    &last,
+                    guard.execute(|client| async {
+                        use futures::StreamExt as _;
+                        let rl = client.build_paths_with_results(&merged, BuildMode::Normal);
+                        tokio::pin!(rl);
+                        while rl.next().await.is_some() {
+                            last.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                        rl.await
                     }),
                 )
                 .await;
