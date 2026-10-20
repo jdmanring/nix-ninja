@@ -2903,10 +2903,7 @@ impl Runner {
                                     // was refused). Passed over only when too
                                     // large to carry, so an edge that resolves
                                     // today emits what it did.
-                                    if is_syncqt
-                                        && SYNCQT_OUTPUT_DIR_FLAGS.contains(&flag)
-                                        && dir_exceeds_files(p, DATA_DIR_CAP)
-                                    {
+                                    if is_syncqt && syncqt_passes_over(flag, p, DATA_DIR_CAP) {
                                         continue;
                                     }
                                     if p.is_dir() {
@@ -4373,16 +4370,11 @@ impl Runner {
         // their command, and every such qtwebengine task died
         // `NODEJS_EXECUTABLE must be set` (task `0wlx1f81`).
         let forwarded = |key: &str| {
-            command_scoped(key).is_none_or(|programs| {
-                cmdline
-                    .as_deref()
-                    .is_some_and(|c| programs.iter().any(|p| c.contains(p)))
-                    || inputs.iter().any(|i| {
-                        Path::new(&i.build_path)
-                            .file_name()
-                            .is_some_and(|n| programs.iter().any(|p| n == *p))
-                    })
-            })
+            scoped_key_reaches(
+                key,
+                cmdline.as_deref(),
+                inputs.iter().map(|i| Path::new(&i.build_path)),
+            )
         };
         let wrapper_vars: HashMap<String, String> = self
             .wrapper_vars
@@ -5394,6 +5386,23 @@ fn forwarded_to_tasks(key: &str) -> bool {
 /// the compiler never reads; scoped to the consumer, only the tasks that
 /// failed without it move. Matched as a substring of the command, which
 /// takes `--msgfmt=<path>` and `msgfmthelper` alike.
+/// Whether a forwarded KEY reaches a task: always unless the key is
+/// command-scoped, and then only when the command names a consumer or an
+/// input carries one by file name.
+fn scoped_key_reaches<'a>(
+    key: &str,
+    cmdline: Option<&str>,
+    mut inputs: impl Iterator<Item = &'a Path>,
+) -> bool {
+    command_scoped(key).is_none_or(|programs| {
+        cmdline.is_some_and(|c| programs.iter().any(|p| c.contains(p)))
+            || inputs.any(|i| {
+                i.file_name()
+                    .is_some_and(|n| programs.iter().any(|p| n == *p))
+            })
+    })
+}
+
 fn command_scoped(key: &str) -> Option<&'static [&'static str]> {
     match key {
         "GETTEXTDATADIRS" => Some(&["msgfmt"]),
@@ -5502,15 +5511,46 @@ mod forwarded_to_tasks_tests {
         assert!(!forwarded_to_tasks("GETTEXTDATADIRS_FOR_BUILD"));
     }
 
-    /// node.py's interpreter, scoped to the commands that run node.py: every
-    /// other task under qtwebengine's nested ninja keys as it did without it.
+    /// node.py's interpreter, scoped to the tasks that run node.py: named on
+    /// the command, or carried as an input through an import closure
+    /// (ts_library.py). Every other task keys as it did without it.
     #[test]
     fn the_node_executable_reaches_node_py_alone() {
+        use std::path::Path;
         assert!(forwarded_to_tasks("NODEJS_EXECUTABLE"));
         assert_eq!(
             super::command_scoped("NODEJS_EXECUTABLE"),
             Some(&["node.py"][..])
         );
+        let k = "NODEJS_EXECUTABLE";
+        let none = std::iter::empty::<&Path>;
+        assert!(super::scoped_key_reaches(
+            k,
+            Some("python3 ../third_party/node/node.py x.js"),
+            none()
+        ));
+        let carried = [
+            Path::new("../tools/typescript/ts_library.py"),
+            Path::new("../third_party/node/node.py"),
+        ];
+        assert!(
+            super::scoped_key_reaches(
+                k,
+                Some("python3 ../tools/typescript/ts_library.py"),
+                carried.into_iter()
+            ),
+            "an import-closure consumer must get the variable"
+        );
+        let other = [
+            Path::new("../tools/grit/grit.py"),
+            Path::new("../third_party/node/node.pyc"),
+        ];
+        assert!(!super::scoped_key_reaches(
+            k,
+            Some("python3 ../tools/grit/grit.py"),
+            other.into_iter()
+        ));
+        assert!(super::scoped_key_reaches("PYTHONPATH", None, none()));
     }
 
     /// The silent half, and the reason it is not a NIX_ PREFIX like the
@@ -14045,6 +14085,86 @@ mod its_and_swig_reader_tests {
         assert!(protoc_invocation(&not).is_none());
     }
 
+    /// inspector_protocol's compatibility check reads `<stem>-<maj>.<min>.json`
+    /// beside each `.pdl` (qtwebengine 6.11.2's argv shape, behind no `cd`);
+    /// other siblings and other commands carry nothing.
+    #[test]
+    fn a_protocol_check_carries_each_pdl_baseline() {
+        use super::Scratch;
+        let d = Scratch::new(format!("nn-pdl-{}", std::process::id()));
+        let bd = d.join("out");
+        std::fs::create_dir_all(d.join("v8/include")).unwrap();
+        std::fs::create_dir_all(&bd).unwrap();
+        for f in [
+            "js_protocol.pdl",
+            "js_protocol-1.2.json",
+            "js_protocol-1.3.json",
+            "js_protocol-x.json",
+            "other-1.3.json",
+        ] {
+            std::fs::write(d.join("v8/include").join(f), b"").unwrap();
+        }
+        let args: Vec<String> = [
+            "python3",
+            "../third_party/inspector_protocol/check_protocol_compatibility.py",
+            "--stamp",
+            "gen/x.stamp",
+            "../v8/include/js_protocol.pdl",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            super::pdl_baselines(&bd, Path::new(""), &args),
+            vec![
+                "../v8/include/js_protocol-1.2.json".to_string(),
+                "../v8/include/js_protocol-1.3.json".to_string()
+            ]
+        );
+        let mut not = args.clone();
+        not[1] = "../tools/other.py".into();
+        assert!(super::pdl_baselines(&bd, Path::new(""), &not).is_empty());
+    }
+
+    /// The store paths a carried tree's files name, existing ones only. The
+    /// positive arm needs a real store path, taken from cargo's own (a store
+    /// path in the dev shell and in CI), never a scan of the store.
+    #[test]
+    fn a_carried_tree_yields_the_store_paths_its_files_name() {
+        use super::Scratch;
+        let d = Scratch::new(format!("nn-tree-store-{}", std::process::id()));
+        let store = super::StoreDir::new(Path::new("/nix/store")).unwrap();
+        let re = regex::Regex::new(r"/nix/store\/[a-z0-9]{32}-[0-9a-zA-Z\+\-\._\?=]+").unwrap();
+        std::fs::create_dir_all(d.join("dtd")).unwrap();
+        std::fs::write(
+            d.join("dtd/x.dtd"),
+            "<!ENTITY % d SYSTEM \"/nix/store/00000000000000000000000000000000-absent/x.dtd\">",
+        )
+        .unwrap();
+        assert!(super::store_paths_named_below(&store, &re, &d)
+            .unwrap()
+            .is_empty());
+        let cargo = std::fs::canonicalize(env!("CARGO")).unwrap();
+        let Some(root) = cargo
+            .strip_prefix("/nix/store")
+            .ok()
+            .and_then(|r| r.components().next())
+        else {
+            eprintln!("NO ANSWER: cargo is not a store path here; positive arm not run");
+            return;
+        };
+        let real = Path::new("/nix/store").join(root.as_os_str());
+        let e = Scratch::new(format!("nn-tree-store2-{}", std::process::id()));
+        std::fs::create_dir_all(e.join("dtd")).unwrap();
+        std::fs::write(
+            e.join("dtd/y.dtd"),
+            format!("<!ENTITY % d SYSTEM \"{}/x\">", real.display()),
+        )
+        .unwrap();
+        let got = super::store_paths_named_below(&store, &re, &e).unwrap();
+        assert_eq!(got.len(), 1, "{got:?}");
+    }
+
     /// Chromium's protoc_wrapper.py, argv as qtwebengine 6.11.2's
     /// toolchain.ninja passes it: `--proto-in-dir` and `--import-dir` are
     /// roots, and each positional proto is relative to the proto-in-dir.
@@ -18294,6 +18414,13 @@ const SYNCQT_OUTPUT_DIR_FLAGS: &[&str] = &[
     "-installIncludeDir",
 ];
 
+/// Whether a syncqt args-file directory token is passed over: it follows a
+/// flag naming where syncqt WRITES, and it is too large to carry. Below the
+/// cap it is carried as before.
+fn syncqt_passes_over(flag: &str, dir: &Path, cap: usize) -> bool {
+    SYNCQT_OUTPUT_DIR_FLAGS.contains(&flag) && dir_exceeds_files(dir, cap)
+}
+
 /// Whether DIR holds more than CAP files, counted without uploading and
 /// memoized per process. Asked where a directory too large to carry is
 /// passed over rather than refused: a `sys.path` root (Chromium's source
@@ -18488,6 +18615,10 @@ mod closure_step_tests {
         }
         assert!(super::dir_exceeds_files(&d, 2));
         assert!(!super::dir_exceeds_files(&d, 3));
+        // syncqt: only an OUTPUT dir, and only over the cap.
+        assert!(super::syncqt_passes_over("-binaryDir", &d, 2));
+        assert!(!super::syncqt_passes_over("-binaryDir", &d, 3));
+        assert!(!super::syncqt_passes_over("-sourceDir", &d, 2));
     }
 }
 
