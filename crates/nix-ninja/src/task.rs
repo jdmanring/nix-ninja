@@ -4208,6 +4208,49 @@ impl Runner {
             }
         }
 
+        // THE IMPORT CLOSURE CHROMIUM RECORDED FOR A PYTHONPATH ROOT. A
+        // `run_with_pythonpath.py -I <root>` command imports packages from
+        // the root that splice further roots onto sys.path inside functions
+        // (web_idl's `_setup_sys_path` adds `tools`, where idl_parser
+        // lives); the task died `No module named 'idl_parser'` (task
+        // baxyy95l). GN's own `.pydeps` lists in the root name every file
+        // that code imports; each one is carried.
+        for root in cmdline
+            .as_deref()
+            .map(run_with_pythonpath_roots)
+            .unwrap_or_default()
+        {
+            let abs_root = self.config.build_dir.join(&root);
+            let mut lists: Vec<PathBuf> = fs::read_dir(&abs_root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "pydeps"))
+                .collect();
+            lists.sort();
+            for list in lists {
+                let Ok(body) = fs::read_to_string(&list) else {
+                    continue;
+                };
+                for line in body.lines().map(str::trim) {
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let f = normalize_build_path_lexical(&abs_root.join(line));
+                    let Some(r) = relative_from(&f, &self.config.build_dir) else {
+                        continue;
+                    };
+                    if input_set.contains_key(&r) || !self.config.build_dir.join(&r).is_file() {
+                        continue;
+                    }
+                    let up = new_opaque_file(&self.rpc_client, &self.config.build_dir, r)?;
+                    self.add_derived_file(files, up.clone());
+                    input_set.insert(up.build_path.clone(), up);
+                }
+            }
+        }
+
         // A PROGRAM IN A node_modules PACKAGE'S bin/ RUNS INSIDE ITS PACKAGE,
         // whichever reader carried it: devtools' build_inspector_overlay.py
         // execs `devtools_paths.rollup_path()` itself, so no node.py command
@@ -4220,6 +4263,21 @@ impl Runner {
             .filter_map(|p| node_bin_package(p))
             .filter(|pkg| self.config.build_dir.join(pkg).is_dir())
             .collect();
+        // Rollup loads a `--plugin <name>` by PACKAGE NAME from its own
+        // node_modules (`@rollup/plugin-<name>`, `rollup-plugin-<name>`),
+        // and the overlay script names `terser` in its own source, not on
+        // the command line: every rollup plugin package beside a carried
+        // rollup rides with it. Then each package brings its dependencies.
+        let plugins: Vec<PathBuf> = bin_pkgs
+            .iter()
+            .filter_map(|pkg| rollup_node_modules(pkg))
+            .flat_map(|nm| rollup_plugin_packages(&self.config.build_dir, &nm))
+            .collect();
+        bin_pkgs.extend(plugins);
+        bin_pkgs.sort();
+        bin_pkgs.dedup();
+        let seeds = bin_pkgs.clone();
+        node_package_dependencies(&self.config.build_dir, &mut bin_pkgs, seeds);
         bin_pkgs.sort();
         bin_pkgs.dedup();
         for pkg in &bin_pkgs {
@@ -13342,17 +13400,7 @@ pub fn node_script_requires(
     let at = |rel: &Path| build_dir.join(rel);
     // Node's rule, on real parents: from the requiring file's directory up
     // to the filesystem root, the first `node_modules/<name>` wins.
-    let resolve_pkg = |from: &Path, name: &str| -> Option<PathBuf> {
-        let mut cur = Some(lexical_join(build_dir, from));
-        while let Some(d) = cur {
-            let cand = d.join("node_modules").join(name);
-            if cand.is_dir() {
-                return relative_from(&cand, build_dir);
-            }
-            cur = d.parent().map(Path::to_path_buf);
-        }
-        None
-    };
+    let resolve_pkg = |from: &Path, name: &str| resolve_node_pkg(build_dir, from, name);
     let mut files: Vec<PathBuf> = Vec::new();
     let mut pkgs: Vec<PathBuf> = Vec::new();
     let mut queue: Vec<PathBuf> = Vec::new();
@@ -13430,27 +13478,7 @@ pub fn node_script_requires(
             }
         }
         // A package's own dependencies resolve from the package.
-        while let Some(pkg) = pkg_queue.pop() {
-            let Ok(body) = fs::read_to_string(at(&pkg.join("package.json"))) else {
-                continue;
-            };
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
-                continue;
-            };
-            let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) else {
-                continue;
-            };
-            let mut names: Vec<&String> = deps.keys().collect();
-            names.sort();
-            for n in names {
-                if let Some(dep) = resolve_pkg(&pkg, n) {
-                    if !pkgs.contains(&dep) {
-                        pkgs.push(dep.clone());
-                        pkg_queue.push(dep);
-                    }
-                }
-            }
-        }
+        node_package_dependencies(build_dir, &mut pkgs, std::mem::take(&mut pkg_queue));
     }
     (
         files
@@ -13459,6 +13487,47 @@ pub fn node_script_requires(
             .collect(),
         pkgs,
     )
+}
+
+/// Node's rule, on real parents: from the requiring directory FROM (build
+/// relative) up to the filesystem root, the first `node_modules/<name>`
+/// directory wins.
+fn resolve_node_pkg(build_dir: &Path, from: &Path, name: &str) -> Option<PathBuf> {
+    let mut cur = Some(lexical_join(build_dir, from));
+    while let Some(d) = cur {
+        let cand = d.join("node_modules").join(name);
+        if cand.is_dir() {
+            return relative_from(&cand, build_dir);
+        }
+        cur = d.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+/// Adds to PKGS each package QUEUE's packages depend on (`package.json`
+/// `dependencies`, resolved from the depending package), transitively.
+fn node_package_dependencies(build_dir: &Path, pkgs: &mut Vec<PathBuf>, mut queue: Vec<PathBuf>) {
+    while let Some(pkg) = queue.pop() {
+        let Ok(body) = fs::read_to_string(build_dir.join(pkg.join("package.json"))) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) else {
+            continue;
+        };
+        let mut names: Vec<&String> = deps.keys().collect();
+        names.sort();
+        for n in names {
+            if let Some(dep) = resolve_node_pkg(build_dir, &pkg, n) {
+                if !pkgs.contains(&dep) {
+                    pkgs.push(dep.clone());
+                    queue.push(dep);
+                }
+            }
+        }
+    }
 }
 
 /// The baselines a `check_protocol_compatibility.py` run reads beside each
@@ -19745,6 +19814,32 @@ mod closure_step_tests {
             super::tool_flag_bare_programs("x --bison=bison"),
             vec!["bison".to_string()]
         );
+        // The color_data.cc edge's operand spelling, and its negative: the
+        // same token after another script names nothing.
+        let positional = "python3 ../s/run_with_pythonpath.py -I ../s ../s/gperf.py gperf \
+                          --key-positions=\\* -D -s 2 ../c/color_data.gperf --output-file=gen/c.cc";
+        assert_eq!(
+            super::tool_flag_bare_programs(positional),
+            vec!["gperf".to_string()]
+        );
+        assert_eq!(
+            super::tool_flag_bare_programs("python3 ../s/make.py gperf -o x"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The event_handler_names.h edge's roots, and nothing for a command
+    /// that is not run_with_pythonpath.py even when it passes `-I`.
+    #[test]
+    fn run_with_pythonpath_roots_are_its_dash_i_values() {
+        assert_eq!(
+            super::run_with_pythonpath_roots(
+                "python3 ../c/blink/renderer/build/scripts/run_with_pythonpath.py \
+                 -I ../c/blink/renderer/bindings/scripts ../c/gen_names.py --webidl x -I y"
+            ),
+            vec!["../c/blink/renderer/bindings/scripts", "y"]
+        );
+        assert!(super::run_with_pythonpath_roots("cc -I ../inc -c a.c").is_empty());
     }
 
     /// generate-tsconfig.js's three dep spellings, from the script's rule.
@@ -20856,6 +20951,50 @@ pub fn node_bin_package(p: &Path) -> Option<PathBuf> {
     below
         .contains(&std::ffi::OsStr::new("bin"))
         .then(|| comps[..end].iter().collect())
+}
+
+/// The `-I` roots of a Chromium `run_with_pythonpath.py` command, which it
+/// puts on PYTHONPATH; nothing for any other command.
+pub fn run_with_pythonpath_roots(cmdline: &str) -> Vec<String> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    if !toks.iter().any(|t| t.ends_with("/run_with_pythonpath.py")) {
+        return Vec::new();
+    }
+    toks.windows(2)
+        .filter(|w| w[0] == "-I" && !w[1].starts_with('-'))
+        .map(|w| w[1].to_string())
+        .collect()
+}
+
+/// The `node_modules` directory holding PKG when PKG is rollup itself
+/// (`<nm>/rollup` or `<nm>/@rollup/wasm-node`), lexically; else None.
+pub fn rollup_node_modules(pkg: &Path) -> Option<PathBuf> {
+    let name = pkg.file_name()?.to_str()?;
+    let parent = pkg.parent()?;
+    match (name, parent.file_name().and_then(|n| n.to_str())) {
+        ("rollup", Some("node_modules")) => Some(parent.to_path_buf()),
+        ("wasm-node", Some("@rollup")) => parent.parent().map(Path::to_path_buf),
+        _ => None,
+    }
+}
+
+/// Every rollup plugin package directory in NM (build relative):
+/// `@rollup/plugin-*` and `rollup-plugin-*`, sorted.
+fn rollup_plugin_packages(build_dir: &Path, nm: &Path) -> Vec<PathBuf> {
+    let list = |dir: &Path, prefix: &str| -> Vec<PathBuf> {
+        fs::read_dir(build_dir.join(dir))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .filter(|e| e.path().is_dir())
+            .map(|e| dir.join(e.file_name()))
+            .collect()
+    };
+    let mut out = list(&nm.join("@rollup"), "plugin-");
+    out.extend(list(nm, "rollup-plugin-"));
+    out.sort();
+    out
 }
 
 /// Every `-p`/`--path` value on a command line (binary_proto_generator's
@@ -26592,13 +26731,21 @@ fn cc_lookup_is_implied<'a>(cmdline: &str, outs: impl Iterator<Item = &'a str>) 
 /// Programs a generator script is HANDED by bare name through a tool flag
 /// and execs itself: blink's `gperf.py` gets `--gperf gperf` and runs it,
 /// and the task died `Command not found` (exit 127; qtwebengine 6.11.2, task
-/// fqp6nz8v). Only flags naming a program, only a value with no `/`.
+/// fqp6nz8v). Only flags naming a program, only a value with no `/`. The
+/// same script also takes the program as its FIRST OPERAND
+/// (`gperf.py gperf --key-positions=*`, color_data.cc, task zmhq4i04), so a
+/// `<tool>.py` followed by the bare `<tool>` names it too.
 pub fn tool_flag_bare_programs(cmdline: &str) -> Vec<String> {
     const TOOL_FLAGS: &[&str] = &["--gperf", "--bison", "--flex"];
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
     let mut out = Vec::new();
     for (i, t) in toks.iter().enumerate() {
+        let operand = TOOL_FLAGS.iter().map(|f| &f[2..]).find(|tool| {
+            Path::new(t).file_name() == Some(std::ffi::OsStr::new(&format!("{tool}.py")))
+                && toks.get(i + 1) == Some(tool)
+        });
         let v = match t.split_once('=') {
+            _ if operand.is_some() => operand.unwrap_or_default(),
             Some((f, v)) if TOOL_FLAGS.contains(&f) => v,
             _ if TOOL_FLAGS.contains(t) => match toks.get(i + 1) {
                 Some(v) => v,
