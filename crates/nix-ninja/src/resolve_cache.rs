@@ -48,6 +48,13 @@ const HEADER_BASE: &str = "nix-ninja-resolve-cache v2 cap=1024";
 /// itself; the failure direction is recompute, never a wrong replay.
 /// If the executable cannot be introspected the stamp is "unknown",
 /// which still self-invalidates against any stamped file.
+/// This driver build's identity stamp (the `driver=` value of `header`).
+pub fn driver_stamp() -> &'static str {
+    header()
+        .rsplit_once(" driver=")
+        .map_or("unknown", |(_, s)| s)
+}
+
 fn header() -> &'static str {
     static H: OnceLock<String> = OnceLock::new();
     H.get_or_init(|| {

@@ -401,10 +401,17 @@ fn invocation(cli: &Cli) -> String {
     .iter()
     .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
     .collect();
+    // THE DRIVER BUILD IS PART OF HOW A PASS RAN. A tree whose records a
+    // different driver wrote (a kept failed round, swept with a fixed
+    // driver) reused that driver's task derivations for every edge it had
+    // emitted, so no fix to such an edge could take effect: the grit edge
+    // emitted the old task under the fixed driver. Within one build every
+    // pass runs one driver, so this never differs there.
     format!(
-        "v={} x={} {}",
+        "v={} x={} driver={} {}",
         cli.verbose,
         cli.expand_rspfile,
+        crate::resolve_cache::driver_stamp(),
         env.join(" ")
     )
     .trim_end()

@@ -1204,16 +1204,35 @@ impl Runner {
             let Some(c) = build.cmdline.as_deref() else {
                 continue;
             };
-            if !c.contains("ts_library.py") && !c.contains("generate-tsconfig.js") {
+            if !c.contains("ts_library.py")
+                && !c.contains("generate-tsconfig.js")
+                && !c.contains("copy-files.js")
+            {
                 continue;
             }
             let Ok(args) = shell_words::split(c) else {
                 continue;
             };
+            // A project over a GENERATED file (`locales.js`) carries that file
+            // too: a bundle reading the project's output imports it (rollup
+            // `Could not load core/i18n/locales.js`, task 8cyhqd83). A source
+            // file is read through its .d.ts and stays out.
+            // A COPIED tsconfig (copy-files.js, 23 edges) lists generated
+            // files beside it: i18n's locales_js-tsconfig.json names
+            // `locales.js`, which generate_locales_js writes.
+            let copied = copied_tsconfig_files(&args, &self.config.build_dir);
+            let generated_file = generate_tsconfig_file(&args).filter(|f| {
+                graph
+                    .files
+                    .lookup(f)
+                    .is_some_and(|fid| graph.files.by_id[fid].input.is_some())
+            });
             for dep in ts_library_dep_tsconfigs(&args)
                 .into_iter()
                 .chain(generate_tsconfig_references(&args))
                 .chain(generate_tsconfig_declaration(&args))
+                .chain(generated_file.clone())
+                .chain(copied.iter().map(|(_, f)| f.clone()))
             {
                 let Some(fid) = graph.files.lookup(&dep) else {
                     continue;
@@ -1338,8 +1357,16 @@ impl Runner {
         }
         if build.outs().len() > 1 {
             let outs: Vec<FileId> = build.outs().to_vec();
+            // MERGED, never replaced: `build_producer_index` already recorded
+            // the ts project references on these outputs, and an insert here
+            // erased them the moment the edge started.
             for fid in build.outs() {
-                self.co_outputs.insert(*fid, outs.clone());
+                let entry = self.co_outputs.entry(*fid).or_default();
+                for o in &outs {
+                    if !entry.contains(o) {
+                        entry.push(*o);
+                    }
+                }
             }
         }
         let mut seen = HashSet::new();
@@ -1523,8 +1550,16 @@ impl Runner {
         // argument as the stamp edges above.
         if build.outs().len() > 1 {
             let outs: Vec<FileId> = build.outs().to_vec();
+            // MERGED, never replaced: `build_producer_index` already recorded
+            // the ts project references on these outputs, and an insert here
+            // erased them the moment the edge started.
             for fid in build.outs() {
-                self.co_outputs.insert(*fid, outs.clone());
+                let entry = self.co_outputs.entry(*fid).or_default();
+                for o in &outs {
+                    if !entry.contains(o) {
+                        entry.push(*o);
+                    }
+                }
             }
         }
 
@@ -4084,6 +4119,34 @@ impl Runner {
             }
         }
 
+        // A FILE A CARRIED SCRIPT JOINS ONTO THE SOURCE ROOT IT IS HANDED.
+        // Chromium's bindings scripts take `--root_src_dir` and open
+        // `os.path.join(self._root_src_dir, "third_party", ..., "x.conf")`;
+        // GN declares such a file for some of the actions running that code
+        // and not others (check_generated_file_list, task 5mjq2s3k).
+        if let Some(root) = cmdline.as_deref().and_then(root_src_dir_arg) {
+            let root = self.config.build_dir.join(&root);
+            let pys: Vec<PathBuf> = input_set
+                .keys()
+                .filter(|p| p.extension().is_some_and(|e| e == "py"))
+                .cloned()
+                .collect();
+            for py in pys {
+                for rel in root_src_dir_joins(&py) {
+                    let f = normalize_build_path_lexical(&root.join(&rel));
+                    let Some(r) = relative_from(&f, &self.config.build_dir) else {
+                        continue;
+                    };
+                    if input_set.contains_key(&r) || !self.config.build_dir.join(&r).is_file() {
+                        continue;
+                    }
+                    let up = new_opaque_file(&self.rpc_client, &self.config.build_dir, r)?;
+                    self.add_derived_file(files, up.clone());
+                    input_set.insert(up.build_path.clone(), up);
+                }
+            }
+        }
+
         // A file named INSIDE a -Wl group is an input no branch above
         // sees: the token starts with '-', so every file-arg branch skips
         // it, and json-c's version script additionally sits in the SOURCE
@@ -6549,11 +6612,7 @@ fn build_task_derivation(
     // the bytes were not (qsvgutils.cpp.o re-ran on an edit to
     // qsvgrenderer.cpp, measured 2026-08-23). The build path is stable.
     let mut inputs: Vec<String> = input_set.into_iter().collect();
-    inputs.sort_by(|a, b| {
-        encoded_build_path(a)
-            .cmp(encoded_build_path(b))
-            .then(a.cmp(b))
-    });
+    sort_encoded_inputs(&mut inputs);
 
     // THE ABI GENERATION IS IN THE KEY, and it is the only thing that is once
     // the builder path stops moving. Absent unless a stable builder is
@@ -6989,7 +7048,10 @@ fn build_task_derivation(
         // `-fuse-ld`: resolve each name the script runs on the caller's PATH
         // and carry what lands in the store. A word that resolves to nothing
         // contributes nothing.
-        for name in script_bare_programs(cmdline) {
+        for name in script_bare_programs(cmdline)
+            .into_iter()
+            .chain(tool_flag_bare_programs(cmdline))
+        {
             if let Ok(Some(sp)) = which_store_path_opt(&task.store_dir, &name) {
                 let entry = format!("{}/bin", task.store_dir.display(&sp));
                 if !path.contains(&entry) {
@@ -7208,11 +7270,7 @@ fn build_dynamic_task_derivation(
         .map(|input| input.to_encoded(store_dir))
         .collect();
     // Same ordering rule as build_task_derivation, same reason.
-    inputs.sort_by(|a, b| {
-        encoded_build_path(a)
-            .cmp(encoded_build_path(b))
-            .then(a.cmp(b))
-    });
+    sort_encoded_inputs(&mut inputs);
     // THE GENERATION BELONGS HERE TOO, and leaving it on the plain derivation
     // alone closes half the class. A dynamic task derivation's OUTPUT is not
     // determined by the plain derivation it embeds: `-t dynamic-task` runs
@@ -12587,7 +12645,7 @@ fn normalize_build_path_lexical(p: &Path) -> PathBuf {
 /// only when it has two or more members that do NOT all share one content,
 /// i.e. one path, two different files.
 fn collision_groups(bps: &[PathBuf], contents: &[String]) -> Vec<(PathBuf, Vec<usize>)> {
-    let mut by_key: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    let mut by_key: rustc_hash::FxHashMap<PathBuf, Vec<usize>> = Default::default();
     for (idx, bp) in bps.iter().enumerate() {
         by_key
             .entry(normalize_build_path_lexical(bp))
@@ -12597,7 +12655,13 @@ fn collision_groups(bps: &[PathBuf], contents: &[String]) -> Vec<(PathBuf, Vec<u
     let mut out = Vec::new();
     // SORTED, so a test can assert a deterministic answer rather than a
     // HashMap order that changes run to run.
-    let mut keys: Vec<PathBuf> = by_key.keys().cloned().collect();
+    // Only a key with two spellings can collide, so only those are sorted:
+    // sorting every input path was a fifth of a large task's resolve.
+    let mut keys: Vec<PathBuf> = by_key
+        .iter()
+        .filter(|(_, g)| g.len() > 1)
+        .map(|(k, _)| k.clone())
+        .collect();
     keys.sort();
     for k in keys {
         let group = &by_key[&k];
@@ -12881,6 +12945,53 @@ fn protoc_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
         return None;
     }
     Some((incs, protos))
+}
+
+/// For a devtools `copy-files.js <srcDir> <genDir> a,b` run, each copied
+/// tsconfig's `files` entries, spelled in genDir: (tsconfig, file) pairs,
+/// read from the SOURCE copy, which exists at resolve time.
+pub fn copied_tsconfig_files(args: &[String], build_dir: &Path) -> Vec<(String, String)> {
+    let Some(i) = args.iter().position(|a| a.ends_with("copy-files.js")) else {
+        return Vec::new();
+    };
+    let (Some(src), Some(gen), Some(list)) = (args.get(i + 1), args.get(i + 2), args.get(i + 3))
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for name in list.split(',').filter(|n| n.ends_with("tsconfig.json")) {
+        let Ok(body) = fs::read_to_string(build_dir.join(src).join(name)) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let tsconfig = Path::new(gen).join(name).to_string_lossy().into_owned();
+        for f in json
+            .get("files")
+            .and_then(|f| f.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|f| f.as_str())
+        {
+            out.push((
+                tsconfig.clone(),
+                lexical_join(Path::new(gen), Path::new(f))
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
+    }
+    out
+}
+
+/// The one file a devtools `generate-tsconfig.js` project compiles, as its
+/// command spells it (relative to the build dir).
+pub fn generate_tsconfig_file(args: &[String]) -> Option<String> {
+    let i = args
+        .iter()
+        .position(|a| a.ends_with("generate-tsconfig.js"))?;
+    args.get(i + 2).cloned()
 }
 
 /// The `.d.ts` a devtools `generate-tsconfig.js` project promises: its one
@@ -19118,6 +19229,43 @@ mod closure_step_tests {
         );
     }
 
+    /// bind_gen's package_initializer.py join, copied from source.
+    #[test]
+    fn a_join_onto_the_source_root_is_read() {
+        use std::path::PathBuf;
+        let d = super::Scratch::new(format!("nn-rootsrc-{}", std::process::id()));
+        let py = d.join("package_initializer.py");
+        std::fs::write(&py, "        union_name_config = os.path.abspath(\n            os.path.join(self._root_src_dir, \"third_party\", \"blink\",\n                         \"renderer\", \"bindings\", \"union_name_map.conf\"))\n").unwrap();
+        assert_eq!(
+            super::root_src_dir_joins(&py),
+            vec![PathBuf::from(
+                "third_party/blink/renderer/bindings/union_name_map.conf"
+            )]
+        );
+        assert_eq!(
+            super::root_src_dir_arg("python3 x.py --root_src_dir ../../src --root_gen_dir gen")
+                .as_deref(),
+            Some("../../src")
+        );
+        assert_eq!(
+            super::root_src_dir_arg("python3 x.py --root_src_dir=../../src").as_deref(),
+            Some("../../src")
+        );
+    }
+
+    /// gen_ssl_error_assistant_proto.py's splatted join, copied from source.
+    #[test]
+    fn a_splatted_pardir_list_is_followed() {
+        use std::path::{Path, PathBuf};
+        let ssl =
+            Path::new("s/chrome/browser/ssl/ssl_error_assistant/gen_ssl_error_assistant_proto.py");
+        let body = "proto_generator_path = os.path.normpath(os.path.join(os.path.abspath(__file__),\n    *[os.path.pardir] * 5 + ['components/resources/protobufs']))\nsys.path.insert(0, proto_generator_path)\n";
+        assert_eq!(
+            super::py_computed_paths(ssl, body).1,
+            vec![PathBuf::from("s/components/resources/protobufs")]
+        );
+    }
+
     /// make_instrumenting_probes.py's own spellings, copied from its source:
     /// the split tuple and the jinja template root inside a function.
     #[test]
@@ -19342,6 +19490,77 @@ mod closure_step_tests {
         );
     }
 
+    /// i18n's locales_js shape: a copied tsconfig names a generated file.
+    #[test]
+    fn a_copied_tsconfig_lists_its_files_in_the_gen_dir() {
+        let d = super::Scratch::new(format!("nn-copied-ts-{}", std::process::id()));
+        let bd = d.join("out");
+        std::fs::create_dir_all(d.join("fe/i18n")).unwrap();
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(
+            d.join("fe/i18n/locales_js-tsconfig.json"),
+            r#"{"compilerOptions":{"composite":true},"files":["locales.js"]}"#,
+        )
+        .unwrap();
+        let args: Vec<String> = [
+            "python3",
+            "node.py",
+            "../s/copy-files.js",
+            "../fe/i18n",
+            "gen/fe/i18n",
+            "locales.d.ts,locales_js-tsconfig.json",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            super::copied_tsconfig_files(&args, &bd),
+            vec![(
+                "gen/fe/i18n/locales_js-tsconfig.json".to_string(),
+                "gen/fe/i18n/locales.js".to_string()
+            )]
+        );
+    }
+
+    /// The one-pass sort gives exactly the order the old comparator gave.
+    #[test]
+    fn sorting_encoded_inputs_keeps_the_emitted_order() {
+        let mut v: Vec<String> = [
+            "/nix/store/b-x:gen/z.h",
+            "/nix/store/a-x:gen/z.h",
+            "/nix/store/c-x:a/b.h",
+            "/nix/store/c-x:a/b.h",
+            "/nix/store/d-y:gen/a.h:rel",
+            "noseparator",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut want = v.clone();
+        want.sort_by(|a, b| {
+            super::encoded_build_path(a)
+                .cmp(super::encoded_build_path(b))
+                .then(a.cmp(b))
+        });
+        super::sort_encoded_inputs(&mut v);
+        assert_eq!(v, want);
+    }
+
+    /// blink's gperf edge shape: `--gperf gperf`, and the `=` spelling.
+    #[test]
+    fn a_tool_flag_names_a_bare_program() {
+        let c = "python3 ../build/run_with_pythonpath.py -I ../x ../blink/scripts/gperf.py --gperf gperf --output_dir gen/x";
+        assert_eq!(super::tool_flag_bare_programs(c), vec!["gperf".to_string()]);
+        assert_eq!(
+            super::tool_flag_bare_programs("x --gperf=/nix/store/a-gperf/bin/gperf"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            super::tool_flag_bare_programs("x --bison=bison"),
+            vec!["bison".to_string()]
+        );
+    }
+
     /// generate-tsconfig.js's three dep spellings, from the script's rule.
     #[test]
     fn generated_tsconfig_references_follow_the_script_rule() {
@@ -19358,6 +19577,10 @@ mod closure_step_tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
+        assert_eq!(
+            super::generate_tsconfig_file(&args).as_deref(),
+            Some("../fe/core/platform/platform.ts")
+        );
         assert_eq!(
             super::generate_tsconfig_declaration(&args),
             vec!["gen/fe/core/platform/platform.d.ts".to_string()]
@@ -20249,6 +20472,47 @@ fn py_path_eval(expr: &str, file: &Path, names: &HashMap<String, PathBuf>) -> Ve
     fn norm(p: &Path) -> PathBuf {
         lexical_join(Path::new(""), p)
     }
+    /// `[a, b] * N + [c]` and the like: list literals joined by `+`, each
+    /// optionally repeated by an integer.
+    fn splat(e: &str, file: &Path, names: &HashMap<String, PathBuf>) -> Option<Vec<V>> {
+        let mut out = Vec::new();
+        for term in split_plus(e) {
+            let (list, times) = match term.rsplit_once('*') {
+                Some((l, n)) if n.trim().parse::<usize>().is_ok() => {
+                    (l.trim(), n.trim().parse::<usize>().ok()?)
+                }
+                _ => (term.trim(), 1),
+            };
+            let inner = list.strip_prefix('[')?.strip_suffix(']')?;
+            let items: Vec<V> = split_top(inner)
+                .into_iter()
+                .map(|i| eval(i, file, names))
+                .collect::<Option<_>>()?;
+            for _ in 0..times {
+                out.extend(items.iter().cloned());
+            }
+        }
+        Some(out)
+    }
+    fn split_plus(s: &str) -> Vec<&str> {
+        let (mut depth, mut quote, mut start, mut out) = (0i32, None::<char>, 0usize, Vec::new());
+        for (i, c) in s.char_indices() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), _) => {}
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '(' | '[') => depth += 1,
+                (None, ')' | ']') => depth -= 1,
+                (None, '+') if depth == 0 => {
+                    out.push(&s[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(&s[start..]);
+        out
+    }
     fn eval(e: &str, file: &Path, names: &HashMap<String, PathBuf>) -> Option<V> {
         let e = e.trim();
         if e.len() >= 2
@@ -20258,8 +20522,8 @@ fn py_path_eval(expr: &str, file: &Path, names: &HashMap<String, PathBuf>) -> Ve
         }
         match e {
             "__file__" => return Some(V::P(file.to_path_buf())),
-            "os.pardir" => return Some(V::S("..".into())),
-            "os.curdir" => return Some(V::S(".".into())),
+            "os.pardir" | "os.path.pardir" | "path.pardir" => return Some(V::S("..".into())),
+            "os.curdir" | "os.path.curdir" | "path.curdir" => return Some(V::S(".".into())),
             _ => {}
         }
         if let Some(p) = names.get(e) {
@@ -20274,10 +20538,16 @@ fn py_path_eval(expr: &str, file: &Path, names: &HashMap<String, PathBuf>) -> Ve
             .strip_prefix("os.path.")
             .or_else(|| callee.strip_prefix("path."))
             .unwrap_or(callee);
-        let args: Vec<V> = split_top(&e[open + 1..e.len() - 1])
-            .into_iter()
-            .map(|a| eval(a, file, names))
-            .collect::<Option<_>>()?;
+        // A `*` argument splats a list expression: `*[os.path.pardir] * 5 +
+        // ['components/resources/protobufs']` (gen_ssl_error_assistant_proto
+        // .py, task y3g16dr5).
+        let mut args: Vec<V> = Vec::new();
+        for a in split_top(&e[open + 1..e.len() - 1]) {
+            match a.strip_prefix('*') {
+                Some(list) => args.extend(splat(list, file, names)?),
+                None => args.push(eval(a, file, names)?),
+            }
+        }
         let as_path = |v: &V| match v {
             V::P(p) => p.clone(),
             V::S(s) => PathBuf::from(s),
@@ -20348,6 +20618,68 @@ fn python_self_spliced_names(dir: &Path, wanted: &[String]) -> Vec<String> {
             }
         }
     }
+    out
+}
+
+/// The `--root_src_dir` value on a command line, either spelling.
+fn root_src_dir_arg(cmdline: &str) -> Option<String> {
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    toks.iter().enumerate().find_map(|(i, t)| {
+        t.strip_prefix("--root_src_dir=")
+            .map(str::to_string)
+            .or_else(|| {
+                (*t == "--root_src_dir")
+                    .then(|| toks.get(i + 1).map(|v| v.to_string()))
+                    .flatten()
+            })
+    })
+}
+
+/// The relative paths a python file joins onto its source root:
+/// `join(<expr naming root_src_dir>, "a", "b", ...)` with every later
+/// argument a string literal. Memoized per file.
+fn root_src_dir_joins(py: &Path) -> Vec<PathBuf> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Vec<PathBuf>>>> =
+        std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(hit) = memo.lock().unwrap().get(py) {
+        return hit.clone();
+    }
+    let mut out = Vec::new();
+    if let Ok(body) = fs::read_to_string(py) {
+        if body.contains("root_src_dir") {
+            for line in py_logical_lines(&body) {
+                for (i, _) in line.match_indices("join(") {
+                    let rest = &line[i + "join(".len()..];
+                    let Some(end) = closing_paren(rest) else {
+                        continue;
+                    };
+                    let args: Vec<&str> = rest[..end].split(',').map(str::trim).collect();
+                    let Some((first, lits)) = args.split_first() else {
+                        continue;
+                    };
+                    if !first.contains("root_src_dir") || lits.is_empty() {
+                        continue;
+                    }
+                    let parts: Option<Vec<&str>> = lits
+                        .iter()
+                        .map(|a| {
+                            a.strip_prefix('"')
+                                .and_then(|x| x.strip_suffix('"'))
+                                .or_else(|| a.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')))
+                        })
+                        .collect();
+                    if let Some(parts) = parts {
+                        let p: PathBuf = parts.iter().collect();
+                        if !out.contains(&p) {
+                            out.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    memo.lock().unwrap().insert(py.to_path_buf(), out.clone());
     out
 }
 
@@ -25567,6 +25899,13 @@ fn with_transitive_climbs(
     // only in the map, and an unreadable file yields no climbs. Its quoted
     // includes then miss beside the store copy and resolve through the
     // include dirs, which is where the climb this pass is for happens.
+    // HASHED AND MEMOIZED, because this runs for every compile over every
+    // header the unit reaches (a Chromium unit reaches about two thousand):
+    // a Vec dedup was quadratic in that, and each header was parsed again
+    // per unit. The climbs a header yields depend only on the header and the
+    // command's include dirs, so they are kept per process under that pair
+    // (qtwebengine's core graph resolved at one task in ~1 s, driver-bound).
+    let mut seen: rustc_hash::FxHashSet<PathBuf> = rustc_hash::FxHashSet::default();
     let mut scanned: Vec<PathBuf> = Vec::new();
     for p in seeds.iter().chain(includes) {
         if p.starts_with(store_dir) {
@@ -25576,7 +25915,7 @@ fn with_transitive_climbs(
             .and_then(|v| v.get(p))
             .cloned()
             .unwrap_or_else(|| abs(p));
-        if !scanned.contains(&read) {
+        if seen.insert(read.clone()) {
             scanned.push(read);
         }
     }
@@ -25588,13 +25927,49 @@ fn with_transitive_climbs(
     // begins with `..` has no prefix `dotdot_prefix` will name; joined onto
     // the build dir and normalized it is `<src>/src/lib`, whose climb is.
     let cmd_abs = absolute_include_dirs(cmdline, build_dir);
+    type ClimbMemo = std::sync::Mutex<HashMap<(String, PathBuf), Vec<PathBuf>>>;
+    static MEMO: std::sync::OnceLock<ClimbMemo> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    let inc_key: String = cmd_abs
+        .split_whitespace()
+        .filter(|t| t.starts_with("-I") || t.starts_with("-iquote") || t.starts_with("-isystem"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut cands: Vec<PathBuf> = Vec::new();
+    let mut cand_seen: rustc_hash::FxHashSet<PathBuf> = rustc_hash::FxHashSet::default();
+    for f in &scanned {
+        let key = (inc_key.clone(), f.clone());
+        let hit = memo.lock().unwrap().get(&key).cloned();
+        let got = match hit {
+            Some(v) => v,
+            None => {
+                let v = c_include_parser::seed_dotdot_dirs(
+                    &cmd_abs,
+                    std::slice::from_ref(f),
+                    virtual_paths,
+                );
+                memo.lock().unwrap().insert(key, v.clone());
+                v
+            }
+        };
+        for d in got {
+            if cand_seen.insert(d.clone()) {
+                cands.push(d);
+            }
+        }
+    }
+    if cands.is_empty() {
+        return dirs;
+    }
     let held: Vec<PathBuf> = seeds.iter().chain(includes).map(|p| abs(p)).collect();
-    for d in c_include_parser::seed_dotdot_dirs(&cmd_abs, &scanned, virtual_paths) {
+    let have: rustc_hash::FxHashSet<PathBuf> = dirs.iter().map(|x| abs(x)).collect();
+    for d in cands {
         let d = abs(&d);
         // Only a dir no task creates today: outside the build dir (whose
         // include dirs ride NIX_NINJA_MAKE_DIRS), inside the project, not
         // the store, and holding no input.
-        if dirs.iter().any(|x| abs(x) == d)
+        if have.contains(&d)
+            || dirs.contains(&d)
             || d.starts_with(build_dir)
             || build_dir.starts_with(&d)
             || d.starts_with(store_dir)
@@ -25650,6 +26025,34 @@ fn absolute_include_dirs(cmdline: &str, build_dir: &Path) -> String {
 }
 
 /// The build-path field of an encoded `store:build_path:rel` input.
+/// Orders encoded inputs by build path, then by the whole string: the
+/// emitted order. Each key is located ONCE: a comparator re-splitting both
+/// strings per comparison was a fifth of a qtwebengine task's resolve
+/// (thousands of inputs per devtools task).
+pub(crate) fn sort_encoded_inputs(inputs: &mut [String]) {
+    let mut idx: Vec<(usize, usize, usize)> = inputs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let bp = encoded_build_path(s);
+            let start = bp.as_ptr() as usize - s.as_ptr() as usize;
+            (i, start, start + bp.len())
+        })
+        .collect();
+    idx.sort_unstable_by(|&(a, a0, a1), &(b, b0, b1)| {
+        inputs[a][a0..a1]
+            .cmp(&inputs[b][b0..b1])
+            .then_with(|| inputs[a].cmp(&inputs[b]))
+    });
+    let sorted: Vec<String> = idx
+        .iter()
+        .map(|&(i, _, _)| std::mem::take(&mut inputs[i]))
+        .collect();
+    for (slot, v) in inputs.iter_mut().zip(sorted) {
+        *slot = v;
+    }
+}
+
 pub(crate) fn encoded_build_path(e: &str) -> &str {
     e.split(':').nth(1).unwrap_or(e)
 }
@@ -25868,6 +26271,31 @@ fn cc_lookup_is_implied<'a>(cmdline: &str, outs: impl Iterator<Item = &'a str>) 
 /// the directory the driver runs in).
 // ponytail: a lexical scan, not a shell parser; quoted separators yield junk
 // words, which resolve to no store binary and are dropped by the caller
+/// Programs a generator script is HANDED by bare name through a tool flag
+/// and execs itself: blink's `gperf.py` gets `--gperf gperf` and runs it,
+/// and the task died `Command not found` (exit 127; qtwebengine 6.11.2, task
+/// fqp6nz8v). Only flags naming a program, only a value with no `/`.
+pub fn tool_flag_bare_programs(cmdline: &str) -> Vec<String> {
+    const TOOL_FLAGS: &[&str] = &["--gperf", "--bison", "--flex"];
+    let toks: Vec<&str> = cmdline.split_whitespace().collect();
+    let mut out = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        let v = match t.split_once('=') {
+            Some((f, v)) if TOOL_FLAGS.contains(&f) => v,
+            _ if TOOL_FLAGS.contains(t) => match toks.get(i + 1) {
+                Some(v) => v,
+                None => continue,
+            },
+            _ => continue,
+        };
+        let v = v.trim_matches(|c| c == '"' || c == '\'');
+        if !v.is_empty() && !v.contains('/') && !out.iter().any(|o| o == v) {
+            out.push(v.to_string());
+        }
+    }
+    out
+}
+
 pub fn script_bare_programs(cmdline: &str) -> Vec<String> {
     const SKIP: &[&str] = &[
         "if", "then", "else", "elif", "fi", "for", "do", "done", "while", "until", "case", "esac",
