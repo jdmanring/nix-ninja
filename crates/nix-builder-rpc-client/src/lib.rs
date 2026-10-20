@@ -1002,6 +1002,24 @@ mod rpc_worker_threads_tests {
     }
 }
 
+/// Printed when `NIX_NINJA_RPC_HOST_ROUTE=1` overrides `NIX_BUILD_TOP`. The
+/// consumer's preflight sweep matches this text to score a drive as keyed
+/// the way the build keys it, so a change here is a change to that contract.
+pub const HOST_ROUTE_NOTICE: &str =
+    "nix-ninja: NIX_NINJA_RPC_HOST_ROUTE=1: host daemon route with NIX_BUILD_TOP set";
+
+#[cfg(test)]
+mod host_route_notice_tests {
+    /// A ratchet, not an oracle: the consumer greps this exact text.
+    #[test]
+    fn the_host_route_notice_is_the_text_the_sweep_matches() {
+        assert_eq!(
+            super::HOST_ROUTE_NOTICE,
+            "nix-ninja: NIX_NINJA_RPC_HOST_ROUTE=1: host daemon route with NIX_BUILD_TOP set"
+        );
+    }
+}
+
 impl BuilderRpcClient {
     /// Connect to `$NIX_REMOTE` if set, otherwise the standard daemon
     pub fn connect_from_env(pool_max: Option<usize>) -> Result<Self> {
@@ -1016,7 +1034,17 @@ impl BuilderRpcClient {
         // There is no simple OS flag to tell if we are running in a derivation,
         // but NIX_BUILD_TOP is always set by the nix daemon before building
         // and has no purpose outside a nix derivation.
-        let in_drv = std::env::var_os("NIX_BUILD_TOP").is_some();
+        //
+        // NIX_NINJA_RPC_HOST_ROUTE=1 forces the host route with NIX_BUILD_TOP
+        // set, so a driver run OUTSIDE a build can carry the build's own
+        // NIX_BUILD_TOP and key what the build keys: the gcc wrapper's
+        // preprocessor fallback reads it (`unbound variable` without it).
+        let build_top = std::env::var_os("NIX_BUILD_TOP").is_some();
+        let forced = std::env::var_os("NIX_NINJA_RPC_HOST_ROUTE").is_some_and(|v| v == "1");
+        if build_top && forced {
+            eprintln!("{HOST_ROUTE_NOTICE}");
+        }
+        let in_drv = build_top && !forced;
 
         Self::connect_unix_sized(
             &path,

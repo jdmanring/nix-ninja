@@ -2798,6 +2798,8 @@ impl Runner {
             // extension: any schema arg to compiler.py implies its schema
             // directory.
             let pdl_refs = pdl_baselines(&self.config.build_dir, &cd_dir, &args);
+            let (node_files, node_pkgs) =
+                node_script_requires(&self.config.build_dir, &cd_dir, &args);
             let schema_tool = cmdline.contains("json_schema_compiler/compiler.py");
             let argc = args.len();
             for (arg_i, arg) in args.into_iter().enumerate() {
@@ -3424,6 +3426,17 @@ impl Runner {
             // unresolved and the check failed (qtwebengine 6.11.2, task
             // `m9yqpy10`).
             referenced.extend(pdl_refs);
+            referenced.extend(node_files);
+            for pkg in &node_pkgs {
+                for input in upload_referenced_dir(
+                    &self.rpc_client,
+                    &self.config.build_dir,
+                    &self.config.build_dir.join(pkg),
+                )? {
+                    self.add_derived_file(files, input.clone());
+                    input_set.insert(input.build_path.clone(), input);
+                }
+            }
             if let Some((incs, protos)) = &protoc {
                 let got = protoc_referenced_paths(&self.config.build_dir, &cd_dir, incs, protos);
                 for p in got {
@@ -12775,6 +12788,164 @@ fn protoc_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
     Some((incs, protos))
 }
 
+/// What a node script run through Chromium's `node.py` loads that no edge
+/// declares: its relative requires and imports (followed file by file) and
+/// the `node_modules` package each bare specifier resolves to by node's own
+/// rule (the nearest `node_modules/<pkg>` walking up from the requiring
+/// file), with every package's `package.json` dependencies resolved the
+/// same way from the package. devtools' generate_devtools_json.js died
+/// `Cannot find module 'uuid'` (qtwebengine 6.11.2, task h5n0i7d9).
+/// Returns (files, package dirs), spelled relative to the build dir.
+pub fn node_script_requires(
+    build_dir: &Path,
+    cd_dir: &Path,
+    args: &[String],
+) -> (Vec<String>, Vec<PathBuf>) {
+    const BUILTINS: &[&str] = &[
+        "assert",
+        "buffer",
+        "child_process",
+        "crypto",
+        "events",
+        "fs",
+        "http",
+        "https",
+        "module",
+        "net",
+        "os",
+        "path",
+        "perf_hooks",
+        "process",
+        "querystring",
+        "readline",
+        "stream",
+        "string_decoder",
+        "tty",
+        "url",
+        "util",
+        "vm",
+        "worker_threads",
+        "zlib",
+    ];
+    let Some(i) = args
+        .iter()
+        .position(|a| a.ends_with("/node.py") || a == "node.py")
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(script) = args[i + 1..].iter().find(|a| {
+        !a.starts_with('-') && (a.ends_with(".js") || a.ends_with(".mjs") || a.ends_with(".cjs"))
+    }) else {
+        return (Vec::new(), Vec::new());
+    };
+    static SPEC: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        Regex::new(r#"(?:require\(\s*|\bfrom\s*|\bimport\s*\(?\s*)['"]([^'"\n]+)['"]"#).unwrap()
+    });
+    let at = |rel: &Path| build_dir.join(rel);
+    // Node's rule, on real parents: from the requiring file's directory up
+    // to the filesystem root, the first `node_modules/<name>` wins.
+    let resolve_pkg = |from: &Path, name: &str| -> Option<PathBuf> {
+        let mut cur = Some(lexical_join(build_dir, from));
+        while let Some(d) = cur {
+            let cand = d.join("node_modules").join(name);
+            if cand.is_dir() {
+                return relative_from(&cand, build_dir);
+            }
+            cur = d.parent().map(Path::to_path_buf);
+        }
+        None
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut pkgs: Vec<PathBuf> = Vec::new();
+    let first = lexical_join(Path::new(""), &rebase_post_cd(cd_dir, script));
+    let mut queue = vec![first.clone()];
+    let mut seen = vec![first];
+    let mut pkg_queue: Vec<PathBuf> = Vec::new();
+    while let Some(f) = queue.pop() {
+        if seen.len() > 2000 {
+            break;
+        }
+        let Ok(text) = fs::read_to_string(at(&f)) else {
+            continue;
+        };
+        let dir = f.parent().unwrap_or(Path::new("")).to_path_buf();
+        for c in spec.captures_iter(&text) {
+            let sp = &c[1];
+            if sp.starts_with("node:") || BUILTINS.contains(&sp.split('/').next().unwrap_or("")) {
+                continue;
+            }
+            if sp.starts_with("./") || sp.starts_with("../") {
+                let base = lexical_join(&dir, Path::new(sp));
+                let hit = [
+                    base.clone(),
+                    base.with_extension("js"),
+                    PathBuf::from(format!("{}.js", base.display())),
+                    PathBuf::from(format!("{}.mjs", base.display())),
+                    base.join("index.js"),
+                ]
+                .into_iter()
+                .find(|c| at(c).is_file());
+                if let Some(h) = hit {
+                    if !seen.contains(&h) {
+                        seen.push(h.clone());
+                        files.push(h.clone());
+                        queue.push(h);
+                    }
+                }
+                continue;
+            }
+            if sp.starts_with('/') {
+                continue;
+            }
+            let mut parts = sp.split('/');
+            let name = match parts.next() {
+                Some(scope) if scope.starts_with('@') => match parts.next() {
+                    Some(n) => format!("{scope}/{n}"),
+                    None => continue,
+                },
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            if let Some(pkg) = resolve_pkg(&dir, &name) {
+                if !pkgs.contains(&pkg) {
+                    pkgs.push(pkg.clone());
+                    pkg_queue.push(pkg);
+                }
+            }
+        }
+        // A package's own dependencies resolve from the package.
+        while let Some(pkg) = pkg_queue.pop() {
+            let Ok(body) = fs::read_to_string(at(&pkg.join("package.json"))) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+                continue;
+            };
+            let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) else {
+                continue;
+            };
+            let mut names: Vec<&String> = deps.keys().collect();
+            names.sort();
+            for n in names {
+                if let Some(dep) = resolve_pkg(&pkg, n) {
+                    if !pkgs.contains(&dep) {
+                        pkgs.push(dep.clone());
+                        pkg_queue.push(dep);
+                    }
+                }
+            }
+        }
+    }
+    (
+        files
+            .iter()
+            .map(|f| f.to_string_lossy().into_owned())
+            .collect(),
+        pkgs,
+    )
+}
+
 /// The baselines a `check_protocol_compatibility.py` run reads beside each
 /// positional `.pdl`: every sibling named `<stem>-<major>.<minor>.json`,
 /// spelled relative to the build dir. Empty for any other command.
@@ -18604,6 +18775,160 @@ mod closure_step_tests {
         assert_eq!(closure_step(false, 9_000, 64), ClosureStep::Seen);
     }
 
+    /// Paths computed from `__file__`, in the spellings qtwebengine 6.11.2's
+    /// Chromium scripts use (copied from their source).
+    #[test]
+    fn computed_paths_follow_names_from_the_file() {
+        use std::path::{Path, PathBuf};
+        let grd = Path::new(
+            "../src/third_party/blink/renderer/build/scripts/generate_permission_element_grd.py",
+        );
+        let body = "import os\n_SRC_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', '..'))\nsys.path.append(os.path.join(_SRC_PATH, 'tools', 'grit'))\n";
+        assert_eq!(
+            super::py_computed_paths(grd, body).1,
+            vec![PathBuf::from("../src/tools/grit")]
+        );
+
+        let probes =
+            Path::new("s/third_party/blink/renderer/build/scripts/make_instrumenting_probes.py");
+        let body = "_MODULE_PATH = os.path.dirname(os.path.realpath(__file__))\n_THIRD_PARTY_DIR = os.path.normpath(os.path.join(_MODULE_PATH, os.pardir, os.pardir, os.pardir, os.pardir))\nsys.path.insert(1, _THIRD_PARTY_DIR)\n";
+        assert_eq!(
+            super::py_computed_paths(probes, body).1,
+            vec![PathBuf::from("s/third_party")]
+        );
+
+        let tp = Path::new("s/third_party/perfetto/tools/gen_tp_table_headers.py");
+        let body = "ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\nsys.path.append(os.path.join(ROOT_DIR))\n";
+        assert_eq!(
+            super::py_computed_paths(tp, body).1,
+            vec![PathBuf::from("s/third_party/perfetto")]
+        );
+
+        let ts = Path::new("d/src/scripts/build/typescript/ts_library.py");
+        let body = "from os import path\n_CURRENT_DIR = path.join(path.dirname(__file__))\nROOT_DIRECTORY_OF_REPOSITORY = path.join(_CURRENT_DIR, '..', '..', '..')\nNODE_MODULES_DIRECTORY = path.join(ROOT_DIRECTORY_OF_REPOSITORY,\n                                  'node_modules')\nTSC_LOCATION = path.join(NODE_MODULES_DIRECTORY, 'typescript', 'bin', 'tsc')\nRESOURCES_INSPECTOR_PATH = path.join(os.getcwd(), 'resources', 'inspector')\ndef f():\n    X = path.join(_CURRENT_DIR, 'local')\n";
+        let (values, sys, _) = super::py_computed_paths(ts, body);
+        assert!(sys.is_empty());
+        assert!(
+            values.contains(&PathBuf::from("d/src/node_modules/typescript/bin/tsc")),
+            "{values:?}"
+        );
+        assert!(
+            !values.iter().any(|v| v.ends_with("resources/inspector")),
+            "getcwd is no answer"
+        );
+        assert!(
+            !values.iter().any(|v| v.ends_with("local")),
+            "a block-local name is not module level"
+        );
+    }
+
+    /// make_instrumenting_probes.py's own spellings, copied from its source:
+    /// the split tuple and the jinja template root inside a function.
+    #[test]
+    fn a_split_tuple_and_a_jinja_loader_root_are_followed() {
+        use std::path::{Path, PathBuf};
+        let f =
+            Path::new("s/third_party/blink/renderer/build/scripts/make_instrumenting_probes.py");
+        let body = "_MODULE_PATH, _ = os.path.split(os.path.realpath(__file__))\n_THIRD_PARTY_DIR = os.path.normpath(\n    os.path.join(_MODULE_PATH, os.pardir, os.pardir, os.pardir, os.pardir))\nsys.path.insert(1, _THIRD_PARTY_DIR)\ndef initialize_jinja_env(config, cache_dir):\n    jinja_env = jinja2.Environment(\n        loader=jinja2.FileSystemLoader(\n            os.path.join(_MODULE_PATH, \"templates\")),\n        keep_trailing_newline=True)\n";
+        let (_, sys, dirs) = super::py_computed_paths(f, body);
+        assert_eq!(sys, vec![PathBuf::from("s/third_party")]);
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from(
+                "s/third_party/blink/renderer/build/scripts/templates"
+            )]
+        );
+    }
+
+    /// A node script's bare require resolves to the nearest node_modules
+    /// package walking up, its package.json dependencies follow, relative
+    /// requires are files, builtins are nothing (devtools-frontend layout).
+    #[test]
+    fn a_node_script_carries_the_packages_it_requires() {
+        use std::path::{Path, PathBuf};
+        let d = super::Scratch::new(format!("nn-node-req-{}", std::process::id()));
+        let bd = d.join("out");
+        let src = d.join("src");
+        for p in [
+            "scripts/build",
+            "node_modules/uuid",
+            "node_modules/dep",
+            "node_modules/@s/p",
+            "third_party/node",
+        ] {
+            std::fs::create_dir_all(src.join(p)).unwrap();
+        }
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(src.join("scripts/build/gen.js"), "const {v4} = require('uuid');\nconst fs = require('fs');\nconst h = require('./helper.js');\nimport x from '@s/p/sub';\n").unwrap();
+        std::fs::write(
+            src.join("scripts/build/helper.js"),
+            "require('node:path');\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("node_modules/uuid/package.json"),
+            r#"{"dependencies":{"dep":"1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("node_modules/dep/package.json"), "{}").unwrap();
+        std::fs::write(src.join("node_modules/@s/p/package.json"), "{}").unwrap();
+        let args: Vec<String> = [
+            "python3",
+            "../src/third_party/node/node.py",
+            "../src/scripts/build/gen.js",
+            "gen/out.json",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (files, pkgs) = super::node_script_requires(&bd, Path::new(""), &args);
+        assert_eq!(files, vec!["../src/scripts/build/helper.js".to_string()]);
+        let mut pkgs = pkgs;
+        pkgs.sort();
+        assert_eq!(
+            pkgs,
+            vec![
+                PathBuf::from("../src/node_modules/@s/p"),
+                PathBuf::from("../src/node_modules/dep"),
+                PathBuf::from("../src/node_modules/uuid")
+            ]
+        );
+        let other: Vec<String> = ["node", "../src/scripts/build/gen.js"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            super::node_script_requires(&bd, Path::new(""), &other),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    /// A file in node_modules carries its package, a scope dir is carried, a
+    /// plain directory is not.
+    #[test]
+    fn a_computed_node_module_path_carries_its_package() {
+        let d = super::Scratch::new(format!("nn-carry-{}", std::process::id()));
+        std::fs::create_dir_all(d.join("node_modules/typescript/bin")).unwrap();
+        std::fs::create_dir_all(d.join("node_modules/@types/node")).unwrap();
+        std::fs::create_dir_all(d.join("config")).unwrap();
+        std::fs::write(d.join("node_modules/typescript/bin/tsc"), b"").unwrap();
+        std::fs::write(d.join("config/base.json"), b"").unwrap();
+        assert_eq!(
+            super::computed_path_carry(&d.join("node_modules/typescript/bin/tsc")),
+            Some(d.join("node_modules/typescript"))
+        );
+        assert_eq!(
+            super::computed_path_carry(&d.join("node_modules/@types")),
+            Some(d.join("node_modules/@types"))
+        );
+        assert_eq!(
+            super::computed_path_carry(&d.join("config/base.json")),
+            Some(d.join("config/base.json"))
+        );
+        assert_eq!(super::computed_path_carry(&d.join("config")), None);
+        assert_eq!(super::computed_path_carry(&d.join("node_modules")), None);
+    }
+
     /// The pass-over predicate counts FILES at every depth, and a directory
     /// exactly at the cap is carried, not passed over.
     #[test]
@@ -18840,6 +19165,18 @@ fn upload_python_closure_uncached(
                             queue.push(holder);
                         }
                     }
+                }
+            }
+            // A file or node_modules package a script names through a path
+            // it COMPUTES from its own location, then reads or runs: the
+            // devtools ts_library.py runs `node_modules/typescript/bin/tsc`
+            // from `TSC_LOCATION`, and the task died `Cannot find module`
+            // (qtwebengine 6.11.2, task xzs9ps5r).
+            for c in python_computed_carries(&dir)? {
+                if c.is_dir() {
+                    upload_dir(&c, out)?;
+                } else {
+                    out.push(new_opaque_file(rpc_client, build_dir, c)?);
                 }
             }
             // sys.path splices readable on one line still help for the
@@ -19291,6 +19628,20 @@ fn python_syspath_dirs(dir: &Path) -> Result<Vec<PathBuf>> {
         let Ok(body) = fs::read_to_string(&p) else {
             continue;
         };
+        // A sys.path entry COMPUTED from `__file__` through named values
+        // (`_SRC_PATH = abspath(join(dirname(__file__), '..', ...))`, then
+        // `sys.path.append(join(_SRC_PATH, 'tools', 'grit'))`). The textual
+        // reading below joins the quoted segments onto this directory and
+        // misses it: blink's generate_permission_element_grd.py died
+        // `No module named 'grit'` (qtwebengine 6.11.2, task 2vz28fhm).
+        // Added beside that reading, which stays, so an edge it already
+        // answers emits what it did.
+        let spelled = dir.join(entry.file_name());
+        for cand in py_computed_paths(&spelled, &body).1 {
+            if cand.is_dir() && cand != dir && !found.contains(&cand) {
+                found.push(cand);
+            }
+        }
         for line in body.lines() {
             if !line.contains("sys.path") {
                 continue;
@@ -19318,6 +19669,285 @@ fn python_syspath_dirs(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(found)
+}
+
+/// A python path expression evaluated LEXICALLY, from `__file__`: string
+/// literals, `os.pardir`/`os.curdir`, names already bound, and
+/// `join`/`dirname`/`abspath`/`normpath`/`realpath` spelled `os.path.X`,
+/// `path.X` or bare. A list literal yields each element. Anything else
+/// (`os.getcwd()`, a call into another module) is no answer, so a value that
+/// does not trace back to the file is never carried.
+fn py_path_eval(expr: &str, file: &Path, names: &HashMap<String, PathBuf>) -> Vec<PathBuf> {
+    #[derive(Clone)]
+    enum V {
+        P(PathBuf),
+        S(String),
+    }
+    fn split_top(s: &str) -> Vec<&str> {
+        let (mut depth, mut quote, mut start, mut out) = (0i32, None::<char>, 0usize, Vec::new());
+        for (i, c) in s.char_indices() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), _) => {}
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '(' | '[') => depth += 1,
+                (None, ')' | ']') => depth -= 1,
+                (None, ',') if depth == 0 => {
+                    out.push(&s[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(&s[start..]);
+        out.into_iter()
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .collect()
+    }
+    fn norm(p: &Path) -> PathBuf {
+        lexical_join(Path::new(""), p)
+    }
+    fn eval(e: &str, file: &Path, names: &HashMap<String, PathBuf>) -> Option<V> {
+        let e = e.trim();
+        if e.len() >= 2
+            && (e.starts_with('\'') && e.ends_with('\'') || e.starts_with('"') && e.ends_with('"'))
+        {
+            return Some(V::S(e[1..e.len() - 1].to_string()));
+        }
+        match e {
+            "__file__" => return Some(V::P(file.to_path_buf())),
+            "os.pardir" => return Some(V::S("..".into())),
+            "os.curdir" => return Some(V::S(".".into())),
+            _ => {}
+        }
+        if let Some(p) = names.get(e) {
+            return Some(V::P(p.clone()));
+        }
+        let open = e.find('(')?;
+        if !e.ends_with(')') {
+            return None;
+        }
+        let callee = e[..open].trim();
+        let func = callee
+            .strip_prefix("os.path.")
+            .or_else(|| callee.strip_prefix("path."))
+            .unwrap_or(callee);
+        let args: Vec<V> = split_top(&e[open + 1..e.len() - 1])
+            .into_iter()
+            .map(|a| eval(a, file, names))
+            .collect::<Option<_>>()?;
+        let as_path = |v: &V| match v {
+            V::P(p) => p.clone(),
+            V::S(s) => PathBuf::from(s),
+        };
+        match (func, args.as_slice()) {
+            ("join", [first, rest @ ..]) => {
+                let mut p = as_path(first);
+                for r in rest {
+                    p.push(as_path(r));
+                }
+                Some(V::P(p))
+            }
+            ("abspath" | "normpath" | "realpath", [a]) => Some(V::P(norm(&as_path(a)))),
+            ("dirname", [a]) => {
+                let n = norm(&as_path(a));
+                Some(V::P(match n.components().next_back() {
+                    None | Some(std::path::Component::ParentDir) => n.join(".."),
+                    Some(_) => n.parent().unwrap_or(Path::new("")).to_path_buf(),
+                }))
+            }
+            _ => None,
+        }
+    }
+    let e = expr.trim();
+    let items: Vec<&str> = match e.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        Some(inner) => split_top(inner),
+        None => vec![e],
+    };
+    items
+        .into_iter()
+        .filter_map(|i| match eval(i, file, names)? {
+            V::P(p) => Some(norm(&p)),
+            V::S(_) => None,
+        })
+        .collect()
+}
+
+/// A python file's logical lines: a line whose brackets do not balance is
+/// joined with the lines after it.
+fn py_logical_lines(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    for line in body.lines() {
+        let code = line.split(" #").next().unwrap_or(line);
+        if cur.is_empty() {
+            cur = code.to_string();
+        } else {
+            cur.push(' ');
+            cur.push_str(code.trim());
+        }
+        depth += code.matches(['(', '[']).count() as i32 - code.matches([')', ']']).count() as i32;
+        if depth <= 0 {
+            out.push(std::mem::take(&mut cur));
+            depth = 0;
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// What a python file computes from its own location: the module-level
+/// names bound to a path that traces back to `__file__` (each value, in
+/// order), and the directories its `sys.path.append`/`insert` calls add.
+/// Paths are spelled from `file`'s own spelling, so they resolve where it
+/// does.
+fn py_computed_paths(file: &Path, body: &str) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let mut names: HashMap<String, PathBuf> = HashMap::new();
+    let mut values = Vec::new();
+    let mut syspath = Vec::new();
+    let mut read_dirs = Vec::new();
+    for line in py_logical_lines(body) {
+        // A template root jinja2 reads (make_instrumenting_probes.py passes
+        // `os.path.join(_MODULE_PATH, "templates")` inside a function).
+        if let Some(i) = line.find("FileSystemLoader(") {
+            let arg = &line[i + "FileSystemLoader(".len()..];
+            if let Some(j) = closing_paren(arg) {
+                read_dirs.extend(py_path_eval(&arg[..j], file, &names));
+            }
+        }
+        if let Some(i) = line.find("sys.path.") {
+            let call = &line[i + "sys.path.".len()..];
+            let arg = call
+                .strip_prefix("append(")
+                .or_else(|| call.strip_prefix("insert("))
+                .and_then(|a| a.rfind(')').map(|j| &a[..j]));
+            if let Some(arg) = arg {
+                // insert(index, path): the path follows the index.
+                let path_arg = if call.starts_with("insert(") {
+                    arg.split_once(',').map_or(arg, |(_, l)| l)
+                } else {
+                    arg
+                };
+                syspath.extend(py_path_eval(path_arg, file, &names));
+            }
+            continue;
+        }
+        // Module level only: an indented assignment is local to a block.
+        if line.starts_with(|c: char| c.is_whitespace()) {
+            continue;
+        }
+        let Some((lhs, rhs)) = line.split_once('=') else {
+            continue;
+        };
+        let name = lhs.trim();
+        // `A, _ = os.path.split(X)`: A is X's directory.
+        if let Some((first, _)) = name.split_once(',') {
+            let r = rhs.trim();
+            let inner = r
+                .strip_prefix("os.path.split(")
+                .or_else(|| r.strip_prefix("path.split("))
+                .and_then(|a| a.strip_suffix(')'));
+            let first = first.trim();
+            if let Some(inner) = inner {
+                if let [d] = &py_path_eval(&format!("os.path.dirname({inner})"), file, &names)[..] {
+                    names.insert(first.to_string(), d.clone());
+                    values.push(d.clone());
+                }
+            }
+            continue;
+        }
+        if rhs.starts_with('=')
+            || name.is_empty()
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        let got = py_path_eval(rhs, file, &names);
+        if got.len() == 1 && !rhs.trim_start().starts_with('[') {
+            names.insert(name.to_string(), got[0].clone());
+        }
+        values.extend(got);
+    }
+    (values, syspath, read_dirs)
+}
+
+/// The byte index of the `)` closing an argument list that starts at 0.
+fn closing_paren(s: &str) -> Option<usize> {
+    let (mut depth, mut quote) = (0i32, None::<char>);
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '(' | '[') => depth += 1,
+            (None, ')' | ']') if depth == 0 => return Some(i),
+            (None, ')' | ']') => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The files and node_modules packages the .py files in `dir` name through
+/// a path computed from `__file__` (`computed_path_carry`), sorted.
+fn python_computed_carries(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .map_err(|e| anyhow!("read_dir({}) for computed paths: {e}", dir.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "py"))
+        .collect();
+    entries.sort();
+    let mut out = Vec::new();
+    for p in entries {
+        let Ok(body) = fs::read_to_string(&p) else {
+            continue;
+        };
+        let (values, _, read_dirs) = py_computed_paths(&p, &body);
+        for v in values {
+            if let Some(c) = computed_path_carry(&v) {
+                if c != p && !out.contains(&c) {
+                    out.push(c);
+                }
+            }
+        }
+        for d in read_dirs {
+            if d.is_dir() && d != dir && !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What a computed path asks to be carried: a file, or for a file inside
+/// `node_modules` its whole package (node resolves the package's own
+/// requires: `typescript/bin/tsc` loads `typescript/lib`); a directory only
+/// when it IS a node_modules package or scope (`@types`). A repo root or
+/// `node_modules` itself is never carried by being named.
+fn computed_path_carry(p: &Path) -> Option<PathBuf> {
+    let comps: Vec<_> = p.components().collect();
+    let nm = comps.iter().rposition(|c| c.as_os_str() == "node_modules");
+    if let Some(k) = nm {
+        let scoped = comps
+            .get(k + 1)
+            .is_some_and(|c| c.as_os_str().to_string_lossy().starts_with('@'));
+        let end = if scoped && (p.is_file() || comps.len() > k + 2) {
+            k + 3
+        } else {
+            k + 2
+        };
+        if comps.len() >= end {
+            let pkg: PathBuf = comps[..end].iter().map(|c| c.as_os_str()).collect();
+            return pkg.is_dir().then_some(pkg);
+        }
+        return None;
+    }
+    p.is_file().then(|| p.to_path_buf())
 }
 
 /// Upload every regular file under a directory the command names as an
