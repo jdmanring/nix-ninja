@@ -1229,27 +1229,12 @@ impl Runner {
             let Ok(args) = shell_words::split(c) else {
                 continue;
             };
-            // A project over a GENERATED file (`locales.js`) carries that file
-            // too: a bundle reading the project's output imports it (rollup
-            // `Could not load core/i18n/locales.js`, task 8cyhqd83). A source
-            // file is read through its .d.ts and stays out.
-            // A COPIED tsconfig (copy-files.js, 23 edges) lists generated
-            // files beside it: i18n's locales_js-tsconfig.json names
-            // `locales.js`, which generate_locales_js writes.
-            let copied = copied_tsconfig_files(&args, &self.config.build_dir);
-            let generated_file = generate_tsconfig_file(&args).filter(|f| {
+            for dep in tsconfig_project_carries(&args, &self.config.build_dir, |f| {
                 graph
                     .files
                     .lookup(f)
                     .is_some_and(|fid| graph.files.by_id[fid].input.is_some())
-            });
-            for dep in ts_library_dep_tsconfigs(&args)
-                .into_iter()
-                .chain(generate_tsconfig_references(&args))
-                .chain(generate_tsconfig_declaration(&args))
-                .chain(generated_file.clone())
-                .chain(copied.iter().map(|(_, f)| f.clone()))
-            {
+            }) {
                 for fid in
                     tsconfig_reference_nodes(&dep, |p| graph.files.lookup(p), &undeclared_tsconfigs)
                 {
@@ -13213,6 +13198,49 @@ pub fn generate_tsconfig_declaration(args: &[String]) -> Vec<String> {
         .into_owned()]
 }
 
+/// What a devtools ts project's outputs carry to their consumers, spelled
+/// from the build dir: the tsconfigs it references, the declaration and
+/// bundle its generate-tsconfig project promises, and generated files it
+/// compiles. A project over a GENERATED file (`locales.js`) carries that
+/// file: a bundle reading the project's output imports it (rollup `Could not
+/// load core/i18n/locales.js`, task 8cyhqd83). A source file is read through
+/// its .d.ts and stays out. A COPIED tsconfig (copy-files.js, 23 edges)
+/// lists generated files beside it: i18n's locales_js-tsconfig.json names
+/// `locales.js`, which generate_locales_js writes.
+pub fn tsconfig_project_carries(
+    args: &[String],
+    build_dir: &Path,
+    is_produced: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    ts_library_dep_tsconfigs(args)
+        .into_iter()
+        .chain(generate_tsconfig_references(args))
+        .chain(generate_tsconfig_declaration(args))
+        .chain(generate_tsconfig_bundle(args))
+        .chain(generate_tsconfig_file(args).filter(|f| is_produced(f)))
+        .chain(
+            copied_tsconfig_files(args, build_dir)
+                .into_iter()
+                .map(|(_, f)| f),
+        )
+        .collect()
+}
+
+/// The bundle a devtools `generate-tsconfig.js` project stands for: its one
+/// file `<stem>.ts` is a devtools_entrypoint, which rollup writes as
+/// `<stem>.js` beside the tsconfig (253 of 253 such projects in qtwebengine
+/// 6.11.2). A bundle importing the entrypoint reads that file, and no edge
+/// declares it to the importer (rollup `Could not resolve
+/// .../web-vitals/web-vitals.js`, task mhbrw58i; `Could not load
+/// .../formatter_worker/FormatterActions.js`, task gwcqxq6c), so it rides
+/// the tsconfig as a co-output.
+pub fn generate_tsconfig_bundle(args: &[String]) -> Vec<String> {
+    generate_tsconfig_declaration(args)
+        .into_iter()
+        .filter_map(|d| d.strip_suffix(".d.ts").map(|s| format!("{s}.js")))
+        .collect()
+}
+
 /// The tsconfigs a devtools `generate-tsconfig.js` output REFERENCES, by
 /// the script's own rule: `<tsconfig> <file> <dep>...`, each dep `:foo`,
 /// `../path:foo` or `../path` (target = last component), resolved to
@@ -19992,6 +20020,10 @@ mod closure_step_tests {
             vec!["gen/fe/core/platform/platform.d.ts".to_string()]
         );
         assert_eq!(
+            super::generate_tsconfig_bundle(&args),
+            vec!["gen/fe/core/platform/platform.js".to_string()]
+        );
+        assert_eq!(
             super::generate_tsconfig_references(&args),
             vec![
                 "gen/fe/core/platform/platform-tsconfig.json".to_string(),
@@ -20063,6 +20095,41 @@ mod closure_step_tests {
         assert_eq!(
             refs(words(format!("/nix/store/x-python3/bin/python3.14 {fe}/scripts/build/typescript/ts_library.py --tsconfig_output_location {g}/ui/legacy/legacy-tsconfig.json --deps ./css_files-tsconfig.json ./legacy-tsconfig.json --front_end_directory {g}/ui/legacy"))),
             legacy.to_vec()
+        );
+    }
+
+    /// qtwebengine 6.11.2's entrypoint projects as n2 hands them over: each
+    /// carries its bundle, which a rollup importer reads (tasks mhbrw58i,
+    /// gwcqxq6c), beside its declaration and references.
+    #[test]
+    fn an_entrypoint_project_carries_its_bundle() {
+        use std::path::Path;
+        let b = Path::new("/build/qtwebengine-everywhere-src-6.11.2/build/src/core/Release/x86_64");
+        let node = "/nix/store/x-python3/bin/python3.14 ../../../../../src/3rdparty/chromium/third_party/node/node.py";
+        let fe = "../../../../../src/3rdparty/chromium/third_party/devtools-frontend/src";
+        let g = "gen/third_party/devtools-frontend/src/front_end";
+        let carries = |c: String| {
+            super::tsconfig_project_carries(&shell_words::split(&c).unwrap(), b, |_| false)
+        };
+        assert_eq!(
+            carries(format!("{node} {fe}/scripts/build/ninja/generate-tsconfig.js {g}/third_party/web-vitals/bundle-tsconfig.json {fe}/front_end/third_party/web-vitals/web-vitals.ts :web-vitals")),
+            vec![
+                format!("{g}/third_party/web-vitals/web-vitals-tsconfig.json"),
+                format!("{g}/third_party/web-vitals/web-vitals.d.ts"),
+                format!("{g}/third_party/web-vitals/web-vitals.js"),
+            ]
+        );
+        assert_eq!(
+            carries(format!("{node} {fe}/scripts/build/ninja/generate-tsconfig.js {g}/entrypoints/formatter_worker/formatter_actions-tsconfig.json {fe}/front_end/entrypoints/formatter_worker/FormatterActions.ts")),
+            vec![
+                format!("{g}/entrypoints/formatter_worker/FormatterActions.d.ts"),
+                format!("{g}/entrypoints/formatter_worker/FormatterActions.js"),
+            ]
+        );
+        // A ts_library project carries its references and no bundle.
+        assert_eq!(
+            carries(format!("/nix/store/x-python3/bin/python3.14 {fe}/scripts/build/typescript/ts_library.py --tsconfig_output_location {g}/models/live-metrics/web-vitals-injected/web-vitals-injected-tsconfig.json --deps ../../../third_party/web-vitals/bundle-tsconfig.json --front_end_directory {g}/models/live-metrics/web-vitals-injected")),
+            vec![format!("{g}/third_party/web-vitals/bundle-tsconfig.json")]
         );
     }
 
