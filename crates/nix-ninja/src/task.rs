@@ -19867,45 +19867,7 @@ fn upload_python_closure_uncached(
                         // python-3, version-suffixed copy: the legacy one
                         // imports interfaces that no longer exist
                         // (html5lib.treebuilders._base, measured).
-                        let tp = anc.join("third_party");
-                        let mut cands: Vec<PathBuf> = Vec::new();
-                        if let Ok(subs) = fs::read_dir(&tp) {
-                            for sub in subs.flatten().map(|e| e.path()) {
-                                if !sub.is_dir() {
-                                    continue;
-                                }
-                                let direct = sub.join(name);
-                                if direct.join("__init__.py").is_file() {
-                                    cands.push(direct);
-                                }
-                                // No else: a direct hit must not hide a
-                                // deeper sibling copy of the same package
-                                // (4.9.3/bs4 sits BESIDE 4.9.3/py3k/bs4,
-                                // and only the deeper one is python 3).
-                                if let Ok(subs2) = fs::read_dir(&sub) {
-                                    cands.extend(
-                                        subs2
-                                            .flatten()
-                                            .map(|e| e.path().join(name))
-                                            .filter(|d| d.join("__init__.py").is_file()),
-                                    );
-                                }
-                            }
-                        }
-                        let score = |p: &Path| -> u32 {
-                            let s = p.to_string_lossy().into_owned();
-                            let versioned = s.split('/').any(|c| {
-                                c.contains('-') && c.chars().any(|ch| ch.is_ascii_digit())
-                            });
-                            u32::from(versioned) * 2 + u32::from(s.contains("py3"))
-                        };
-                        // `max_by_key` returns the LAST maximum, so with an
-                        // unsorted candidate list two equally-scored vendored
-                        // copies were chosen by readdir order. Sorting makes
-                        // the tie-break the path, which is a property of the
-                        // tree.
-                        cands.sort();
-                        if let Some(pkg) = cands.into_iter().max_by_key(|p| score(p)) {
+                        if let Some(pkg) = vendored_package(&anc.join("third_party"), name) {
                             if upload_dir(&pkg, out)? {
                                 queue.push(pkg);
                             }
@@ -20365,6 +20327,67 @@ fn python_join_segments(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
+/// The vendored copy of package NAME below TP (`<tp>/<pkg>/<name>` or
+/// `<tp>/<pkg>/<subdir>/<name>`), preferring a python-3, version-suffixed
+/// copy; see the ancestors arm of `upload_python_closure_uncached`.
+///
+/// Memoized per process on (TP, NAME). The closure asks it for every
+/// unsatisfied import of every directory it queues, and each ask lists TP
+/// and every directory under it: at Chromium scale that listing was most of
+/// a drive's python closure time (statx and getdents64, 45% of samples on
+/// a 286-task mojom drive). The answer is a function of the tree, which
+/// does not change under one driver process, the same assumption the walk
+/// and import-name memos make.
+fn vendored_package(tp: &Path, name: &str) -> Option<PathBuf> {
+    type VendoredMemo = std::sync::Mutex<HashMap<(PathBuf, String), Option<PathBuf>>>;
+    static MEMO: std::sync::OnceLock<VendoredMemo> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    let key = (tp.to_path_buf(), name.to_string());
+    if let Some(hit) = memo.lock().unwrap().get(&key) {
+        return hit.clone();
+    }
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Ok(subs) = fs::read_dir(tp) {
+        for sub in subs.flatten().map(|e| e.path()) {
+            if !sub.is_dir() {
+                continue;
+            }
+            let direct = sub.join(name);
+            if direct.join("__init__.py").is_file() {
+                cands.push(direct);
+            }
+            // No else: a direct hit must not hide a
+            // deeper sibling copy of the same package
+            // (4.9.3/bs4 sits BESIDE 4.9.3/py3k/bs4,
+            // and only the deeper one is python 3).
+            if let Ok(subs2) = fs::read_dir(&sub) {
+                cands.extend(
+                    subs2
+                        .flatten()
+                        .map(|e| e.path().join(name))
+                        .filter(|d| d.join("__init__.py").is_file()),
+                );
+            }
+        }
+    }
+    let score = |p: &Path| -> u32 {
+        let s = p.to_string_lossy().into_owned();
+        let versioned = s
+            .split('/')
+            .any(|c| c.contains('-') && c.chars().any(|ch| ch.is_ascii_digit()));
+        u32::from(versioned) * 2 + u32::from(s.contains("py3"))
+    };
+    // `max_by_key` returns the LAST maximum, so with an
+    // unsorted candidate list two equally-scored vendored
+    // copies were chosen by readdir order. Sorting makes
+    // the tie-break the path, which is a property of the
+    // tree.
+    cands.sort();
+    let found = cands.into_iter().max_by_key(|p| score(p));
+    memo.lock().unwrap().insert(key, found.clone());
+    found
+}
+
 /// The directory below `root` holding `<name>.py`, or the package dir
 /// `<name>/` holding an `__init__.py` - whichever a runtime
 /// sys.path.insert into the importer's own subtree would reach. BFS to
@@ -20806,7 +20829,34 @@ fn py_logical_lines(body: &str) -> Vec<String> {
 /// order), and the directories its `sys.path.append`/`insert` calls add.
 /// Paths are spelled from `file`'s own spelling, so they resolve where it
 /// does.
+///
+/// Memoized per process on (FILE, a hash of BODY): the python closure asks
+/// it for every file from three readers (`python_syspath_dirs`,
+/// `python_computed_carries`, `python_self_spliced_names`), and the line
+/// scan was the largest driver-side cost left after the vendored-package
+/// memo. Keyed on the body too, so one path read with other bytes is a
+/// fresh answer.
 fn py_computed_paths(file: &Path, body: &str) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    type Computed = (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>);
+    type ComputedMemo = std::sync::Mutex<HashMap<(PathBuf, u64), Computed>>;
+    static MEMO: std::sync::OnceLock<ComputedMemo> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    let key = (
+        file.to_path_buf(),
+        crate::ninja_state::rapidhash(body.as_bytes()),
+    );
+    if let Some(hit) = memo.lock().unwrap().get(&key) {
+        return hit.clone();
+    }
+    let found = py_computed_paths_uncached(file, body);
+    memo.lock().unwrap().insert(key, found.clone());
+    found
+}
+
+fn py_computed_paths_uncached(
+    file: &Path,
+    body: &str,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     let mut names: HashMap<String, PathBuf> = HashMap::new();
     let mut values = Vec::new();
     let mut syspath = Vec::new();
