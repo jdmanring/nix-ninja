@@ -14840,8 +14840,8 @@ mod its_and_swig_reader_tests {
 
     /// THE TRIGGER IS THE PROGRAM, behind whatever wrapper the generator
     /// emits: chromium's GN runs `gn_run_binary.py host/flatc`, so the
-    /// token `host/flatc` must match by basename. A bare `-I` is an empty
-    /// root and the `.fbs` after it is still a file, the protoc trap.
+    /// token `host/flatc` must match by basename. A separated `-I` takes the
+    /// next token as its root whatever it looks like, as flatc does.
     #[test]
     fn flatc_names_its_schema_and_roots() {
         let a: Vec<String> = [
@@ -14879,7 +14879,7 @@ mod its_and_swig_reader_tests {
     /// must come back as the RELATIVE join of the two or the wiring drops
     /// it in silence.
     #[test]
-    fn a_flatc_include_is_emitted_relative_to_the_build_dir() {
+    fn a_flatc_include_is_emitted_as_the_cwd_resolves_it() {
         use super::Scratch;
         use std::path::Path;
         let d = Scratch::new(format!("nn-flatc-emit-{}", std::process::id()));
@@ -14931,6 +14931,77 @@ mod its_and_swig_reader_tests {
         std::fs::write(bd.join("x.fbs"), "include \"nowhere/nope.fbs\";\n").unwrap();
         let got = flatc_referenced_paths(&bd, Path::new(""), &[], &["x.fbs".into()]);
         assert!(got.is_empty(), "carried {got:?}");
+    }
+
+    /// AN INCLUDE OF AN INCLUDE: flatc parses each included schema as a
+    /// source of its own, so the second level is opened as surely as the
+    /// first. A cycle (`b` includes `a` back) must terminate.
+    #[test]
+    fn a_flatc_include_closure_is_followed_and_terminates() {
+        use super::Scratch;
+        use std::path::Path;
+        let d = Scratch::new(format!("nn-flatc-closure-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::create_dir_all(d.join("src/a")).unwrap();
+        std::fs::create_dir_all(d.join("src/b")).unwrap();
+        std::fs::write(d.join("src/top.fbs"), "include \"a/a.fbs\";\n").unwrap();
+        std::fs::write(d.join("src/a/a.fbs"), "include \"b/b.fbs\";\n").unwrap();
+        std::fs::write(d.join("src/b/b.fbs"), "include \"a/a.fbs\";\n").unwrap();
+        let got = flatc_referenced_paths(
+            &bd,
+            Path::new(""),
+            &["../src".into()],
+            &["../src/top.fbs".into()],
+        );
+        assert_eq!(
+            got,
+            vec!["../src/a/a.fbs".to_string(), "../src/b/b.fbs".to_string()]
+        );
+    }
+
+    /// flatc RESOLVES BESIDE THE INCLUDER FIRST, then through the roots. With
+    /// one name in both places the reader must carry the one flatc opens.
+    #[test]
+    fn a_flatc_include_beside_its_includer_wins_over_a_root() {
+        use super::Scratch;
+        use std::path::Path;
+        let d = Scratch::new(format!("nn-flatc-order-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(bd.join("s")).unwrap();
+        std::fs::create_dir_all(bd.join("r")).unwrap();
+        std::fs::write(bd.join("s/top.fbs"), "include \"dup.fbs\";\n").unwrap();
+        std::fs::write(bd.join("s/dup.fbs"), "table Beside {}\n").unwrap();
+        std::fs::write(bd.join("r/dup.fbs"), "table Root {}\n").unwrap();
+        let got = flatc_referenced_paths(&bd, Path::new(""), &["r".into()], &["s/top.fbs".into()]);
+        assert_eq!(got, vec!["s/dup.fbs".to_string()]);
+    }
+
+    /// A LEADING `cd`: the spellings stay as the post-`cd` cwd sees them,
+    /// and `referenced_file_rel` rebases them once. Existence is asked of
+    /// that cwd, not the build dir.
+    #[test]
+    fn a_flatc_include_under_a_cd_is_resolved_from_the_cwd() {
+        use super::Scratch;
+        use std::path::Path;
+        let d = Scratch::new(format!("nn-flatc-cd-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(bd.join("sub")).unwrap();
+        std::fs::create_dir_all(d.join("src/inc")).unwrap();
+        std::fs::write(d.join("src/top.fbs"), "include \"inc/i.fbs\";\n").unwrap();
+        std::fs::write(d.join("src/inc/i.fbs"), "table I {}\n").unwrap();
+        let got = flatc_referenced_paths(
+            &bd,
+            Path::new("sub"),
+            &["../../src".into()],
+            &["../../src/top.fbs".into()],
+        );
+        assert_eq!(got, vec!["../../src/inc/i.fbs".to_string()]);
+        assert_eq!(
+            super::rebase_post_cd(Path::new("sub"), &got[0]),
+            std::path::PathBuf::from("../src/inc/i.fbs"),
+            "one rebase lands the include in the tree the top schema sits in"
+        );
     }
 
     /// obs-studio's wrapper edge, driven through the production path: the
@@ -15704,73 +15775,111 @@ fn swig_referenced_paths(
     out
 }
 
-/// The schemas a flatc run's `include "..."` lines name, resolved through
-/// the command's `-I` roots in order with the including schema's own
-/// directory as fallback. Only what EXISTS is carried, and every spelling
-/// emitted is relative to the build dir: an absolute one is dropped in
-/// silence downstream, the trap the swig emitter test pins.
+/// The schemas a flatc run's `include "..."` lines name, walked as a
+/// CLOSURE: flatc parses an included schema with that file as the source, so
+/// an include of an include is opened exactly the same way (`DoParse` calls
+/// itself). A one-level read carries the first and drops the second, and the
+/// run dies on it with the same `unable to load include file`.
+///
+/// RESOLUTION ORDER IS flatc's, not the obvious one: the included file's own
+/// directory first, then the `-I` roots in the order given. Two schemas of one
+/// name resolve differently under the wrong order, and the task then reads a
+/// different schema than real ninja does, with no error.
+///
+/// Spellings are as given on the command line or as composed from it, which
+/// is what the post-`cd` cwd resolves: an `-I` root spelled `../chromium`
+/// yields `../chromium/<include>`. `referenced_file_rel` rebases that once.
 fn flatc_referenced_paths(
     build_dir: &Path,
     cd_dir: &Path,
     incs: &[String],
     files: &[String],
 ) -> Vec<String> {
+    // Every spelling is either as given or composed from one, so it is what
+    // the post-`cd` cwd resolves; `on_disk` asks the filesystem for it.
     let root = build_dir.join(cd_dir);
-    let mut out = Vec::new();
-    for a in files {
-        if !a.ends_with(".fbs") {
-            continue;
+    let on_disk = |p: &Path| {
+        if p.is_absolute() {
+            p.is_file()
+        } else {
+            root.join(p).is_file()
         }
-        let Ok(text) = std::fs::read_to_string(root.join(a)) else {
+    };
+    // `seen` is keyed by the FILE, not the spelling: one schema reached two
+    // ways (beside its includer, and through a root) is walked and carried
+    // once.
+    let key_of = |p: &Path| {
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        };
+        std::fs::canonicalize(&abs).unwrap_or(abs)
+    };
+    let mut queue: Vec<PathBuf> = files
+        .iter()
+        .filter(|a| a.ends_with(".fbs"))
+        .map(PathBuf::from)
+        .filter(|p| on_disk(p))
+        .collect();
+    let mut seen: rustc_hash::FxHashSet<PathBuf> = queue.iter().map(|p| key_of(p)).collect();
+    let mut out: Vec<String> = Vec::new();
+    while let Some(doc) = queue.pop() {
+        let text = if doc.is_absolute() {
+            std::fs::read_to_string(&doc)
+        } else {
+            std::fs::read_to_string(root.join(&doc))
+        };
+        let Ok(text) = text else {
             continue;
         };
-        let fbs_dir = Path::new(a).parent().unwrap_or(Path::new(""));
-        for line in text.lines() {
-            let t = line.trim_start();
-            let Some(rest) = t.strip_prefix("include") else {
-                continue;
-            };
-            let rest = rest.trim_start();
-            let quote = rest.chars().next().unwrap_or('"');
-            if !matches!(quote, '"' | '\'') {
-                continue;
-            }
-            let rest = &rest[quote.len_utf8()..];
-            let Some(j) = rest.find(quote) else { continue };
-            let target = &rest[..j];
+        let doc_dir = doc.parent().unwrap_or(Path::new("")).to_path_buf();
+        for target in flatc_include_names(&text) {
             if target.is_empty() {
                 continue;
             }
-            // flatc searches its `-I` roots, so they come first; the schema's
-            // own directory is the fallback for a layout that ships the
-            // include beside its includer.
-            let spelled = incs
-                .iter()
-                .map(|d| Path::new(d).join(target))
-                .find(|p| {
-                    if p.is_absolute() {
-                        p.is_file()
-                    } else {
-                        root.join(p).is_file()
-                    }
-                })
-                .or_else(|| {
-                    let p = fbs_dir.join(target);
-                    (root.join(&p).is_file() || root.join(target).is_file()).then(|| {
-                        Path::new(a)
-                            .parent()
-                            .map(|d| d.join(target))
-                            .unwrap_or_else(|| PathBuf::from(target))
-                    })
-                });
-            let Some(spelled) = spelled else {
+            let Some(spelled) = std::iter::once(doc_dir.join(&target))
+                .chain(incs.iter().map(|d| Path::new(d).join(&target)))
+                .find(|p| on_disk(p))
+            else {
                 continue;
             };
-            let s = spelled.to_string_lossy().into_owned();
-            if !out.contains(&s) {
-                out.push(s);
+            if !seen.insert(key_of(&spelled)) {
+                continue;
             }
+            queue.push(spelled.clone());
+            out.push(spelled.to_string_lossy().into_owned());
         }
+    }
+    out
+}
+
+/// The names an `include "..."` directive names. A directive opens the line
+/// and is followed by whitespace, so `includes` and `native_include` do not
+/// match; a `//` comment line is skipped; any quote character flatc accepts
+/// closes the name.
+fn flatc_include_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("//") {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("include") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            continue;
+        };
+        let inner = &rest[quote.len_utf8()..];
+        let Some(end) = inner.find(quote) else {
+            continue;
+        };
+        out.push(inner[..end].to_string());
     }
     out
 }
@@ -16011,7 +16120,8 @@ fn qrc_file_candidate_rel(build_dir: &Path, cd_dir: &Path, q: &str) -> Option<Pa
 /// The edge's own outputs as normalized build-relative paths. A qrc
 /// candidate naming one is the edge naming what it writes (`rcc -project
 /// -o gen.qrc`): absent at scan time, so without this guard it would defer
-/// on itself and abort on the cycle. Both qrc candidate sites consult it.
+/// on itself and abort on the cycle. The two qrc candidate sites and the grd
+/// candidate site consult it.
 fn own_output_rels(build: &Build, files: &graph::GraphFiles, build_dir: &Path) -> Vec<PathBuf> {
     build
         .outs()
