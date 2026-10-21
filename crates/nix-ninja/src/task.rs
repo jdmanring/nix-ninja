@@ -14948,16 +14948,63 @@ mod its_and_swig_reader_tests {
         std::fs::write(d.join("src/top.fbs"), "include \"a/a.fbs\";\n").unwrap();
         std::fs::write(d.join("src/a/a.fbs"), "include \"b/b.fbs\";\n").unwrap();
         std::fs::write(d.join("src/b/b.fbs"), "include \"a/a.fbs\";\n").unwrap();
-        let got = flatc_referenced_paths(
-            &bd,
-            Path::new(""),
-            &["../src".into()],
-            &["../src/top.fbs".into()],
-        );
+        // ON A THREAD WITH A DEADLINE: without the `seen` guard the walk
+        // cycles a, b, a forever, and a hang is not a failing outcome.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bd2 = bd.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(flatc_referenced_paths(
+                &bd2,
+                Path::new(""),
+                &["../src".into()],
+                &["../src/top.fbs".into()],
+            ));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the include walk did not terminate on a cycle");
         assert_eq!(
             got,
             vec!["../src/a/a.fbs".to_string(), "../src/b/b.fbs".to_string()]
         );
+    }
+
+    /// THE DIRECTIVE IS A TOKEN, NOT A WORD FOLLOWED BY A SPACE: flatc lexes
+    /// `include"x"` as two tokens, while `includes` and `include_x` are
+    /// identifiers. A comment line names nothing.
+    #[test]
+    fn a_flatc_include_directive_is_read_as_flatc_lexes_it() {
+        assert_eq!(
+            super::flatc_include_names(
+                "include \"a.fbs\";\ninclude\"b.fbs\";\ninclude 'c.fbs';\nincludes \"no1\";\n\
+                 include_x \"no2\";\n// include \"no3\";\nnative_include \"no4\";\n"
+            ),
+            vec!["a.fbs", "b.fbs", "c.fbs"]
+        );
+    }
+
+    /// TWO BUILD-TREE SPELLINGS, ONE STORE FILE: in local mode both are
+    /// symlinks to one content-addressed path, and both are inputs the
+    /// command reads. Keying `seen` on the canonical file carried one.
+    #[cfg(unix)]
+    #[test]
+    fn two_flatc_includes_linked_to_one_file_are_both_carried() {
+        use super::Scratch;
+        use std::path::Path;
+        let d = Scratch::new(format!("nn-flatc-links-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(bd.join("x")).unwrap();
+        std::fs::create_dir_all(d.join("store")).unwrap();
+        std::fs::write(d.join("store/same.fbs"), "table S {}\n").unwrap();
+        std::os::unix::fs::symlink(d.join("store/same.fbs"), bd.join("x/one.fbs")).unwrap();
+        std::os::unix::fs::symlink(d.join("store/same.fbs"), bd.join("x/two.fbs")).unwrap();
+        std::fs::write(
+            bd.join("x/top.fbs"),
+            "include \"one.fbs\";\ninclude \"two.fbs\";\n",
+        )
+        .unwrap();
+        let got = flatc_referenced_paths(&bd, Path::new(""), &[], &["x/top.fbs".into()]);
+        assert_eq!(got, vec!["x/one.fbs".to_string(), "x/two.fbs".to_string()]);
     }
 
     /// flatc RESOLVES BESIDE THE INCLUDER FIRST, then through the roots. With
@@ -15805,16 +15852,18 @@ fn flatc_referenced_paths(
             root.join(p).is_file()
         }
     };
-    // `seen` is keyed by the FILE, not the spelling: one schema reached two
-    // ways (beside its includer, and through a root) is walked and carried
-    // once.
+    // `seen` is keyed by the LEXICAL path, not the canonical one: in local
+    // mode a placed product is a symlink into the store, and two build-tree
+    // schemas that point at one content-addressed store file are two files
+    // the command reads and two inputs the task needs. Canonicalizing would
+    // collapse them and, when the store spelling came first, hide the
+    // in-tree one that `referenced_file_rel` would have kept.
     let key_of = |p: &Path| {
-        let abs = if p.is_absolute() {
+        if p.is_absolute() {
             p.to_path_buf()
         } else {
             root.join(p)
-        };
-        std::fs::canonicalize(&abs).unwrap_or(abs)
+        }
     };
     let mut queue: Vec<PathBuf> = files
         .iter()
@@ -15855,9 +15904,10 @@ fn flatc_referenced_paths(
 }
 
 /// The names an `include "..."` directive names. A directive opens the line
-/// and is followed by whitespace, so `includes` and `native_include` do not
-/// match; a `//` comment line is skipped; any quote character flatc accepts
-/// closes the name.
+/// and is not followed by an identifier character, so `includes` and
+/// `include_x` do not match while flatc's own `include"x"` does; a `//`
+/// comment line is skipped, and any quote character flatc accepts closes
+/// the name.
 fn flatc_include_names(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -15868,7 +15918,7 @@ fn flatc_include_names(text: &str) -> Vec<String> {
         let Some(rest) = t.strip_prefix("include") else {
             continue;
         };
-        if !rest.starts_with(char::is_whitespace) {
+        if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
             continue;
         }
         let rest = rest.trim_start();
