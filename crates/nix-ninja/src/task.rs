@@ -2793,6 +2793,7 @@ impl Runner {
             let doxyfile = doxygen_invocation(&args);
             let msgfmt_dirs = msgfmt_invocation(&args);
             let swig_i = swig_invocation(&args);
+            let flatc = flatc_invocation(&args);
             let gir_filelists = gir_filelist_invocation(&args);
             // A `g-ir-scanner` RUN NAMES ITS SOURCES POSITIONALLY when the edge
             // carries no `--filelist`: meson emits them as bare names after the
@@ -3491,6 +3492,16 @@ impl Runner {
             // same reader placement as the ones around it.
             if let Some((files, incs)) = &swig_i {
                 for p in swig_referenced_paths(&self.config.build_dir, &cd_dir, files, incs) {
+                    referenced.push(p);
+                }
+            }
+            // A FLATC RUN RESOLVES ITS OWN `include` TARGETS through the
+            // command's `-I` roots. qtwebengine's `indexed_ruleset.fbs`
+            // includes `url_pattern_index.fbs` through one, and the edge
+            // declares only the top schema, so the run died `unable to
+            // load include file`. Same family and reader placement as swig.
+            if let Some((incs, files)) = &flatc {
+                for p in flatc_referenced_paths(&self.config.build_dir, &cd_dir, incs, files) {
                     referenced.push(p);
                 }
             }
@@ -4399,6 +4410,14 @@ impl Runner {
         // so found manifests re-enter the list.
         lap(&NT_PY_MS);
 
+        // The edge's own outputs, for the self-output guards below: a
+        // candidate spelling that names what this edge writes is not an
+        // input, and deferring on it would re-queue the edge on itself.
+        let own = own_output_rels(build, files, &self.config.build_dir);
+        // A deferral the qrc and grd candidate passes share: one re-queue
+        // carries the producer as an implicit input, and the second
+        // resolution finds the DerivedFile.
+        let mut qrc_defer_out: Option<DeferMiss> = None;
         let mut grd_list: Vec<PathBuf> = input_set
             .keys()
             .filter(|p| p.extension().is_some_and(|e| e == "grd" || e == "grdp"))
@@ -4442,12 +4461,17 @@ impl Runner {
                 if input_set.contains_key(&cand) {
                     continue;
                 }
+                if own.contains(&cand) {
+                    continue;
+                }
                 let Some(gfid) = files.lookup(&cand.to_string_lossy()) else {
                     continue;
                 };
                 let mut expand = vec![gfid];
+                let mut found = false;
                 while let Some(nfid) = expand.pop() {
                     if let Some(df) = self.derived_files.get(&nfid) {
+                        found = true;
                         if input_set.contains_key(&df.build_path) {
                             continue;
                         }
@@ -4456,6 +4480,25 @@ impl Runner {
                             expand.extend(sibs.iter().filter(|s| **s != nfid));
                         }
                     }
+                }
+                // A PRODUCED NODE WITH NO REGISTERED DERIVED FILE: the
+                // consumer resolved before its producer, which no declared
+                // input orders after it (grit's `.svg.compressed` files:
+                // the compress edge is nobody's declared input). Defer
+                // through the same machinery as the qrc miss below: the
+                // scheduler re-queues the edge with the producer as an
+                // implicit input, and the second resolution finds the
+                // DerivedFile. Restricted to nodes with a producing edge
+                // (`input.is_some()`), never any graph name, so a source
+                // file that happens to share a spelling cannot invent a
+                // false dependency.
+                if !found && files.by_id[gfid].input.is_some() {
+                    qrc_defer_out = Some(DeferMiss {
+                        fids: vec![gfid],
+                        header: cand.to_string_lossy().into_owned(),
+                        at: cand.clone(),
+                    });
+                    break;
                 }
             }
         }
@@ -4486,9 +4529,6 @@ impl Runner {
         // Members of a GENERATED qrc are not covered here: the qrc is
         // unreadable at (re-)resolution, so they never become candidates
         // single-pass (open shape).
-        let mut qrc_defer_out: Option<DeferMiss> = None;
-        // The edge's own outputs, for the self-output guard below.
-        let own = own_output_rels(build, files, &self.config.build_dir);
         for cand in &qrc_candidates {
             if input_set.contains_key(cand) {
                 continue;
@@ -14212,6 +14252,40 @@ fn swig_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
     Some((files, incs))
 }
 
+/// A FLATBUFFERS SCHEMA COMPILER RUN READS ITS OWN `include` TARGETS. Same
+/// family as the swig `%include` and protoc `import` readers: the edge
+/// declares the top schema and flatc opens what it includes. Chromium's GN
+/// runs it behind `gn_run_binary.py host/flatc`, so the trigger is the
+/// program token wherever it sits in argv, and the include roots are `-I`
+/// in both spellings (separated first: a bare `-I` must not fall through
+/// to the positional branch, the protoc trap one tool over).
+fn flatc_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
+    if !args.iter().any(|a| a.rsplit('/').next() == Some("flatc")) {
+        return None;
+    }
+    let (mut files, mut incs) = (Vec::new(), Vec::new());
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        if a == "-I" {
+            if let Some(v) = it.next() {
+                if !v.is_empty() {
+                    incs.push(v.clone());
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("-I") {
+            if !v.is_empty() {
+                incs.push(v.to_string());
+            }
+        } else if !a.starts_with('-') && a.ends_with(".fbs") {
+            files.push(a.clone());
+        }
+    }
+    if incs.is_empty() && files.is_empty() {
+        return None;
+    }
+    Some((incs, files))
+}
+
 /// A `g-ir-scanner` RUN READS ITS SOURCES FROM A FILE IT NAMES ON THE COMMAND
 /// LINE, and nothing else declares them. The trigger returns the `--filelist`
 /// VALUE (the file the scanner opens), not the sources: a separate function
@@ -14540,11 +14614,11 @@ fn glib_mkenums_referenced_paths(build_dir: &Path, cwd: &Path, files: &[String])
 #[cfg(test)]
 mod its_and_swig_reader_tests {
     use super::{
-        gir_positional_referenced_paths, gir_positional_sources_invocation,
-        glib_mkenums_invocation, glib_mkenums_referenced_paths, its_rule_targets,
-        msgfmt_invocation, msgfmt_its_referenced_paths, proto_imports, protoc_invocation,
-        protoc_referenced_paths, protoc_wrapper_roots, swig_invocation, swig_referenced_paths,
-        valac_invocation, valac_referenced_paths,
+        flatc_invocation, flatc_referenced_paths, gir_positional_referenced_paths,
+        gir_positional_sources_invocation, glib_mkenums_invocation, glib_mkenums_referenced_paths,
+        its_rule_targets, msgfmt_invocation, msgfmt_its_referenced_paths, proto_imports,
+        protoc_invocation, protoc_referenced_paths, protoc_wrapper_roots, swig_invocation,
+        swig_referenced_paths, valac_invocation, valac_referenced_paths,
     };
     use std::path::Path;
 
@@ -14761,6 +14835,101 @@ mod its_and_swig_reader_tests {
         std::fs::create_dir_all(&bd).unwrap();
         std::fs::write(bd.join("x.i"), "%include \"nowhere/nope.h\"\n").unwrap();
         let got = swig_referenced_paths(&bd, Path::new(""), &["x.i".into()], &[]);
+        assert!(got.is_empty(), "carried {got:?}");
+    }
+
+    /// THE TRIGGER IS THE PROGRAM, behind whatever wrapper the generator
+    /// emits: chromium's GN runs `gn_run_binary.py host/flatc`, so the
+    /// token `host/flatc` must match by basename. A bare `-I` is an empty
+    /// root and the `.fbs` after it is still a file, the protoc trap.
+    #[test]
+    fn flatc_names_its_schema_and_roots() {
+        let a: Vec<String> = [
+            "python3.14",
+            "../../chromium/build/gn_run_binary.py",
+            "host/flatc",
+            "-c",
+            "--keep-prefix",
+            "-o",
+            "gen/components/x",
+            "-I",
+            "../../chromium/",
+            "../../chromium/components/x/indexed_ruleset.fbs",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            flatc_invocation(&a),
+            Some((
+                vec!["../../chromium/".to_string()],
+                vec!["../../chromium/components/x/indexed_ruleset.fbs".to_string()]
+            ))
+        );
+        let b: Vec<String> = ["flatc", "-Iroot", "x.fbs"].map(String::from).to_vec();
+        assert_eq!(
+            flatc_invocation(&b),
+            Some((vec!["root".to_string()], vec!["x.fbs".to_string()]))
+        );
+        assert_eq!(flatc_invocation(&["gcc".into(), "x.fbs".into()]), None);
+    }
+
+    /// THE EMITTED SPELLING, which the trigger test above cannot see. The
+    /// qtwebengine geometry: the top schema sits deep under the source
+    /// tree, the `-I` root climbs out of the build dir, and the include
+    /// must come back as the RELATIVE join of the two or the wiring drops
+    /// it in silence.
+    #[test]
+    fn a_flatc_include_is_emitted_relative_to_the_build_dir() {
+        use super::Scratch;
+        use std::path::Path;
+        let d = Scratch::new(format!("nn-flatc-emit-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::create_dir_all(d.join("chromium/components/subresource_filter/core/common/flat"))
+            .unwrap();
+        std::fs::create_dir_all(d.join("chromium/components/url_pattern_index/flat")).unwrap();
+        std::fs::write(
+            d.join("chromium/components/url_pattern_index/flat/url_pattern_index.fbs"),
+            "namespace url_pattern_index.flat;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("chromium/components/subresource_filter/core/common/flat/indexed_ruleset.fbs"),
+            "include \"components/url_pattern_index/flat/url_pattern_index.fbs\";\n",
+        )
+        .unwrap();
+        let got = flatc_referenced_paths(
+            &bd,
+            Path::new(""),
+            &["../chromium/".into()],
+            &[
+                "../chromium/components/subresource_filter/core/common/flat/indexed_ruleset.fbs"
+                    .into(),
+            ],
+        );
+        assert_eq!(
+            got,
+            vec!["../chromium/components/url_pattern_index/flat/url_pattern_index.fbs".to_string()],
+            "the reader must emit a RELATIVE spelling or the wiring drops it"
+        );
+        assert!(
+            !got.iter().any(|p| Path::new(p).is_absolute()),
+            "an absolute candidate is dropped silently by starts_with(store_dir)"
+        );
+    }
+
+    /// An `include` naming a file that is NOT there contributes nothing.
+    /// The top schema itself is placed where the reader looks, so this
+    /// exercises the include guard and not the absent-schema early return.
+    #[test]
+    fn a_flatc_include_that_does_not_exist_is_dropped() {
+        use super::Scratch;
+        use std::path::Path;
+        let d = Scratch::new(format!("nn-flatc-absent-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(bd.join("x.fbs"), "include \"nowhere/nope.fbs\";\n").unwrap();
+        let got = flatc_referenced_paths(&bd, Path::new(""), &[], &["x.fbs".into()]);
         assert!(got.is_empty(), "carried {got:?}");
     }
 
@@ -15525,6 +15694,77 @@ fn swig_referenced_paths(
                     continue;
                 };
                 p
+            };
+            let s = spelled.to_string_lossy().into_owned();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// The schemas a flatc run's `include "..."` lines name, resolved through
+/// the command's `-I` roots in order with the including schema's own
+/// directory as fallback. Only what EXISTS is carried, and every spelling
+/// emitted is relative to the build dir: an absolute one is dropped in
+/// silence downstream, the trap the swig emitter test pins.
+fn flatc_referenced_paths(
+    build_dir: &Path,
+    cd_dir: &Path,
+    incs: &[String],
+    files: &[String],
+) -> Vec<String> {
+    let root = build_dir.join(cd_dir);
+    let mut out = Vec::new();
+    for a in files {
+        if !a.ends_with(".fbs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(root.join(a)) else {
+            continue;
+        };
+        let fbs_dir = Path::new(a).parent().unwrap_or(Path::new(""));
+        for line in text.lines() {
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix("include") else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let quote = rest.chars().next().unwrap_or('"');
+            if !matches!(quote, '"' | '\'') {
+                continue;
+            }
+            let rest = &rest[quote.len_utf8()..];
+            let Some(j) = rest.find(quote) else { continue };
+            let target = &rest[..j];
+            if target.is_empty() {
+                continue;
+            }
+            // flatc searches its `-I` roots, so they come first; the schema's
+            // own directory is the fallback for a layout that ships the
+            // include beside its includer.
+            let spelled = incs
+                .iter()
+                .map(|d| Path::new(d).join(target))
+                .find(|p| {
+                    if p.is_absolute() {
+                        p.is_file()
+                    } else {
+                        root.join(p).is_file()
+                    }
+                })
+                .or_else(|| {
+                    let p = fbs_dir.join(target);
+                    (root.join(&p).is_file() || root.join(target).is_file()).then(|| {
+                        Path::new(a)
+                            .parent()
+                            .map(|d| d.join(target))
+                            .unwrap_or_else(|| PathBuf::from(target))
+                    })
+                });
+            let Some(spelled) = spelled else {
+                continue;
             };
             let s = spelled.to_string_lossy().into_owned();
             if !out.contains(&s) {
