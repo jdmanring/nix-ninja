@@ -15904,10 +15904,9 @@ fn flatc_referenced_paths(
 }
 
 /// The names an `include "..."` directive names. A directive opens the line
-/// and is not followed by an identifier character, so `includes` and
-/// `include_x` do not match while flatc's own `include"x"` does; a `//`
-/// comment line is skipped, and any quote character flatc accepts closes
-/// the name.
+/// and its next non-space character is a quote, which rejects `includes` and
+/// `include_x` while keeping flatc's own `include"x"`; a `//` comment line is
+/// skipped, and any quote character flatc accepts closes the name.
 fn flatc_include_names(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -15918,9 +15917,6 @@ fn flatc_include_names(text: &str) -> Vec<String> {
         let Some(rest) = t.strip_prefix("include") else {
             continue;
         };
-        if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
-            continue;
-        }
         let rest = rest.trim_start();
         let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
             continue;
