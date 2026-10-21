@@ -494,6 +494,14 @@ Mechanisms, cited by symbol because line numbers rot:
 - **Daemon exchanges** are bounded (`bounded`; ladder `300 << 2n` on
   `build_paths`); `BuilderRpcClient::pool` is a `BoundedPool` whose only
   acquire takes a deadline, so a bare acquire is a COMPILE error.
+  On the host route (`in_drv` false: outside a build, or
+  `NIX_NINJA_RPC_HOST_ROUTE=1`) the pool is `new_reaped`: each host-daemon
+  worker keeps the RSS it reached, so parked connections close after
+  `REAP_QUIET` without a release, every `RECYCLE_EVERY`th release closes
+  its connection, and idle expiry is `host_route_config`'s; inside a build
+  the pool is the default one. `reaped`/`recycled` in `nix-ninja-stats`
+  count them. A retired worker drops its temp roots, so never collect
+  beside a host-route drive.
 
 ## Failure classes
 
