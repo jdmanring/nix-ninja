@@ -302,7 +302,8 @@ fn upload_allowance() -> std::time::Duration {
 /// than a property a test has to count occurrences of. (That test was
 /// written first, and it failed four times on its own needles: the fix's
 /// name contains the counted substring, one call spans a line break, and
-/// the assertion message matched itself.)
+/// the assertion message matched itself.) The one exception is the reaper's
+/// `close_idle`, which holds the inner pool and bounds its own acquire.
 ///
 /// THE ACQUIRE WAS THE ONE UNBOUNDED WAIT. A pool connection is held for
 /// the whole of a build, so a request that finds every connection busy
@@ -317,16 +318,193 @@ fn upload_allowance() -> std::time::Duration {
 /// later request queues behind a guard that will never be released.
 ///
 /// A TIMEOUT HERE IS NOT THE SAME EVENT AS A TIMEOUT ON THE EXCHANGE, and
-/// the message says which: nothing was sent, so there is no wedged
-/// connection to drop and no daemon child to kill. What the caller gets is
+/// the message says which: no request was sent, so there is no wedged
+/// exchange to drop (a connect cut off mid-handshake is discarded by the
+/// pool with the timed-out future). What the caller gets is
 /// the same `DaemonStalled`, because the caller's recovery is the same -
 /// retry on a fresh connection, which the build loop already does and which
 /// re-reads the pool.
-struct BoundedPool(ConnectionPool);
+///
+/// The other fields: the `now_ms` of the latest release, which the reaper
+/// reads; the count of releases; the release quota after which a
+/// connection is closed rather than parked (0 for never); and whether the
+/// pool is reaped, which is also whether `acquire_retrying` retries.
+struct BoundedPool(
+    ConnectionPool,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    u64,
+    bool,
+);
+
+/// Close the connections parked idle in POOL, stopping as soon as a release
+/// moves LAST past SEEN or nothing is left parked, and return how many
+/// acquires here closed one. A parked connection already past the pool's
+/// idle expiry is discarded by the pop itself and not counted. A request
+/// that takes or releases a connection between the check and the acquire
+/// can make this close a just-released connection or a fresh one it
+/// connected, costing one fork. Bounded, so a pool whose every slot is held
+/// cannot hold the reaper.
+async fn close_idle(
+    pool: &ConnectionPool,
+    last: &std::sync::atomic::AtomicU64,
+    seen: u64,
+) -> usize {
+    let mut closed = 0;
+    while pool.stats().await.0 > 0 && last.load(std::sync::atomic::Ordering::Relaxed) == seen {
+        match tokio::time::timeout(std::time::Duration::from_millis(500), pool.acquire()).await {
+            Ok(Ok(guard)) => {
+                guard.mark_broken();
+                closed += 1;
+            }
+            _ => break,
+        }
+    }
+    closed
+}
+
+/// Connections the reaper's acquires closed, for the driver's stats line. A
+/// parked connection the pool's idle expiry discards during the pop is not
+/// counted, and a fresh one the reaper connected after a race is.
+pub static REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Released connections closed for reaching the quota, for the stats line.
+/// A release whose exchange failed is counted too, though the pool would
+/// have discarded that connection anyway.
+pub static RECYCLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a host-route pool must go without a release before the reaper
+/// closes its parked connections.
+///
+/// On the host route (a driver outside any build) the daemon forks one
+/// worker process per connection, and a parked connection keeps its worker
+/// alive. The pool expires an idle connection only when a later acquire
+/// pops it, so a driver resolving on its own CPU held every worker it had
+/// opened, idle, at whatever RSS each had reached. Closing on every release
+/// instead costs a fork per exchange, each logged by the daemon. Reaping
+/// after a quiet spell keeps reuse inside a burst of exchanges and still
+/// lets the workers go when the driver stops asking.
+///
+/// Inside a build the socket is the build's own daemon, one thread per
+/// connection in one process, and none of this is measured there, so the
+/// pool keeps its default behaviour on that route.
+///
+/// A path an exchange added or built loses its temp root when the worker
+/// that added it exits, and a retired worker exits while the driver still
+/// runs, so this is safe only where no collector (min-free auto-GC
+/// included) runs beside a host-route drive.
+const REAP_QUIET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Every this many releases on the host route, the released connection is
+/// closed rather than parked. A host-route worker grows while it serves,
+/// not only while it idles: on one v8 class a driver reaping idle
+/// connections alone saw its six workers grow from 0.31 to 8.82 GiB
+/// (summed RSS) in two minutes of busy exchanges. Retiring every Nth
+/// release gives each connection about N exchanges on average before its
+/// worker exits, at one fork per N exchanges, so a busy driver's workers
+/// do not keep what they grew for the rest of the drive. It does not cap
+/// the peak: a few heavy exchanges grow a worker before its quota comes.
+/// Prime, so that under a regular
+/// release order the retirements do not fall on the same few of a pool's
+/// connections every time.
+const RECYCLE_EVERY: u64 = 499;
+
+/// The host route's pool configuration for a reaper with quiet spell QUIET.
+/// A trickle of exchanges never lets the pool go quiet. Expiring a parked
+/// connection idle past twice the quiet spell on pop trims the pool under a
+/// slow trickle, but the pool reuses first in, first out, so a serial
+/// trickle every T seconds keeps about 2 * QUIET / T + 1 connections fresh,
+/// and a trickle faster than that keeps the whole pool; the release quota
+/// retires those. Twice the spell keeps connections parked together clear
+/// of the reaper, which fires between one and one and a half spells after
+/// the last release, so the reaper finds them rather than the pop
+/// discarding them.
+fn host_route_config(max_size: usize, quiet: std::time::Duration) -> PoolConfig {
+    PoolConfig {
+        max_size,
+        max_idle_time: 2 * quiet,
+        ..PoolConfig::default()
+    }
+}
+
+/// A pooled connection that stamps the pool's release time when dropped,
+/// and closes the connection instead of parking it on every quota-th
+/// release.
+struct Lease(
+    Option<PooledConnectionGuard>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    u64,
+);
+
+impl std::ops::Deref for Lease {
+    type Target = PooledConnectionGuard;
+    fn deref(&self) -> &PooledConnectionGuard {
+        self.0.as_ref().expect("lease is held until drop")
+    }
+}
+
+impl std::ops::DerefMut for Lease {
+    fn deref_mut(&mut self) -> &mut PooledConnectionGuard {
+        self.0.as_mut().expect("lease is held until drop")
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Stamped before the connection is parked, which narrows, but does
+        // not close, the window in which a reaper that read the old stamp
+        // pops this connection (see `close_idle`).
+        self.1.store(now_ms(), Relaxed);
+        let n = self.2.fetch_add(1, Relaxed) + 1;
+        match self.0.take() {
+            Some(guard) if self.3 > 0 && n.is_multiple_of(self.3) => {
+                guard.mark_broken();
+                RECYCLED.fetch_add(1, Relaxed);
+            }
+            other => drop(other),
+        }
+    }
+}
 
 impl BoundedPool {
     fn new(path: &Path, config: PoolConfig) -> Self {
-        Self(ConnectionPool::new(path, config))
+        Self(
+            ConnectionPool::new(path, config),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_ms())),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            0,
+            false,
+        )
+    }
+
+    /// A pool whose parked connections are closed once no lease has been
+    /// released for QUIET, and whose every EVERY-th released connection is
+    /// closed. The reaper runs on RT for the pool's lifetime.
+    fn new_reaped(
+        path: &Path,
+        config: PoolConfig,
+        rt: &Runtime,
+        quiet: std::time::Duration,
+        every: u64,
+    ) -> Self {
+        let mut pool = Self::new(path, config);
+        pool.3 = every;
+        pool.4 = true;
+        let (inner, last) = (pool.0.clone(), pool.1.clone());
+        let tick = (quiet / 2).max(std::time::Duration::from_millis(50));
+        rt.spawn(async move {
+            loop {
+                tokio::time::sleep(tick).await;
+                let seen = last.load(std::sync::atomic::Ordering::Relaxed);
+                if now_ms().saturating_sub(seen) >= quiet.as_millis() as u64 {
+                    let n = close_idle(&inner, &last, seen).await;
+                    REAPED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        pool
     }
 
     /// Hold a slot WITHOUT a deadline, for the test that proves a full
@@ -338,17 +516,16 @@ impl BoundedPool {
         self.0.acquire().await
     }
 
-    async fn acquire(
-        &self,
-        what: &str,
-        allowance: std::time::Duration,
-    ) -> Result<PooledConnectionGuard> {
+    async fn acquire(&self, what: &str, allowance: std::time::Duration) -> Result<Lease> {
         match tokio::time::timeout(allowance, self.0.acquire()).await {
-            Ok(out) => out.map_err(Error::from),
+            Ok(out) => out
+                .map(|g| Lease(Some(g), self.1.clone(), self.2.clone(), self.3))
+                .map_err(Error::from),
             Err(_elapsed) => {
                 eprintln!(
-                    "nix-ninja: [{}] WATCHDOG timeout on {what}: no pooled connection in {}s \
-                     (every connection is held by a build that has not returned); nothing sent",
+                    "nix-ninja: [{}] WATCHDOG timeout on {what}: no connection in {}s \
+                     (every slot held by a build that has not returned, or the connect \
+                     itself did not finish); no request sent",
                     now_s(),
                     allowance.as_secs(),
                 );
@@ -357,6 +534,43 @@ impl BoundedPool {
                     connect_failures: 0,
                     last_allowance_s: allowance.as_secs(),
                 })
+            }
+        }
+    }
+
+    /// `acquire` with the build loop's connect ladder, for the exchanges
+    /// outside the build loop, on a reaped pool only. An exchange after a
+    /// reap connects afresh, so a refused or timed-out connect (a daemon
+    /// restart, a busy accept after a wedge recovery) would otherwise fail
+    /// the driver outright; a permanent connect error fails after six
+    /// retries and 185 s of backoff, plus each attempt's connect timeout. A
+    /// pool-wait stall passes straight through: it is not a connect. Safe to
+    /// retry because the retry comes before any request is sent. It takes no
+    /// retry gate: the build loop holds its gate through a whole build, so a
+    /// shared gate would park an upload's retry behind it with nothing
+    /// printed. An unreaped pool (inside a build) keeps the single attempt.
+    async fn acquire_retrying(&self, what: &str, allowance: std::time::Duration) -> Result<Lease> {
+        if !self.4 {
+            return self.acquire(what, allowance).await;
+        }
+        let mut failures = 0u32;
+        loop {
+            match self.acquire(what, allowance).await {
+                Err(e) if !matches!(e, Error::DaemonStalled { .. }) => {
+                    failures += 1;
+                    if failures > CONNECT_RETRIES {
+                        return Err(e);
+                    }
+                    let wait =
+                        CONNECT_BACKOFF_S[(failures as usize - 1).min(CONNECT_BACKOFF_S.len() - 1)];
+                    eprintln!(
+                        "nix-ninja: [{}] WATCHDOG connect-fail on {what} ({e}); retrying in \
+                         {wait}s (connect failures {failures}/{CONNECT_RETRIES})",
+                        now_s(),
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                }
+                other => return other,
             }
         }
     }
@@ -521,6 +735,211 @@ mod bounded_exchange_tests {
                 got.is_ok(),
                 "a free slot must be granted, not reported as a stall"
             );
+        });
+    }
+
+    /// THE REAPER CLOSES EVERY PARKED CONNECTION ONCE THE POOL GOES QUIET,
+    /// AND NONE WHILE RELEASES KEEP COMING. An idle expiry inside the
+    /// reaper's window would discard the parked connections uncounted and
+    /// make the reaper connect a fresh one to close; two parked connections and the
+    /// reaper's own count tell those apart, where one could not. The
+    /// configuration is production's own (`host_route_config`). The busy
+    /// readings are the controls, and they also fail a reaper that ignores
+    /// the quiet gate or a lease that never stamps it.
+    #[test]
+    fn idle_connections_are_reaped_after_a_quiet_spell() {
+        use super::{host_route_config, BoundedPool, REAPED};
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::time::Duration;
+
+        let socket = std::path::Path::new("/nix/var/nix/daemon-socket/socket");
+        if !socket.exists() {
+            eprintln!("SKIP: no daemon socket");
+            return;
+        }
+        let quiet = Duration::from_secs(2);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        // The only reaper with a short quiet spell on a live socket, so
+        // nothing else moves REAPED while this arm reads it; the route
+        // test's reaper points at a missing socket and has nothing parked.
+        let pool = BoundedPool::new_reaped(socket, host_route_config(2, quiet), &rt, quiet, 0);
+        rt.block_on(async {
+            let (a, b) = match (
+                pool.acquire("probe", Duration::from_secs(30)).await,
+                pool.acquire("probe", Duration::from_secs(30)).await,
+            ) {
+                (Ok(a), Ok(b)) => (a, b),
+                _ => {
+                    eprintln!("SKIP: daemon not answering");
+                    return;
+                }
+            };
+            drop(a);
+            drop(b);
+            let before = REAPED.load(Relaxed);
+            // Twelve releases 400 ms apart outlast the quiet spell twice
+            // over, so a reaper that ignores the gate, or a lease that never
+            // stamps it, closes a connection in here. Read AFTER each pause:
+            // a premature close lands between releases, on a reaper tick.
+            // At the reaper's latest tick the older connection has idled
+            // 3.4 s against the 4 s expiry, the margin a loaded machine gets.
+            for i in 0..12 {
+                let lease = pool
+                    .acquire("probe", Duration::from_secs(30))
+                    .await
+                    .expect("a parked connection");
+                drop(lease);
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let (idle, active, _) = pool.0.stats().await;
+                assert_eq!(
+                    (idle, active),
+                    (2, 0),
+                    "release {i}: a busy pool keeps its connections"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(3500)).await;
+            let (idle, active, _) = pool.0.stats().await;
+            assert_eq!(
+                (idle, active),
+                (0, 0),
+                "a quiet pool's parked connections are closed"
+            );
+            assert_eq!(
+                REAPED.load(Relaxed) - before,
+                2,
+                "the reaper closed the two parked connections itself"
+            );
+        });
+    }
+
+    /// AN UNREAPED POOL (INSIDE A BUILD) DOES NOT RETRY A FAILED CONNECT:
+    /// its first refusal comes straight back, where a reaped pool would
+    /// wait 5 s before its first retry. No daemon is needed, since a socket
+    /// that does not exist refuses at once.
+    #[test]
+    fn an_unreaped_pool_does_not_retry_a_connect() {
+        use super::BoundedPool;
+        use harmonia_store_remote::PoolConfig;
+        use std::time::{Duration, Instant};
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = BoundedPool::new(
+            std::path::Path::new("/nonexistent/nn-no-daemon.sock"),
+            PoolConfig {
+                max_size: 1,
+                ..PoolConfig::default()
+            },
+        );
+        let started = Instant::now();
+        let got = rt.block_on(pool.acquire_retrying("probe", Duration::from_secs(30)));
+        assert!(got.is_err(), "a missing socket cannot connect");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "an unreaped pool retried: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A REAPED POOL (THE HOST ROUTE) DOES RETRY: on the same missing
+    /// socket it is still in its backoff two seconds later, where the
+    /// unreaped pool above had already returned.
+    #[test]
+    fn a_reaped_pool_retries_a_connect() {
+        use super::BoundedPool;
+        use harmonia_store_remote::PoolConfig;
+        use std::time::Duration;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = BoundedPool::new_reaped(
+            std::path::Path::new("/nonexistent/nn-no-daemon.sock"),
+            PoolConfig {
+                max_size: 1,
+                ..PoolConfig::default()
+            },
+            &rt,
+            Duration::from_secs(600),
+            0,
+        );
+        let got = rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                pool.acquire_retrying("probe", Duration::from_secs(30)),
+            )
+            .await
+        });
+        assert!(got.is_err(), "a reaped pool returned instead of retrying");
+    }
+
+    /// THE ROUTE DECIDES THE POOL: a client inside a build gets the default
+    /// pool, one on the host route the reaped one. Read off the client the
+    /// production constructor builds; it connects nothing.
+    #[test]
+    fn only_the_host_route_reaps() {
+        let path = std::path::Path::new("/nonexistent/nn-no-daemon.sock");
+        let in_build = super::BuilderRpcClient::connect_unix_sized(path, true, 2).unwrap();
+        let host = super::BuilderRpcClient::connect_unix_sized(path, false, 2).unwrap();
+        assert!(!in_build.pool.4 && in_build.pool.3 == 0, "inside a build");
+        assert!(
+            host.pool.4 && host.pool.3 == super::RECYCLE_EVERY,
+            "host route"
+        );
+    }
+
+    /// EVERY QUOTA-TH RELEASE CLOSES ITS CONNECTION AND EVERY OTHER PARKS
+    /// IT. A one-slot pool makes each reading exact: after a retiring
+    /// release nothing is parked, after any other the one connection is.
+    #[test]
+    fn a_busy_connection_is_retired_after_its_quota() {
+        use super::BoundedPool;
+        use harmonia_store_remote::PoolConfig;
+        use std::time::Duration;
+
+        let socket = std::path::Path::new("/nix/var/nix/daemon-socket/socket");
+        if !socket.exists() {
+            eprintln!("SKIP: no daemon socket");
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        // A quiet spell no test outlasts, so only the quota closes anything.
+        let pool = BoundedPool::new_reaped(
+            socket,
+            PoolConfig {
+                max_size: 1,
+                ..PoolConfig::default()
+            },
+            &rt,
+            Duration::from_secs(600),
+            3,
+        );
+        rt.block_on(async {
+            for n in 1..=9u64 {
+                match pool.acquire("probe", Duration::from_secs(30)).await {
+                    Ok(lease) => drop(lease),
+                    Err(e) if n == 1 => {
+                        eprintln!("SKIP: daemon not answering ({e:?})");
+                        return;
+                    }
+                    Err(e) => panic!("release {n}: acquire failed after the first: {e:?}"),
+                }
+                let (idle, active, _) = pool.0.stats().await;
+                let want = if n % 3 == 0 { 0 } else { 1 };
+                assert_eq!((idle, active), (want, 0), "release {n} of quota 3");
+            }
         });
     }
 }
@@ -1140,13 +1559,25 @@ impl BuilderRpcClient {
             .worker_threads(rpc_worker_threads(pool_max))
             .enable_all()
             .build()?;
-        let pool = BoundedPool::new(
-            path,
-            PoolConfig {
-                max_size: pool_max.max(1),
-                ..PoolConfig::default()
-            },
-        );
+        // Reaping and recycling are measured on the host route only (see
+        // REAP_QUIET); inside a build the pool keeps its default behaviour.
+        let pool = if in_drv {
+            BoundedPool::new(
+                path,
+                PoolConfig {
+                    max_size: pool_max.max(1),
+                    ..PoolConfig::default()
+                },
+            )
+        } else {
+            BoundedPool::new_reaped(
+                path,
+                host_route_config(pool_max.max(1), REAP_QUIET),
+                &runtime,
+                REAP_QUIET,
+                RECYCLE_EVERY,
+            )
+        };
         Ok(Self {
             runtime,
             pool,
@@ -1191,7 +1622,7 @@ impl BuilderRpcClient {
         let info = self.runtime.block_on(async {
             let mut guard = self
                 .pool
-                .acquire(&format!("add_drv_to_store {name}"), upload_allowance())
+                .acquire_retrying(&format!("add_drv_to_store {name}"), upload_allowance())
                 .await?;
             let source = BufReader::new(Cursor::new(bytes.clone()));
             bounded(
@@ -1244,7 +1675,10 @@ impl BuilderRpcClient {
             .runtime
             .block_on(async {
                 let what = format!("add_to_store_text {name}");
-                let mut guard = self.pool.acquire(&what, upload_allowance()).await?;
+                let mut guard = self
+                    .pool
+                    .acquire_retrying(&what, upload_allowance())
+                    .await?;
                 let source = BufReader::new(Cursor::new(bytes));
                 if self.in_drv {
                     bounded(
@@ -1384,8 +1818,10 @@ impl BuilderRpcClient {
     /// Peak is now the duplex capacity per upload instead of the tree size.
     /// The encoder runs on the blocking pool and the daemon drains the pipe,
     /// so a NAR larger than the buffer streams through rather than sitting in
-    /// it. Safe against retries because there are none: `execute` is FnOnce
-    /// and poisons its connection on error, and no caller retries this.
+    /// it. The exchange itself is never retried: `execute` is FnOnce and
+    /// poisons its connection on error, and no caller retries this. Only the
+    /// connect is (`acquire_retrying`), and the pipe is read only after it
+    /// returns, so a retried connect loses no bytes.
     pub fn add_to_store_nar(&self, name: &str, path: &Path) -> Result<StorePath> {
         timed_add(|| self.add_to_store_nar_inner(name, path))
     }
@@ -1410,7 +1846,10 @@ impl BuilderRpcClient {
                     Ok(())
                 });
                 let what = format!("add_to_store_nar {name}");
-                let mut guard = self.pool.acquire(&what, upload_allowance()).await?;
+                let mut guard = self
+                    .pool
+                    .acquire_retrying(&what, upload_allowance())
+                    .await?;
                 let source = BufReader::new(reader);
                 let out = if self.in_drv {
                     bounded(
@@ -2188,7 +2627,10 @@ impl BuilderRpcClient {
     pub fn submit_output(&self, path: &SingleDerivedPath, name: &OutputName) -> Result<()> {
         self.runtime.block_on(async {
             let what = format!("submit_output {name}");
-            let mut guard = self.pool.acquire(&what, upload_allowance()).await?;
+            let mut guard = self
+                .pool
+                .acquire_retrying(&what, upload_allowance())
+                .await?;
             bounded(
                 &what,
                 upload_allowance(),

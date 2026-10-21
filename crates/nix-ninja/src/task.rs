@@ -7600,7 +7600,7 @@ fn report_progress(n_tasks: u64) {
          \"dyn_adddrv_calls\":{},\"plain_adddrv_ms\":{},\"plain_adddrv_calls\":{},\
          \"sandbox_adddrv_ms\":{},\"sandbox_adddrv_calls\":{},\
          \"outer_stage_placed\":{},\"outer_stage_restored\":{},\"rss_mib\":{},\
-         \"drv_entries\":{},\"drv_bytes\":{}}}",
+         \"drv_entries\":{},\"drv_bytes\":{},\"reaped\":{},\"recycled\":{}}}",
         n_tasks,
         RESOLVE_MS.load(Ordering::Relaxed),
         DYN_MS.load(Ordering::Relaxed),
@@ -7617,6 +7617,8 @@ fn report_progress(n_tasks: u64) {
         self_rss_mib(),
         d.0,
         d.1,
+        nix_builder_rpc_client::REAPED.load(Ordering::Relaxed),
+        nix_builder_rpc_client::RECYCLED.load(Ordering::Relaxed),
     );
     // Persist resolve-cache entries computed since the last tick;
     // a killed driver loses at most one tick's worth.
