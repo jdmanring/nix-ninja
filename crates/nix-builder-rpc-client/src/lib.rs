@@ -343,8 +343,11 @@ struct BoundedPool(
 /// idle expiry is discarded by the pop itself and not counted. A request
 /// that takes or releases a connection between the check and the acquire
 /// can make this close a just-released connection or a fresh one it
-/// connected, costing one fork. Bounded, so a pool whose every slot is held
-/// cannot hold the reaper.
+/// connected, costing one fork. A pop that finds only expired connections
+/// connects afresh; a failed connect, or one still unfinished at the bound
+/// while a slot is free, is printed and ends this pass. Bounded, so a pool
+/// whose every slot is held cannot hold the reaper, and that wait ends the
+/// pass without a line.
 async fn close_idle(
     pool: &ConnectionPool,
     last: &std::sync::atomic::AtomicU64,
@@ -357,7 +360,26 @@ async fn close_idle(
                 guard.mark_broken();
                 closed += 1;
             }
-            _ => break,
+            Ok(Err(e)) => {
+                eprintln!(
+                    "nix-ninja: [{}] WATCHDOG reaper connect-fail ({e})",
+                    now_s()
+                );
+                break;
+            }
+            Err(_elapsed) => {
+                // A free slot after the wait means the time went on a fresh
+                // connect that did not finish, not on a held slot.
+                let (_, active, cap) = pool.stats().await;
+                if active < cap && last.load(std::sync::atomic::Ordering::Relaxed) == seen {
+                    eprintln!(
+                        "nix-ninja: [{}] WATCHDOG reaper connect-timeout: no connection \
+                         in 500ms with a slot free",
+                        now_s()
+                    );
+                }
+                break;
+            }
         }
     }
     closed
@@ -365,7 +387,8 @@ async fn close_idle(
 
 /// Connections the reaper's acquires closed, for the driver's stats line. A
 /// parked connection the pool's idle expiry discards during the pop is not
-/// counted, and a fresh one the reaper connected after a race is.
+/// counted, and a fresh one the reaper connected is, whether after a race
+/// or because every parked connection had expired.
 pub static REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Released connections closed for reaching the quota, for the stats line.
@@ -559,6 +582,12 @@ impl BoundedPool {
                 Err(e) if !matches!(e, Error::DaemonStalled { .. }) => {
                     failures += 1;
                     if failures > CONNECT_RETRIES {
+                        eprintln!(
+                            "nix-ninja: [{}] WATCHDOG giving-up on {what}: connect failed \
+                             {failures} times over {}s ({e})",
+                            now_s(),
+                            CONNECT_BACKOFF_S.iter().sum::<u64>(),
+                        );
                         return Err(e);
                     }
                     let wait =
