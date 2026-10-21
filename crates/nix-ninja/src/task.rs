@@ -4130,9 +4130,11 @@ impl Runner {
                 if first_fill {
                     self.add_derived_file(files, sib.clone());
                 }
-                if !input_set.contains_key(&sib.build_path) {
-                    input_set.insert(sib.build_path.clone(), sib.clone());
-                }
+                // entry() hashes the path once; contains_key then insert hashed
+                // it twice for every new path, and Path::hash walks components.
+                input_set
+                    .entry(sib.build_path.clone())
+                    .or_insert_with(|| sib.clone());
             }
         }
 
@@ -21668,9 +21670,9 @@ pub fn merge_stamp_record(
                 continue;
             }
         }
-        if !input_set.contains_key(&df.build_path) {
-            input_set.insert(df.build_path.clone(), df.clone());
-        }
+        input_set
+            .entry(df.build_path.clone())
+            .or_insert_with(|| df.clone());
     }
     true
 }
