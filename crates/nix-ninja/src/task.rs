@@ -26167,8 +26167,10 @@ pub struct Discovered {
 /// header, compiles that build today. One `-M -MG` run with the command's
 /// own flags answers which are live: the depfile lists a live include at its
 /// resolved path or, missing, under its spelling, and never one in a branch
-/// the build does not take. A failed run confirms nothing: no candidate
-/// survives it, so the edge defers on nothing and emits as before.
+/// the build does not take. A failed run confirms nothing ABOUT WHICH
+/// CANDIDATES ARE LIVE, and keeps every one of them: the run failed because
+/// the produced header is absent, and a gate that needs the header present
+/// cannot be the precondition for the deferral that supplies it.
 fn preprocessor_confirmed(
     cmdline: &str,
     build_dir: &Path,
@@ -26176,7 +26178,23 @@ fn preprocessor_confirmed(
     candidates: Vec<DeferMiss>,
 ) -> Vec<DeferMiss> {
     let Ok(deps) = preprocessor_deps(cmdline, build_dir, view) else {
-        return Vec::new();
+        // A RUN THAT CANNOT COMPLETE HAS NOT ANSWERED which candidates are
+        // live. It fails HERE because the header the index proved is absent
+        // from the disk, which is the case this deferral exists for, so
+        // discarding every candidate on that failure made the gate
+        // unsatisfiable: qtwebengine's `net/disk_cache/buildflags.h` is a
+        // detected miss whose `-M -MG` run exits 1 and writes no depfile,
+        // the deferral was dropped, and the sandbox compile then died on the
+        // header this feature was built to supply.
+        //
+        // The index's proof is the evidence; this run only REMOVES candidates
+        // naming a header in a branch the build never takes. Filtering
+        // nothing when it cannot run is therefore the conservative reading,
+        // and a candidate it should not have kept costs one re-run:
+        // `handle_deferred_input` sees the re-run miss with the producer
+        // already an input, logs `deferral on ... added nothing`, and builds
+        // the edge without the index.
+        return candidates;
     };
     let root = view.unwrap_or(build_dir);
     let rel = |p: &Path| {
@@ -33201,19 +33219,58 @@ mod unresolved_include_defer_tests {
         );
     }
 
-    /// A preprocessor run that fails confirms nothing, the emission of
-    /// before: with the carried trees shown to it, a failure is no longer
-    /// the driver's view being incomplete.
+    /// A RUN THAT CANNOT COMPLETE KEEPS ITS CANDIDATES. The run fails because
+    /// the produced header is absent, so discarding every candidate here made
+    /// the deferral unsatisfiable for exactly the edges it exists to serve
+    /// (qtwebengine's `net/disk_cache/buildflags.h`: detected miss, `-M -MG`
+    /// exit 1, no depfile, no deferral, sandbox compile died on the header).
+    /// The negative control sits in the SAME test: a run that SUCCEEDS and
+    /// lists no candidate must still drop them, so the assertion below is
+    /// about the failure arm and not about the filter being gone.
     #[test]
-    fn a_failed_preprocessor_run_confirms_nothing() {
-        let c = vec![DeferMiss {
-            fids: vec![],
-            header: "QtWidgets/QWidget".into(),
-            at: PathBuf::from("include/QtWidgets/QWidget"),
-        }];
-        let got =
-            super::preprocessor_confirmed("/nonexistent/cc -c x.c -o x.o", Path::new("/"), None, c);
-        assert!(got.is_empty());
+    fn a_failed_preprocessor_run_keeps_its_candidates() {
+        let cand = |h: &str| {
+            vec![DeferMiss {
+                fids: vec![],
+                header: h.into(),
+                at: PathBuf::from(format!("include/{h}")),
+            }]
+        };
+        // The failure arm: no compiler at all, so the run cannot answer.
+        let got = super::preprocessor_confirmed(
+            "/nonexistent/cc -c x.c -o x.o",
+            Path::new("/"),
+            None,
+            cand("QtWidgets/QWidget"),
+        );
+        assert_eq!(
+            got.iter().map(|c| c.header.as_str()).collect::<Vec<_>>(),
+            vec!["QtWidgets/QWidget"],
+            "a failed run has not answered which candidates are live"
+        );
+        // THE CONTROL, where the fixture can execute: a real preprocessor
+        // that succeeds and never names the candidate still filters it out.
+        if std::process::Command::new("gcc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("SKIP control: no gcc on PATH");
+            return;
+        }
+        let d = super::Scratch::new(format!("nn-defer-failctl-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("tu.c"), "int x;\n").unwrap();
+        let cmd = format!("gcc -c {}/tu.c -o tu.o", d.display());
+        let dropped = super::preprocessor_confirmed(&cmd, &d, None, cand("dead/branch.h"));
+        assert!(
+            dropped.is_empty(),
+            "a run that succeeds without naming the candidate must drop it: {:?}",
+            dropped
+                .iter()
+                .map(|c| c.header.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Only module trees hold a spelling; an autogen tree, qtbase gtk3's
@@ -33281,7 +33338,16 @@ mod unresolved_include_defer_tests {
         let with_view = super::preprocessor_confirmed(&cmd, &build, Some(&view), cand());
         let without = super::preprocessor_confirmed(&cmd, &build, None, cand());
         assert_eq!(with_view.len(), 1, "the view holds the unit and the config");
-        assert!(without.is_empty(), "the bare disk has no translation unit");
+        // THE VIEW IS WHAT DECIDES, not the failure arm: the bare disk has no
+        // translation unit, so the run cannot complete and the candidate
+        // survives on the index's proof. The control that the run STILL
+        // filters is `a_failed_preprocessor_run_keeps_its_candidates`, whose
+        // fixture gives the preprocessor a unit it can actually read.
+        assert_eq!(
+            without.len(),
+            1,
+            "a run that cannot complete keeps the candidate on the index's proof"
+        );
     }
 
     /// CMake writes a phony edge over every file the configure step read;
