@@ -4452,9 +4452,7 @@ impl Runner {
         if realise_ok {
             // ONE GRD AT A TIME: `build_paths` fails the whole batch for one
             // unrealisable path, which would turn one bad manifest into a
-            // missed member for every produced grd on the edge. A grd that
-            // fails here simply has no realised copy, and the loop below
-            // skips or defers it on its own.
+            // missed member for every produced grd on the edge.
             for df in &produced_grds {
                 match local::build_derived_files(
                     &self.rpc_client,
@@ -4462,11 +4460,13 @@ impl Runner {
                     std::slice::from_ref(df),
                 ) {
                     Ok(built) => realised_grds.extend(built),
-                    // A manifest that will not realise is a missed member. It
-                    // is NOT recoverable by deferring: `build_paths` was asked
-                    // for this path and failed, so re-queueing the consumer
-                    // presents the same path a second time. Say so rather
-                    // than loop the scheduler.
+                    // A MANIFEST THAT WILL NOT REALISE ENDS THE RESOLUTION,
+                    // with the grd named. Deferring is not obviously useless -
+                    // a transient failure or a stall is not recorded in the
+                    // client's failure memo, so a re-queue would retry - but
+                    // there is no producer to wait on here, so a retry would
+                    // spend a deferral cycle to reach the same failure. This
+                    // edge derives no output; say which grd and stop.
                     Err(e) => {
                         anyhow::bail!("realising produced grd {}: {e}", df.build_path.display())
                     }
@@ -4506,9 +4506,8 @@ impl Runner {
                 // answer, not re-queue.
                 //
                 // UNOBSERVED ORDERING. Every run so far resolved producers
-                // first (run 5: 821 members carried, deferrals=0), so this
-                // arm is written to the mechanism rather than to a log that
-                // fired it.
+                // first, so this arm is written to the mechanism rather
+                // than to a log that fired it.
                 if realise_ok {
                     if let Some(gfid) = files.lookup(&grd.to_string_lossy()) {
                         if files.by_id[gfid].input.is_some() {
