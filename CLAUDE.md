@@ -410,6 +410,14 @@ Mechanisms, cited by symbol because line numbers rot:
   prologue cannot rebase twice. A store-path datadir needs the `inputSrcs`
   route. Drop a climb to a STORE dir before it forms
   (`macro_arm_include_dirs`), or the task deepens out of its tree.
+- **Deferral candidates and the confirming run** (`find_unresolved_miss`,
+  `preprocessor_confirmed`): a failed run CONFIRMS NOTHING and keeps its
+  candidates. `-M -MG` exits 1 writing no depfile exactly when the header is
+  absent, which is the state the deferral exists for, so reading the failure
+  as every candidate being dead makes the deferral unsatisfiable for its own
+  class. A kept candidate costs one extra resolve, is logged `deferral on ...
+  added nothing`, and cannot loop (`suppress_defer` clears the producer
+  index), and a deferral refuses to emit, so nothing re-keys.
 - **Macro arms** (`macro_arm_headers`): keep an arm only if it resolves to
   a REGULAR FILE; quoted and angle spellings; a single quoted arm skipped,
   a single angle arm carried; resolved through the command's own include
