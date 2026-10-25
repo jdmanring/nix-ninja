@@ -4423,11 +4423,107 @@ impl Runner {
             .filter(|p| p.extension().is_some_and(|e| e == "grd" || e == "grdp"))
             .cloned()
             .collect();
-        while let Some(grd) = grd_list.pop() {
-            if !Path::new(&grd).is_file() {
-                continue;
+        // A GRD AN EDGE PRODUCES IS NOT ON DISK WHEN ITS CONSUMER RESOLVES,
+        // so both passes below would skip it and every member it names would
+        // go uncarried. Real ninja reads the grd at load time and orders the
+        // consumer after whatever writes each member (qtwebengine's
+        // generated devtools grd names 821 `.compressed` files a compress
+        // edge writes, and grit died FileNotFoundError on the first). The
+        // producing edge is already an implicit input, so its output can be
+        // asked for now: `build_derived_files` returns the realised path, and
+        // the passes below walk the real bytes.
+        //
+        // ONLY A LOCAL NON-QUERY RUN REALISES. `-t drv` dispatches to
+        // `subtool`, whose `drv` arm calls `build` with `emit_only` set
+        // (cli.tool.is_some()), and the contract there is that a query about
+        // the graph must not build (RunnerConfig::emit_only, Task::emit_only).
+        // The predicate is the same one `moc_walk` applies, spelled from
+        // `config` because `new_task` runs before the Task exists. A query
+        // therefore sees the pre-fix behaviour: a generated grd that is
+        // absent is skipped, never built.
+        let realise_ok = !self.config.is_output_derivation && !self.config.emit_only;
+        let produced_grds: Vec<DerivedFile> = grd_list
+            .iter()
+            .filter(|g| !self.config.build_dir.join(g).is_file())
+            .filter_map(|g| produced_output(&self.config.build_dir, files, &self.derived_files, g))
+            .collect();
+        let mut realised_grds: std::collections::HashMap<PathBuf, PathBuf> =
+            std::collections::HashMap::new();
+        if realise_ok {
+            // ONE GRD AT A TIME: `build_paths` fails the whole batch for one
+            // unrealisable path, which would turn one bad manifest into a
+            // missed member for every produced grd on the edge. A grd that
+            // fails here simply has no realised copy, and the loop below
+            // skips or defers it on its own.
+            for df in &produced_grds {
+                match local::build_derived_files(
+                    &self.rpc_client,
+                    &self.config.store_dir,
+                    std::slice::from_ref(df),
+                ) {
+                    Ok(built) => realised_grds.extend(built),
+                    // A manifest that will not realise is a missed member. It
+                    // is NOT recoverable by deferring: `build_paths` was asked
+                    // for this path and failed, so re-queueing the consumer
+                    // presents the same path a second time. Say so rather
+                    // than loop the scheduler.
+                    Err(e) => {
+                        anyhow::bail!("realising produced grd {}: {e}", df.build_path.display())
+                    }
+                }
             }
-            let mut refs = grd_references(&grd)?;
+        }
+        while let Some(grd) = grd_list.pop() {
+            // THE SPELLING THE MEMBERS JOIN AGAINST IS THE BUILD ONE, never
+            // the realised store copy: grit names `Images/x.compressed`
+            // relative to the grd's place in the tree. Only the BYTES come
+            // from the realised copy, and only when the tree has none.
+            // `grd` is already the graph's build-relative name; joining the
+            // build dir onto it gave an absolute path, and the candidates
+            // built from it matched no graph node.
+            //
+            // EXISTENCE IS ASKED OF THE BUILD DIR, NEVER THE PROCESS CWD: a
+            // bare `is_file()` on the graph name would answer about whatever
+            // directory the driver happens to run from.
+            let on_disk = if self.config.build_dir.join(&grd).is_file() {
+                Some(self.config.build_dir.join(&grd))
+            } else {
+                produced_output(&self.config.build_dir, files, &self.derived_files, &grd)
+                    .and_then(|d| realised_grds.get(&d.build_path).cloned())
+                    .filter(|h| h.is_file())
+            };
+            let Some(on_disk) = on_disk else {
+                // A PRODUCED GRD WITH NO REALISED COPY IN THIS PROCESS: the
+                // node has a producing edge (`produced_output` answers only
+                // there) but `derived_files` holds no entry for it, and
+                // `derived_files` is per process, so the consumer resolved
+                // before its producer registered. Defer through the qrc
+                // machinery, exactly as the candidate loop below does for a
+                // member in the same state: the re-queue carries the producer
+                // as an implicit input and the second resolution finds the
+                // DerivedFile. The query guard is `realise_ok`: under
+                // `-t drv` nothing is deferred, because the query must
+                // answer, not re-queue.
+                //
+                // UNOBSERVED ORDERING. Every run so far resolved producers
+                // first (run 5: 821 members carried, deferrals=0), so this
+                // arm is written to the mechanism rather than to a log that
+                // fired it.
+                if realise_ok {
+                    if let Some(gfid) = files.lookup(&grd.to_string_lossy()) {
+                        if files.by_id[gfid].input.is_some() {
+                            qrc_defer_out = Some(DeferMiss {
+                                fids: vec![gfid],
+                                header: grd.to_string_lossy().into_owned(),
+                                at: grd.clone(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                continue;
+            };
+            let mut refs = grd_references_at(&on_disk, &grd)?;
             // A FLATTENED page opens what it links: grit's html_inline
             // inlines each `src`/`href`, `<include src>` and css `url()`
             // relative to the page, recursively (incognito_tab.html pulls
@@ -4457,7 +4553,7 @@ impl Runner {
             // scan time and so never pass the existence filter above.
             // A candidate that names a graph node routes as a Built
             // input with its co-outputs, same as cmdline node args.
-            for cand in grd_reference_candidates(&grd)? {
+            for cand in grd_reference_candidates_at(&on_disk, &grd)? {
                 if input_set.contains_key(&cand) {
                     continue;
                 }
@@ -20931,9 +21027,12 @@ fn html_inline_closure(pages: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-fn grd_reference_candidates(grd: &Path) -> Result<Vec<PathBuf>> {
-    let body = fs::read_to_string(grd)
-        .map_err(|e| anyhow!("read({}) for grd candidates: {e}", grd.display()))?;
+/// Candidates for a grd whose bytes are a realised copy:
+/// the candidates are graph names, so they join against the grd's tree
+/// place, never the store copy's.
+fn grd_reference_candidates_at(read_from: &Path, grd: &Path) -> Result<Vec<PathBuf>> {
+    let body = fs::read_to_string(read_from)
+        .map_err(|e| anyhow!("read({}) for grd candidates: {e}", read_from.display()))?;
     let dir = grd.parent().unwrap_or(Path::new(""));
     let mut out = Vec::new();
     for attr in ["file=\"", "path=\""] {
@@ -20945,7 +21044,27 @@ fn grd_reference_candidates(grd: &Path) -> Result<Vec<PathBuf>> {
                 continue;
             }
             let val = val.replace('\\', "/");
-            out.push(lexical_join(dir, Path::new(&val)));
+            // A GRAPH NODE IS NAMED RELATIVE TO THE BUILD DIR, never by an
+            // absolute path: `lookup` keys on the graph's own spelling, so an
+            // absolute candidate matched nothing and every produced member
+            // was dropped in silence. `dir` is the grd's tree place, so the
+            // join lands build-relative.
+            //
+            // TWO SHAPES ARE REFUSED. A leading `/` is absolute. A climb
+            // deeper than `dir` leaves `ParentDir` in the join; it would
+            // miss `lookup` anyway, and refusing it states the intent.
+            let rel = Path::new(&val);
+            if rel.is_absolute() || rel.components().any(|c| c == std::path::Component::RootDir) {
+                continue;
+            }
+            let joined = lexical_join(dir, rel);
+            if joined
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+            {
+                continue;
+            }
+            out.push(joined);
         }
     }
     Ok(out)
@@ -22285,8 +22404,16 @@ fn upload_referenced_dir_uncached(
 /// a .grdp, so the conventional chromium scale dirs are tried as well;
 /// existence keeps the false candidates out, same as the base case.
 fn grd_references(grd: &Path) -> Result<Vec<PathBuf>> {
-    let body = fs::read_to_string(grd)
-        .map_err(|e| anyhow!("read({}) for grd scan: {e}", grd.display()))?;
+    grd_references_at(grd, grd)
+}
+
+/// `grd_references` for a grd whose BYTES are somewhere else: `grd` is where
+/// the members resolve (its place in the build tree), `read_from` is the copy
+/// to parse. A generated grd is realised into the store, and its members live
+/// beside its tree path, not beside the store copy.
+fn grd_references_at(read_from: &Path, grd: &Path) -> Result<Vec<PathBuf>> {
+    let body = fs::read_to_string(read_from)
+        .map_err(|e| anyhow!("read({}) for grd scan: {e}", read_from.display()))?;
     let dir = grd.parent().unwrap_or(Path::new(""));
     let mut contexts: Vec<String> = [
         "default_100_percent",
@@ -24620,6 +24747,83 @@ mod normalize_output_tests {
         assert!(refs.contains(&scaled.join("favicon.png")));
         assert_eq!(refs.len(), 2, "absent file must not be invented: {refs:?}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A GENERATED grd's bytes live in the store, its members in the tree:
+    /// both readers join against the grd's TREE place, never the realised
+    /// copy's directory. Joining against the copy found nothing beside it
+    /// and carried no member; joining against an absolute spelling matched
+    /// no graph node. The second argument decides the base in both calls.
+    #[test]
+    fn a_realised_grd_resolves_its_members_against_the_tree() {
+        use super::{grd_reference_candidates_at, grd_references_at};
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("grd-at-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let tree = base.join("tree/gen/frontend");
+        let member = tree.join("Images/x.svg.compressed");
+        fs::create_dir_all(member.parent().unwrap()).unwrap();
+        fs::write(&member, b"compressed").unwrap();
+        let realised = base.join("store/realised.grd");
+        fs::create_dir_all(realised.parent().unwrap()).unwrap();
+        fs::write(
+            &realised,
+            r#"<grit><structure><file path="Images/x.svg.compressed"/></structure></grit>"#,
+        )
+        .unwrap();
+        let place = tree.join("res.grd");
+
+        let refs = grd_references_at(&realised, &place).unwrap();
+        assert_eq!(refs, vec![member.clone()]);
+        // The copy's own directory names no member: this is the empty
+        // outcome the store-joined first attempt produced on the real edge.
+        let none = grd_references_at(&realised, &realised).unwrap();
+        assert!(
+            none.is_empty(),
+            "store-joined refs must stay empty: {none:?}"
+        );
+
+        let cands = grd_reference_candidates_at(&realised, &place).unwrap();
+        assert!(
+            cands.contains(&member),
+            "candidate must name the tree member: {cands:?}"
+        );
+        assert!(
+            cands.iter().all(|c| !c.starts_with(base.join("store"))),
+            "no candidate may join against the realised copy: {cands:?}"
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A MANIFEST VALUE IS JOINED AGAINST THE GRD'S PLACE, NEVER THE BUILD
+    /// ROOT OR THE FILESYSTEM ROOT. An absolute value discards the base and
+    /// a long climb pops every component of it, so either names a file
+    /// outside the tree. Both are dropped rather than joined.
+    #[test]
+    fn a_grd_candidate_never_escapes_the_grd_directory() {
+        use super::grd_reference_candidates_at;
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("grd-esc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let grd = base.join("res.grd");
+        fs::write(
+            &grd,
+            r#"<grit>
+                 <structure file="Images/ok.svg.compressed"/>
+                 <structure file="/abs/escape.svg.compressed"/>
+                 <structure file="../../../../../../../../outside.svg.compressed"/>
+               </grit>"#,
+        )
+        .unwrap();
+
+        let cands = grd_reference_candidates_at(&grd, &grd).unwrap();
+        assert_eq!(
+            cands,
+            vec![base.join("Images/ok.svg.compressed")],
+            "absolute and climbing values must be dropped: {cands:?}"
+        );
+        fs::remove_dir_all(&base).unwrap();
     }
 
     // ---- the store-name length cap -------------------------------------
