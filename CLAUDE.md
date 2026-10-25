@@ -347,6 +347,21 @@ Mechanisms, cited by symbol because line numbers rot:
   not `deps = gcc` (`a7a5f4a`).
 - **Generated files** hit resolve (`virtual_paths`), scan and upload;
   fixing one leaves the next fatal.
+- **A produced grd is realised before its consumer resolves members.** On
+  local non-query runs (`realise_ok = !is_output_derivation && !emit_only`)
+  the driver collects `produced_grds` via `produced_output` and realises each
+  with `local::build_derived_files`, ONE AT A TIME (a batch fails whole for
+  one unrealisable path, turning one bad manifest into a missed member for
+  every produced grd on the edge); a failure bails naming `df.build_path`,
+  because there is no producer to wait on and a re-queue reaches the same
+  failure. Members are read from the REALISED COPY against the grd's TREE
+  place (`grd_references_at`, `grd_reference_candidates_at`), never the store
+  copy's directory: a candidate is a GRAPH NAME, so joining against the copy
+  finds nothing and joining an absolute spelling matches no node. A
+  produced-but-unregistered grd, and a candidate naming a produced node with
+  no registered derived file, DEFER through the qrc machinery, which
+  re-queues the edge with the producer as an implicit input. An absolute
+  value or a climb past the grd's directory is dropped, never joined.
 - **Environment**: `forwarded_to_tasks` is an allowlist (`NIX_*`,
   `XML_CATALOG_FILES`, `PYTHONPATH`, `XDG_DATA_DIRS`,
   `NIX_GOBJECT_INTROSPECTION_DEFAULT_FALLBACK_LIBPATH`, `PKG_CONFIG_PATH`),
@@ -365,7 +380,12 @@ Mechanisms, cited by symbol because line numbers rot:
   there puts the fix in the DRIVER whatever the CMake rule's `DEPENDS`
   says. A reader that reads a file must also declare it (`-P` script).
   They sit beside `cmake_script_referenced_paths` in the driver; the
-  earliest members are `swig_invocation` and `msgfmt_invocation`.
+  earliest members are `swig_invocation` and `msgfmt_invocation`;
+  `flatc_invocation` is a closure walker, not a single read: it follows
+  includes transitively, searches the includer's own directory BEFORE the
+  `-I` roots (flatc's order; the reverse carries a different schema with no
+  error), and keys its seen set LEXICALLY, because a canonical key
+  collapses two build-tree symlinks onto one store file.
   Enumerate members by shape, never by a count:
   `grep -nE 'let [a-z_]+ = [a-z_]+\(&args\)' crates/nix-ninja/src/task.rs`
   (plus `python_module_invocation` inside the argv loop of
