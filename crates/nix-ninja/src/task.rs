@@ -1049,6 +1049,12 @@ pub struct Runner {
 
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
+    /// Every edge with a thread outstanding: (id, grep-able label, start).
+    /// The result channel is the scheduler's only witness that a thread is
+    /// alive, and `wait` used to block on it in silence: a thread that died
+    /// without sending parked the driver for hours with CPU flat, no FAILED
+    /// and no watchdog line. The wait announces from this list instead.
+    in_flight: Vec<(BuildId, String, std::time::Instant)>,
     tools: Tools,
     rpc_client: Arc<BuilderRpcClient>,
     config: RunnerConfig,
@@ -1176,6 +1182,7 @@ impl Runner {
             local_edges: HashSet::new(),
             tx,
             rx,
+            in_flight: Vec::new(),
             tools,
             rpc_client,
             config,
@@ -1397,6 +1404,14 @@ impl Runner {
             .collect();
         let cmdline = build.cmdline.clone().unwrap_or_default();
         self.local_edges.insert(bid);
+        // The thread prints only on COMPLETION; a nested command that never
+        // returns used to leave no line naming it. Print the start too.
+        eprintln!("nix-ninja: running local edge {label} ({member})");
+        self.in_flight.push((
+            bid,
+            format!("local edge {label} ({member})"),
+            std::time::Instant::now(),
+        ));
 
         let width = self.permits.cap;
         let permit = self.permits.acquire_weighted(width);
@@ -1800,6 +1815,12 @@ impl Runner {
             .as_ref()
             .and_then(|name| self.pool_permits.get(name))
             .map(|p| p.acquire_weighted(1));
+        let label = task
+            .outs()
+            .first()
+            .map(|fid| task.files[fid].name.clone())
+            .unwrap_or_else(|| format!("{bid:?}"));
+        self.in_flight.push((bid, label, std::time::Instant::now()));
 
         let config = self.config.clone();
         let rpc_client = self.rpc_client.clone();
@@ -2051,16 +2072,86 @@ impl Runner {
         Ok(())
     }
 
-    /// Returns the finished build and whether it SUCCEEDED. A failure is
-    /// fully reported here (error chain to stderr); the scheduler decides
-    /// whether it is fatal - under keep-going it abandons the failed
-    /// subtree and drains the rest, so one round surfaces every
-    /// independent failure instead of the first.
+    /// The one wait with no witness: every task thread reports through the
+    /// result channel, and the scheduler used to block on it in silence. A
+    /// thread that died without sending (or a nested command that never
+    /// returns) parked the driver for hours with CPU flat, no FAILED and no
+    /// watchdog line. Announce what is still out instead, every interval
+    /// with no result.
+    const WAIT_ANNOUNCE_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Up to five labels, then a count: a 16k-edge stall must name its
+    /// blocker without dumping the whole worklist into the log.
+    fn summarize_labels(labels: &[String]) -> String {
+        let mut shown: Vec<String> = labels.iter().take(5).cloned().collect();
+        if labels.len() > shown.len() {
+            shown.push(format!("(+{} more)", labels.len() - shown.len()));
+        }
+        shown.join(", ")
+    }
+
+    /// The line `wait` prints when no edge reports for a whole interval.
+    /// None before the interval elapses: a slow link is not a stall.
+    fn wait_stall_line(
+        label_count: usize,
+        labels: &[String],
+        oldest_waited: std::time::Duration,
+    ) -> Option<String> {
+        if oldest_waited < Self::WAIT_ANNOUNCE_EVERY {
+            return None;
+        }
+        Some(format!(
+            "nix-ninja: still waiting on {label_count} edge(s), oldest {}s with no result: {}",
+            oldest_waited.as_secs(),
+            Self::summarize_labels(labels),
+        ))
+    }
+
     pub fn wait(
         &mut self,
         files: &mut graph::GraphFiles,
     ) -> Result<(BuildId, bool, Option<DeferMiss>)> {
-        let result = self.rx.recv().unwrap();
+        // Returns the finished build and whether it SUCCEEDED. A failure is
+        // fully reported here (error chain to stderr); the scheduler decides
+        // whether it is fatal - under keep-going it abandons the failed
+        // subtree and drains the rest, so one round surfaces every
+        // independent failure instead of the first.
+        let result = loop {
+            match self.rx.recv_timeout(Self::WAIT_ANNOUNCE_EVERY) {
+                Ok(result) => break result,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // The runner holds a sender, so this means every task
+                    // thread died without reporting: fail loudly naming what
+                    // was out, instead of parking forever on a channel that
+                    // can never deliver.
+                    let labels: Vec<String> = self
+                        .in_flight
+                        .iter()
+                        .map(|(_, label, _)| label.clone())
+                        .collect();
+                    anyhow::bail!(
+                        "no task thread is left to answer, yet the scheduler still waits on {} edge(s): {}",
+                        labels.len(),
+                        Self::summarize_labels(&labels),
+                    );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let labels: Vec<String> = self
+                        .in_flight
+                        .iter()
+                        .map(|(_, label, _)| label.clone())
+                        .collect();
+                    if let Some(since) = self.in_flight.iter().map(|(_, _, since)| *since).min() {
+                        if let Some(line) =
+                            Self::wait_stall_line(labels.len(), &labels, since.elapsed())
+                        {
+                            eprintln!("{line}");
+                        }
+                    }
+                }
+            }
+        };
+        self.in_flight.retain(|(bid, _, _)| *bid != result.bid);
         if let Some(err) = result.err {
             // The edge ran a whole build here; under keep-going there is no
             // independent subtree left that it did not feed.
@@ -4920,6 +5011,28 @@ impl Runner {
 /// and namelink out, made by `cmake -E cmake_symlink_library`. Keyed on the
 /// COMMAND, since the rule name is the generator's and the shape alone (one
 /// `.so` in, `.so` out) also fits a real link of one object-less library.
+#[test]
+fn stall_line_names_the_blocker() {
+    let labels = vec!["a.o".to_string(), "b.o".to_string()];
+    let line = Runner::wait_stall_line(2, &labels, std::time::Duration::from_secs(301)).unwrap();
+    assert!(line.contains("2 edge(s)"), "{line}");
+    assert!(line.contains("a.o"), "{line}");
+}
+
+#[test]
+fn stall_line_caps_long_worklists() {
+    let labels: Vec<String> = (0..10).map(|i| format!("e{i}.o")).collect();
+    let line = Runner::wait_stall_line(10, &labels, std::time::Duration::from_secs(600)).unwrap();
+    assert!(line.contains("(+5 more)"), "{line}");
+    assert!(!line.contains("e9.o"), "{line}");
+}
+
+#[test]
+fn stall_line_silent_before_the_interval() {
+    let labels = vec!["slow-link".to_string()];
+    assert!(Runner::wait_stall_line(1, &labels, std::time::Duration::from_secs(299)).is_none());
+}
+
 pub fn soname_link_edge(cmdline: &str, ins: &[&str], outs: &[&str]) -> bool {
     cmdline.contains("cmake_symlink_library")
         && ins.len() == 1
