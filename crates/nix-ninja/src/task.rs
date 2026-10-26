@@ -21305,12 +21305,13 @@ static RESOLVE_ANNOUNCED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 static RESOLVE_LABEL: LazyLock<Mutex<String>> = LazyLock::new(Default::default);
 static RESOLVE_WATCHDOG: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
-/// Whether the resolve in flight has earned its one line: it is still the
-/// same resolve (`gen`), that resolve has not been announced yet, and it has
-/// been running at least the threshold. Pure, so the three conditions are
-/// pinned without a process and without a clock.
+/// Whether the resolve in flight has earned its one line: a resolve is
+/// running (`started_ms` nonzero; the drop clears it, the generation only
+/// ever rises so no two resolves share one), it has not been announced yet,
+/// and it has been running at least the threshold. Pure, so the conditions
+/// are pinned without a process and without a clock.
 fn resolve_stall_due(now_ms: u64, started_ms: u64, gen: u64, announced: u64) -> bool {
-    gen != 0 && gen != announced && now_ms.saturating_sub(started_ms) >= RESOLVE_STALL_MS
+    started_ms != 0 && gen != announced && now_ms.saturating_sub(started_ms) >= RESOLVE_STALL_MS
 }
 
 fn resolve_elapsed_ms() -> u64 {
@@ -21332,6 +21333,14 @@ fn resolve_watch(label: &str) -> ResolveWatch {
             if !resolve_stall_due(resolve_elapsed_ms(), started, gen, announced) {
                 continue;
             }
+            // Re-read before printing: the resolve may have returned between
+            // the load and this tick, and its drop clears the start. A line
+            // printed after the return would name a resolve that finished.
+            let live_gen = RESOLVE_GEN.load(std::sync::atomic::Ordering::Relaxed);
+            let live_started = RESOLVE_STARTED_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if live_started == 0 || live_gen != gen {
+                continue;
+            }
             // Claim the line before printing, so two ticks cannot both emit
             // it for the same resolve.
             RESOLVE_ANNOUNCED.store(gen, std::sync::atomic::Ordering::Relaxed);
@@ -21343,16 +21352,23 @@ fn resolve_watch(label: &str) -> ResolveWatch {
         });
     });
     *RESOLVE_LABEL.lock().unwrap() = label.to_string();
-    RESOLVE_STARTED_MS.store(resolve_elapsed_ms(), std::sync::atomic::Ordering::Relaxed);
+    // Clamped off zero: PROCESS_START initialises on first read, so the
+    // process's first-ever resolve would otherwise store a zero start, which
+    // the predicate reads as idle and the watchdog would never fire for it.
+    RESOLVE_STARTED_MS.store(
+        resolve_elapsed_ms().max(1),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     RESOLVE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     ResolveWatch
 }
 
 impl Drop for ResolveWatch {
     fn drop(&mut self) {
-        // A zero start is the idle state the predicate already rejects.
+        // Idle is a zero start. The generation is never reset: reusing 1 for
+        // every resolve would collide with the previous resolve's announcement
+        // and silence every resolve after the first that overruns.
         RESOLVE_STARTED_MS.store(0, std::sync::atomic::Ordering::Relaxed);
-        RESOLVE_GEN.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -28827,6 +28843,13 @@ pub(crate) static OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(())
 #[cfg(test)]
 static CHDIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The pre-resolve watchdog's state is process-global for the same reason the
+/// working directory is, so its lock is file scope too. Only one test arms it
+/// today; a second one added anywhere in the file would otherwise race this
+/// one over the generation counters and pass or fail by schedule.
+#[cfg(test)]
+static RESOLVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod ninja_pool_tests {
     use super::OUT_ENV_LOCK;
@@ -32713,27 +32736,86 @@ mod vapigen_outputs_tests {
 #[cfg(test)]
 mod unresolved_include_defer_tests {
     /// The stall line is the only heartbeat that can fire for a resolve that
-    /// never returns, so its three conditions are pinned here rather than
-    /// left to a 30-second wall clock nobody can run in a suite. Each arm
-    /// is a state the watchdog really meets: idle between resolves (gen 0),
-    /// a resolve that already printed its one line, and a resolve younger
-    /// than the threshold. The positive arm is the round of 2026-10-25.
+    /// never returns, so its conditions are pinned here rather than left to a
+    /// 30-second wall clock nobody can run in a suite. Each arm is a state the
+    /// watchdog really meets: idle between resolves (zero start, generations
+    /// kept rising), a resolve that already printed its one line, and a
+    /// resolve younger than the threshold. The last arm is the round of
+    /// 2026-10-25 read back at its own layer: the only legal production
+    /// sequence that reaches the announcement twice uses two generations,
+    /// because the drop never resets them. A mutant that resets the
+    /// generation on drop would keep that sequence legal and must die on the
+    /// comment below naming the breakage, not on this test going red.
     #[test]
     fn a_resolve_is_announced_once_when_it_overruns() {
         use super::resolve_stall_due;
         const T: u64 = super::RESOLVE_STALL_MS;
         // Positive: running for exactly the threshold, not yet announced.
-        assert!(resolve_stall_due(T, 0, 1, 0));
+        assert!(resolve_stall_due(100 + T, 100, 1, 0));
         // Positive: well past it.
         assert!(resolve_stall_due(T + 600_000, 1_000, 7, 3));
-        // Idle: no resolve in flight, so a stale start must not speak.
+        // Idle: no resolve in flight, so a stale start must not speak, even
+        // when earlier generations overran and were announced.
         assert!(!resolve_stall_due(T * 10, 0, 0, 0));
+        assert!(!resolve_stall_due(T * 10, 0, 5, 4));
         // Already announced for THIS resolve: one line per resolve.
-        assert!(!resolve_stall_due(T * 10, 0, 7, 7));
+        assert!(!resolve_stall_due(T * 10, 100, 7, 7));
         // Younger than the threshold.
-        assert!(!resolve_stall_due(T - 1, 0, 1, 0));
+        assert!(!resolve_stall_due(100 + T - 1, 100, 1, 0));
         // A later resolve is a new subject even though an earlier one spoke.
-        assert!(resolve_stall_due(T, 0, 8, 7));
+        assert!(resolve_stall_due(100 + T, 100, 8, 7));
+    }
+
+    /// A GENERATION IS SPENT ONCE. `resolve_watch` takes a fresh generation per
+    /// resolve and `ResolveWatch::drop` clears only the start, so the pair
+    /// (announced, next generation) can never collide. This test walks that
+    /// pair across a sequence of resolves through the real atomics and the
+    /// real `resolve_watch`/drop, which is the layer a predicate-only test
+    /// cannot reach: the mutant that resets the generation on drop leaves
+    /// every arm of `a_resolve_is_announced_once_when_it_overruns` green and
+    /// fails here on the second overrun.
+    #[test]
+    fn a_resolve_that_overruns_after_another_is_announced_too() {
+        use std::sync::atomic::Ordering;
+        let _g = super::RESOLVE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let seen = |label: &str| {
+            let watch = super::resolve_watch(label);
+            let gen = super::RESOLVE_GEN.load(Ordering::Relaxed);
+            assert_ne!(
+                super::RESOLVE_STARTED_MS.load(Ordering::Relaxed),
+                0,
+                "arming starts a resolve"
+            );
+            // Pretend the watchdog ticked and printed for this generation.
+            super::RESOLVE_ANNOUNCED.store(gen, Ordering::Relaxed);
+            drop(watch);
+            assert_eq!(
+                super::RESOLVE_STARTED_MS.load(Ordering::Relaxed),
+                0,
+                "the drop leaves no resolve in flight"
+            );
+            gen
+        };
+        let first = seen("first.cc.o");
+        let second = seen("second.cc.o");
+        assert_ne!(
+            first, second,
+            "a generation is spent once: reusing it would silence every \
+             resolve after the first that overruns"
+        );
+        // The resolve after an announced one runs against one MORE generation
+        // than announcement, which is exactly the state the reset-on-drop
+        // mutant cannot reach: it would hand this resolve the OLD announced
+        // generation, and the predicate's `gen != announced` arm would refuse
+        // its one line.
+        assert!(
+            super::resolve_stall_due(100 + super::RESOLVE_STALL_MS, 100, second, first,),
+            "the resolve after an announced one is still announceable"
+        );
+        // Leave the statics as the suite found them: idle.
+        super::RESOLVE_STARTED_MS.store(0, Ordering::Relaxed);
     }
 
     use super::{find_unresolved_miss, producer_index_of, DeferMiss, ProducerIndex};
