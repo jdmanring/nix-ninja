@@ -418,6 +418,19 @@ Mechanisms, cited by symbol because line numbers rot:
   class. A kept candidate costs one extra resolve, is logged `deferral on ...
   added nothing`, and cannot loop (`suppress_defer` clears the producer
   index), and a deferral refuses to emit, so nothing re-keys.
+- **Pre-resolve watchdog** (`resolve_watch`, `resolve_stall_due`,
+  `ResolveWatch`): every other heartbeat in `task.rs` prints on the way OUT
+  (`RESOLVE_MS`, the stats line), so a resolve that never returns is silent
+  while the process burns CPU. A thread armed BEFORE `new_task` and disarmed
+  by `ResolveWatch::drop` prints `nix-ninja: resolve still running for <edge>
+  after N s (no derivation emitted yet)` once per resolve that passes
+  `RESOLVE_STALL_MS`. The state is four process-global atomics, not a thread
+  per task: at 16,000 edges a thread each costs more than the line is worth.
+  A generation is SPENT ONCE: the drop clears only the start and arming
+  stores it off zero, because a zero start reads as idle and a reused
+  generation matches the previous announcement, which silences every resolve
+  after the first that overruns. `RESOLVE_LOCK` (file scope) guards the
+  statics for tests, as `CHDIR_LOCK` does for the working directory.
 - **Macro arms** (`macro_arm_headers`): keep an arm only if it resolves to
   a REGULAR FILE; quoted and angle spellings; a single quoted arm skipped,
   a single angle arm carried; resolved through the command's own include
@@ -613,7 +626,8 @@ about formatting; a pushed commit is green only once its CI run is read.
 Tests live in `crates/nix-ninja` reaching `pub` functions (a test under the
 fileset spends every banked compile); fixtures build their own store
 objects, never name resident paths; locks over process-global state
-(`set_current_dir`, env) live at FILE SCOPE (`CHDIR_LOCK`, `OUT_ENV_LOCK`);
+(`set_current_dir`, env, the pre-resolve watchdog's atomics) live at FILE
+SCOPE (`CHDIR_LOCK`, `OUT_ENV_LOCK`, `RESOLVE_LOCK`);
 a control reads a different source than its subject. Pin the WIRING:
 mutation-check that reverting the guard fails a test that runs it; a
 flag-pair predicate's negative control carries the pair. Export a predicate
