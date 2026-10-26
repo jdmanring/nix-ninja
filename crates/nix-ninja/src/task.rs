@@ -26712,6 +26712,12 @@ pub fn scan_c_includes(
     let dirs = include_dirs_as_given(cmdline);
     let mut checked: HashSet<PathBuf> = HashSet::new();
     let mut pending: Vec<PathBuf> = files.into_iter().chain(scan.includes.clone()).collect();
+    // MEMBERSHIP IS A SET, ORDER IS THE VEC, as in `defer_walk`: the BOM
+    // walk below tests `scan.includes` for every include a BOM closure
+    // yields, and a `Vec::contains` over a closure a jumbo TU reaches in
+    // the tens of thousands is quadratic in that. The Vec keeps
+    // first-occurrence order, so the scan's answer is unchanged.
+    let mut includes_seen: HashSet<PathBuf> = scan.includes.iter().cloned().collect();
     while let Some(file) = pending.pop() {
         if file.starts_with(store_dir) || !checked.insert(file.clone()) {
             continue;
@@ -26743,7 +26749,7 @@ pub fn scan_c_includes(
             seeds.push(spelled);
         }
         seeds.push(canonical);
-        seeds.retain(|s| !scan.includes.contains(s));
+        seeds.retain(|s| !includes_seen.contains(s));
         if seeds.is_empty() {
             continue;
         }
@@ -26751,7 +26757,7 @@ pub fn scan_c_includes(
             c_include_parser::retrieve_c_includes_checked(cmdline, seeds, declared.cloned())?;
         scan.incomplete |= more.incomplete;
         for p in more.includes {
-            if !scan.includes.contains(&p) {
+            if includes_seen.insert(p.clone()) {
                 scan.includes.push(p.clone());
                 pending.push(p);
             }
