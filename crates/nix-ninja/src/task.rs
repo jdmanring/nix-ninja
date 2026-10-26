@@ -26813,6 +26813,26 @@ pub(crate) fn tree_reached_headers(
     out
 }
 
+/// The miss walk's file list: the seeds plus every scanned include, first
+/// occurrence first, store paths left out. MEMBERSHIP IS A SET, ORDER IS
+/// THE VEC: the walk feeds a 25k-file blink jumbo closure, and
+/// `Vec::contains` made this dedup quadratic in that (round qwe-...,
+/// 2026-10-25: tasks 15000-18000 resolved at ~1 s each and climbing,
+/// discover 91 s -> 3096 s, ticks 15-30 min apart reading as a stuck
+/// resolve while no SLOW RESOLVE fired because every resolve completed).
+/// The Vec keeps first-occurrence order, so the candidates - and which
+/// miss deferral names first - are unchanged.
+fn defer_walk(files: &[PathBuf], c_includes: &[PathBuf], store_dir: &Path) -> Vec<PathBuf> {
+    let mut walk: Vec<PathBuf> = files.to_vec();
+    let mut known: rustc_hash::FxHashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
+    for p in c_includes {
+        if !p.starts_with(store_dir) && known.insert(p.as_path()) {
+            walk.push(p.clone());
+        }
+    }
+    walk
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn discover_c_includes(
     rpc_client: &Arc<BuilderRpcClient>,
@@ -27141,12 +27161,7 @@ pub fn discover_c_includes(
     // never saw them. Store paths are left out: a system header cannot spell
     // a header this project generates.
     let defer_miss = producer.as_ref().and_then(|idx| {
-        let mut walk: Vec<PathBuf> = files.clone();
-        for p in &c_includes {
-            if !p.starts_with(store_dir.to_path()) && !walk.contains(p) {
-                walk.push(p.clone());
-            }
-        }
+        let walk = defer_walk(&files, &c_includes, store_dir.to_path());
         let candidates = find_unresolved_miss(
             idx,
             &walk,
@@ -32818,7 +32833,58 @@ mod unresolved_include_defer_tests {
         super::RESOLVE_STARTED_MS.store(0, Ordering::Relaxed);
     }
 
-    use super::{find_unresolved_miss, producer_index_of, DeferMiss, ProducerIndex};
+    use super::{defer_walk, find_unresolved_miss, producer_index_of, DeferMiss, ProducerIndex};
+
+    /// The miss walk keeps seeds first, then scanned includes in first-
+    /// occurrence order, minus store paths. The ORDER is the contract:
+    /// deferral names the first confirmed miss, so a dedup that reorders
+    /// changes which header a task waits on.
+    #[test]
+    fn defer_walk_keeps_first_occurrence_order() {
+        let store = Path::new("/nix/store");
+        let walk = defer_walk(
+            &[PathBuf::from("a.cpp"), PathBuf::from("b.h")],
+            &[
+                PathBuf::from("b.h"),
+                PathBuf::from("c.h"),
+                PathBuf::from("/nix/store/hash-x/d.h"),
+                PathBuf::from("c.h"),
+                PathBuf::from("a.cpp"),
+            ],
+            store,
+        );
+        assert_eq!(
+            walk,
+            vec![
+                PathBuf::from("a.cpp"),
+                PathBuf::from("b.h"),
+                PathBuf::from("c.h"),
+            ],
+        );
+    }
+
+    /// The negative control for the quadratic: 60k includes must dedup in
+    /// well under the ~30 s `Vec::contains` pays for them (1.8B component
+    /// comparisons at >=15 ns each on this tree's paths). The margin is
+    /// 100x against machine variance either way: the set answers in
+    /// milliseconds, the linear scan cannot answer in under 10 s on any
+    /// machine this suite runs on.
+    #[test]
+    fn defer_walk_dedup_is_not_quadratic() {
+        let store = Path::new("/nix/store");
+        let files = vec![PathBuf::from("tu.cpp")];
+        let includes: Vec<PathBuf> = (0..60_000)
+            .map(|i| PathBuf::from(format!("gen/dir/file{i}.h")))
+            .collect();
+        let start = std::time::Instant::now();
+        let walk = defer_walk(&files, &includes, store);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "defer_walk took {:?} for 60k includes",
+            start.elapsed()
+        );
+        assert_eq!(walk.len(), 60_001);
+    }
 
     /// The first candidate the detector returns, the form these tests assert.
     fn first_miss(
