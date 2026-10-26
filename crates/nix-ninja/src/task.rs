@@ -1545,6 +1545,15 @@ impl Runner {
             return Ok(());
         }
 
+        let _resolve_watch = resolve_watch(
+            &build
+                .outs()
+                .first()
+                .map(|f| files.by_id[*f].name.clone())
+                .unwrap_or_else(|| format!("{bid:?}")),
+        );
+        resolve_section("records");
+
         // Record stamp edges BEFORE building the task, so any later
         // consumer's expansion sees them (ninja emits producers before
         // consumers in the traversal order the driver walks).
@@ -1700,17 +1709,6 @@ impl Runner {
         // is always on because its cost is two atomics per task.
         use std::sync::atomic::Ordering;
         let t0 = std::time::Instant::now();
-        // ARMED BEFORE `new_task`, not after: every other heartbeat in this
-        // file reports on the way OUT, so a resolve that never returns is
-        // silent. The label is the edge's first output, the same name the
-        // failure and progress lines use.
-        let _resolve_watch = resolve_watch(
-            &build
-                .outs()
-                .first()
-                .map(|f| files.by_id[*f].name.clone())
-                .unwrap_or_else(|| format!("{bid:?}")),
-        );
         let mut task = match self.new_task(files, build) {
             Ok(task) => task,
             // A LATER PASS DOES NOT NEED TO RESOLVE AN EDGE IT REUSES: the
@@ -1808,15 +1806,17 @@ impl Runner {
         // predictor of its memory cost available at admission time and was
         // previously thrown away by counting every task as one. Small tasks
         // run wide, deep ones approach serial, and the same round does both.
-        let permit = self
-            .permits
-            .acquire_weighted(admission_weight(task.inputs.len(), self.permits.cap));
-
         // THEN the edge's declared ninja pool, if it has one. Order matters
         // and is always global-then-pool: a thread waiting on a pool already
         // holds its global units, so the threads that will free the pool are
         // never blocked behind it and the pair cannot deadlock. Reversing it
         // would let pool holders queue for global slots held by pool waiters.
+        resolve_section("permits");
+        let permit = self
+            .permits
+            .acquire_weighted(admission_weight(task.inputs.len(), self.permits.cap));
+
+        resolve_section("pool");
         let pool_permit = build
             .pool
             .as_ref()
@@ -2475,6 +2475,7 @@ impl Runner {
         let mut store_srcs: Vec<PathBuf> = Vec::new();
         let mut input_set: rustc_hash::FxHashMap<PathBuf, DerivedFile> =
             rustc_hash::FxHashMap::default();
+        resolve_section("worklist");
         // Expand phony aliases (transitively) into the real inputs behind
         // them. `via_phony` marks fids reached through an expansion: a
         // pure-ordering token that is not a file (CMake emits `phony || .`,
@@ -2802,6 +2803,7 @@ impl Runner {
         }
 
         lap(&NT_WORKLIST_MS);
+        resolve_section("cmdline");
 
         // Meson resolves `files(...)` in custom_target commands to absolute
         // paths at configure time. Those paths do not exist inside the task
@@ -4518,6 +4520,7 @@ impl Runner {
         // worklist shape as the python-sibling pass; .grdp partials nest,
         // so found manifests re-enter the list.
         lap(&NT_PY_MS);
+        resolve_section("grd");
 
         // The edge's own outputs, for the self-output guards below: a
         // candidate spelling that names what this edge writes is not an
@@ -4842,6 +4845,7 @@ impl Runner {
 
         // Extract store paths from cmdline and add pre-extracted wrapper store paths
         lap(&NT_GRD_MS);
+        resolve_section("tail");
 
         // The @-argument itself resolves from the post-cd cwd; swap in the
         // compensated spelling computed by the branch above.
@@ -21423,7 +21427,14 @@ static RESOLVE_STARTED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 static RESOLVE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RESOLVE_ANNOUNCED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static RESOLVE_LABEL: LazyLock<Mutex<String>> = LazyLock::new(Default::default);
+static RESOLVE_SECTION: LazyLock<Mutex<String>> = LazyLock::new(Default::default);
 static RESOLVE_WATCHDOG: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+fn resolve_section(sec: &str) {
+    if let Ok(mut l) = RESOLVE_SECTION.lock() {
+        *l = sec.to_string();
+    }
+}
 
 /// Whether the resolve in flight has earned its one line: a resolve is
 /// running (`started_ms` nonzero; the drop clears it, the generation only
@@ -21436,6 +21447,13 @@ fn resolve_stall_due(now_ms: u64, started_ms: u64, gen: u64, announced: u64) -> 
 
 fn resolve_elapsed_ms() -> u64 {
     PROCESS_START.elapsed().as_millis() as u64
+}
+
+fn resolve_stall_line(label: &str, section: &str, elapsed_ms: u64) -> String {
+    format!(
+        "nix-ninja: resolve still running for {label} after {} s (no derivation emitted yet) [section: {section}]",
+        elapsed_ms / 1000
+    )
 }
 
 /// Arms the watchdog for one resolve and disarms it on drop, so an early
@@ -21465,9 +21483,13 @@ fn resolve_watch(label: &str) -> ResolveWatch {
             // it for the same resolve.
             RESOLVE_ANNOUNCED.store(gen, std::sync::atomic::Ordering::Relaxed);
             let label = RESOLVE_LABEL.lock().map(|l| l.clone()).unwrap_or_default();
+            let sec = RESOLVE_SECTION
+                .lock()
+                .map(|s| s.clone())
+                .unwrap_or_default();
             eprintln!(
-                "nix-ninja: resolve still running for {label} after {} s (no derivation emitted yet)",
-                (resolve_elapsed_ms().saturating_sub(started)) / 1000
+                "{}",
+                resolve_stall_line(&label, &sec, resolve_elapsed_ms().saturating_sub(started))
             );
         });
     });
@@ -32905,6 +32927,16 @@ mod unresolved_include_defer_tests {
         assert!(!resolve_stall_due(100 + T - 1, 100, 1, 0));
         // A later resolve is a new subject even though an earlier one spoke.
         assert!(resolve_stall_due(100 + T, 100, 8, 7));
+    }
+
+    #[test]
+    fn a_stall_line_names_the_edge_and_its_section() {
+        let line = super::resolve_stall_line("edge.o", "grd", 42_000);
+        assert_eq!(
+            line,
+            "nix-ninja: resolve still running for edge.o \
+             after 42 s (no derivation emitted yet) [section: grd]"
+        );
     }
 
     /// A GENERATION IS SPENT ONCE. `resolve_watch` takes a fresh generation per
