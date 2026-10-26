@@ -922,7 +922,10 @@ impl JobPermits {
                 .min(budget_for_load(self.cap, r.load, self.load_limit));
             if *count == 0 || *count + weight <= budget {
                 if announced {
-                    eprintln!("nix-ninja: job permit acquired after {}s wait", t0.elapsed().as_secs());
+                    eprintln!(
+                        "nix-ninja: job permit acquired after {}s wait",
+                        t0.elapsed().as_secs()
+                    );
                 }
                 break;
             }
