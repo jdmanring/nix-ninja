@@ -906,6 +906,8 @@ impl JobPermits {
         let weight = weight.clamp(1, self.cap.max(1));
         let (lock, cvar) = &*self.inner;
         let mut count = lock.lock().unwrap();
+        let t0 = std::time::Instant::now();
+        let mut announced = false;
         loop {
             let r = self.readings.unwrap_or_else(|| {
                 let (reserve_gib, full_gib) = memory_bounds_gib();
@@ -916,15 +918,17 @@ impl JobPermits {
                     full_gib,
                 }
             });
-            // The tighter of the two controls wins. Memory is the one that
-            // matters here; load is honoured because -l was asked for, and its
-            // weakness is documented at budget_for_load. Unconditional: there
-            // is no longer a branch that answers `self.cap` without consulting
-            // either, which is what nothing was pinning.
             let budget = budget_for_memory(self.cap, r.avail_gib, r.reserve_gib, r.full_gib)
                 .min(budget_for_load(self.cap, r.load, self.load_limit));
             if *count == 0 || *count + weight <= budget {
+                if announced {
+                    eprintln!("nix-ninja: job permit acquired after {}s wait", t0.elapsed().as_secs());
+                }
                 break;
+            }
+            if t0.elapsed() > std::time::Duration::from_secs(30) && !announced {
+                eprintln!("nix-ninja: waiting for job permits (held {count} / budget {budget}, weight {weight})...");
+                announced = true;
             }
             let (c, _) = cvar
                 .wait_timeout(count, std::time::Duration::from_secs(2))
