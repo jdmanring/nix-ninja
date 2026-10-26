@@ -1678,6 +1678,17 @@ impl Runner {
         // is always on because its cost is two atomics per task.
         use std::sync::atomic::Ordering;
         let t0 = std::time::Instant::now();
+        // ARMED BEFORE `new_task`, not after: every other heartbeat in this
+        // file reports on the way OUT, so a resolve that never returns is
+        // silent. The label is the edge's first output, the same name the
+        // failure and progress lines use.
+        let _resolve_watch = resolve_watch(
+            &build
+                .outs()
+                .first()
+                .map(|f| files.by_id[*f].name.clone())
+                .unwrap_or_else(|| format!("{bid:?}")),
+        );
         let mut task = match self.new_task(files, build) {
             Ok(task) => task,
             // A LATER PASS DOES NOT NEED TO RESOLVE AN EDGE IT REUSES: the
@@ -21271,6 +21282,80 @@ impl Drop for DynDiscoveryTimer {
     }
 }
 
+/// A RESOLVE THAT NEVER RETURNS PRINTS NOTHING, because every existing
+/// heartbeat sits after `new_task`: `SLOW RESOLVE` and the every-500-tasks
+/// stats line are both emitted on the way out. A resolve stuck inside the
+/// include scan or the confirming preprocessor therefore looks exactly like
+/// a hung process, which is what the qtwebengine round of 2026-10-25 showed
+/// from outside: 31 minutes at 1.6 cores, two per-TU outputs, no children,
+/// and not one of `nix-ninja-stats`, `SLOW RESOLVE` or `TASKS` in a 2h35m
+/// log. The thread census settled it (9 to 18 threads, fluctuating, one
+/// runnable), and nothing in the log could have.
+///
+/// So this one is announced BEFORE the work, from a watchdog that names the
+/// edge and the seconds spent. A threshold rather than a tick, because the
+/// price has to stay at one atomic store per resolve: a thread per task
+/// would cost more than the line is worth at 16,000 edges.
+const RESOLVE_STALL_MS: u64 = 30_000;
+
+static PROCESS_START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+static RESOLVE_STARTED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RESOLVE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RESOLVE_ANNOUNCED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RESOLVE_LABEL: LazyLock<Mutex<String>> = LazyLock::new(Default::default);
+static RESOLVE_WATCHDOG: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Whether the resolve in flight has earned its one line: it is still the
+/// same resolve (`gen`), that resolve has not been announced yet, and it has
+/// been running at least the threshold. Pure, so the three conditions are
+/// pinned without a process and without a clock.
+fn resolve_stall_due(now_ms: u64, started_ms: u64, gen: u64, announced: u64) -> bool {
+    gen != 0 && gen != announced && now_ms.saturating_sub(started_ms) >= RESOLVE_STALL_MS
+}
+
+fn resolve_elapsed_ms() -> u64 {
+    PROCESS_START.elapsed().as_millis() as u64
+}
+
+/// Arms the watchdog for one resolve and disarms it on drop, so an early
+/// return out of `start` (a refusal, a deferral) cannot leave a stale line
+/// waiting to fire against an edge that is no longer running.
+struct ResolveWatch;
+
+fn resolve_watch(label: &str) -> ResolveWatch {
+    RESOLVE_WATCHDOG.get_or_init(|| {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let gen = RESOLVE_GEN.load(std::sync::atomic::Ordering::Relaxed);
+            let started = RESOLVE_STARTED_MS.load(std::sync::atomic::Ordering::Relaxed);
+            let announced = RESOLVE_ANNOUNCED.load(std::sync::atomic::Ordering::Relaxed);
+            if !resolve_stall_due(resolve_elapsed_ms(), started, gen, announced) {
+                continue;
+            }
+            // Claim the line before printing, so two ticks cannot both emit
+            // it for the same resolve.
+            RESOLVE_ANNOUNCED.store(gen, std::sync::atomic::Ordering::Relaxed);
+            let label = RESOLVE_LABEL.lock().map(|l| l.clone()).unwrap_or_default();
+            eprintln!(
+                "nix-ninja: resolve still running for {label} after {} s (no derivation emitted yet)",
+                (resolve_elapsed_ms().saturating_sub(started)) / 1000
+            );
+        });
+    });
+    *RESOLVE_LABEL.lock().unwrap() = label.to_string();
+    RESOLVE_STARTED_MS.store(resolve_elapsed_ms(), std::sync::atomic::Ordering::Relaxed);
+    RESOLVE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ResolveWatch
+}
+
+impl Drop for ResolveWatch {
+    fn drop(&mut self) {
+        // A zero start is the idle state the predicate already rejects.
+        RESOLVE_STARTED_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        RESOLVE_GEN.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 static NT_WORKLIST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static NT_CMDLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static NT_PY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -32627,6 +32712,30 @@ mod vapigen_outputs_tests {
 /// `n2::load::Loader`, which is how the scheduler reads it too.
 #[cfg(test)]
 mod unresolved_include_defer_tests {
+    /// The stall line is the only heartbeat that can fire for a resolve that
+    /// never returns, so its three conditions are pinned here rather than
+    /// left to a 30-second wall clock nobody can run in a suite. Each arm
+    /// is a state the watchdog really meets: idle between resolves (gen 0),
+    /// a resolve that already printed its one line, and a resolve younger
+    /// than the threshold. The positive arm is the round of 2026-10-25.
+    #[test]
+    fn a_resolve_is_announced_once_when_it_overruns() {
+        use super::resolve_stall_due;
+        const T: u64 = super::RESOLVE_STALL_MS;
+        // Positive: running for exactly the threshold, not yet announced.
+        assert!(resolve_stall_due(T, 0, 1, 0));
+        // Positive: well past it.
+        assert!(resolve_stall_due(T + 600_000, 1_000, 7, 3));
+        // Idle: no resolve in flight, so a stale start must not speak.
+        assert!(!resolve_stall_due(T * 10, 0, 0, 0));
+        // Already announced for THIS resolve: one line per resolve.
+        assert!(!resolve_stall_due(T * 10, 0, 7, 7));
+        // Younger than the threshold.
+        assert!(!resolve_stall_due(T - 1, 0, 1, 0));
+        // A later resolve is a new subject even though an earlier one spoke.
+        assert!(resolve_stall_due(T, 0, 8, 7));
+    }
+
     use super::{find_unresolved_miss, producer_index_of, DeferMiss, ProducerIndex};
 
     /// The first candidate the detector returns, the form these tests assert.
