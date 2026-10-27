@@ -418,19 +418,25 @@ Mechanisms, cited by symbol because line numbers rot:
   class. A kept candidate costs one extra resolve, is logged `deferral on ...
   added nothing`, and cannot loop (`suppress_defer` clears the producer
   index), and a deferral refuses to emit, so nothing re-keys.
-- **Pre-resolve watchdog** (`resolve_watch`, `resolve_stall_due`,
-  `ResolveWatch`): every other heartbeat in `task.rs` prints on the way OUT
-  (`RESOLVE_MS`, the stats line), so a resolve that never returns is silent
-  while the process burns CPU. A thread armed BEFORE `new_task` and disarmed
-  by `ResolveWatch::drop` prints `nix-ninja: resolve still running for <edge>
-  after N s (no derivation emitted yet)` once per resolve that passes
-  `RESOLVE_STALL_MS`. The state is four process-global atomics, not a thread
-  per task: at 16,000 edges a thread each costs more than the line is worth.
-  A generation is SPENT ONCE: the drop clears only the start and arming
-  stores it off zero, because a zero start reads as idle and a reused
-  generation matches the previous announcement, which silences every resolve
-  after the first that overruns. `RESOLVE_LOCK` (file scope) guards the
-  statics for tests, as `CHDIR_LOCK` does for the working directory.
+- **Pre-resolve watchdog and dispatch heartbeat** (`resolve_watch`, `resolve_stall_due`,
+  `ResolveWatch`, `RESOLVE_SECTION`, `resolve_stall_line`): every other
+  heartbeat in `task.rs` prints on the way OUT (`RESOLVE_MS`, the stats line),
+  so a resolve that never returns is silent while the process burns CPU. A
+  thread armed before `new_task` and disarmed by `ResolveWatch::drop` prints
+  `nix-ninja: resolve still running for <edge> after N s (no derivation emitted
+  yet) [section: <sec>]` once per resolve that passes `RESOLVE_STALL_MS`.
+  Dispatch phases stamp `RESOLVE_SECTION` (`records`/`worklist`/`cmdline`/`grd`/
+  `tail`/`permits`/`pool`), so a stalled resolve names its exact phase.
+  State is four process-global atomics guarded by `RESOLVE_LOCK`.
+- **Stalled wait and permit starvation** (`Runner::wait`, `JobPermits`):
+  `wait` uses `recv_timeout` (300 s) and prints `nix-ninja: still waiting on N
+  edge(s), oldest Ss with no result: ...` (capped at five labels), failing
+  loudly with the missing edges if every sender dies. `JobPermits` announces
+  `nix-ninja: waiting for job permits (...)` after 30 s and reports wait time
+  on acquisition.
+- **BOM walk membership set** (`scan_c_includes`): mirrors `scan.includes`
+  in an `includes_seen` `HashSet` for constant-time membership checks instead
+  of quadratic `Vec::contains` over jumbo closures.
 - **Macro arms** (`macro_arm_headers`): keep an arm only if it resolves to
   a REGULAR FILE; quoted and angle spellings; a single quoted arm skipped,
   a single angle arm carried; resolved through the command's own include
