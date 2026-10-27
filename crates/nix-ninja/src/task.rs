@@ -791,6 +791,27 @@ fn admission_weight(inputs: usize, budget: usize) -> usize {
     (1 + inputs / INPUTS_PER_WEIGHT).clamp(1, budget.max(1))
 }
 
+/// Admission weight for a task: links take the whole budget so a heavy final
+/// link runs alone, everything else keeps the input-count weight.
+///
+/// Pure so the wiring is testable without a scheduler: reverting the call
+/// site to `admission_weight` fails the link tests below. A weight of `cap`
+/// can only acquire once nothing else holds a unit (`acquire_weighted`
+/// admits an over-budget weight at count zero), which is exclusive in
+/// effect while keeping the global-then-pool order.
+fn task_admission_weight<'a>(
+    cmdline: Option<&str>,
+    outs: impl Iterator<Item = &'a str>,
+    inputs: usize,
+    budget: usize,
+) -> usize {
+    if is_link_task(cmdline, outs) {
+        budget.max(1)
+    } else {
+        admission_weight(inputs, budget)
+    }
+}
+
 /// Available memory in GiB, or `u64::MAX` where /proc cannot be read - an
 /// unreadable meminfo must not silently serialize the whole round.
 pub(crate) fn available_gib() -> u64 {
@@ -1806,15 +1827,20 @@ impl Runner {
         // predictor of its memory cost available at admission time and was
         // previously thrown away by counting every task as one. Small tasks
         // run wide, deep ones approach serial, and the same round does both.
+        // A link takes the whole budget instead and runs alone: a final
+        // link exhausts the box at widths a compile round needs.
         // THEN the edge's declared ninja pool, if it has one. Order matters
         // and is always global-then-pool: a thread waiting on a pool already
         // holds its global units, so the threads that will free the pool are
         // never blocked behind it and the pair cannot deadlock. Reversing it
         // would let pool holders queue for global slots held by pool waiters.
         resolve_section("permits");
-        let permit = self
-            .permits
-            .acquire_weighted(admission_weight(task.inputs.len(), self.permits.cap));
+        let permit = self.permits.acquire_weighted(task_admission_weight(
+            task.cmdline.as_deref(),
+            task.outputs.iter().filter_map(|p| p.to_str()),
+            task.inputs.len(),
+            self.permits.cap,
+        ));
 
         resolve_section("pool");
         let pool_permit = build
@@ -6270,6 +6296,18 @@ fn link_shaped_outputs<'a>(mut outs: impl Iterator<Item = &'a str>) -> bool {
         None => false,
         Some(first) => link_shaped(first) && outs.all(link_shaped),
     }
+}
+
+/// A task that LINKS rather than compiles: every declared output is plainly a
+/// link product and the command does not compile.
+///
+/// The two halves each exclude a real ambiguity. The name half alone calls
+/// krb5's PIC compile (`gcc -c threads.c -o threads.so`) a link; the command
+/// half alone calls a shell-wrapped link a compile (`command_is_compile`
+/// ignores a `-c` directly after a shell for that reason). Together they are
+/// what `wants_dependency_discovery` already asks with the opposite polarity.
+fn is_link_task<'a>(cmdline: Option<&str>, outs: impl Iterator<Item = &'a str>) -> bool {
+    link_shaped_outputs(outs) && !command_is_compile(cmdline)
 }
 
 /// A COMPILER OPENS A FILE THE GRAPH NEVER DECLARED, and this is the edge
@@ -23777,6 +23815,81 @@ mod link_shaped_tests {
     #[test]
     fn no_outputs_is_not_a_link() {
         assert!(!link_shaped_outputs(std::iter::empty()));
+    }
+}
+
+#[cfg(test)]
+mod link_task_tests {
+    use super::{is_link_task, task_admission_weight};
+
+    /// A shared-library link is one: the shape this whole change exists for.
+    #[test]
+    fn a_shared_link_is_a_link_task() {
+        assert!(is_link_task(
+            Some("c++ a.o b.o -o libfoo.so"),
+            ["libfoo.so"].into_iter(),
+        ));
+        assert!(is_link_task(
+            Some("cc a.o -o hello"),
+            ["hello"].into_iter()
+        ));
+    }
+
+    /// krb5 COMPILES to a `.so` suffix, so the name half alone calls it a
+    /// link. The command half excludes it: this is the case the two-half
+    /// form exists for.
+    #[test]
+    fn a_so_suffixed_compile_is_not_a_link_task() {
+        assert!(!is_link_task(
+            Some("gcc -c threads.c -o threads.so"),
+            ["threads.so"].into_iter(),
+        ));
+    }
+
+    /// Meson objects under `<target>.so.p/` are objects, not links.
+    #[test]
+    fn a_meson_target_object_is_not_a_link_task() {
+        assert!(!is_link_task(
+            Some("cc -c word1lib.c -o libword1.so.p/word1lib.c.o"),
+            ["libword1.so.p/word1lib.c.o"].into_iter(),
+        ));
+    }
+
+    /// A `-c` directly after a shell is not evidence of a compile
+    /// (`command_is_compile`), so a shell-wrapped link stays a link.
+    #[test]
+    fn a_shell_wrapped_link_is_a_link_task() {
+        assert!(is_link_task(
+            Some("sh -c 'cc a.o -o libfoo.so'"),
+            ["libfoo.so"].into_iter(),
+        ));
+    }
+
+    /// No outputs is not a link task.
+    #[test]
+    fn no_outputs_is_not_a_link_task() {
+        assert!(!is_link_task(Some("c++ a.o -o libfoo.so"), std::iter::empty()));
+    }
+
+    /// THE WIRING. A link takes the whole budget however few inputs it
+    /// declares; a compile keeps the input-count weight. Reverting the
+    /// call site to `admission_weight` gives the link weight 1 and fails
+    /// the first assertion.
+    #[test]
+    fn links_take_the_whole_budget_compiles_keep_their_weight() {
+        assert_eq!(
+            task_admission_weight(Some("c++ a.o b.o -o libfoo.so"), ["libfoo.so"].into_iter(), 2, 8),
+            8
+        );
+        assert_eq!(
+            task_admission_weight(
+                Some("gcc -c threads.c -o threads.so"),
+                ["threads.so"].into_iter(),
+                2,
+                8
+            ),
+            super::admission_weight(2, 8)
+        );
     }
 }
 
