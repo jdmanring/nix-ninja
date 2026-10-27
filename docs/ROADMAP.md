@@ -46,7 +46,7 @@ And the supporting sections:
 
 - [What does not work today](#what-does-not-work-today), the open list
 - [The next concrete work, item by item](#the-next-concrete-work-item-by-item),
-  ten items with a first action each
+  13 items with a first action each
 - [What could stop this](#what-could-stop-this), the risks
 - [How a milestone ships](#how-a-milestone-ships)
 
@@ -288,7 +288,7 @@ What is missing is larger than that: a STRANGER cannot reach the same place. The
 difference is the published apparatus rather than the driver, the corpus, the
 failure signatures, and the record of what is already known to break.
 
-The route is the ten items below, which is where each one's first action lives.
+The route is the 13 items below, which is where each one's first action lives.
 What belongs here is the criterion they add up to.
 
 EXIT CRITERION: a clone of this repository, with nothing installed but an
@@ -476,6 +476,13 @@ nothing is outstanding.
 - **Nothing here has ever been built on more than one machine.** The capability
   is expected to come free from Nix, and an expectation is not a measurement.
   Item 9 is one afternoon that settles it.
+- **A qtwebengine retry re-walks every edge.** The resolve memo is off inside
+  a build by design and the stamps die with the failed derivation, so each
+  retry of the outer derivation pays the full `discover_c_includes` walk
+  again. Item 11 caches it.
+- **Heavy links can exhaust the box.** Final link steps admit alongside
+  compiles with no deterministic isolation, so a bounded round still meets
+  a cgroup kill. Item 12 serializes them.
 
 ## The next concrete work, item by item
 
@@ -753,6 +760,53 @@ After it, in order of measured saving, each measured before it is designed:
   task binary's fileset, so the knob belongs on the driver's side of
   admission. n2 has no jobserver client. Measure first whether the daemon's
   `max-jobs` on the inner connection also binds.
+
+### 11. Cache discovery outputs across retries (qtwebengine priority)
+
+Each retry of the outer qtwebengine derivation re-walks every compile edge
+in `discover_c_includes`, with `dyn_discover` the dominant term in the
+resolve breakdown. The resolve memo is off inside a build by design and
+the NAR stamps die with the failed derivation, so every retry starts cold.
+
+The fix is a fingerprint-keyed disk cache of the `Discovered` set per edge
+(same `Fingerprint` family as `resolve_cache.rs`: dir mtime, count, size
+sum, max mtime), in an explicit directory outside the walked build dir and
+outside the source tree, passed by the retry loop. Entries carry the
+driver stamp with whole-line equality, and a stale entry that adds or drops
+an input fails loudly through the resolve-cache gate. A cache hit must emit
+byte-identical derivations, proved by `emission-price.sh` before landing,
+with the price recorded in `local/pending/next-rekey-batch.md`.
+
+### 12. Serialize link-phase tasks (qtwebengine priority)
+
+Heavy final links admit alongside compiles and exhaust the box under a
+bounded floor. Admission already takes the global weighted permit and then
+the edge's ninja pool permit in global-then-pool order, which cannot
+deadlock, but nothing isolates links deterministically.
+
+The fix is an `is_link_task` predicate from the existing
+`link_shaped_outputs` / `command_is_compile` /
+`wants_dependency_discovery` family, with the ambiguous cases pinned
+(krb5 `.so` compiles, meson `.so.p` objects, `.ol` / `.os`), giving link
+tasks exclusive global weight or a depth-1 link pool in the same order.
+Scheduling only, so emission-free by construction and proved by
+`emission-price.sh`. A unit test with injected `Readings` plus a small
+link-heavy fixture shows two links never overlap, with a reverted
+predicate as the negative control.
+
+### 13. Make a signal-9 retry resume instead of restart (qtwebengine priority)
+
+A cgroup kill of the outer derivation today discards the resolve and the
+realised task outputs with it, so the retry pays the full discovery walk
+and rebuilds what the killed attempt already banked. Items 11 and 12 are
+the two halves that make a retry cheap: the discovery map replays from
+cache and heavy links stop killing the box. What remains is recording
+which task derivations the killed attempt already realised so the retry
+reuses them rather than re-deriving, extending the later-pass reuse record
+(`emitted.v1`, `files.v1`, `inputs.v1`) across retries through the same
+explicit directory as item 11. First action: measure what a killed
+qtwebengine attempt leaves banked versus what its retry rebuilds, then
+design the record from that gap.
 
 ## What could stop this
 
