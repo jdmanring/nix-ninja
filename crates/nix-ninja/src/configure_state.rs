@@ -25,6 +25,18 @@
 //! (`keep_originals`), and a later pass reads configure's version for its
 //! duration. A changed build.ninja is a re-configure: no record answers for
 //! it and the walk records afresh.
+//!
+//! A RETRY REUSES THE KILLED ATTEMPT'S RECORD. A signal-9 kill takes the
+//! sandbox filesystem with it, so the next attempt starts with no local
+//! state and re-derives every task. Where the retry loop names an explicit
+//! directory outside the build (`NIX_NINJA_DISCOVERY_CACHE_DIR`, the same
+//! one the discovery cache rides), each pass journals every edge it derives
+//! there and writes the merged record back on a clean exit; a first pass
+//! that finds no local configure record but finds the killed attempt's loads
+//! it instead, so reuse, the fallback count and the exit stale check all run
+//! against the attempt before. The journal is append-only with a torn tail
+//! as its expected state, so a load never fails: bad lines are skipped, and
+//! a torn compacted file falls back to the journal underneath it.
 
 use harmonia_store_derivation::derived_path::SingleDerivedPath;
 use nix_ninja_task::derived_file::DerivedFile;
@@ -115,6 +127,14 @@ static EMITTED_INPUTS: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 type Interned = (Vec<String>, std::collections::HashMap<String, u32>);
 static INTERNED: std::sync::Mutex<Option<Interned>> = std::sync::Mutex::new(None);
+/// This pass's attempt directory (`NIX_NINJA_DISCOVERY_CACHE_DIR` plus
+/// `attempts/<key>`), where `note_task` journals every derived edge: set by
+/// `begin_pass` on every in-build pass with a header, read by `pass_report`
+/// for the merged write-back. None where the loop names no directory.
+static ATTEMPT_DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+/// Whole journal blocks (`note_task` appends one edge's block at a time)
+/// waiting for the next flush to the attempt directory.
+static JOURNAL_BUF: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// What each tree file holds now, hashed once per process, outside `PASS`.
 static NOW: std::sync::Mutex<Option<std::collections::HashMap<String, Option<String>>>> =
     std::sync::Mutex::new(None);
@@ -239,6 +259,31 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
     } else {
         Default::default()
     };
+    // The attempt directory is keyed by what a retry reuses on: the tree's
+    // header and the invocation. A retry of the same tree under the same
+    // invocation names the same directory; anything else names another one
+    // and shares nothing. The loop's directory must therefore be stable
+    // across one package's attempts. Set on every in-build pass, later ones
+    // included, so a kill in a later phase retries from the merged record.
+    let attempt_dir = reuse_allowed
+        .then(|| attempt_dir_in(build_dir, invocation))
+        .flatten();
+    *ATTEMPT_DIR.lock().unwrap() = attempt_dir.clone();
+    JOURNAL_BUF.lock().unwrap().clear();
+    // A retry's first pass has no local record (the kill took the sandbox),
+    // but may have the killed attempt's in the loop's explicit directory: it
+    // loads exactly like an earlier pass's, so every counter below answers
+    // about the attempt before.
+    let (earlier, files, edge_inputs) = match attempt_dir
+        .as_deref()
+        .filter(|_| !later)
+        .and_then(|d| load_attempt(d, build_dir))
+    {
+        Some((attempt_earlier, attempt_files, attempt_inputs)) => {
+            (Some(attempt_earlier), attempt_files, attempt_inputs)
+        }
+        None => (earlier, files, edge_inputs),
+    };
     *PASS.lock().unwrap() = Some(Pass {
         state,
         build_dir: build_dir.to_path_buf(),
@@ -252,6 +297,119 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
         unresolved: Default::default(),
     });
     Ok(())
+}
+
+/// This pass's attempt directory: the retry loop's explicit directory plus
+/// `attempts/<key>`, the key hashing the tree header with the invocation.
+/// None where the loop names no directory, or the tree has no header yet.
+/// Creating nothing: a first attempt only reads, and journaling creates.
+fn attempt_dir_in(build_dir: &Path, invocation: &str) -> Option<PathBuf> {
+    let dir: PathBuf = std::env::var_os("NIX_NINJA_DISCOVERY_CACHE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)?;
+    let hdr = header(build_dir)?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hdr.hash(&mut h);
+    invocation.hash(&mut h);
+    Some(dir.join("attempts").join(format!("{:016x}", h.finish())))
+}
+
+/// The killed attempt's record: its task derivations with the tree files
+/// each edge read. `InputRecord` is defined beside `load_inputs` below.
+type AttemptRecord = (
+    std::collections::BTreeMap<String, String>,
+    Vec<(String, String)>,
+    std::collections::HashMap<String, Vec<usize>>,
+);
+
+/// The killed attempt's record: the compacted files where a clean exit wrote
+/// them, the journal folded over them where it did not. Never an error: a
+/// torn tail is the expected state of a killed attempt, and bad lines are
+/// skipped, so a corrupt record reads as no record and the pass derives
+/// everything again. None where the directory holds no usable entry.
+fn load_attempt(dir: &Path, build_dir: &Path) -> Option<AttemptRecord> {
+    let mut earlier = std::collections::BTreeMap::new();
+    for l in read_lines(&dir.join("emitted.v1"), build_dir)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    {
+        let (k, d) = l.split_once('\t')?;
+        earlier.insert(k.to_string(), d.to_string());
+    }
+    let (mut files, mut edges) = load_inputs(dir, build_dir).unwrap_or_default();
+    // The journal names one edge per block: its inputs (`I` lines, path and
+    // hash as `note_task` saw them), then the edge itself (`E` line, key and
+    // derivation). A later block for the same key wins, as a replaced edge's
+    // does in the merged record; indices continue the compacted files, which
+    // never move. An `I` line naming nothing indexed, or an index past the
+    // files, is torn, and the edge with it.
+    let mut index: std::collections::HashMap<(String, String), usize> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.clone(), i))
+        .collect();
+    let mut pending: Vec<usize> = Vec::new();
+    for l in std::fs::read_to_string(dir.join("journal.v1"))
+        .map(|s| s.lines().map(str::to_string).collect::<Vec<_>>())
+        .unwrap_or_default()
+    {
+        // Flushes hold one lock across the whole append, so lines never
+        // interleave and only the tail tears: a bad line clears the block it
+        // is in, leftovers at the end are dropped with `pending`, and a torn
+        // derivation reads as a fallback (`present` fails it), never a reuse.
+        let Some((tag, rest)) = l.split_once('\t') else {
+            pending.clear();
+            continue;
+        };
+        match tag {
+            "I" => {
+                let Some((p, h)) = rest.split_once('\t') else {
+                    pending.clear();
+                    continue;
+                };
+                if p.contains('\n') {
+                    pending.clear();
+                    continue;
+                }
+                match index.get(&(p.to_string(), h.to_string())) {
+                    Some(&i) => pending.push(i),
+                    None => {
+                        let next = files.len();
+                        files.push((p.to_string(), h.to_string()));
+                        index.insert((p.to_string(), h.to_string()), next);
+                        pending.push(next);
+                    }
+                }
+            }
+            "E" => {
+                let Some((k, d)) = rest.split_once('\t') else {
+                    pending.clear();
+                    continue;
+                };
+                earlier.insert(k.to_string(), d.to_string());
+                edges.insert(k.to_string(), std::mem::take(&mut pending));
+            }
+            _ => pending.clear(),
+        }
+    }
+    (!earlier.is_empty()).then_some((earlier, files, edges))
+}
+
+/// Writes the merged record to the attempt directory, where the retry finds
+/// it, and drops the journal it supersedes. Best effort: the local record is
+/// already written, and a retry without this write-back still reuses what the
+/// journal holds.
+fn write_back_attempt(build_dir: &Path, lines: &[String], files: &[String], edges: &[String]) {
+    let dir = ATTEMPT_DIR.lock().unwrap().clone();
+    let Some(dir) = dir else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = write_lines(&dir.join("emitted.v1"), build_dir, lines, false);
+    let _ = write_lines(&dir.join("files.v1"), build_dir, files, false);
+    let _ = write_lines(&dir.join("inputs.v1"), build_dir, edges, false);
+    let _ = std::fs::remove_file(dir.join("journal.v1"));
 }
 
 /// An invocation record without its `driver=` field.
@@ -319,6 +477,10 @@ pub fn note_unresolved(drv: &str) {
 /// tree files (build paths) it read.
 pub fn note_task(outputs: &[PathBuf], drv: &str, inputs: Vec<String>) {
     if let Some(key) = task_key(outputs) {
+        // Journal the edge for the retry before interning consumes the
+        // inputs: each input first, then the edge, so a torn tail always
+        // drops the edge with the inputs it lost.
+        journal_edge(&key, drv, &inputs);
         let ix: Vec<u32> = {
             let mut g = INTERNED.lock().unwrap();
             let (names, index) = g.get_or_insert_with(Default::default);
@@ -334,6 +496,46 @@ pub fn note_task(outputs: &[PathBuf], drv: &str, inputs: Vec<String>) {
         };
         EMITTED_INPUTS.lock().unwrap().insert(key.clone(), ix);
         EMITTED.lock().unwrap().insert(key, drv.to_string());
+    }
+}
+
+/// Appends one journal block (each input, then the edge) for the attempt
+/// directory, one append per edge. Best effort: journaling must never fail a
+/// pass. One file open per edge is the cost of surviving the kill it exists
+/// for; batching would hold the tail the kill takes in memory.
+fn journal_edge(key: &str, drv: &str, inputs: &[String]) {
+    let dir = ATTEMPT_DIR.lock().unwrap().clone();
+    let Some(dir) = dir else { return };
+    let build_dir = PASS.lock().unwrap().as_ref().map(|p| p.build_dir.clone());
+    let Some(build_dir) = build_dir else { return };
+    let mut buf = JOURNAL_BUF.lock().unwrap();
+    for p in inputs {
+        if p.contains(['\n', '\t']) {
+            continue;
+        }
+        // The hash is read now, as the task was given the file: by exit the
+        // tree may hold a hook's edit or placement's bytes instead. Absent
+        // now is unknown, which the exit check skips over.
+        let h = now_hash(&build_dir, p).unwrap_or_else(|| UNKNOWN.to_string());
+        buf.push(format!("I\t{p}\t{h}"));
+    }
+    buf.push(format!("E\t{key}\t{drv}"));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("journal.v1"))
+        .and_then(|mut f| {
+            for l in buf.iter() {
+                writeln!(f, "{l}")?;
+            }
+            Ok(())
+        })
+        .is_ok()
+    {
+        buf.clear();
     }
 }
 
@@ -648,6 +850,9 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
             false,
         )?;
         write_lines(&path, &pass.build_dir, &lines, false)?;
+        // The retry reads this merged record where the sandbox does not
+        // survive: same bytes as the local one, so a change here re-prices.
+        write_back_attempt(&pass.build_dir, &lines, &file_lines, &edge_lines);
     }
     if pass.earlier.is_none() {
         return Ok(None);
@@ -2815,6 +3020,100 @@ mod tests {
         super::STRICT.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(&state);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A RETRY REUSES THE KILLED ATTEMPT'S RECORD. The first pass journals to
+    /// the loop's explicit directory and merges on exit; the retry, with no
+    /// local state left, reuses the merged record (a torn journal alone
+    /// reuses what its whole blocks hold). A corrupt record reads as none.
+    #[test]
+    fn a_retry_reuses_the_killed_attempts_record() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let d = scratch("retry");
+        let bd = d.join("build");
+        write(&bd.join("build.ninja"), "default all\n");
+        write(&bd.join("src/a.c"), "int a;");
+        let loopdir = scratch("retry-loop");
+        std::env::set_var("NIX_NINJA_DISCOVERY_CACHE_DIR", &loopdir);
+        let out = |n: &str| vec![PathBuf::from(n)];
+        let reset = || {
+            super::EMITTED.lock().unwrap().clear();
+            super::EMITTED_INPUTS.lock().unwrap().clear();
+            *super::NOW.lock().unwrap() = None;
+            *super::PASS.lock().unwrap() = None;
+        };
+        // The killed attempt: a first pass that never reaches a later one.
+        reset();
+        super::begin_pass(&bd, true, "v=false").unwrap();
+        assert!(!super::later_pass(), "no local record yet");
+        super::note_task(&out("a.o"), "/nix/store/aaa-a.drv", vec!["src/a.c".into()]);
+        super::note_task(&out("b.o"), "/nix/store/bbb-b.drv", Vec::new());
+        assert_eq!(super::pass_report().unwrap(), None, "pass 1 says nothing");
+        // The merge landed where the retry finds it; the journal it
+        // supersedes is gone.
+        let key = {
+            let dir = super::ATTEMPT_DIR
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("attempt dir set");
+            assert!(dir.starts_with(&loopdir), "under the loop's directory");
+            assert!(!dir.join("journal.v1").exists(), "journal superseded");
+            assert!(dir.join("emitted.v1").is_file(), "merged record written");
+            dir
+        };
+        // The kill: the sandbox filesystem is gone, but the loop's dir is not.
+        let _ = std::fs::remove_dir_all(super::state_dir(&bd));
+        // The retry reuses the killed attempt's edges and says so.
+        reset();
+        super::begin_pass(&bd, true, "v=false").unwrap();
+        assert!(super::later_pass(), "the attempt reads as an earlier pass");
+        assert_eq!(
+            super::reuse(&out("a.o"), |_| true).as_deref(),
+            Some("/nix/store/aaa-a.drv")
+        );
+        assert_eq!(
+            super::reuse(&out("b.o"), |_| true).as_deref(),
+            Some("/nix/store/bbb-b.drv")
+        );
+        let line = super::pass_report().unwrap().expect("a retry reports");
+        assert!(line.contains("reused 2 task(s), derived 0 fresh"), "{line}");
+        // A journal with no merge reuses its whole blocks; the torn tail
+        // reads as a fallback, never a reuse.
+        let _ = std::fs::remove_dir_all(super::state_dir(&bd));
+        let _ = std::fs::remove_file(key.join("emitted.v1"));
+        let _ = std::fs::remove_file(key.join("files.v1"));
+        let _ = std::fs::remove_file(key.join("inputs.v1"));
+        std::fs::write(
+            key.join("journal.v1"),
+            "I\tsrc/a.c\t-\nE\ta.o\t/nix/store/aaa-a.drv\nE\ttorn\n",
+        )
+        .unwrap();
+        reset();
+        super::begin_pass(&bd, true, "v=false").unwrap();
+        assert_eq!(
+            super::reuse(&out("a.o"), |_| true).as_deref(),
+            Some("/nix/store/aaa-a.drv"),
+            "a whole block reuses"
+        );
+        assert_eq!(
+            super::reuse(&out("torn"), |_| true),
+            None,
+            "no inputs, no reuse"
+        );
+        // A corrupt record reads as no record: the pass derives everything.
+        let _ = std::fs::remove_dir_all(super::state_dir(&bd));
+        std::fs::write(key.join("journal.v1"), "garbage\n").unwrap();
+        reset();
+        super::begin_pass(&bd, true, "v=false").unwrap();
+        assert!(!super::later_pass(), "corrupt reads as none");
+        assert_eq!(super::reuse(&out("a.o"), |_| true), None);
+        assert_eq!(super::pass_report().unwrap(), None);
+        std::env::remove_var("NIX_NINJA_DISCOVERY_CACHE_DIR");
+        *super::PASS.lock().unwrap() = None;
+        super::STRICT.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&loopdir);
     }
 
     /// One edge of a driven pass: its output, its task derivation, and the
