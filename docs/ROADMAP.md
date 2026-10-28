@@ -53,7 +53,7 @@ And the supporting sections:
 ## Where this file comes from
 
 The project began when `pdtpartners/nix-ninja` stopped. Work continued here:
-the tree is more than 850 commits past the last upstream commit of May 2026,
+the tree is more than 940 commits past the last upstream commit of May 2026,
 and the milestone numbering above two is new. `docs/todo.md` records the state
 of the issues that came with the project; this file is what comes after them.
 
@@ -493,7 +493,7 @@ provide: what to open, and how to know the change is right.
 ### 1. Publish the wider corpus, cheapest group first
 
 The instrument that verifies every closed class is not in this repository. A
-triage over the whole corpus, measured rather than asserted, splits 94 gate
+triage over the whole corpus, measured rather than asserted, splits 95 gate
 scripts three ways:
 
 1. **Gates that reach for a store path that can be collected.** ONE script,
@@ -518,7 +518,7 @@ groups. The work is therefore almost entirely group 2, which is a copy and one
 runner assumption, and group 3, which is the real cost.
 
 **Publishing is a copy; RUNNING is the cost, and the two are not the same
-size.** Measured over the same corpus: 80 of the 94 scripts invoke nix at all
+size.** Measured over the same corpus: 81 of the 95 scripts invoke nix at all
 (a `build`, an `eval` or a `develop`), counting an invocation in CODE rather
 than any mention of the word, because one probe prints the words "nix builds at
 once" in an explanatory line and needs no nix whatsoever. Of the 14 that do not,
