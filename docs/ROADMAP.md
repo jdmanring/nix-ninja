@@ -146,7 +146,7 @@ binary had to learn:
 Every one is closed against an instrument that fails on the revision before its
 fix. How many of those instruments are in THIS repository is a question the
 gate cell answers differently by how it is read: counting a row whose GATE cell
-names a file under `tests/` or a `*_tests` symbol gives 5 of 95, also allowing
+names a file under `tests/` or a `*_tests` symbol gives 5 of 96, also allowing
 a test named in prose gives 20, and allowing "mutation-check" as well gives 24.
 These are read from the table, not from this paragraph, so they move when a row
 lands; re-derive them by parsing the gate cell rather than copying these
@@ -493,7 +493,7 @@ provide: what to open, and how to know the change is right.
 ### 1. Publish the wider corpus, cheapest group first
 
 The instrument that verifies every closed class is not in this repository. A
-triage over the whole corpus, measured rather than asserted, splits 95 gate
+triage over the whole corpus, measured rather than asserted, splits 96 gate
 scripts three ways:
 
 1. **Gates that reach for a store path that can be collected.** ONE script,
@@ -518,7 +518,7 @@ groups. The work is therefore almost entirely group 2, which is a copy and one
 runner assumption, and group 3, which is the real cost.
 
 **Publishing is a copy; RUNNING is the cost, and the two are not the same
-size.** Measured over the same corpus: 81 of the 95 scripts invoke nix at all
+size.** Measured over the same corpus: 82 of the 96 scripts invoke nix at all
 (a `build`, an `eval` or a `develop`), counting an invocation in CODE rather
 than any mention of the word, because one probe prints the words "nix builds at
 once" in an explanatory line and needs no nix whatsoever. Of the 14 that do not,
