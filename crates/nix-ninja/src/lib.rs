@@ -1,6 +1,7 @@
 mod build;
 pub mod cli;
 mod configure_state;
+mod discovery_cache;
 mod dyndep;
 pub mod local;
 pub(crate) mod local_edge;

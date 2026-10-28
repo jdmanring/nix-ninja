@@ -1125,6 +1125,10 @@ impl Runner {
         // restart half; entries validate per hit by size+mtime).
         crate::resolve_cache::init(config.store_dir.clone(), config.build_dir.clone());
         rpc_client.seed_nar_stamps(crate::resolve_cache::load_nar_stamps());
+        // The persistent discovery cache lives only where
+        // NIX_NINJA_DISCOVERY_CACHE_DIR names; unset, this is a no-op and
+        // every edge discovers cold.
+        crate::discovery_cache::init(config.store_dir.clone(), config.build_dir.clone());
 
         let mut wrapper_vars = HashMap::new();
         for (key, value) in env::vars() {
@@ -5912,7 +5916,8 @@ mod wl_produced_output_tests {
 
 pub fn persist_resolve_caches(rpc_client: &Arc<BuilderRpcClient>) -> Result<()> {
     crate::resolve_cache::flush()?;
-    crate::resolve_cache::save_nar_stamps(&rpc_client.nar_stamps_snapshot())
+    crate::resolve_cache::save_nar_stamps(&rpc_client.nar_stamps_snapshot())?;
+    crate::discovery_cache::flush()
 }
 
 /// Environment variables the outer build holds that a task cannot work
@@ -8004,6 +8009,7 @@ fn report_progress(n_tasks: u64) {
              realise {}/{} sent, nar {}/{} sent, \
              file adds {} s/{} calls ({} s on cache hits), \
              scan {}/{} parsed, \
+             discovery cache {}/{} hits, \
              rss {} MiB{}{}",
         RESOLVE_MS.load(Ordering::Relaxed) / 1000,
         NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
@@ -8030,6 +8036,8 @@ fn report_progress(n_tasks: u64) {
         file_add_hit_ms / 1000,
         scan_miss,
         scan_hit + scan_miss,
+        DISCOVERY_CACHE_HITS.load(Ordering::Relaxed),
+        DISCOVERY_CACHE_LOOKUPS.load(Ordering::Relaxed),
         self_rss_mib(),
         heap,
         prune,
@@ -21367,6 +21375,14 @@ fn self_heap_mib() -> Option<(u64, u64)> {
 /// prices the change with no behavior change and no risk.
 static DECLARED_HEADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static USED_HEADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Discovery-cache lookups and hits (`discovery_cache.rs`). Counted whether
+/// or not the cache is enabled, so a run with the directory unset prints
+/// `0/0` instead of silence, which reads as "never consulted" rather than
+/// "consulted and always missed".
+pub(crate) static DISCOVERY_CACHE_LOOKUPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DISCOVERY_CACHE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// A zero numerator against a nonzero denominator is the SIGNATURE of the
 /// disjointness defect this counter shipped with once - two sets that cannot
@@ -23829,10 +23845,7 @@ mod link_task_tests {
             Some("c++ a.o b.o -o libfoo.so"),
             ["libfoo.so"].into_iter(),
         ));
-        assert!(is_link_task(
-            Some("cc a.o -o hello"),
-            ["hello"].into_iter()
-        ));
+        assert!(is_link_task(Some("cc a.o -o hello"), ["hello"].into_iter()));
     }
 
     /// krb5 COMPILES to a `.so` suffix, so the name half alone calls it a
@@ -23868,7 +23881,10 @@ mod link_task_tests {
     /// No outputs is not a link task.
     #[test]
     fn no_outputs_is_not_a_link_task() {
-        assert!(!is_link_task(Some("c++ a.o -o libfoo.so"), std::iter::empty()));
+        assert!(!is_link_task(
+            Some("c++ a.o -o libfoo.so"),
+            std::iter::empty()
+        ));
     }
 
     /// THE WIRING. A link takes the whole budget however few inputs it
@@ -23878,7 +23894,12 @@ mod link_task_tests {
     #[test]
     fn links_take_the_whole_budget_compiles_keep_their_weight() {
         assert_eq!(
-            task_admission_weight(Some("c++ a.o b.o -o libfoo.so"), ["libfoo.so"].into_iter(), 2, 8),
+            task_admission_weight(
+                Some("c++ a.o b.o -o libfoo.so"),
+                ["libfoo.so"].into_iter(),
+                2,
+                8
+            ),
             8
         );
         assert_eq!(
@@ -25811,7 +25832,7 @@ mod forced_include_wiring_tests {
         // Model the filter the way the site now builds it and assert the
         // forced header survives it.
         let forced = forced_include_seeds(&cmd, &build);
-        let declared = super::declared_skip_set(files.clone(), &forced);
+        let declared = super::declared_skip_set(&files, &forced);
         let uploaded: Vec<_> = scan
             .includes
             .iter()
@@ -25967,8 +25988,12 @@ mod generated_not_yet_written_tests {
 /// so its includes are walked and is declared by no edge, so it must reach
 /// the upload like anything else the walk found. One function so the test
 /// runs the filter the site runs, not a copy of it.
-fn declared_skip_set(seeds: Vec<PathBuf>, forced: &[PathBuf]) -> HashSet<PathBuf> {
-    seeds.into_iter().filter(|f| !forced.contains(f)).collect()
+fn declared_skip_set(seeds: &[PathBuf], forced: &[PathBuf]) -> HashSet<PathBuf> {
+    seeds
+        .iter()
+        .filter(|f| !forced.contains(f))
+        .cloned()
+        .collect()
 }
 
 /// A discovered include that the caller declared virtual and that nothing
@@ -27193,6 +27218,27 @@ pub fn discover_c_includes(
     let dotdot_dirs = c_include_parser::seed_dotdot_dirs(cmdline, &files, virtual_paths.as_ref());
     // The scan below takes the map; the transitive-climb pass reads it after.
     let climb_paths = virtual_paths.clone();
+    // THE PERSISTENT DISCOVERY CACHE answers from the previous attempt's map
+    // before the scan runs. A hit replays the recorded `Discovered` with no
+    // deferral: the task's Built inputs still order it behind its producers,
+    // and producer outputs are deterministic for a fixed outer derivation,
+    // so the bytes the replay carries are the bytes a recompute would upload.
+    // Only no-defer answers are ever recorded (see the record site below).
+    if let Some(cached) = crate::discovery_cache::lookup(
+        cmdline,
+        &files,
+        virtual_paths.as_ref(),
+        depfile,
+        carried_trees,
+    ) {
+        if explain {
+            eprintln!(
+                "nix-ninja: discovery {seed}: cache hit, replaying {} input(s)",
+                cached.deps.len() + cached.store_paths.len(),
+            );
+        }
+        return Ok((cached, None));
+    }
     let c_includes = match depfile_read_back(
         build_dir,
         AsRef::<Path>::as_ref(store_dir),
@@ -27484,7 +27530,7 @@ pub fn discover_c_includes(
 
     // Convert input files to a set for filtering. A forced-include seed is
     // NOT a declared input and must not be filtered as one; see above.
-    let input_files = declared_skip_set(files, &forced);
+    let input_files = declared_skip_set(&files, &forced);
 
     // Declared-and-opened, deduped: a header reached twice in one preprocess
     // is one input kept, and counting occurrences could push the numerator
@@ -27671,14 +27717,26 @@ pub fn discover_c_includes(
         std::sync::atomic::Ordering::Relaxed,
     );
 
-    Ok((
-        Discovered {
-            deps: discovered_deps,
-            store_paths: discovered_store_paths,
-            dotdot_dirs,
-        },
-        defer_miss,
-    ))
+    let discovered = Discovered {
+        deps: discovered_deps,
+        store_paths: discovered_store_paths,
+        dotdot_dirs,
+    };
+    // Only no-defer answers enter the persistent cache. A deferred edge's
+    // answer depends on which producers have run, which changes as the run
+    // proceeds; `virtual_declared` is the untouched clone of the map the
+    // lookup keyed on, taken before the scan consumed the original.
+    if defer_miss.is_none() {
+        crate::discovery_cache::record(
+            cmdline,
+            &files,
+            virtual_declared.as_ref(),
+            depfile,
+            carried_trees,
+            &discovered,
+        );
+    }
+    Ok((discovered, defer_miss))
 }
 
 /// The seeds' climb dirs plus those a project header the scan REACHED needs
