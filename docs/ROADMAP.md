@@ -476,13 +476,13 @@ nothing is outstanding.
 - **Nothing here has ever been built on more than one machine.** The capability
   is expected to come free from Nix, and an expectation is not a measurement.
   Item 9 is one afternoon that settles it.
-- **A qtwebengine retry re-walks every edge.** The resolve memo is off inside
+- **A qtwebengine retry re-walked every edge.** The resolve memo is off inside
   a build by design and the stamps die with the failed derivation, so each
-  retry of the outer derivation pays the full `discover_c_includes` walk
-  again. Item 11 caches it.
-- **Heavy links can exhaust the box.** Final link steps admit alongside
-  compiles with no deterministic isolation, so a bounded round still meets
-  a cgroup kill. Item 12 serializes them.
+  retry of the outer derivation paid the full `discover_c_includes` walk
+  again. Item 11 caches it, now landed.
+- **Heavy links could exhaust the box.** Final link steps admitted alongside
+  compiles with no deterministic isolation, so a bounded round still met
+  a cgroup kill. Item 12 serializes them, now landed.
 
 ## The next concrete work, item by item
 
@@ -763,36 +763,45 @@ After it, in order of measured saving, each measured before it is designed:
 
 ### 11. Cache discovery outputs across retries (qtwebengine priority)
 
-Each retry of the outer qtwebengine derivation re-walks every compile edge
-in `discover_c_includes`, with `dyn_discover` the dominant term in the
-resolve breakdown. The resolve memo is off inside a build by design and
-the NAR stamps die with the failed derivation, so every retry starts cold.
+LANDED. Each retry of the outer qtwebengine derivation re-walked every
+compile edge in `discover_c_includes`, with `dyn_discover` the dominant term
+in the resolve breakdown. The resolve memo is off inside a build by design
+and the NAR stamps die with the failed derivation, so every retry started
+cold.
 
 The fix is a fingerprint-keyed disk cache of the `Discovered` set per edge
-(same `Fingerprint` family as `resolve_cache.rs`: dir mtime, count, size
-sum, max mtime), in an explicit directory outside the walked build dir and
-outside the source tree, passed by the retry loop. Entries carry the
+(`crates/nix-ninja/src/discovery_cache.rs`, same `Fingerprint` family as
+`resolve_cache.rs`: dir mtime, count, size sum, max mtime), in an explicit
+directory (`NIX_NINJA_DISCOVERY_CACHE_DIR`) outside the walked build dir
+and outside the source tree, passed by the retry loop. Entries carry the
 driver stamp with whole-line equality, and a stale entry that adds or drops
-an input fails loudly through the resolve-cache gate. A cache hit must emit
-byte-identical derivations, proved by `emission-price.sh` before landing,
-with the price recorded in `local/pending/next-rekey-batch.md`.
+an input fails loudly through the discovery-cache gate
+(`discovery-cache-added-input.sh`: a hit emits the run-one derivation byte
+for byte, an added input re-keys, and the re-keyed run equals the
+cache-deleted run). Priced FREE by `emission-price.sh` (task `drvPath`
+unmoved, five shapes identical), price recorded in
+`local/pending/next-rekey-batch.md`. Passing the directory from the retry
+loop is consumer-side work.
 
 ### 12. Serialize link-phase tasks (qtwebengine priority)
 
-Heavy final links admit alongside compiles and exhaust the box under a
-bounded floor. Admission already takes the global weighted permit and then
-the edge's ninja pool permit in global-then-pool order, which cannot
-deadlock, but nothing isolates links deterministically.
+LANDED. Heavy final links admitted alongside compiles and exhausted the box
+under a bounded floor. Admission already took the global weighted permit and
+then the edge's ninja pool permit in global-then-pool order, which cannot
+deadlock, but nothing isolated links deterministically.
 
 The fix is an `is_link_task` predicate from the existing
 `link_shaped_outputs` / `command_is_compile` /
 `wants_dependency_discovery` family, with the ambiguous cases pinned
 (krb5 `.so` compiles, meson `.so.p` objects, `.ol` / `.os`), giving link
-tasks exclusive global weight or a depth-1 link pool in the same order.
+tasks exclusive global admission weight in the same order.
 Scheduling only, so emission-free by construction and proved by
-`emission-price.sh`. A unit test with injected `Readings` plus a small
-link-heavy fixture shows two links never overlap, with a reverted
-predicate as the negative control.
+`emission-price.sh` (task `drvPath` unmoved, five shapes identical).
+Unit tests pin the predicate against `Readings` including every ambiguous
+case plus the no-outputs and no-`.so`-output halves; the negative control
+is the predicate reverted, which overlaps. Consumer wiring (governor
+bounds, retry-loop classification, the fixed driver rev) stays
+consumer-side.
 
 ### 13. Make a signal-9 retry resume instead of restart (qtwebengine priority)
 
