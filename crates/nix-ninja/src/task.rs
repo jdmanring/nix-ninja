@@ -1773,6 +1773,10 @@ impl Runner {
             );
         }
         if n_tasks.is_multiple_of(500) {
+            // The bound check rides the tick: the earliest projection lands
+            // after 500 tasks, minutes into the run, not hours. A refusal
+            // aborts through this function's caller with the peak named.
+            check_heap_bound(n_tasks)?;
             report_progress(n_tasks);
             // Persist periodically so a run killed mid-way leaves usable
             // caches; reporting and persistence share a tick, nothing more.
@@ -7915,7 +7919,8 @@ fn report_progress(n_tasks: u64) {
          \"dyn_adddrv_calls\":{},\"plain_adddrv_ms\":{},\"plain_adddrv_calls\":{},\
          \"sandbox_adddrv_ms\":{},\"sandbox_adddrv_calls\":{},\
          \"outer_stage_placed\":{},\"outer_stage_restored\":{},\"rss_mib\":{},\
-         \"drv_entries\":{},\"drv_bytes\":{},\"reaped\":{},\"recycled\":{}}}",
+         \"drv_entries\":{},\"drv_bytes\":{},\"reaped\":{},\"recycled\":{},\
+         \"total_tasks\":{}}}",
         n_tasks,
         RESOLVE_MS.load(Ordering::Relaxed),
         DYN_MS.load(Ordering::Relaxed),
@@ -7934,6 +7939,7 @@ fn report_progress(n_tasks: u64) {
         d.1,
         nix_builder_rpc_client::REAPED.load(Ordering::Relaxed),
         nix_builder_rpc_client::RECYCLED.load(Ordering::Relaxed),
+        TOTAL_TASKS.load(Ordering::Relaxed),
     );
     // Persist resolve-cache entries computed since the last tick;
     // a killed driver loses at most one tick's worth.
@@ -7995,14 +8001,36 @@ fn report_progress(n_tasks: u64) {
     // unreadable without knowing how many were considered, and this
     // number exists to be compared against the cost of acting on it.
     let prune = prune_line(declared, kept);
-    let heap = match self_heap_mib() {
+    // Read ONCE: mallinfo2 walks every arena under the malloc lock, so the
+    // tick below shares this sample instead of taking a second.
+    let heap_now = self_heap_mib();
+    let heap = match heap_now {
         Some((live, retained)) => {
             format!(", heap {live} MiB live / {retained} MiB retained")
         }
         None => String::new(),
     };
+    // Resolve-phase growth since the schedule started, beside the absolute
+    // pair above. The baseline holds everything the driver carried before
+    // the first resolve - the loaded graph, the producer index, the
+    // build-dir walk's memos - so a climb here is the resolve's own
+    // retention and a flat delta under a climbing absolute is the
+    // allocator sitting on its high-water mark, not the schedule growing.
+    let heap_delta = match heap_now {
+        Some((live, retained)) if HEAP_BASE_SET.load(Ordering::Relaxed) => {
+            let dl = live.saturating_sub(HEAP_BASE_LIVE.load(Ordering::Relaxed));
+            let dr = retained.saturating_sub(HEAP_BASE_RET.load(Ordering::Relaxed));
+            format!(" (+{dl}/+{dr} MiB since schedule)")
+        }
+        _ => String::new(),
+    };
+    // The schedule's own size, when the want phase walked it (build.rs).
+    // Zero is unset, never a schedule of nothing: print the bare count as
+    // before rather than a denominator of nothing.
+    let total = TOTAL_TASKS.load(Ordering::Relaxed);
+    let tasks_fragment = progress_tasks_fragment(n_tasks, total);
     eprintln!(
-        "nix-ninja: resolved {n_tasks} tasks, {} s total resolve time \
+        "nix-ninja: resolved {tasks_fragment} tasks, {} s total resolve time \
              (worklist {} s, cmdline {} s, py {} s, grd {} s), \
              dyn {} s (realise {} s, discover {} s, update {} s/{} calls, adddrv {} s/{} calls, \
              plain adddrv {} s/{} calls, sandbox adddrv {} s/{} calls), \
@@ -8010,7 +8038,7 @@ fn report_progress(n_tasks: u64) {
              file adds {} s/{} calls ({} s on cache hits), \
              scan {}/{} parsed, \
              discovery cache {}/{} hits, \
-             rss {} MiB{}{}",
+             rss {} MiB{}{}{}",
         RESOLVE_MS.load(Ordering::Relaxed) / 1000,
         NT_WORKLIST_MS.load(Ordering::Relaxed) / 1000,
         NT_CMDLINE_MS.load(Ordering::Relaxed) / 1000,
@@ -8040,8 +8068,22 @@ fn report_progress(n_tasks: u64) {
         DISCOVERY_CACHE_LOOKUPS.load(Ordering::Relaxed),
         self_rss_mib(),
         heap,
+        heap_delta,
         prune,
     );
+}
+
+/// The `resolved` fragment of the stats line: `n/total` once the want phase
+/// walked the schedule, the bare count where it never did. A free function
+/// so the shape is pinnable: the fragment is consumed exactly once, so
+/// deleting the total from the format string leaves it unused and the
+/// deny-warnings build fails instead of silently returning to a bare count.
+fn progress_tasks_fragment(n_tasks: u64, total: u64) -> String {
+    if total > 0 {
+        format!("{n_tasks}/{total}")
+    } else {
+        format!("{n_tasks}")
+    }
 }
 
 /// A PRODUCED QRC IS READ FROM ITS REALISED COPY, and the source files it
@@ -21408,6 +21450,213 @@ use nix_ninja_task::derived_file::{confined_relative_dir, header_like};
 // Hoisted with RESOLVE_MS, same reason: the end-of-run report needs the
 // task count and it is no longer read only from inside the loop.
 static TASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The schedule's own size: edges with a command the want phase reached,
+/// set once the full graph closure is walked (build.rs) and moved again if
+/// a deferral wants a producer mid-run. Phonies are excluded, matching
+/// TASKS, which only counts the resolve path in `start` that phonies
+/// return before. Zero means unset: stats lines print the bare count as
+/// before rather than a denominator of nothing.
+pub(crate) static TOTAL_TASKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Heap at the moment the schedule started resolving, by the same
+/// (live, retained) pair `self_heap_mib` reports. Everything the driver
+/// holds before the first resolve - the loaded graph, the producer index,
+/// the build-dir walk's memos - sits in this baseline, so the per-tick
+/// delta in the stats line separates resolve-phase growth from what the
+/// run started with. Unset (a non-glibc allocator has no reader): the
+/// line prints no delta rather than a delta from zero.
+static HEAP_BASE_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HEAP_BASE_RET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HEAP_BASE_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_total_tasks(n: u64) {
+    TOTAL_TASKS.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Snapshot the allocator pair before the first resolve; see HEAP_BASE_*.
+/// Called once per schedule, beside `set_total_tasks`.
+pub(crate) fn record_heap_baseline() {
+    if let Some((live, retained)) = self_heap_mib() {
+        HEAP_BASE_LIVE.store(live, std::sync::atomic::Ordering::Relaxed);
+        HEAP_BASE_RET.store(retained, std::sync::atomic::Ordering::Relaxed);
+        HEAP_BASE_SET.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The heap the schedule refuses to outgrow, in MiB.
+/// `NIX_NINJA_HEAP_LIMIT_MIB` sets it outright; otherwise half of physical
+/// RAM, because the driver shares the machine and the OOM killer does not
+/// negotiate. Unreadable machine memory means no bound rather than a
+/// guessed one: a refusal on a fiction wastes the run it claims to save.
+/// `u64::MAX` is that no-bound case, and the schedule line prints it as
+/// `none` rather than a number nobody can spend.
+pub(crate) fn heap_limit_mib() -> u64 {
+    parse_heap_limit(
+        std::env::var("NIX_NINJA_HEAP_LIMIT_MIB").ok().as_deref(),
+        phys_mem_mib(),
+    )
+}
+
+fn parse_heap_limit(var: Option<&str>, phys_mem_mib: Option<u64>) -> u64 {
+    if let Some(v) = var {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    phys_mem_mib.map(|m| m / 2).unwrap_or(u64::MAX)
+}
+
+fn phys_mem_mib() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("MemTotal:")?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .map(|kb| kb / 1024)
+}
+
+/// Linear projection of resolve-phase live heap at schedule end, in MiB.
+/// None when there is nothing to project from (no sample yet) or nothing
+/// left (the schedule is drained). Integer MiB means sub-MiB growth over
+/// the sample reads as zero per task and the projection is just now: an
+/// honest floor, not a promise the leak stopped. LIVE, not retained: the
+/// allocator's free-but-held high-water mark is not a working set and
+/// refusing on it would kill schedules with room to finish.
+fn projected_live_mib(base_live: u64, now_live: u64, n: u64, total: u64) -> Option<u64> {
+    if n == 0 || total <= n {
+        return None;
+    }
+    let growth = now_live.saturating_sub(base_live);
+    Some(now_live.saturating_add(growth.saturating_mul(total - n) / n))
+}
+
+/// Refuse a schedule whose resolve heap projects past the limit. Called on
+/// the progress tick, so the earliest projection lands after 500 tasks -
+/// minutes, not the hours a full qtwebengine resolve burns before dying.
+/// A bail here aborts the run through `start`'s caller with the projected
+/// peak named, which is the verdict the OOM kill never prints.
+fn check_heap_bound(n_tasks: u64) -> Result<()> {
+    let total = TOTAL_TASKS.load(std::sync::atomic::Ordering::Relaxed);
+    if total == 0 || n_tasks < 500 || total <= n_tasks {
+        return Ok(());
+    }
+    let Some((live, _)) = self_heap_mib() else {
+        return Ok(());
+    };
+    if !HEAP_BASE_SET.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    let base = HEAP_BASE_LIVE.load(std::sync::atomic::Ordering::Relaxed);
+    let limit = heap_limit_mib();
+    if let Some(proj) = projected_live_mib(base, live, n_tasks, total) {
+        if proj > limit {
+            anyhow::bail!(
+                "nix-ninja: heap bound refused: resolve live heap projects to {proj} MiB at task {total} ({live} MiB live at task {n_tasks}/{total}, limit {limit} MiB); set NIX_NINJA_HEAP_LIMIT_MIB to raise it"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod heap_bound_tests {
+    //! The bound refuses on a projection, never on a feeling: flat growth
+    //! projects flat, linear growth projects linearly, and a drained
+    //! schedule or an empty sample projects nothing. The env knob wins over
+    //! the machine-derived default, and garbage in the knob falls back to
+    //! the default rather than refusing everything or nothing.
+    use super::{parse_heap_limit, progress_tasks_fragment, projected_live_mib};
+
+    #[test]
+    fn flat_growth_projects_now() {
+        // Sub-MiB growth over the sample is the same case in integer MiB:
+        // zero per task, so the projection is the floor, not a promise
+        // the leak stopped.
+        assert_eq!(projected_live_mib(100, 100, 500, 15500), Some(100));
+    }
+
+    #[test]
+    fn linear_growth_projects_to_end() {
+        // 100 MiB over the first 500 of 15,500 tasks: 30 MiB/task over
+        // 15,000 left, 450,100 MiB at the end.
+        assert_eq!(
+            projected_live_mib(100, 200, 500, 15500),
+            Some(200 + 100 * 15000 / 500)
+        );
+    }
+
+    #[test]
+    fn drained_or_empty_sample_projects_nothing() {
+        assert_eq!(projected_live_mib(100, 200, 15500, 15500), None);
+        assert_eq!(projected_live_mib(100, 200, 0, 15500), None);
+    }
+
+    #[test]
+    fn freed_heap_does_not_project_negative() {
+        assert_eq!(projected_live_mib(200, 100, 500, 15500), Some(100));
+    }
+
+    #[test]
+    fn the_knob_wins_garbage_falls_back() {
+        assert_eq!(parse_heap_limit(Some("8192"), Some(64000)), 8192);
+        assert_eq!(parse_heap_limit(Some(" 4096 "), Some(64000)), 4096);
+        assert_eq!(parse_heap_limit(Some("0"), Some(64000)), 32000);
+        assert_eq!(parse_heap_limit(Some("much"), Some(64000)), 32000);
+        assert_eq!(parse_heap_limit(None, Some(64000)), 32000);
+        assert_eq!(parse_heap_limit(None, None), u64::MAX);
+    }
+
+    #[test]
+    fn the_fragment_carries_the_denominator() {
+        assert_eq!(progress_tasks_fragment(500, 15500), "500/15500");
+        assert_eq!(progress_tasks_fragment(500, 0), "500");
+    }
+
+    #[test]
+    fn the_bound_fires_on_a_live_schedule_and_not_without_one() {
+        use super::{check_heap_bound, HEAP_BASE_LIVE, HEAP_BASE_SET, OUT_ENV_LOCK, TOTAL_TASKS};
+        use std::sync::atomic::Ordering;
+        // Under the lock every other env-mutating test takes; the globals
+        // rigged here are read by no other test, and all four are restored
+        // before asserting so a failure still leaves the process clean.
+        let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_total = TOTAL_TASKS.load(Ordering::Relaxed);
+        let old_base = HEAP_BASE_LIVE.load(Ordering::Relaxed);
+        let old_set = HEAP_BASE_SET.load(Ordering::Relaxed);
+        let old_var = std::env::var("NIX_NINJA_HEAP_LIMIT_MIB").ok();
+        // Four live MiB the allocator cannot round away. The seed comes
+        // from black_box: with a literal fill the optimizer knows every
+        // byte is zero and folds the checksum without reading, eliding
+        // the allocation it was meant to keep alive (which is exactly
+        // how this test failed under --release the first time).
+        let seed: u8 = std::hint::black_box(7);
+        let hold = vec![seed; 4 * 1024 * 1024];
+        let checksum: u64 = hold.iter().map(|&b| b as u64).sum();
+        std::hint::black_box(checksum);
+        TOTAL_TASKS.store(15500, Ordering::Relaxed);
+        HEAP_BASE_LIVE.store(0, Ordering::Relaxed);
+        HEAP_BASE_SET.store(true, Ordering::Relaxed);
+        std::env::set_var("NIX_NINJA_HEAP_LIMIT_MIB", "1");
+        let refused = check_heap_bound(500);
+        std::env::set_var("NIX_NINJA_HEAP_LIMIT_MIB", "18446744073709551615");
+        let allowed = check_heap_bound(500);
+        TOTAL_TASKS.store(old_total, Ordering::Relaxed);
+        HEAP_BASE_LIVE.store(old_base, Ordering::Relaxed);
+        HEAP_BASE_SET.store(old_set, Ordering::Relaxed);
+        match old_var {
+            Some(v) => std::env::set_var("NIX_NINJA_HEAP_LIMIT_MIB", v),
+            None => std::env::remove_var("NIX_NINJA_HEAP_LIMIT_MIB"),
+        }
+        assert!(refused.is_err(), "a 1 MiB limit refuses a live schedule");
+        assert!(allowed.is_ok(), "no bound means no refusal");
+    }
+}
 // Hoisted from inside the resolve loop so report_progress can read it: the
 // summary is now printed at the end of a run as well as every 500 tasks.
 static RESOLVE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

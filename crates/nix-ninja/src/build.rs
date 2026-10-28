@@ -182,6 +182,20 @@ pub fn build(
         scheduler.want_file(fid)?;
         target_fids.push((name.clone(), fid));
     }
+    // The want phase just walked the full closure, so the schedule's own
+    // size is known here and not before: every stats line from this point
+    // prints `resolved n/total` against it. The heap baseline is the same
+    // moment's allocator pair, so the per-tick delta separates
+    // resolve-phase growth from what the run started with.
+    let total = scheduler.total_wanted() as u64;
+    task::set_total_tasks(total);
+    task::record_heap_baseline();
+    let limit = task::heap_limit_mib();
+    if limit == u64::MAX {
+        eprintln!("nix-ninja: schedule {total} tasks (heap limit none)");
+    } else {
+        eprintln!("nix-ninja: schedule {total} tasks (heap limit {limit} MiB)");
+    }
     scheduler.run()?;
 
     // Persist the cross-run caches at end of run, not only on the
@@ -375,6 +389,13 @@ struct BuildStates {
     /// Total number of builds that haven't had a derivation generated yet.
     total_pending: usize,
 
+    /// Edges with a command the want phase reached: the denominator
+    /// `resolved n/total` prints against. Counted separately from
+    /// `total_pending` because phonies never resolve (TASKS only counts
+    /// the resolve path in `start` that phonies return before), so a
+    /// denominator that included them could never converge.
+    total_wanted: usize,
+
     /// Builds in the ready state, stored redundantly for quick access.
     ready: VecDeque<BuildId>,
 }
@@ -384,6 +405,7 @@ impl BuildStates {
         BuildStates {
             states: DenseMap::new_sized(size, BuildState::Unneeded),
             total_pending: 0,
+            total_wanted: 0,
             ready: VecDeque::new(),
         }
     }
@@ -412,6 +434,10 @@ impl BuildStates {
 
     fn unfinished(&self) -> bool {
         self.total_pending > 0
+    }
+
+    fn total_wanted(&self) -> usize {
+        self.total_wanted
     }
 
     fn want_file(&mut self, graph: &Graph, stack: &mut Vec<FileId>, fid: FileId) -> Result<bool> {
@@ -465,6 +491,12 @@ impl BuildStates {
         }
 
         self.set(bid, state);
+        // First visit only (the early return above skips the visited):
+        // an edge with a command is one `start` will resolve and TASKS
+        // will count, so the denominator converges with the numerator.
+        if build.cmdline.is_some() {
+            self.total_wanted += 1;
+        }
 
         for &fid in build.validation_ins() {
             let _ = self.want_file(graph, stack, fid)?;
@@ -507,6 +539,10 @@ impl<'a> Scheduler<'a> {
         let mut stack = Vec::new();
         self.build_states.want_file(self.graph, &mut stack, fid)?;
         Ok(())
+    }
+
+    pub fn total_wanted(&self) -> usize {
+        self.build_states.total_wanted()
     }
 
     // Check whether a given build is ready, after one of its inputs was
@@ -694,6 +730,10 @@ impl<'a> Scheduler<'a> {
             let mut stack = Vec::new();
             self.build_states.want_file(self.graph, &mut stack, *fid)?;
         }
+        // A deferral can want edges the first walk never reached, so the
+        // denominator moves with it; otherwise `resolved n/total` freezes
+        // against a stale total for the rest of the run.
+        task::set_total_tasks(self.total_wanted() as u64);
         let label = self.graph.builds[consumer]
             .outs()
             .first()
