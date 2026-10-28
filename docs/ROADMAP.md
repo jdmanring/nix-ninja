@@ -805,9 +805,9 @@ consumer-side.
 
 ### 13. Make a signal-9 retry resume instead of restart (qtwebengine priority)
 
-A cgroup kill of the outer derivation today discards the resolve and the
-realised task outputs with it, so the retry pays the full discovery walk
-and rebuilds what the killed attempt already banked. Items 11 and 12 are
+LANDED. A cgroup kill of the outer derivation discarded the resolve and the
+realised task outputs with it, so the retry paid the full discovery walk
+and rebuilt what the killed attempt already banked. Items 11 and 12 are
 the two halves that make a retry cheap: the discovery map replays from
 cache and heavy links stop killing the box. The third half is the
 later-pass reuse record (`emitted.v1`, `files.v1`, `inputs.v1`) extended
