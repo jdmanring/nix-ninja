@@ -809,13 +809,15 @@ A cgroup kill of the outer derivation today discards the resolve and the
 realised task outputs with it, so the retry pays the full discovery walk
 and rebuilds what the killed attempt already banked. Items 11 and 12 are
 the two halves that make a retry cheap: the discovery map replays from
-cache and heavy links stop killing the box. What remains is recording
-which task derivations the killed attempt already realised so the retry
-reuses them rather than re-deriving, extending the later-pass reuse record
-(`emitted.v1`, `files.v1`, `inputs.v1`) across retries through the same
-explicit directory as item 11. First action: measure what a killed
-qtwebengine attempt leaves banked versus what its retry rebuilds, then
-design the record from that gap.
+cache and heavy links stop killing the box. The third half is the
+later-pass reuse record (`emitted.v1`, `files.v1`, `inputs.v1`) extended
+across retries through the same explicit directory as item 11: each pass
+journals every edge it derives there and merges on a clean exit, and a
+first pass with no local record loads the killed attempt's exactly like
+an earlier pass's, so reuse, fallback and the exit stale check answer
+about the attempt before. The measurement that drove it: qtwebengine
+iters 1-4 each carried exactly one signal-9 kill, and each retry re-paid
+~15 min of resolve plus ~25-32 GB of re-emitted derivation JSON.
 
 ## What could stop this
 
