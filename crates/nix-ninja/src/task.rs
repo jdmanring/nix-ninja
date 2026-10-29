@@ -1312,18 +1312,49 @@ impl Runner {
                     .lookup(rel)
                     .is_some_and(|f| files.by_id[f].input.is_some())
         })?;
-        for path in plan.uploads {
-            let derived_file =
-                match new_opaque_file(&self.rpc_client, &self.config.build_dir, path.clone()) {
-                    Ok(d) => d,
-                    Err(e)
-                        if e.downcast_ref::<std::io::Error>()
-                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
-                    {
-                        continue
-                    }
-                    Err(e) => return Err(e),
-                };
+        let rpc_client = self.rpc_client.clone();
+        let build_dir = self.config.build_dir.clone();
+        // Bounded like `new_opaque_files`: 8 uploads in flight, chunk by
+        // chunk, not one thread per file. A build dir holding thousands of
+        // undeclared files would otherwise spawn thousands of threads here.
+        let mut derived_files: Vec<DerivedFile> = Vec::with_capacity(plan.uploads.len());
+        for chunk in plan.uploads.chunks(PER_TASK_ADDS) {
+            let results: Vec<Result<Option<DerivedFile>>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|p| {
+                        let rpc_client = rpc_client.clone();
+                        let build_dir = build_dir.clone();
+                        let p = p.clone();
+                        scope.spawn(move || match new_opaque_file(&rpc_client, &build_dir, p) {
+                            Ok(d) => Ok(Some(d)),
+                            Err(e)
+                                if e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                                    io.kind() == std::io::ErrorKind::NotFound
+                                }) =>
+                            {
+                                Ok(None)
+                            }
+                            Err(e) => Err(e),
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| Err(anyhow!("upload thread panicked")))
+                    })
+                    .collect()
+            });
+            for r in results {
+                if let Some(d) = r? {
+                    derived_files.push(d);
+                }
+            }
+        }
+
+        for derived_file in derived_files {
             let fid = self.add_derived_file(files, derived_file.clone());
             self.build_dir_inputs.insert(fid, derived_file);
         }
@@ -9364,12 +9395,17 @@ fn wl_file_candidates(group: &str) -> Vec<&str> {
 /// shebang sites for the race a pid-only name loses.
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Upload parallelism, shared by per-task batches and the build-dir flush.
+/// One NAR add holds one daemon connection for the whole file; 8-wide
+/// thread scopes are the width already proven against the daemon, so both
+/// sites use it rather than each growing its own knob.
+const PER_TASK_ADDS: usize = 8;
+
 pub(crate) fn new_opaque_files(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &std::path::Path,
     paths: Vec<PathBuf>,
 ) -> Result<Vec<DerivedFile>> {
-    const PER_TASK_ADDS: usize = 8;
     let mut out = Vec::with_capacity(paths.len());
     for chunk in paths.chunks(PER_TASK_ADDS) {
         let results: Vec<Result<DerivedFile>> = std::thread::scope(|scope| {
