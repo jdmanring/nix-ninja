@@ -46,7 +46,7 @@ And the supporting sections:
 
 - [What does not work today](#what-does-not-work-today), the open list
 - [The next concrete work, item by item](#the-next-concrete-work-item-by-item),
-  13 items with a first action each
+  14 items with a first action each
 - [What could stop this](#what-could-stop-this), the risks
 - [How a milestone ships](#how-a-milestone-ships)
 
@@ -288,7 +288,7 @@ What is missing is larger than that: a STRANGER cannot reach the same place. The
 difference is the published apparatus rather than the driver, the corpus, the
 failure signatures, and the record of what is already known to break.
 
-The route is the 13 items below, which is where each one's first action lives.
+The route is the 14 items below, which is where each one's first action lives.
 What belongs here is the criterion they add up to.
 
 EXIT CRITERION: a clone of this repository, with nothing installed but an
@@ -602,10 +602,9 @@ original environment before the second depends on it.
 
 ### 3. Narrow the configure derivation's source
 
-The configure cache is built and does not pay, because `src` is an input, so a
-source edit rebuilds it. First action: split the configure derivation's inputs
-into what configure actually reads, and measure whether a source edit then
-leaves it alone. A measurement, then a change.
+LANDED. The configure cache was built and did not pay because `src` was an input, so any source edit rebuilt it.
+The fix introduces a content-addressed `*-configure-src` derivation (`modules/flake/pkgs/mkMesonPackage/default.nix`) that stubs non-build file contents as empty mode-preserving files while preserving build system files (`meson.build`, `meson_options.txt`, `CMakeLists.txt`, `Cargo.toml`, etc.) verbatim, so source edits leave `meson setup` cached.
+Priced FREE by `emission-price.sh d7357cd`, verified by `run-all.sh`, and recorded in `CHANGELOG.md` (`dc3ec7c`).
 
 ### 4. The cost-of-a-change instruments
 
@@ -818,6 +817,23 @@ an earlier pass's, so reuse, fallback and the exit stale check answer
 about the attempt before. The measurement that drove it: qtwebengine
 iters 1-4 each carried exactly one signal-9 kill, and each retry re-paid
 ~15 min of resolve plus ~25-32 GB of re-emitted derivation JSON.
+
+### 13. Build-phase progress heartbeat for consumer spin detection
+
+LANDED. A zero-completion spin (inner driver burning CPU with no finished
+builds and a frozen client log) was invisible to the consumer's retry loop,
+whose stall watch read driver CPU as progress. The fix is two process-global
+atomics (`COMPLETED_BUILDS`, `LAST_COMPLETED_MS`) beside the existing
+resolve-phase counters in `crates/nix-ninja/src/task.rs`, recorded on
+`Runner::wait`'s success path and emitted on stderr as
+`nix-ninja: progress completed=C total=T active=A idle_for_s=S` on the 1st
+and every 50th completion, plus unconditionally on the 300 s `recv_timeout`
+tick so a zero-completion spin prints with growing `idle_for_s`. Stderr-only
+by the `report_progress` precedent (a knob would be inert inside the
+sandbox); emission-free by construction and proved by `emission-price.sh
+d7357cd` (task `drvPath` unmoved, five shapes identical). Unit tests pin
+`progress_line` formatting and counter advancement; `logging-contract-repro.sh`
+confirms the stderr prefix and untouched stdout contract.
 
 ## What could stop this
 
