@@ -1,5 +1,6 @@
 { lib
 , coreutils
+, findutils
 , meson
 , nix
 , nix-ninja
@@ -30,7 +31,64 @@ let
   # Passing nothing leaves `args'` without the attribute and the emitted
   # derivation byte-identical, which is what makes landing it free.
   useConfigureCache = args'.useConfigureCache or false;
-  baseArgs = builtins.removeAttrs args' [ "useConfigureCache" ];
+  baseArgs = builtins.removeAttrs args' [ "useConfigureCache" "configureSourceFilter" ];
+
+  # Narrow `src` to what `meson setup` reads, so a source edit leaves the
+  # cached configure derivation alone.
+  #
+  # Dropping files by NAME is unsound: meson.build enumerates its sources,
+  # and setup fails on the missing file (`ERROR: File main.cpp does not
+  # exist` on the first attempt at this). So the narrowed tree keeps every
+  # NAME and stubs the contents: build-system files verbatim, everything
+  # else an empty file carrying the original's mode. Existence checks,
+  # globs and source lists all pass; a content edit to a stubbed file
+  # changes nothing in this tree.
+  #
+  # The stub tree is its own CONTENT-ADDRESSED derivation, which is what
+  # makes the edit free: the output path hashes outputs, so a stubbed edit
+  # rebuilds this cheap file walk and leaves the configure derivation - and
+  # the `meson setup` it caches - untouched. An input-addressed copy would
+  # re-key on every edit and buy nothing.
+  #
+  # Known limit: setup never COMPILES sources, but it does READ some - a
+  # version taken from a file's contents, a configure_file over a source,
+  # a script setup executes. Those packages keep the full `src` through
+  # `configureSourceFilter`, which overrides this wholesale.
+  configureSrc =
+    if args' ? configureSourceFilter then
+      args'.configureSourceFilter src
+    else
+      stdenv.mkDerivation {
+        name = "${name}-configure-src";
+        inherit src;
+        __contentAddressed = true;
+        nativeBuildInputs = [ coreutils findutils ];
+        phases = [ "unpackPhase" "patchPhase" "installPhase" ];
+        installPhase = ''
+          runHook preInstall
+          mkdir -p "$out"
+          cd "$NIX_BUILD_TOP/$sourceRoot"
+          find . -mindepth 1 -print0 | while IFS= read -r -d "" entry; do
+            rel="''${entry#./}"
+            if [ -L "$entry" ]; then
+              mkdir -p "$out/$(dirname "$rel")"
+              cp -P "$entry" "$out/$rel"
+            elif [ -d "$entry" ]; then
+              mkdir -p "$out/$rel"
+            else
+              mkdir -p "$out/$(dirname "$rel")"
+              case "$(basename "$entry")" in
+                meson.build|meson_options.txt|CMakeLists.txt|configure.ac|Makefile.am|*.cmake|*.in)
+                  cp "$entry" "$out/$rel" ;;
+                *)
+                  touch -d "@1" "$out/$rel"
+                  chmod --reference="$entry" "$out/$rel" ;;
+              esac
+            fi
+          done
+          runHook postInstall
+        '';
+      };
 
   # An ORDINARY derivation: a real $out, no builder-rpc-v0, no dynamic
   # derivations. That is the entire point - it is cacheable and
@@ -49,6 +107,9 @@ let
     "mkMesonPackage: useConfigureCache cannot be used with a package that ${lib.head cacheBlockers}";
     stdenv.mkDerivation (baseArgs // {
     name = "${name}-configure";
+
+    # Existence and contents, per the comment on `configureSrc` above.
+    src = configureSrc;
 
     # THE PREFIX MUST MATCH THE UNCACHED BUILD OR THE OPTION IS NOT
     # TRANSPARENT. stdenv defaults `prefix` to `$out`, and meson's setup hook
