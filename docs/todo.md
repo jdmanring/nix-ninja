@@ -56,15 +56,15 @@ issues that came with the project.
     resolved the task's own declared output as one of its inputs and
     materialized it read-only over the path the compiler writes. A path an
     edge declares as an output is now never resolved as an input.
-- [ ] mkMesonPackage do configure caching
+- [x] mkMesonPackage do configure caching
   - [x] Separate out configure and build into two derivations, behind an
     opt-in `useConfigureCache`. Opting out leaves the emitted derivation
     byte-identical. Measured caveat: a source edit still re-runs configure,
     because `src` is an input of the configure derivation, so the split as
     described does not cache across the common case. Narrowing the configure
     derivation's source is what would make it pay.
-  - Put source into one output path
-  - Put build_dir_inputs into one output path
+  - [x] Put source into one output path (content-addressed `configureSrc` stub tree)
+  - [x] Put build_dir_inputs into one output path
 - [ ] Writing derivation caching for local mode
   - Need to adopt something similar to n2's db or ninja's deps cache
   - Scheduler needs to do mtime dirtying to write derivations
