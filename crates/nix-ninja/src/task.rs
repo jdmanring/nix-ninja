@@ -2179,6 +2179,16 @@ impl Runner {
         ))
     }
 
+    /// The build-phase heartbeat: completions, not resolve. Resolve has its
+    /// own tick (`report_progress`, every 500 resolved), which prints nothing
+    /// during a spin that resolves nothing new - the incident this answers.
+    /// Pure, so the format is unit-tested without running a build.
+    fn progress_line(completed: u64, total: u64, active: usize, idle_s: u64) -> String {
+        format!(
+            "nix-ninja: progress completed={completed} total={total} active={active} idle_for_s={idle_s}"
+        )
+    }
+
     pub fn wait(
         &mut self,
         files: &mut graph::GraphFiles,
@@ -2220,6 +2230,34 @@ impl Runner {
                             eprintln!("{line}");
                         }
                     }
+                    // UNCONDITIONAL: this arm fires with zero completions too,
+                    // which is the spin shape the stall line above cannot name
+                    // (it needs an oldest edge; an empty in-flight set prints
+                    // nothing). A frozen log with no heartbeat means wedged;
+                    // a heartbeat with growing idle_for_s means spinning.
+                    // `last == 0` is "no completion yet", not "idle zero
+                    // seconds": the completed/total/active triple is the
+                    // load-bearing signal, the age only its qualifier.
+                    let last = LAST_COMPLETED_MS.load(std::sync::atomic::Ordering::Relaxed);
+                    let idle_s = if last == 0 {
+                        0
+                    } else {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(last)
+                            .saturating_sub(last)
+                            / 1000
+                    };
+                    eprintln!(
+                        "{}",
+                        Self::progress_line(
+                            COMPLETED_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+                            TOTAL_TASKS.load(std::sync::atomic::Ordering::Relaxed),
+                            self.in_flight.len(),
+                            idle_s,
+                        )
+                    );
                 }
             }
         };
@@ -2302,6 +2340,23 @@ impl Runner {
         // the graph edit (an implicit input on the edge, added by the
         // scheduler from `defer.new_ids`) lands on the next pass, and the
         // task's `new_task` then resolves the input like any declared one.
+        //
+        // The build-phase heartbeat ticks here too: the first completion
+        // proves the wait loop is delivering, then every 50th bounds the
+        // volume (a 15k-task build gains ~300 lines, not 15k). The timeout
+        // arm covers the zero-completion spin; this covers the live build.
+        let completed = note_build_completed();
+        if completed == 1 || completed.is_multiple_of(50) {
+            eprintln!(
+                "{}",
+                Self::progress_line(
+                    completed,
+                    TOTAL_TASKS.load(std::sync::atomic::Ordering::Relaxed),
+                    self.in_flight.len(),
+                    0,
+                )
+            );
+        }
         Ok((result.bid, true, result.defer))
     }
 
@@ -5107,6 +5162,34 @@ fn stall_line_caps_long_worklists() {
 fn stall_line_silent_before_the_interval() {
     let labels = vec!["slow-link".to_string()];
     assert!(Runner::wait_stall_line(1, &labels, std::time::Duration::from_secs(299)).is_none());
+}
+
+#[test]
+fn progress_line_names_counts_and_idle() {
+    let line = Runner::progress_line(7, 100, 3, 42);
+    assert!(line.starts_with("nix-ninja: progress"), "{line}");
+    assert!(line.contains("completed=7"), "{line}");
+    assert!(line.contains("total=100"), "{line}");
+    assert!(line.contains("active=3"), "{line}");
+    assert!(line.contains("idle_for_s=42"), "{line}");
+}
+
+#[test]
+fn completed_counter_advances_and_stamps_time() {
+    use std::sync::atomic::Ordering;
+    let before = COMPLETED_BUILDS.load(Ordering::Relaxed);
+    let ret = note_build_completed();
+    let after = COMPLETED_BUILDS.load(Ordering::Relaxed);
+    assert!(after > before, "counter did not advance");
+    assert!(
+        ret >= 1 && ret <= after,
+        "returned {ret}, counter at {after}"
+    );
+    assert_ne!(
+        LAST_COMPLETED_MS.load(Ordering::Relaxed),
+        0,
+        "no completion timestamp recorded"
+    );
 }
 
 pub fn soname_link_edge(cmdline: &str, ins: &[&str], outs: &[&str]) -> bool {
@@ -21506,6 +21589,34 @@ static HEAP_BASE_SET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 pub(crate) fn set_total_tasks(n: u64) {
     TOTAL_TASKS.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Finished BUILDS, as opposed to TASKS, which counts resolved edges.
+/// Resolve and execution overlap, and a spin can resolve nothing new while
+/// burning CPU, so a liveness signal needs the completion side: the
+/// consumer's retry loop reads it off the heartbeat line instead of
+/// inferring progress from driver CPU. Paired with LAST_COMPLETED_MS, set
+/// on the same path, so one load pair answers "how many" and "how long ago".
+static COMPLETED_BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Epoch millis of the last finished build, zero before the first. The
+/// heartbeat prints the AGE derived from this, never the timestamp, so a
+/// reader never subtracts clocks.
+static LAST_COMPLETED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one finished build; returns the new completed count. Called on
+/// the `wait` success path only: a FAILED edge is not progress, a deferred
+/// one has not finished, and keep-going abandonments never reach here.
+/// The count increments BEFORE the timestamp stores, so a concurrent
+/// heartbeat reader can see a new count with an old timestamp (age
+/// overstated, fail toward fault) and never an old count with a fresh one.
+fn note_build_completed() -> u64 {
+    let completed = COMPLETED_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    LAST_COMPLETED_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+    completed
 }
 
 /// Snapshot the allocator pair before the first resolve; see HEAP_BASE_*.
