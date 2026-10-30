@@ -24706,7 +24706,7 @@ mod compile_task_tests {
 mod job_permits_tests {
     use super::{
         admission_weight, budget_for_load, budget_for_memory, capped_available_gib,
-        cgroup_available_bytes, cgroup_max_mib, cgroup_oom_kills, JobPermits,
+        cgroup_available_bytes, cgroup_max_mib, cgroup_oom_kills, JobPermits, OUT_ENV_LOCK,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -25015,6 +25015,9 @@ mod job_permits_tests {
     #[test]
     fn cgroup_reader_parses_ceiling_and_current() {
         use std::io::Write as _;
+        // The heap test next door sets NIX_NINJA_MEMORY_CGROUP under this
+        // same lock; without it this reader observes its 1 GiB scratch dir.
+        let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = super::Scratch::new(format!("nn-cgroup-{}", std::process::id()));
         let write = |name: &str, body: &str| {
             let mut f = std::fs::File::create(dir.join(name)).unwrap();
