@@ -827,6 +827,108 @@ pub(crate) fn available_gib() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// The sandbox cgroup whose ceiling kills builders, from
+/// `NIX_NINJA_MEMORY_CGROUP` (`/sys/fs/cgroup/nixbuild` on the Saxum
+/// campaign host). The governor, the heap default and the OOM annotations
+/// all read through this one variable, so an unset variable keeps every one
+/// of them on today's host-only behavior. A set-but-unreadable directory
+/// warns once and then behaves as unset: a typo must not silently govern
+/// from the host while claiming a ceiling.
+fn memory_cgroup_dir() -> Option<PathBuf> {
+    let dir: PathBuf = std::env::var_os("NIX_NINJA_MEMORY_CGROUP")?.into();
+    if !dir.is_dir() {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "nix-ninja: NIX_NINJA_MEMORY_CGROUP={} is not a readable directory; \
+                 governing from host meminfo alone",
+                dir.display()
+            );
+        }
+        return None;
+    }
+    Some(dir)
+}
+
+/// Bytes the cgroup may still spend: `memory.max` minus `memory.current`.
+/// None where either file is unreadable or the ceiling is `max` (no limit),
+/// and both cases mean the host reading stands - an unreadable ceiling must
+/// not serialize the round, and a limitless one adds nothing.
+fn cgroup_available_bytes(dir: &Path) -> Option<u64> {
+    let max: u64 = std::fs::read_to_string(dir.join("memory.max"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let current: u64 = std::fs::read_to_string(dir.join("memory.current"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(max.saturating_sub(current))
+}
+
+/// OOM kills the cgroup has recorded, or None where the counter cannot be
+/// read. A zero is a reading (no kills); None is no instrument. The two
+/// must not be confused: printing "0 kills" from an unreadable counter
+/// would exonerate a cgroup nobody looked at.
+fn cgroup_oom_kills(dir: &Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join("memory.events"))
+        .ok()?
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(' ')?;
+            (k == "oom_kill").then(|| v.trim().parse::<u64>().ok())?
+        })
+}
+
+/// The killer's counters through the one variable, or None where it is
+/// unset. Every annotation site uses this, so an unconfigured round prints
+/// no OOM line at all rather than a zero that claims a reading.
+fn current_oom_kills() -> Option<u64> {
+    cgroup_oom_kills(&memory_cgroup_dir()?)
+}
+
+/// The OOM clause for a failure, bail or stall line: names the rise only
+/// when both ends read. Either end unreadable prints nothing rather than a
+/// zero that exonerates a cgroup nobody looked at. Pure so the wording is
+/// unit-tested; call sites pass the live pair.
+fn oom_delta_clause(start: Option<u64>, now: Option<u64>, during: &str) -> String {
+    match (start, now) {
+        (Some(a), Some(b)) if b > a => {
+            format!(", cgroup oom_kill rose {} {during} (now {b})", b - a)
+        }
+        _ => String::new(),
+    }
+}
+
+/// The ceiling in MiB, for the heap default. None where unset, unreadable
+/// or limitless: all three keep today's host-derived bound.
+fn cgroup_max_mib() -> Option<u64> {
+    let max: u64 = std::fs::read_to_string(memory_cgroup_dir()?.join("memory.max"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(max / (1024 * 1024))
+}
+
+/// What the governor may admit against: the tighter of the host and the
+/// cgroup ceiling. Pure so the min is unit-tested; the composition with the
+/// live readers is one line in the acquire loop and one in the heap
+/// default, each pinned by a wiring arm that fails when the min is cut.
+fn capped_available_gib(host_avail_gib: u64, cgroup_avail_gib: Option<u64>) -> u64 {
+    cgroup_avail_gib.map_or(host_avail_gib, |c| host_avail_gib.min(c))
+}
+
+/// The cgroup ceiling in GiB through the one variable, or None where the
+/// round is not cgrouped. The acquire loop mins this under the host
+/// reading; keeping the two separate (rather than pre-minning here) puts
+/// the min on the path the wiring test covers.
+fn live_cgroup_avail_gib() -> Option<u64> {
+    memory_cgroup_dir().and_then(|d| cgroup_available_bytes(&d).map(|b| b / (1024 * 1024 * 1024)))
+}
+
 struct JobPermits {
     inner: Arc<(Mutex<usize>, Condvar)>,
     cap: usize,
@@ -857,6 +959,11 @@ struct JobPermits {
 #[derive(Clone, Copy)]
 struct Readings {
     avail_gib: u64,
+    /// The cgroup ceiling in GiB, or None where the round is not cgrouped.
+    /// Injected rather than read live so the wiring arm below can put the
+    /// ceiling somewhere the host never is; a live read would assert about
+    /// whichever machine ran the test.
+    cgroup_avail_gib: Option<u64>,
     load: f64,
     reserve_gib: u64,
     full_gib: u64,
@@ -872,9 +979,6 @@ impl JobPermits {
     /// announcement is not a heartbeat, and a frozen log means wedged.
     const PERMIT_FIRST_ANNOUNCE: std::time::Duration = std::time::Duration::from_secs(30);
     const PERMIT_REANNOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
-    /// Thirty minutes with no completion and no release. Elapsed time
-    /// alone never bails: a healthy slow link waits out a whole wave.
-    const PERMIT_ZERO_DRAIN_BAIL: std::time::Duration = std::time::Duration::from_secs(1800);
     const PERMIT_WAIT_TICK: std::time::Duration = std::time::Duration::from_secs(2);
 
     fn new(cap: usize) -> Self {
@@ -915,6 +1019,7 @@ impl JobPermits {
             cap,
             Readings {
                 avail_gib: 64,
+                cgroup_avail_gib: None,
                 load: 0.0,
                 reserve_gib: 6,
                 full_gib: 15,
@@ -922,11 +1027,15 @@ impl JobPermits {
         )
     }
 
+    /// Thirty minutes with no released permit. Elapsed time alone never
+    /// bails: a healthy slow link waits out a whole wave.
+    const PERMIT_ZERO_DRAIN_BAIL: std::time::Duration = std::time::Duration::from_secs(1800);
+    ///
     /// Blocks until `weight` units free, or bails after thirty minutes with
-    /// zero drain (no finished build and no released permit). Blocking in the
-    /// scheduler's start() is deliberate backpressure: running task threads
-    /// complete and release without needing the main loop. The bail turns a
-    /// wedged round into a loud error naming held/budget/weight instead of a
+    /// zero drain (no released permit). Blocking in the scheduler's start()
+    /// is deliberate backpressure: running task threads complete and release
+    /// without needing the main loop. The bail turns a wedged round into a
+    /// loud error naming held/budget/weight instead of a silent hang.
     /// silent park; elapsed time alone never triggers it, so a healthy slow
     /// link waits out a whole compile wave.
     ///
@@ -963,25 +1072,35 @@ impl JobPermits {
         let mut last_announce = t0;
         let mut announced = false;
         // The zero-drain clock resets on every observed release (held count
-        // falling) and on every finished build. A release a rival waiter
-        // instantly re-acquires still moves the count, so progress the
-        // waiter cannot use still holds the bail off; only a round where
-        // nothing finishes and nothing releases is stuck.
+        // falling) and nothing else. Finished builds do NOT reset it: the
+        // completions counter is bumped by wait() on this same thread, and
+        // while this waiter is parked in start() wait() cannot run, so the
+        // counter cannot move under it. An arm that consulted it would read
+        // dead for the whole park - honest only if it says releases.
         let mut last_drain = t0;
         let mut prev_count = *count;
-        let mut completed_seen = COMPLETED_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+        // The OOM counter at the moment this waiter parked, so the bail can
+        // name churn during the park rather than asserting stuckness from
+        // silence alone. One file read per park, never on the tick.
+        let oom_at_park = current_oom_kills();
         loop {
             let r = self.readings.unwrap_or_else(|| {
                 let (reserve_gib, full_gib) = memory_bounds_gib();
                 Readings {
                     avail_gib: available_gib(),
+                    cgroup_avail_gib: live_cgroup_avail_gib(),
                     load: load_average(),
                     reserve_gib,
                     full_gib,
                 }
             });
-            let budget = budget_for_memory(self.cap, r.avail_gib, r.reserve_gib, r.full_gib)
-                .min(budget_for_load(self.cap, r.load, self.load_limit));
+            let budget = budget_for_memory(
+                self.cap,
+                capped_available_gib(r.avail_gib, r.cgroup_avail_gib),
+                r.reserve_gib,
+                r.full_gib,
+            )
+            .min(budget_for_load(self.cap, r.load, self.load_limit));
             if *count == 0 || *count + weight <= budget {
                 if announced {
                     eprintln!(
@@ -991,10 +1110,8 @@ impl JobPermits {
                 }
                 break;
             }
-            let completed_now = COMPLETED_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
-            if *count < prev_count || completed_now != completed_seen {
+            if *count < prev_count {
                 last_drain = std::time::Instant::now();
-                completed_seen = completed_now;
             }
             prev_count = *count;
             let announce_due = if announced {
@@ -1015,8 +1132,10 @@ impl JobPermits {
                 last_announce = std::time::Instant::now();
             }
             if last_drain.elapsed() >= zero_drain_bail {
+                let oom_clause =
+                    oom_delta_clause(oom_at_park, current_oom_kills(), "during the park");
                 anyhow::bail!(
-                    "job permit acquisition stalled with no completions or releases for {}s (held {count} / budget {budget}, weight {weight})",
+                    "job permit acquisition stalled with no released permits for {}s (held {count} / budget {budget}, weight {weight}){oom_clause}",
                     last_drain.elapsed().as_secs()
                 );
             }
@@ -1147,6 +1266,14 @@ pub struct Runner {
     /// without sending parked the driver for hours with CPU flat, no FAILED
     /// and no watchdog line. The wait announces from this list instead.
     in_flight: Vec<(BuildId, String, std::time::Instant)>,
+    /// The OOM count when the oldest in-flight edge started, captured at push
+    /// time. Used by the stall watcher to report OOM growth during a hang.
+    in_flight_oom: HashMap<BuildId, Option<u64>>,
+    /// The OOM count at the last stall checkpoint. Refreshed on every
+    /// Timeout arm and reset at each wait() entry, so the stall line names
+    /// only kills during the current wait, never a stale total carried
+    /// across completions.
+    last_stall_oom: Option<u64>,
     tools: Tools,
     rpc_client: Arc<BuilderRpcClient>,
     config: RunnerConfig,
@@ -1279,6 +1406,8 @@ impl Runner {
             tx,
             rx,
             in_flight: Vec::new(),
+            in_flight_oom: HashMap::new(),
+            last_stall_oom: None,
             tools,
             rpc_client,
             config,
@@ -1539,6 +1668,7 @@ impl Runner {
             format!("local edge {label} ({member})"),
             std::time::Instant::now(),
         ));
+        self.in_flight_oom.insert(bid, current_oom_kills());
 
         let width = self.permits.cap;
         let permit = self.permits.acquire_weighted(width).with_context(|| {
@@ -1973,6 +2103,7 @@ impl Runner {
             })
             .transpose()?;
         self.in_flight.push((bid, label, std::time::Instant::now()));
+        self.in_flight_oom.insert(bid, current_oom_kills());
 
         let config = self.config.clone();
         let rpc_client = self.rpc_client.clone();
@@ -2243,19 +2374,24 @@ impl Runner {
     }
 
     /// The line `wait` prints when no edge reports for a whole interval.
-    /// None before the interval elapses: a slow link is not a stall.
+    /// None before the interval elapses: a slow link is not a stall. The
+    /// OOM pair names kills during the stall; either end unreadable prints
+    /// no clause rather than a zero that claims a reading.
     fn wait_stall_line(
         label_count: usize,
         labels: &[String],
         oldest_waited: std::time::Duration,
+        oom_start: Option<u64>,
+        oom_now: Option<u64>,
     ) -> Option<String> {
         if oldest_waited < Self::WAIT_ANNOUNCE_EVERY {
             return None;
         }
         Some(format!(
-            "nix-ninja: still waiting on {label_count} edge(s), oldest {}s with no result: {}",
+            "nix-ninja: still waiting on {label_count} edge(s), oldest {}s with no result: {}{}",
             oldest_waited.as_secs(),
             Self::summarize_labels(labels),
+            oom_delta_clause(oom_start, oom_now, "during the stall"),
         ))
     }
 
@@ -2278,6 +2414,12 @@ impl Runner {
         // whether it is fatal - under keep-going it abandons the failed
         // subtree and drains the rest, so one round surfaces every
         // independent failure instead of the first.
+        // The OOM baseline for this wait: the Timeout arms below diff
+        // against it, so the stall line names kills during THIS wait only.
+        // One file read per completed edge; the alternative (a baseline
+        // carried across completions) attributes ancient kills to a new
+        // stall.
+        self.last_stall_oom = current_oom_kills();
         let result = loop {
             match self.rx.recv_timeout(Self::WAIT_ANNOUNCE_EVERY) {
                 Ok(result) => break result,
@@ -2304,11 +2446,21 @@ impl Runner {
                         .map(|(_, label, _)| label.clone())
                         .collect();
                     if let Some(since) = self.in_flight.iter().map(|(_, _, since)| *since).min() {
-                        if let Some(line) =
-                            Self::wait_stall_line(labels.len(), &labels, since.elapsed())
-                        {
+                        let oom_now = current_oom_kills();
+                        if let Some(line) = Self::wait_stall_line(
+                            labels.len(),
+                            &labels,
+                            since.elapsed(),
+                            self.last_stall_oom,
+                            oom_now,
+                        ) {
                             eprintln!("{line}");
                         }
+                        // The baseline tracks the latest reading, so the
+                        // next arm names only the rise since this one: a
+                        // stall outliving several intervals reports per-arm
+                        // churn, never a stale total.
+                        self.last_stall_oom = oom_now;
                     }
                     // UNCONDITIONAL: this arm fires with zero completions too,
                     // which is the spin shape the stall line above cannot name
@@ -2341,6 +2493,7 @@ impl Runner {
                 }
             }
         };
+        let oom_start = self.in_flight_oom.remove(&result.bid).flatten();
         self.in_flight.retain(|(bid, _, _)| *bid != result.bid);
         if let Some(err) = result.err {
             // The edge ran a whole build here; under keep-going there is no
@@ -2354,6 +2507,17 @@ impl Runner {
             // Named by the edge's output rather than by a BuildId, which is
             // a graph index and means nothing to a reader.
             eprintln!("nix-ninja: FAILED {}: {err}", result.label);
+            // The killer's counter rose while this edge ran: name it on the
+            // failure, which is the line the round's triage greps. Silent
+            // where the cgroup is unreadable at either end.
+            let oom_clause = oom_delta_clause(
+                oom_start,
+                current_oom_kills(),
+                "while this edge was in flight",
+            );
+            if !oom_clause.is_empty() {
+                eprintln!("nix-ninja: FAILED {}{oom_clause}", result.label);
+            }
 
             eprintln!("nix-ninja: caused by:");
             for cause in err.chain().skip(1) {
@@ -5225,7 +5389,8 @@ impl Runner {
 #[test]
 fn stall_line_names_the_blocker() {
     let labels = vec!["a.o".to_string(), "b.o".to_string()];
-    let line = Runner::wait_stall_line(2, &labels, std::time::Duration::from_secs(301)).unwrap();
+    let line = Runner::wait_stall_line(2, &labels, std::time::Duration::from_secs(301), None, None)
+        .unwrap();
     assert!(line.contains("2 edge(s)"), "{line}");
     assert!(line.contains("a.o"), "{line}");
 }
@@ -5233,7 +5398,9 @@ fn stall_line_names_the_blocker() {
 #[test]
 fn stall_line_caps_long_worklists() {
     let labels: Vec<String> = (0..10).map(|i| format!("e{i}.o")).collect();
-    let line = Runner::wait_stall_line(10, &labels, std::time::Duration::from_secs(600)).unwrap();
+    let line =
+        Runner::wait_stall_line(10, &labels, std::time::Duration::from_secs(600), None, None)
+            .unwrap();
     assert!(line.contains("(+5 more)"), "{line}");
     assert!(!line.contains("e9.o"), "{line}");
 }
@@ -5241,7 +5408,56 @@ fn stall_line_caps_long_worklists() {
 #[test]
 fn stall_line_silent_before_the_interval() {
     let labels = vec!["slow-link".to_string()];
-    assert!(Runner::wait_stall_line(1, &labels, std::time::Duration::from_secs(299)).is_none());
+    assert!(
+        Runner::wait_stall_line(1, &labels, std::time::Duration::from_secs(299), None, None)
+            .is_none()
+    );
+}
+
+#[test]
+fn stall_line_names_an_oom_rise_and_nothing_else() {
+    let labels = vec!["slow-link".to_string()];
+    let risen = Runner::wait_stall_line(
+        1,
+        &labels,
+        std::time::Duration::from_secs(301),
+        Some(30),
+        Some(32),
+    )
+    .unwrap();
+    assert!(
+        risen.contains("oom_kill rose 2 during the stall (now 32)"),
+        "{risen}"
+    );
+    let flat = Runner::wait_stall_line(
+        1,
+        &labels,
+        std::time::Duration::from_secs(301),
+        Some(32),
+        Some(32),
+    )
+    .unwrap();
+    assert!(!flat.contains("oom_kill"), "{flat}");
+    let unreadable = Runner::wait_stall_line(
+        1,
+        &labels,
+        std::time::Duration::from_secs(301),
+        None,
+        Some(32),
+    )
+    .unwrap();
+    assert!(!unreadable.contains("oom_kill"), "{unreadable}");
+}
+
+#[test]
+fn oom_clause_needs_both_ends_and_a_rise() {
+    assert_eq!(
+        oom_delta_clause(Some(30), Some(32), "during the park"),
+        ", cgroup oom_kill rose 2 during the park (now 32)"
+    );
+    assert_eq!(oom_delta_clause(Some(32), Some(32), "during the park"), "");
+    assert_eq!(oom_delta_clause(None, Some(32), "during the park"), "");
+    assert_eq!(oom_delta_clause(Some(30), None, "during the park"), "");
 }
 
 #[test]
@@ -21715,12 +21931,16 @@ pub(crate) fn record_heap_baseline() {
 /// negotiate. Unreadable machine memory means no bound rather than a
 /// guessed one: a refusal on a fiction wastes the run it claims to save.
 /// `u64::MAX` is that no-bound case, and the schedule line prints it as
-/// `none` rather than a number nobody can spend.
+/// `none` rather than a number nobody can spend. The cgroup ceiling caps
+/// the host half from below: inside a sandbox the killer enforces
+/// `memory.max`, never host meminfo, so an uncapped heap bound is a promise
+/// the round cannot keep.
 pub(crate) fn heap_limit_mib() -> u64 {
     parse_heap_limit(
         std::env::var("NIX_NINJA_HEAP_LIMIT_MIB").ok().as_deref(),
         phys_mem_mib(),
     )
+    .min(cgroup_max_mib().unwrap_or(u64::MAX))
 }
 
 fn parse_heap_limit(var: Option<&str>, phys_mem_mib: Option<u64>) -> u64 {
@@ -21882,6 +22102,40 @@ mod heap_bound_tests {
         }
         assert!(refused.is_err(), "a 1 MiB limit refuses a live schedule");
         assert!(allowed.is_ok(), "no bound means no refusal");
+    }
+
+    /// The heap default reads the killer's ceiling: a 1 GiB cgroup caps
+    /// the bound at 1024 MiB no matter what the host reports, and unsetting
+    /// the variable restores the host value. Cutting the min out of
+    /// heap_limit_mib returns the host half and fails the first assertion.
+    /// Under the same env lock as the bound test above; both variables are
+    /// restored before asserting.
+    #[test]
+    fn the_heap_default_bows_to_the_cgroup_ceiling() {
+        use super::{heap_limit_mib, Scratch, OUT_ENV_LOCK};
+        let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_cgroup = std::env::var_os("NIX_NINJA_MEMORY_CGROUP");
+        let old_limit = std::env::var_os("NIX_NINJA_HEAP_LIMIT_MIB");
+        let dir = Scratch::new(format!("nn-heap-cgroup-{}", std::process::id()));
+        std::fs::write(dir.join("memory.max"), "1073741824\n").unwrap();
+        std::env::set_var("NIX_NINJA_MEMORY_CGROUP", &dir.0);
+        std::env::remove_var("NIX_NINJA_HEAP_LIMIT_MIB");
+        let capped = heap_limit_mib();
+        std::env::remove_var("NIX_NINJA_MEMORY_CGROUP");
+        let uncapped = heap_limit_mib();
+        match old_cgroup {
+            Some(v) => std::env::set_var("NIX_NINJA_MEMORY_CGROUP", v),
+            None => std::env::remove_var("NIX_NINJA_MEMORY_CGROUP"),
+        }
+        match old_limit {
+            Some(v) => std::env::set_var("NIX_NINJA_HEAP_LIMIT_MIB", v),
+            None => std::env::remove_var("NIX_NINJA_HEAP_LIMIT_MIB"),
+        }
+        assert_eq!(capped, 1024, "a 1 GiB cgroup caps the heap default");
+        assert!(
+            uncapped >= capped,
+            "unsetting the cgroup restores the host half: {uncapped} < {capped}"
+        );
     }
 }
 // Hoisted from inside the resolve loop so report_progress can read it: the
@@ -24450,7 +24704,10 @@ mod compile_task_tests {
 
 #[cfg(test)]
 mod job_permits_tests {
-    use super::{admission_weight, budget_for_load, budget_for_memory, JobPermits};
+    use super::{
+        admission_weight, budget_for_load, budget_for_memory, capped_available_gib,
+        cgroup_available_bytes, cgroup_max_mib, cgroup_oom_kills, JobPermits,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -24606,6 +24863,7 @@ mod job_permits_tests {
     fn admission_throttles_below_the_cap_when_memory_is_tight() {
         let tight = super::Readings {
             avail_gib: 10,
+            cgroup_avail_gib: None,
             load: 0.0,
             reserve_gib: 6,
             full_gib: 15,
@@ -24658,6 +24916,7 @@ mod job_permits_tests {
                 8,
                 super::Readings {
                     avail_gib: 64,
+                    cgroup_avail_gib: None,
                     load: 9.0,
                     reserve_gib: 6,
                     full_gib: 15,
@@ -24689,6 +24948,109 @@ mod job_permits_tests {
         );
     }
 
+    /// The cgroup ceiling caps host availability: the governor reads the
+    /// killer's ceiling, never the host's optimism. Roomy host numbers plus
+    /// a 2 GiB ceiling must serialize; cutting the min out of the loop
+    /// admits wide and fails the peak assertion. Unset (None) keeps the
+    /// host reading, which the tight-memory arm above already pins.
+    #[test]
+    fn admission_serializes_under_the_cgroup_ceiling() {
+        let capped = super::Readings {
+            avail_gib: 64,
+            cgroup_avail_gib: Some(2),
+            load: 0.0,
+            reserve_gib: 6,
+            full_gib: 15,
+        };
+        assert_eq!(
+            budget_for_memory(
+                8,
+                capped_available_gib(capped.avail_gib, capped.cgroup_avail_gib),
+                capped.reserve_gib,
+                capped.full_gib
+            ),
+            1,
+            "a 2 GiB cgroup ceiling must serialize an 8-slot cap"
+        );
+        assert_eq!(
+            capped_available_gib(64, None),
+            64,
+            "no cgroup keeps the host reading"
+        );
+        assert_eq!(
+            capped_available_gib(3, Some(20)),
+            3,
+            "the min runs both ways: a fuller host still caps"
+        );
+
+        let permits = Arc::new(JobPermits::with_readings(8, capped));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let (permits, running, peak) = (permits.clone(), running.clone(), peak.clone());
+            handles.push(std::thread::spawn(move || {
+                let _permit = permits.acquire_weighted(1).unwrap();
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                running.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "peak under a 2 GiB cgroup ceiling: admission is not consulting it"
+        );
+    }
+
+    /// The cgroup file readers: a normal pair answers the difference, a
+    /// current past max saturates at zero, `max` means no ceiling (None,
+    /// and the host reading stands), and unreadable files are None rather
+    /// than a zero that would serialize every round on a machine whose
+    /// cgroup fs hides them.
+    #[test]
+    fn cgroup_reader_parses_ceiling_and_current() {
+        use std::io::Write as _;
+        let dir = super::Scratch::new(format!("nn-cgroup-{}", std::process::id()));
+        let write = |name: &str, body: &str| {
+            let mut f = std::fs::File::create(dir.join(name)).unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+        };
+        write("memory.max", "4294967296\n");
+        write("memory.current", "3221225472\n");
+        assert_eq!(
+            cgroup_available_bytes(&dir),
+            Some(1024 * 1024 * 1024),
+            "1 GiB of headroom in bytes"
+        );
+        assert_eq!(
+            cgroup_max_mib(),
+            None,
+            "the env var is unset in the test process"
+        );
+        // A current past max saturates rather than wrapping.
+        write("memory.current", "8589934592\n");
+        assert_eq!(cgroup_available_bytes(&dir), Some(0));
+        // `max` is no ceiling: None, and the host reading stands.
+        write("memory.max", "max\n");
+        assert_eq!(cgroup_available_bytes(&dir), None);
+        // Unreadable files are None, never a zero that serializes the round.
+        std::fs::remove_file(dir.join("memory.current")).unwrap();
+        assert_eq!(cgroup_available_bytes(&dir), None);
+        // The OOM counter: present, absent, and missing file.
+        let events = dir.join("memory.events");
+        std::fs::write(&events, "low 0\nhigh 0\nmax 0\noom 0\noom_kill 32\n").unwrap();
+        assert_eq!(cgroup_oom_kills(&dir), Some(32));
+        std::fs::write(&events, "low 0\nhigh 0\nmax 0\noom 0\n").unwrap();
+        assert_eq!(cgroup_oom_kills(&dir), None);
+        std::fs::remove_file(&events).unwrap();
+        assert_eq!(cgroup_oom_kills(&dir), None);
+    }
+
     #[test]
     fn permit_released_on_panic() {
         let permits = Arc::new(JobPermits::roomy(1));
@@ -24704,10 +25066,10 @@ mod job_permits_tests {
     }
 
     /// The bail: a wait with zero drain must fail loudly instead of parking
-    /// forever. The holder never releases and nothing completes, so the
-    /// drain clock runs out; short clocks keep the test in milliseconds. The
-    /// waiter answers through a channel, so a mutant that deletes the bail
-    /// fails on a timeout instead of hanging the suite.
+    /// forever. The holder never releases, so the drain clock runs out;
+    /// short clocks keep the test in milliseconds. The waiter answers
+    /// through a channel, so a mutant that deletes the bail fails on a
+    /// timeout instead of hanging the suite.
     #[test]
     fn permit_wait_bails_on_zero_drain() {
         let permits = Arc::new(JobPermits::roomy(1));
@@ -24732,7 +25094,7 @@ mod job_permits_tests {
         let err = res.expect_err("a wait with zero drain must bail");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("no completions or releases"),
+            msg.contains("no released permits"),
             "the bail must name the cause: {msg}"
         );
         assert!(msg.contains("held 1"), "the bail must name held: {msg}");
@@ -24792,6 +25154,55 @@ mod job_permits_tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("a starved waiter must answer, not park forever");
         res.expect_err("a wait with zero drain must bail once releases stop");
+    }
+
+    /// Finished builds must NOT hold the bail off. The completions counter
+    /// is bumped by wait() on the scheduler thread, and a waiter parked in
+    /// start() shares that thread, so no completion can land mid-park: an
+    /// arm consulting it reads dead for the whole wait. This arm bumps the
+    /// counter hard for longer than the bail window; the waiter must still
+    /// answer on the releases clock. Restoring the completions arm holds the
+    /// bail off past the window and fails the elapsed assertion.
+    #[test]
+    fn permit_wait_ignores_completions() {
+        let permits = Arc::new(JobPermits::roomy(1));
+        let _held = permits.acquire_weighted(1).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = permits.clone();
+        let t0 = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let res = waiter
+                .acquire_weighted_with(
+                    1,
+                    std::time::Duration::from_millis(10),
+                    std::time::Duration::from_millis(10),
+                    std::time::Duration::from_millis(300),
+                    std::time::Duration::from_millis(5),
+                )
+                .map(|_| ());
+            let _ = tx.send(res);
+        });
+        // Bump completions for longer than the bail window. No release ever
+        // lands: the unit stays held the whole time.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bumper_stop = stop.clone();
+        let bumper = std::thread::spawn(move || {
+            while !bumper_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                super::note_build_completed();
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        });
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a starved waiter must answer, not park forever");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        bumper.join().unwrap();
+        res.expect_err("completions must not hold the bail off");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(1500),
+            "waiter answered after {}ms: completions reset the drain clock",
+            t0.elapsed().as_millis()
+        );
     }
 }
 
