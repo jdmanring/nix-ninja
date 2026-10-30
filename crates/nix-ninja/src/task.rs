@@ -868,6 +868,15 @@ struct JobPermit {
 }
 
 impl JobPermits {
+    /// First "waiting" line after 30 s, then a repeat every 60 s: one
+    /// announcement is not a heartbeat, and a frozen log means wedged.
+    const PERMIT_FIRST_ANNOUNCE: std::time::Duration = std::time::Duration::from_secs(30);
+    const PERMIT_REANNOUNCE: std::time::Duration = std::time::Duration::from_secs(60);
+    /// Thirty minutes with no completion and no release. Elapsed time
+    /// alone never bails: a healthy slow link waits out a whole wave.
+    const PERMIT_ZERO_DRAIN_BAIL: std::time::Duration = std::time::Duration::from_secs(1800);
+    const PERMIT_WAIT_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
     fn new(cap: usize) -> Self {
         JobPermits {
             inner: Arc::new((Mutex::new(0), Condvar::new())),
@@ -913,9 +922,13 @@ impl JobPermits {
         )
     }
 
-    /// Blocks until `weight` units free. Blocking in the scheduler's start()
-    /// is deliberate backpressure: running task threads complete and
-    /// release without needing the main loop, so this cannot deadlock.
+    /// Blocks until `weight` units free, or bails after thirty minutes with
+    /// zero drain (no finished build and no released permit). Blocking in the
+    /// scheduler's start() is deliberate backpressure: running task threads
+    /// complete and release without needing the main loop. The bail turns a
+    /// wedged round into a loud error naming held/budget/weight instead of a
+    /// silent park; elapsed time alone never triggers it, so a healthy slow
+    /// link waits out a whole compile wave.
     ///
     /// The effective budget shrinks under memory pressure, which is what lets
     /// one round run the shallow strata wide and the deep ones nearly serial
@@ -923,12 +936,40 @@ impl JobPermits {
     /// to the FULL budget can still exceed the shrunken one, so the wait
     /// admits it once nothing else holds a unit - otherwise low memory would
     /// hang the round rather than slow it.
-    fn acquire_weighted(&self, weight: usize) -> JobPermit {
+    fn acquire_weighted(&self, weight: usize) -> Result<JobPermit> {
+        self.acquire_weighted_with(
+            weight,
+            Self::PERMIT_FIRST_ANNOUNCE,
+            Self::PERMIT_REANNOUNCE,
+            Self::PERMIT_ZERO_DRAIN_BAIL,
+            Self::PERMIT_WAIT_TICK,
+        )
+    }
+
+    /// The wait, with its clocks as parameters so a test drives it in
+    /// milliseconds instead of half an hour.
+    fn acquire_weighted_with(
+        &self,
+        weight: usize,
+        first_announce: std::time::Duration,
+        reannounce: std::time::Duration,
+        zero_drain_bail: std::time::Duration,
+        tick: std::time::Duration,
+    ) -> Result<JobPermit> {
         let weight = weight.clamp(1, self.cap.max(1));
         let (lock, cvar) = &*self.inner;
         let mut count = lock.lock().unwrap();
         let t0 = std::time::Instant::now();
+        let mut last_announce = t0;
         let mut announced = false;
+        // The zero-drain clock resets on every observed release (held count
+        // falling) and on every finished build. A release a rival waiter
+        // instantly re-acquires still moves the count, so progress the
+        // waiter cannot use still holds the bail off; only a round where
+        // nothing finishes and nothing releases is stuck.
+        let mut last_drain = t0;
+        let mut prev_count = *count;
+        let mut completed_seen = COMPLETED_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
         loop {
             let r = self.readings.unwrap_or_else(|| {
                 let (reserve_gib, full_gib) = memory_bounds_gib();
@@ -950,20 +991,43 @@ impl JobPermits {
                 }
                 break;
             }
-            if t0.elapsed() > std::time::Duration::from_secs(30) && !announced {
-                eprintln!("nix-ninja: waiting for job permits (held {count} / budget {budget}, weight {weight})...");
-                announced = true;
+            let completed_now = COMPLETED_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+            if *count < prev_count || completed_now != completed_seen {
+                last_drain = std::time::Instant::now();
+                completed_seen = completed_now;
             }
-            let (c, _) = cvar
-                .wait_timeout(count, std::time::Duration::from_secs(2))
-                .unwrap();
+            prev_count = *count;
+            let announce_due = if announced {
+                last_announce.elapsed() >= reannounce
+            } else {
+                t0.elapsed() >= first_announce
+            };
+            if announce_due {
+                if announced {
+                    eprintln!(
+                        "nix-ninja: still waiting for job permits (held {count} / budget {budget}, weight {weight}, waited {}s)...",
+                        t0.elapsed().as_secs()
+                    );
+                } else {
+                    eprintln!("nix-ninja: waiting for job permits (held {count} / budget {budget}, weight {weight})...");
+                    announced = true;
+                }
+                last_announce = std::time::Instant::now();
+            }
+            if last_drain.elapsed() >= zero_drain_bail {
+                anyhow::bail!(
+                    "job permit acquisition stalled with no completions or releases for {}s (held {count} / budget {budget}, weight {weight})",
+                    last_drain.elapsed().as_secs()
+                );
+            }
+            let (c, _) = cvar.wait_timeout(count, tick).unwrap();
             count = c;
         }
         *count += weight;
-        JobPermit {
+        Ok(JobPermit {
             inner: self.inner.clone(),
             weight,
-        }
+        })
     }
 }
 
@@ -1477,12 +1541,20 @@ impl Runner {
         ));
 
         let width = self.permits.cap;
-        let permit = self.permits.acquire_weighted(width);
+        let permit = self.permits.acquire_weighted(width).with_context(|| {
+            format!("local edge {label} ({member}): stalled waiting for job permits")
+        })?;
         let pool_permit = build
             .pool
             .as_ref()
-            .and_then(|name| self.pool_permits.get(name))
-            .map(|p| p.acquire_weighted(1));
+            .and_then(|name| {
+                self.pool_permits.get(name).map(|p| {
+                    p.acquire_weighted(1).with_context(|| {
+                        format!("local edge {label} ({member}): stalled waiting for pool {name}")
+                    })
+                })
+            })
+            .transpose()?;
         let tx = self.tx.clone();
         let rpc_client = self.rpc_client.clone();
         let config = self.config.clone();
@@ -1874,24 +1946,32 @@ impl Runner {
         // never blocked behind it and the pair cannot deadlock. Reversing it
         // would let pool holders queue for global slots held by pool waiters.
         resolve_section("permits");
-        let permit = self.permits.acquire_weighted(task_admission_weight(
-            task.cmdline.as_deref(),
-            task.outputs.iter().filter_map(|p| p.to_str()),
-            task.inputs.len(),
-            self.permits.cap,
-        ));
-
-        resolve_section("pool");
-        let pool_permit = build
-            .pool
-            .as_ref()
-            .and_then(|name| self.pool_permits.get(name))
-            .map(|p| p.acquire_weighted(1));
         let label = task
             .outs()
             .first()
             .map(|fid| task.files[fid].name.clone())
             .unwrap_or_else(|| format!("{bid:?}"));
+        let permit = self
+            .permits
+            .acquire_weighted(task_admission_weight(
+                task.cmdline.as_deref(),
+                task.outputs.iter().filter_map(|p| p.to_str()),
+                task.inputs.len(),
+                self.permits.cap,
+            ))
+            .with_context(|| format!("edge {label}: stalled waiting for job permits"))?;
+
+        resolve_section("pool");
+        let pool_permit = build
+            .pool
+            .as_ref()
+            .and_then(|name| {
+                self.pool_permits.get(name).map(|p| {
+                    p.acquire_weighted(1)
+                        .with_context(|| format!("edge {label}: stalled waiting for pool {name}"))
+                })
+            })
+            .transpose()?;
         self.in_flight.push((bid, label, std::time::Instant::now()));
 
         let config = self.config.clone();
@@ -24385,7 +24465,7 @@ mod job_permits_tests {
             let running = running.clone();
             let peak = peak.clone();
             handles.push(std::thread::spawn(move || {
-                let _permit = permits.acquire_weighted(1);
+                let _permit = permits.acquire_weighted(1).unwrap();
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -24504,7 +24584,7 @@ mod job_permits_tests {
     #[test]
     fn an_oversized_task_still_runs_alone() {
         let permits = std::sync::Arc::new(JobPermits::roomy(2));
-        let _p = permits.acquire_weighted(usize::MAX);
+        let _p = permits.acquire_weighted(usize::MAX).unwrap();
         // Acquiring it at all proves the empty-pool escape hatch works.
     }
 
@@ -24543,7 +24623,7 @@ mod job_permits_tests {
         for _ in 0..24 {
             let (permits, running, peak) = (permits.clone(), running.clone(), peak.clone());
             handles.push(std::thread::spawn(move || {
-                let _permit = permits.acquire_weighted(1);
+                let _permit = permits.acquire_weighted(1).unwrap();
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -24591,7 +24671,7 @@ mod job_permits_tests {
         for _ in 0..8 {
             let (permits, running, peak) = (permits.clone(), running.clone(), peak.clone());
             handles.push(std::thread::spawn(move || {
-                let _permit = permits.acquire_weighted(1);
+                let _permit = permits.acquire_weighted(1).unwrap();
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -24614,13 +24694,104 @@ mod job_permits_tests {
         let permits = Arc::new(JobPermits::roomy(1));
         let p2 = permits.clone();
         let _ = std::thread::spawn(move || {
-            let _permit = p2.acquire_weighted(1);
+            let _permit = p2.acquire_weighted(1).unwrap();
             panic!("task died");
         })
         .join();
         // If the panicking thread leaked its permit, this blocks forever
         // and the test times out; acquiring proves the Drop ran.
-        let _permit = permits.acquire_weighted(1);
+        let _permit = permits.acquire_weighted(1).unwrap();
+    }
+
+    /// The bail: a wait with zero drain must fail loudly instead of parking
+    /// forever. The holder never releases and nothing completes, so the
+    /// drain clock runs out; short clocks keep the test in milliseconds. The
+    /// waiter answers through a channel, so a mutant that deletes the bail
+    /// fails on a timeout instead of hanging the suite.
+    #[test]
+    fn permit_wait_bails_on_zero_drain() {
+        let permits = Arc::new(JobPermits::roomy(1));
+        let _held = permits.acquire_weighted(1).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = permits.clone();
+        std::thread::spawn(move || {
+            let res = waiter
+                .acquire_weighted_with(
+                    1,
+                    std::time::Duration::from_millis(10),
+                    std::time::Duration::from_millis(10),
+                    std::time::Duration::from_millis(100),
+                    std::time::Duration::from_millis(5),
+                )
+                .map(|_| ());
+            let _ = tx.send(res);
+        });
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a starved waiter must answer, not park forever");
+        let err = res.expect_err("a wait with zero drain must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no completions or releases"),
+            "the bail must name the cause: {msg}"
+        );
+        assert!(msg.contains("held 1"), "the bail must name held: {msg}");
+        assert!(msg.contains("budget 1"), "the bail must name budget: {msg}");
+        assert!(msg.contains("weight 1"), "the bail must name weight: {msg}");
+    }
+
+    /// The reset half: releases must hold the bail off. The waiter wants both
+    /// units while the test holds one the whole time, so it can never be
+    /// admitted; a helper cycling the other unit supplies drain without
+    /// admission. The waiter must stay silent through the cycling and bail
+    /// only after it stops. A bail keyed on elapsed time fires mid-cycle and
+    /// a deleted bail never fires at all, so this arm fails on both mutants.
+    #[test]
+    fn permit_wait_resets_drain_on_release() {
+        let permits = Arc::new(JobPermits::roomy(2));
+        let _held = permits.acquire_weighted(1).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = permits.clone();
+        std::thread::spawn(move || {
+            let res = waiter
+                .acquire_weighted_with(
+                    2,
+                    std::time::Duration::from_millis(10),
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(300),
+                    std::time::Duration::from_millis(5),
+                )
+                .map(|_| ());
+            let _ = tx.send(res);
+        });
+        // Let the waiter settle into the loop before the cycling starts.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let helper_stop = stop.clone();
+        let helper_permits = permits.clone();
+        let helper = std::thread::spawn(move || {
+            while !helper_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let p = helper_permits.acquire_weighted(1).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                drop(p);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        // Cycle for longer than the bail window: a bail keyed on elapsed
+        // time fires here, a drain-keyed one stays silent.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert!(
+            rx.try_recv().is_err(),
+            "the waiter answered while permits were still releasing: \
+             the drain clock is not resetting it"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        helper.join().unwrap();
+        // Releases stopped with one unit still held: the waiter bails now.
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a starved waiter must answer, not park forever");
+        res.expect_err("a wait with zero drain must bail once releases stop");
     }
 }
 
