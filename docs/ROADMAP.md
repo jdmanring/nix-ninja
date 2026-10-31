@@ -46,7 +46,7 @@ And the supporting sections:
 
 - [What does not work today](#what-does-not-work-today), the open list
 - [The next concrete work, item by item](#the-next-concrete-work-item-by-item),
-  14 items with a first action each
+  15 items with a first action each
 - [What could stop this](#what-could-stop-this), the risks
 - [How a milestone ships](#how-a-milestone-ships)
 
@@ -288,7 +288,7 @@ What is missing is larger than that: a STRANGER cannot reach the same place. The
 difference is the published apparatus rather than the driver, the corpus, the
 failure signatures, and the record of what is already known to break.
 
-The route is the 14 items below, which is where each one's first action lives.
+The route is the 15 items below, which is where each one's first action lives.
 What belongs here is the criterion they add up to.
 
 EXIT CRITERION: a clone of this repository, with nothing installed but an
@@ -818,7 +818,7 @@ about the attempt before. The measurement that drove it: qtwebengine
 iters 1-4 each carried exactly one signal-9 kill, and each retry re-paid
 ~15 min of resolve plus ~25-32 GB of re-emitted derivation JSON.
 
-### 13. Build-phase progress heartbeat for consumer spin detection
+### 14. Build-phase progress heartbeat for consumer spin detection
 
 LANDED. A zero-completion spin (inner driver burning CPU with no finished
 builds and a frozen client log) was invisible to the consumer's retry loop,
@@ -834,6 +834,23 @@ sandbox); emission-free by construction and proved by `emission-price.sh
 d7357cd` (task `drvPath` unmoved, five shapes identical). Unit tests pin
 `progress_line` formatting and counter advancement; `logging-contract-repro.sh`
 confirms the stderr prefix and untouched stdout contract.
+
+### 15. Admit under the cgroup ceiling and name the kills (qtwebengine priority)
+
+LANDED. The admission governor and the heap default read host meminfo while
+the killer enforces the sandbox cgroup ceiling, so a cgrouped round admitted
+past its limit and failures never named the kills. `NIX_NINJA_MEMORY_CGROUP`
+carries the cgroup path; admission and the heap default take the min with its
+ceiling, and FAILED, permit-bail and stall lines name the `oom_kill` rise
+while an edge is in flight. A permit wait with zero drain re-announces every
+minute as a heartbeat and bails after thirty minutes naming held, budget,
+weight and the waiting edge; the drain clock resets on every release and
+every finished build, so a healthy slow link never trips it. Unset keeps
+host-only behavior. Scheduling and stderr only, so emission-free by
+construction and proved by `emission-price.sh df404f1` (task `drvPath`
+`sgx22gc5` unmoved, five shapes identical). Unit tests pin the ceiling
+readers, the min, the bail and the drain reset; `logging-contract-repro.sh`
+holds the stderr contract.
 
 ## What could stop this
 
