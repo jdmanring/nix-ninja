@@ -2124,7 +2124,9 @@ impl Runner {
             // tree hooks and placement have changed since: the build is
             // already done, and deriving it again is how a pass rebuilt it.
             // Its outer-stage outputs are copied as a fresh one's are.
-            let reused = (!config.is_output_derivation)
+            // EXCEPT when the task has an unresolved error or its inputs are stale
+            // (e.g. source file modified between passes, like plat.c in meson-python).
+            let reused = (!config.is_output_derivation && task.unresolved.is_none())
                 .then(|| {
                     crate::configure_state::reuse(&task.outputs, |d| {
                         config.store_dir.parse::<StorePath>(d).is_ok() && Path::new(d).exists()
