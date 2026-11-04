@@ -159,9 +159,11 @@ struct Pass {
     files: Vec<(String, String)>,
     /// The edges this pass reused (key, derivation), compared at exit.
     reused_edges: Vec<(String, String)>,
-    /// Reused edges that could not be resolved against the tree as it
-    /// stands, by derivation.
-    unresolved: std::collections::BTreeSet<String>,
+    /// Every output earlier passes recorded, plus every path their placement
+    /// wrote: files placement manages. An edit to one is transient by design
+    /// (placement writes it over) and stays on the reuse-and-count path,
+    /// policed at exit; only an edit outside this set re-derives.
+    managed: std::collections::HashSet<String>,
 }
 
 /// The record's key for an edge: its outputs, joined on NUL, which no path
@@ -284,17 +286,38 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
         }
         None => (earlier, files, edge_inputs),
     };
+    // Every output earlier passes recorded, plus every path their placement
+    // wrote: files placement manages. An edit to one is transient by design
+    // (this pass writes it over) and stays on the reuse-and-count path,
+    // policed at exit; only an edit outside this set re-derives.
+    let mut managed: std::collections::HashSet<String> = earlier
+        .as_ref()
+        .map(|m| {
+            m.keys()
+                .flat_map(|k| k.split('\0').map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if later {
+        managed.extend(
+            read_lines(&state.join("placed.v1"), build_dir)
+                .unwrap_or_default()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|l| parse_journal(l).map(|(_, rel, _)| rel.to_string())),
+        );
+    }
     *PASS.lock().unwrap() = Some(Pass {
         state,
         build_dir: build_dir.to_path_buf(),
-        earlier,
+        earlier: earlier.clone(),
         reused: 0,
         fallback: Vec::new(),
         replaced: Default::default(),
         edge_inputs,
         files,
         reused_edges: Vec::new(),
-        unresolved: Default::default(),
+        managed,
     });
     Ok(())
 }
@@ -443,6 +466,12 @@ pub fn recorded(outputs: &[PathBuf]) -> bool {
 /// On a later pass, the task derivation an earlier pass wrote for the edge
 /// with `outputs`. `present` says whether it is still in the store; one
 /// that is not is counted as a fallback, and the edge is derived again.
+/// So is one whose recorded inputs read differently now (a source edited
+/// between passes): the recorded derivation was built from the old bytes,
+/// so reusing it rebuilds nothing and the edge is derived again. Only a
+/// file present now with content differing from a known baseline refuses;
+/// an input set aside until this pass replaces it, or one no exit has held
+/// yet, reuses exactly as before and the exit still counts it stale.
 pub fn reuse(outputs: &[PathBuf], present: impl Fn(&str) -> bool) -> Option<String> {
     let mut pass = PASS.lock().unwrap();
     let pass = pass.as_mut()?;
@@ -454,23 +483,61 @@ pub fn reuse(outputs: &[PathBuf], present: impl Fn(&str) -> bool) -> Option<Stri
         return None;
     };
     let drv = earlier.get(&key)?.clone();
-    if present(&drv) {
-        pass.reused += 1;
-        pass.reused_edges.push((key, drv.clone()));
-        Some(drv)
-    } else {
+    if !present(&drv) {
         pass.fallback.push(drv);
         pass.replaced.insert(key);
-        None
+        return None;
     }
+    if inputs_changed(pass, &key) {
+        pass.replaced.insert(key);
+        return None;
+    }
+    pass.reused += 1;
+    pass.reused_edges.push((key, drv.clone()));
+    Some(drv)
 }
 
-/// Counts a reused edge that could not be resolved against the tree as it
-/// stands: the tree changed under it since it was written.
-pub fn note_unresolved(drv: &str) {
-    if let Some(p) = PASS.lock().unwrap().as_mut() {
-        p.unresolved.insert(drv.to_string());
-    }
+/// Whether an earlier pass's edge read a file whose bytes differ now: the
+/// recorded derivation was built from the old content, so reusing it
+/// rebuilds nothing and the edge is derived again. Only a file outside what
+/// placement manages refuses: an edit to a recorded output is transient by
+/// design (this pass writes it over) and stays on the reuse-and-count path,
+/// policed at exit. Fresh reads, never the `NOW` memo: the memo answers the
+/// exit comparison from settled state, and a mid-pass read cached there
+/// would poison it (an input set aside now but placed by exit would read
+/// stale at exit and trip the round).
+fn inputs_changed(pass: &Pass, key: &str) -> bool {
+    pass.edge_inputs.get(key).into_iter().flatten().any(|&i| {
+        let Some((p, then)) = pass.files.get(i) else {
+            return false;
+        };
+        if then == UNKNOWN {
+            return false;
+        }
+        // Placed paths are journaled build-relative as the kernel spells them
+        // (through any link), while an input keeps the spelling the task was
+        // given (an absolute path, a `./` prefix); compare the same
+        // normalization, or every spelling but the journal's reads as
+        // unmanaged. An input outside the tree never matches: placement only
+        // writes inside it.
+        let rel = std::path::Path::new(p)
+            .strip_prefix(&pass.build_dir)
+            .map(|r| r.to_path_buf())
+            .unwrap_or_else(|_| std::path::Path::new(p).to_path_buf());
+        let p = written_at(&pass.build_dir, &rel).unwrap_or_else(|| p.clone());
+        if placement_managed(&pass.managed, &p) {
+            return false;
+        }
+        // Present now and different: changed. Absent now: reuse as before;
+        // the exit counts it stale exactly as it always has.
+        tree_hash(&pass.build_dir.join(p)).is_some_and(|now| &now != then)
+    })
+}
+
+/// Whether placement manages `p`: it is a recorded output, or a directory
+/// holding one. Component-wise, so `gen2/x.h` is not inside `gen`.
+fn placement_managed(managed: &std::collections::HashSet<String>, p: &str) -> bool {
+    managed.contains(p) || managed.iter().any(|o| o.starts_with(&format!("{p}/")))
 }
 
 /// Notes the task derivation written for an edge with `outputs`, and the
@@ -861,11 +928,12 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
     pass.fallback
         .extend(nix_builder_rpc_client::built_watched());
     // A REUSED EDGE A TREE FILE OF WHICH CHANGED SINCE IT WAS WRITTEN (a
-    // hook edited or removed a source or a generated file between phases)
-    // is not rebuilt, as reuse is the point; it is counted, so the round
-    // sees it. Compared here, at exit, as the record was taken: placement
-    // has put this pass's outputs back and the rewind has finished, so
-    // both sides see the tree as a pass leaves it.
+    // hook edited a generated file between phases) is not rebuilt, as reuse
+    // is the point; it is counted, so the round sees it. A source edited
+    // between passes never reaches here: `reuse` refuses its edge, which
+    // derives again. Compared here, at exit, as the record was taken:
+    // placement has put this pass's outputs back and the rewind has
+    // finished, so both sides see the tree as a pass leaves it.
     // A HOOK'S EDIT PLACEMENT WROTE OVER (what the hook left differs from
     // what the pass leaves) counts for every input it is, is inside (a
     // directory input) or is behind (a link input), matched by resolved
@@ -931,7 +999,6 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
                 }),
         );
     }
-    stale.extend(pass.unresolved.iter().cloned());
     let first3 = |v: Vec<&str>| v.into_iter().take(3).collect::<Vec<_>>().join(" ");
     Ok(Some(format!(
         "nix-ninja: later-pass reused {} task(s), derived {} fresh, {} fallback, {} stale: \
@@ -2919,11 +2986,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// A LATER PASS REUSES WHAT EARLIER PASSES WROTE. Pass 1 records its
-    /// tasks and prints nothing; pass 2 reuses them (a recorded task gone
-    /// from the store is a fallback, derived again) and records the edge it
-    /// derived fresh; pass 3 reuses that edge too. A later pass whose task
-    /// record is missing stops rather than deriving everything again.
+    /// A LATER PASS REUSES WHAT EARLIER PASSES WROTE, except an edge whose
+    /// recorded inputs read differently now. Pass 1 records its tasks and
+    /// prints nothing; pass 2, after an edit to a source, refuses the edited
+    /// edge and derives it again (a recorded task gone from the store is a
+    /// fallback, derived again) and records the edge it derived fresh; pass 3
+    /// reuses that edge too. A later pass whose task record is missing stops
+    /// rather than deriving everything again.
     #[test]
     fn later_passes_reuse_what_earlier_passes_wrote() {
         let _g = super::PASS_TEST_LOCK.lock().unwrap();
@@ -2956,13 +3025,16 @@ mod tests {
         super::note_task(&out("b.o"), "/nix/store/bbb-b.drv", Vec::new());
         assert_eq!(super::pass_report().unwrap(), None, "pass 1 says nothing");
         save_in(&state, &bd, &ConfigureState::default()).expect("saved");
-        // Pass 2, after a hook edited a source a reused edge read.
+        // Pass 2, after a hook edited a source an earlier edge read: the
+        // recorded derivation is refused and the edge derives again, so no
+        // stale reuse is counted for it.
         write(&bd.join("src/a.c"), "int a = 1;");
         reset();
         super::begin_pass(&bd, true, "v=false").unwrap();
         assert_eq!(
-            super::reuse(&out("a.o"), |_| true).as_deref(),
-            Some("/nix/store/aaa-a.drv")
+            super::reuse(&out("a.o"), |_| true),
+            None,
+            "edited: derived again"
         );
         assert_eq!(
             super::reuse(&out("b.o"), |_| false),
@@ -2972,11 +3044,13 @@ mod tests {
         super::note_task(&out("b.o"), "/nix/store/bb2-b.drv", Vec::new());
         super::note_task(&out("check"), "/nix/store/ccc-check.drv", Vec::new());
         // A second writer of an edge already recorded does not replace it.
-        super::note_task(&out("a.o"), "/nix/store/zzz-a.drv", Vec::new());
+        super::note_task(&out("check"), "/nix/store/zzz-check.drv", Vec::new());
+        // The refused edge derives again, reading the edited source.
+        super::note_task(&out("a.o"), "/nix/store/aaa2-a.drv", vec!["src/a.c".into()]);
         let line = super::pass_report().unwrap().expect("a later pass reports");
         assert!(
             line.starts_with(
-                "nix-ninja: later-pass reused 1 task(s), derived 1 fresh, 1 fallback, 1 stale: "
+                "nix-ninja: later-pass reused 0 task(s), derived 1 fresh, 1 fallback, 0 stale: "
             ),
             "{line}"
         );
@@ -2992,11 +3066,12 @@ mod tests {
         );
         assert_eq!(
             super::reuse(&out("a.o"), |_| true).as_deref(),
-            Some("/nix/store/aaa-a.drv")
+            Some("/nix/store/aaa2-a.drv"),
+            "the refused edge's fresh derivation is what later passes reuse"
         );
         let line = super::pass_report().unwrap().unwrap();
         assert!(
-            line.contains("reused 3 task(s), derived 0 fresh, 0 fallback, 1 stale"),
+            line.contains("reused 3 task(s), derived 0 fresh, 0 fallback, 0 stale"),
             "{line}"
         );
         // Untrusted earlier runs only: outside a build nothing is reused.
@@ -3231,12 +3306,13 @@ mod tests {
     }
 
     /// STALE IS COUNTED AGAINST WHAT EACH EDGE READ, at exit, as the record
-    /// was taken: a source a hook changed or removed counts, and so does a
-    /// file inside a directory input; an edge a later pass derived after
-    /// the change read the new content and does not count on the pass
-    /// after; a placed output the rewind found edited counts, though
-    /// placement wrote the reused output back over the edit, and not once
-    /// placed again.
+    /// was taken: a removed source counts (absent reuses), and so does a
+    /// managed file a hook edited; a source a hook changed re-derives
+    /// instead, as does a file inside a directory input, so neither counts.
+    /// An edge a later pass derived after the change read the new content
+    /// and does not count on the pass after; a placed output the rewind
+    /// found edited counts, though placement wrote the reused output back
+    /// over the edit, and not once placed again.
     #[test]
     fn stale_counts_what_each_edge_read() {
         let _g = super::PASS_TEST_LOCK.lock().unwrap();
@@ -3259,16 +3335,32 @@ mod tests {
         write(&bd.join("data/x.txt"), "two");
         std::fs::remove_file(bd.join("gone.h")).unwrap();
         write(&bd.join("gen.h"), "a hook's edit of it");
-        // Pass 2 places gen.h back over the edit; c.o is derived fresh.
+        // Pass 2 places gen.h back over the edit; a.o and d.o read changed
+        // sources and derive fresh, c.o is derived fresh.
         let mut two = edges.to_vec();
         two.push(("c.o", "/nix/store/ccc-x.drv", &["h.h"]));
         let line = drive_pass(&bd, &r, &two, &gen).unwrap();
-        assert!(line.contains(", 4 stale: "), "{line}");
-        // Pass 3, nothing changed since.
-        let line = drive_pass(&bd, &r, &two, &gen).unwrap();
-        assert!(line.contains(", 3 stale: "), "{line}");
         assert!(
-            !line.contains("ccc-x.drv") && !line.contains("ggg-x.drv"),
+            line.starts_with(
+                "nix-ninja: later-pass reused 2 task(s), derived 1 fresh, 0 fallback, 2 stale: "
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains("fff-x.drv") && line.contains("ggg-x.drv"),
+            "{line}"
+        );
+        // Pass 3, nothing changed since: the re-derived edges reuse, and
+        // only the removed source still counts.
+        let line = drive_pass(&bd, &r, &two, &gen).unwrap();
+        assert!(
+            line.contains("reused 5 task(s), derived 0 fresh, 0 fallback, 1 stale"),
+            "{line}"
+        );
+        assert!(
+            line.contains("fff-x.drv")
+                && !line.contains("ccc-x.drv")
+                && !line.contains("ggg-x.drv"),
             "{line}"
         );
         end_passes(&d, &bd);
@@ -3639,6 +3731,9 @@ mod tests {
         drive_pass(&bd, &r, &edges, &place);
         std::fs::remove_file(bd.join("g.h")).unwrap();
         write(&bd.join("g.h/x"), "inside");
+        // The edge that read the file reuses the recorded derivation and is
+        // counted stale: the file is placed, so the edit is transient by
+        // design and this pass writes it over.
         let line = drive_pass(&bd, &r, &edges, &[]).unwrap();
         assert!(line.contains(", 1 stale: "), "standing: {line}");
         std::fs::remove_dir_all(bd.join("g.h")).unwrap();

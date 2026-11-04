@@ -2124,8 +2124,11 @@ impl Runner {
             // tree hooks and placement have changed since: the build is
             // already done, and deriving it again is how a pass rebuilt it.
             // Its outer-stage outputs are copied as a fresh one's are.
-            // EXCEPT when the task has an unresolved error or its inputs are stale
-            // (e.g. source file modified between passes, like plat.c in meson-python).
+            // EXCEPT when the task has an unresolved error, or an earlier
+            // pass's edge read different bytes than the tree holds now (a
+            // source edited between passes, like plat.c in meson-python):
+            // the first never reaches reuse, and `reuse` itself refuses the
+            // second, so the edge derives again.
             let reused = (!config.is_output_derivation && task.unresolved.is_none())
                 .then(|| {
                     crate::configure_state::reuse(&task.outputs, |d| {
@@ -2136,9 +2139,6 @@ impl Runner {
                 .and_then(|d| config.store_dir.parse::<StorePath>(&d).ok());
             let (derived_path, err) = if let Some(drv_path) = reused {
                 let shown = config.store_dir.display(&drv_path).to_string();
-                if task.unresolved.is_some() {
-                    crate::configure_state::note_unresolved(&shown);
-                }
                 nix_builder_rpc_client::watch_built(shown);
                 match place_outer_stage_outputs(&rpc_client, &config, &task, &drv_path) {
                     Ok(()) => (Some(SingleDerivedPath::Opaque(drv_path)), None),
@@ -6815,10 +6815,16 @@ fn build_task_derivation(
     // for an LTO compile, which keeps the real paths everywhere: the
     // placeholder would be baked into checksummed LTO bytecode, so the
     // equal-length byte rewrite that restores it cannot reach it.
-    // The second arm is the fallback for a restore that cannot reach its bytes
-    // (`placeholder_residue`); unset, the emission is what it was.
+    // The same holds for a compile whose -D/-U literals a znver4 gcc
+    // splits into overlapping vector stores (nss secload.c, 2026-11-03):
+    // the byte swap cannot reach those pieces either. Detected here, at
+    // emission, from the command line: a literal occurrence of an outer
+    // path inside a -D or -U argument takes the raw arm. Whole-path
+    // occurrences elsewhere still take the placeholder.
     let lto_raw = (task.deps.as_deref() == Some("gcc") && task_is_lto(cmdline, &task.wrapper_vars))
-        || raw_outer_paths_forced();
+        || raw_outer_paths_forced()
+        || define_names_outer_path(cmdline, &outer_output_paths())
+        || wrapper_defines_outer_path(&task.wrapper_vars, &outer_output_paths());
     // Mirror any include directory the command names inside the outer
     // derivation's own output. Computed BEFORE the placeholder rewrite,
     // because the rewrite is what makes the outer path unrecognisable, and
@@ -29295,6 +29301,158 @@ fn command_program(cmdline: &str) -> Option<&str> {
     command_argv(cmdline)?
         .next()
         .map(|tok| tok.trim_matches(|c| c == '"' || c == '\''))
+}
+
+/// Whether a `-D`/`-U` argument names an outer output path: such a literal
+/// reaches the object as a string constant, and gcc at `-march=znver4`
+/// splits constant-length copies of one into overlapping vector stores
+/// (nss `secload.c` `-DNIX_NSS_LIBDIR="<out>/lib/"`, measured 2026-11-03:
+/// 21 of 25 residue windows survive, so the swap misses it and placement
+/// refuses). A bare occurrence elsewhere (an `-I` path, the output itself)
+/// still takes the placeholder: only `-D`/`-U` literals are compiled into
+/// code this way.
+fn define_names_outer_path(cmdline: &str, outer: &[String]) -> bool {
+    let Ok(args) = shell_words::split(cmdline) else {
+        return false;
+    };
+    // A bare `-D`/`-U` takes its value from the NEXT argument (`gcc -D
+    // FOO="<out>/lib"`), so the scan carries one argument of state.
+    let mut prev_bare = false;
+    args.iter().any(|a| {
+        let value = if prev_bare {
+            prev_bare = false;
+            Some(a.as_str())
+        } else if a == "-D" || a == "-U" {
+            prev_bare = true;
+            return false;
+        } else {
+            match a.strip_prefix("-D").or_else(|| a.strip_prefix("-U")) {
+                Some(rest) if !rest.is_empty() => Some(rest),
+                _ => {
+                    let Some((f, v)) = a.split_once('=') else {
+                        return false;
+                    };
+                    if f != "-D" && f != "-U" {
+                        return false;
+                    }
+                    Some(v)
+                }
+            }
+        };
+        let Some(value) = value else {
+            return false;
+        };
+        outer.iter().any(|o| value.contains(o.as_str()))
+    })
+}
+
+/// Whether a `-D`/`-U` value in a forwarded wrapper variable names an outer
+/// output path: nss carries `-DNIX_NSS_LIBDIR="<out>/lib/"` in
+/// NIX_CFLAGS_COMPILE, never on the ninja command line, and gcc at
+/// `-march=znver4` splits that literal into overlapping vector stores the
+/// byte swap cannot reach. Same raw arm as the command-line half.
+fn wrapper_defines_outer_path(wrapper_vars: &HashMap<String, String>, outer: &[String]) -> bool {
+    wrapper_vars
+        .iter()
+        .filter(|(k, _)| k.starts_with("NIX_CFLAGS_COMPILE") || k.starts_with("NIX_LDFLAGS"))
+        .any(|(_, v)| {
+            let Ok(args) = shell_words::split(v) else {
+                return false;
+            };
+            let mut prev_bare = false;
+            args.iter().any(|a| {
+                let value = if prev_bare {
+                    prev_bare = false;
+                    Some(a.as_str())
+                } else if a == "-D" || a == "-U" {
+                    prev_bare = true;
+                    return false;
+                } else {
+                    match a.strip_prefix("-D").or_else(|| a.strip_prefix("-U")) {
+                        Some(rest) if !rest.is_empty() => Some(rest),
+                        _ => {
+                            let Some((f, val)) = a.split_once('=') else {
+                                return false;
+                            };
+                            if f != "-D" && f != "-U" {
+                                return false;
+                            }
+                            Some(val)
+                        }
+                    }
+                };
+                let Some(value) = value else {
+                    return false;
+                };
+                outer.iter().any(|o| value.contains(o.as_str()))
+            })
+        })
+}
+
+#[cfg(test)]
+mod define_names_outer_path_tests {
+    use super::define_names_outer_path;
+
+    const OUT: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nss-3.112.5";
+
+    fn outer() -> Vec<String> {
+        vec![OUT.to_string()]
+    }
+
+    #[test]
+    fn a_define_naming_the_outer_output_takes_the_raw_arm() {
+        assert!(define_names_outer_path(
+            &format!("gcc -DNIX_NSS_LIBDIR=\"{OUT}/lib/\" -c a.c -o a.o"),
+            &outer()
+        ));
+    }
+
+    #[test]
+    fn a_separate_d_and_path_takes_the_raw_arm() {
+        // `gcc -D FOO="<out>/lib"`: argv `-D`, `FOO="<out>/lib"`.
+        assert!(define_names_outer_path(
+            &format!("gcc -D FOO=\"{OUT}/lib\" -c a.c -o a.o"),
+            &outer()
+        ));
+    }
+
+    // THE ZERO CASE: an -I path and the output itself keep the placeholder.
+    #[test]
+    fn an_include_of_the_outer_output_keeps_the_placeholder() {
+        assert!(!define_names_outer_path(
+            &format!("gcc -I{OUT}/private/nss -c a.c -o a.o"),
+            &outer()
+        ));
+    }
+
+    #[test]
+    fn no_outer_output_means_no_raw_arm() {
+        assert!(!define_names_outer_path("gcc -DFOO=1 -c a.c -o a.o", &[]));
+    }
+
+    #[test]
+    fn a_define_in_nix_cflags_compile_takes_the_raw_arm() {
+        use std::collections::HashMap;
+        let vars: HashMap<String, String> = [(
+            "NIX_CFLAGS_COMPILE".to_string(),
+            format!("-Wno-error -DNIX_NSS_LIBDIR=\"{OUT}/lib/\" -DNSS_USE_64=1 -fno-lto"),
+        )]
+        .into_iter()
+        .collect();
+        assert!(super::wrapper_defines_outer_path(&vars, &outer()));
+    }
+
+    #[test]
+    fn an_include_in_nix_cflags_compile_keeps_the_placeholder() {
+        use std::collections::HashMap;
+        let vars: HashMap<String, String> = [(
+            "NIX_CFLAGS_COMPILE".to_string(),
+            format!("-I{OUT}/private/nss"),
+        )]
+        .into_iter()
+        .collect();
+        assert!(!super::wrapper_defines_outer_path(&vars, &outer()));
+    }
 }
 
 /// The program's build-root-relative spelling: absolute programs relativised
