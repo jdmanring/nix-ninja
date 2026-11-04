@@ -728,7 +728,10 @@ configure left, journal what placement wrote, and make a later pass set that
 aside, put back configure's version of a path placement replaced, and answer
 the build-dir walk, include dirs and directory listings from configure's
 record; `a92cdad` onward make a later pass inside a build reuse the task
-derivation each edge recorded and derive only edges no earlier pass wrote.
+derivation each edge recorded and derive unrecorded edges, edges whose
+recorded inputs changed (`87d6c6b`), and consumers of a replaced edge's
+outputs (`20cde62`, the meson-python reentrant leaf: the compile re-derived
+while the link reused its recorded drv).
 Every later pass prints how many tasks it reused, derived fresh, fell back on
 (a recorded task gone from the store) and counted stale (a hook changed what
 an edge read), so a round can stop on the last two. The placeholder residue

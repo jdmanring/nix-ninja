@@ -446,7 +446,9 @@ binding rule; the long form is the detail file's mechanism notes.
   (`mark_start`); errors read DIRTY, never clean.
 - **Later passes** (`configure_state`; B): a pass after the first rewinds
   earlier placements (`Rewind`, `placed.v1`) and REUSES each recorded task
-  derivation (`emitted.v1`). Every later-pass exit prints `nix-ninja:
+  derivation (`emitted.v1`), deriving unrecorded edges, edges whose recorded
+  inputs changed (`inputs_changed`), and consumers of replaced outputs
+  (`replaced_outputs`). Every later-pass exit prints `nix-ninja:
   later-pass reused R task(s), derived M fresh, F fallback, S stale: ...`;
   the consumer's tripwire stops on F>0 or S>0. A missing, corrupt or
   other-configure record, or another invocation (`-v`, builder knobs), is a
