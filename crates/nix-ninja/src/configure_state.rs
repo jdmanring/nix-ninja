@@ -153,6 +153,12 @@ struct Pass {
     fallback: Vec<String>,
     /// Edges whose recorded derivation was gone: this pass's replaces it.
     replaced: std::collections::HashSet<String>,
+    /// Outputs of edges this pass refused and re-derived: a consumer resolved
+    /// after one must not reuse a derivation keyed on the pre-pass input
+    /// (meson-python's link reused its recorded drv while the compile it
+    /// reads rebuilt, 2026-11-04). The reuse decision for a consumer runs at
+    /// entry, before the producer rebuilds, so only this set carries it.
+    replaced_outputs: std::collections::HashSet<String>,
     /// For each recorded edge, the tree files it read, as indices into
     /// `files` (path, content hash when an earlier pass wrote the edge).
     edge_inputs: std::collections::HashMap<String, Vec<usize>>,
@@ -314,6 +320,7 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
         reused: 0,
         fallback: Vec::new(),
         replaced: Default::default(),
+        replaced_outputs: Default::default(),
         edge_inputs,
         files,
         reused_edges: Vec::new(),
@@ -489,7 +496,34 @@ pub fn reuse(outputs: &[PathBuf], present: impl Fn(&str) -> bool) -> Option<Stri
         return None;
     }
     if inputs_changed(pass, &key) {
-        pass.replaced.insert(key);
+        pass.replaced.insert(key.clone());
+        for o in key.split('\0') {
+            pass.replaced_outputs.insert(o.to_string());
+        }
+        return None;
+    }
+    // A replaced edge's output rebuilt this pass: a derivation recorded
+    // against the pre-pass bytes is stale even though the entry-time read
+    // matched (the producer rebuilds after this check runs).
+    let consumed_replaced = pass.edge_inputs.get(&key).into_iter().flatten().any(|&i| {
+        pass.files.get(i).is_some_and(|(p, _)| {
+            let rel = std::path::Path::new(p)
+                .strip_prefix(&pass.build_dir)
+                .map(|r| r.to_path_buf())
+                .unwrap_or_else(|_| std::path::Path::new(p).to_path_buf());
+            let q = written_at(&pass.build_dir, &rel).unwrap_or_else(|| p.clone());
+            pass.replaced_outputs.contains(&q)
+                || pass
+                    .replaced_outputs
+                    .iter()
+                    .any(|o| q.starts_with(&format!("{o}/")) || o.starts_with(&format!("{q}/")))
+        })
+    });
+    if consumed_replaced {
+        pass.replaced.insert(key.clone());
+        for o in key.split('\0') {
+            pass.replaced_outputs.insert(o.to_string());
+        }
         return None;
     }
     pass.reused += 1;
@@ -3303,6 +3337,36 @@ mod tests {
         super::STRICT.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(super::state_dir(bd));
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// A consumer of a replaced edge's output re-derives too: its recorded
+    /// derivation was keyed on the pre-pass input bytes, and the entry-time
+    /// read matched only because the producer rebuilds after this check runs
+    /// (meson-python's link reused its recorded drv while its compile
+    /// rebuilt, so the module kept the pre-edit bytes, 2026-11-04).
+    #[test]
+    fn a_consumer_of_a_replaced_edge_rederives() {
+        let _g = super::PASS_TEST_LOCK.lock().unwrap();
+        let (d, bd) = pass_dir("cascade");
+        let r = ConfigureState::default();
+        write(&bd.join("plat.c"), "v1");
+        // The link reads only the object; the compile reads the source.
+        let edges: [Edge; 2] = [
+            ("plat.o", "/nix/store/aaa-x.drv", &["plat.c"]),
+            ("plat.so", "/nix/store/bbb-x.drv", &["plat.o"]),
+        ];
+        assert_eq!(drive_pass(&bd, &r, &edges, &[]), None, "pass 1");
+        write(&bd.join("plat.c"), "v2");
+        // The compile refuses and re-derives; the link must refuse too,
+        // though its entry-time read (the pre-pass object) still matches.
+        let line = drive_pass(&bd, &r, &edges, &[]).unwrap();
+        assert!(
+            line.starts_with(
+                "nix-ninja: later-pass reused 0 task(s), derived 0 fresh, 0 fallback, 0 stale: "
+            ),
+            "{line}"
+        );
+        end_passes(&d, &bd);
     }
 
     /// STALE IS COUNTED AGAINST WHAT EACH EDGE READ, at exit, as the record
