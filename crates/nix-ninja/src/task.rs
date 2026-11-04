@@ -159,6 +159,8 @@ impl Tools {
 struct Task {
     system: String,
     wrapper_vars: HashMap<String, String>,
+    /// Pre-rewrite `wrapper_vars`, for the raw arm's `-D`/`-U` check.
+    wrapper_vars_raw: HashMap<String, String>,
     input_srcs: Vec<StorePath>,
 
     build_dir: PathBuf,
@@ -1278,6 +1280,14 @@ pub struct Runner {
     rpc_client: Arc<BuilderRpcClient>,
     config: RunnerConfig,
     wrapper_vars: HashMap<String, String>,
+    /// As `wrapper_vars` arrived from the environment, before the outer-output
+    /// placeholder rewrite below. A `-D`/`-U` literal naming an outer output
+    /// is compiled into code gcc splits into overlapping vector stores the
+    /// byte swap cannot reach (nss `NIX_NSS_LIBDIR`, 2026-11-03); the
+    /// predicate that detects it must see the REAL path, which the rewrite
+    /// has already made unrecognisable in `wrapper_vars`. Read-only after
+    /// construction: `wrapper_vars` is what every task is emitted with.
+    wrapper_vars_raw: HashMap<String, String>,
     /// The store paths each forwarded variable's value names, per KEY, so a
     /// command-scoped variable's inputs travel only with the tasks that
     /// receive it (`command_scoped`).
@@ -1363,6 +1373,9 @@ impl Runner {
         }
 
         // Outer output paths -> placeholders in the forwarded env too.
+        // The pre-rewrite copy stays beside it: the raw arm's `-D`/`-U`
+        // predicate must read the REAL outer path, unrecognisable after.
+        let wrapper_vars_raw = wrapper_vars.clone();
         let rewrite = outer_rewrite_map();
         for value in wrapper_vars.values_mut() {
             *value = rewrite_str(value, &rewrite);
@@ -1412,6 +1425,7 @@ impl Runner {
             rpc_client,
             config,
             wrapper_vars,
+            wrapper_vars_raw,
             wrapper_store_paths,
             store_regex,
         })
@@ -2761,6 +2775,7 @@ impl Runner {
         Some(Task {
             system: self.config.system.clone(),
             wrapper_vars: HashMap::new(),
+            wrapper_vars_raw: HashMap::new(),
             input_srcs: Vec::new(),
             build_dir: self.config.build_dir.clone(),
             build_deps: build.dependencies.clone(),
@@ -5313,6 +5328,15 @@ impl Runner {
             .filter(|(k, _)| forwarded(k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        // The pre-rewrite values for the caller's own check below: what
+        // `wrapper_vars` held before the placeholder rewrite, so a real
+        // outer path is still readable there.
+        let wrapper_vars_raw: HashMap<String, String> = self
+            .wrapper_vars_raw
+            .iter()
+            .filter(|(k, _)| forwarded(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let mut input_srcs: Vec<StorePath> = self
             .wrapper_store_paths
             .iter()
@@ -5333,6 +5357,7 @@ impl Runner {
         Ok(Task {
             system: self.config.system.clone(),
             wrapper_vars,
+            wrapper_vars_raw,
             input_srcs,
             build_dir: self.config.build_dir.clone(),
             build_deps: build.dependencies.clone(),
@@ -6824,7 +6849,7 @@ fn build_task_derivation(
     let lto_raw = (task.deps.as_deref() == Some("gcc") && task_is_lto(cmdline, &task.wrapper_vars))
         || raw_outer_paths_forced()
         || define_names_outer_path(cmdline, &outer_output_paths())
-        || wrapper_defines_outer_path(&task.wrapper_vars, &outer_output_paths());
+        || wrapper_defines_outer_path(&task.wrapper_vars_raw, &outer_output_paths());
     // Mirror any include directory the command names inside the outer
     // derivation's own output. Computed BEFORE the placeholder rewrite,
     // because the rewrite is what makes the outer path unrecognisable, and
@@ -29448,6 +29473,24 @@ mod define_names_outer_path_tests {
         let vars: HashMap<String, String> = [(
             "NIX_CFLAGS_COMPILE".to_string(),
             format!("-I{OUT}/private/nss"),
+        )]
+        .into_iter()
+        .collect();
+        assert!(!super::wrapper_defines_outer_path(&vars, &outer()));
+    }
+
+    // The rewritten value must NOT take the raw arm: after the placeholder
+    // rewrite the real path is gone and nothing compiled-time remains.
+    // The production call site reads the PRE-rewrite copy for exactly
+    // this reason (nss secload, 2026-11-04: the predicate fired on raw
+    // values and never in production until then).
+    #[test]
+    fn a_rewritten_define_keeps_the_placeholder() {
+        use std::collections::HashMap;
+        let placeholder = "/nix/store/hjbdq8s5j5dkn2a110sy8zlhfcs4lxsx-nss-3.112.5";
+        let vars: HashMap<String, String> = [(
+            "NIX_CFLAGS_COMPILE".to_string(),
+            format!("-Wno-error -DNIX_NSS_LIBDIR=\"{placeholder}/lib/\" -DNSS_USE_64=1 -fno-lto"),
         )]
         .into_iter()
         .collect();
