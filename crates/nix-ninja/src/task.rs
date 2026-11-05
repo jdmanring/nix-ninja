@@ -931,8 +931,13 @@ fn live_cgroup_avail_gib() -> Option<u64> {
     memory_cgroup_dir().and_then(|d| cgroup_available_bytes(&d).map(|b| b / (1024 * 1024 * 1024)))
 }
 
+struct PermitState {
+    count: usize,
+    heavy: usize,
+}
+
 struct JobPermits {
-    inner: Arc<(Mutex<usize>, Condvar)>,
+    inner: Arc<(Mutex<PermitState>, Condvar)>,
     cap: usize,
     /// Ninja's `-l`: 0.0 disables, matching ninja.
     load_limit: f64,
@@ -972,7 +977,7 @@ struct Readings {
 }
 
 struct JobPermit {
-    inner: Arc<(Mutex<usize>, Condvar)>,
+    inner: Arc<(Mutex<PermitState>, Condvar)>,
     weight: usize,
 }
 
@@ -985,7 +990,10 @@ impl JobPermits {
 
     fn new(cap: usize) -> Self {
         JobPermits {
-            inner: Arc::new((Mutex::new(0), Condvar::new())),
+            inner: Arc::new((
+                Mutex::new(PermitState { count: 0, heavy: 0 }),
+                Condvar::new(),
+            )),
             cap,
             load_limit: 0.0,
             readings: None,
@@ -1069,7 +1077,7 @@ impl JobPermits {
     ) -> Result<JobPermit> {
         let weight = weight.clamp(1, self.cap.max(1));
         let (lock, cvar) = &*self.inner;
-        let mut count = lock.lock().unwrap();
+        let mut state = lock.lock().unwrap();
         let t0 = std::time::Instant::now();
         let mut last_announce = t0;
         let mut announced = false;
@@ -1080,11 +1088,23 @@ impl JobPermits {
         // counter cannot move under it. An arm that consulted it would read
         // dead for the whole park - honest only if it says releases.
         let mut last_drain = t0;
-        let mut prev_count = *count;
+        let mut prev_count = state.count;
         // The OOM counter at the moment this waiter parked, so the bail can
         // name churn during the park rather than asserting stuckness from
         // silence alone. One file read per park, never on the tick.
         let oom_at_park = current_oom_kills();
+        // Exclusive-waiter latch (FIFO fairness for weight == cap). A link
+        // takes the full budget so it runs alone, which needs held at zero;
+        // a stream of small tasks re-acquiring on every wakeup never lets
+        // held rest at zero, so the exclusive waiter starves past the
+        // zero-drain bail. Once a full-budget waiter parks, light waiters
+        // queue behind it instead of racing ahead. Heavy admits under
+        // today's rule (held zero); the bail stays the wedge backstop.
+        // ponytail: full-budget weights only; per-weight FIFO if medium weights ever starve.
+        let heavy = weight == self.cap.max(1);
+        if heavy {
+            state.heavy += 1;
+        }
         loop {
             let r = self.readings.unwrap_or_else(|| {
                 let (reserve_gib, full_gib) = memory_bounds_gib();
@@ -1103,19 +1123,28 @@ impl JobPermits {
                 r.full_gib,
             )
             .min(budget_for_load(self.cap, r.load, self.load_limit));
-            if *count == 0 || *count + weight <= budget {
+            let count = state.count;
+            let blocked_by_heavy = !heavy && state.heavy > 0;
+            if !blocked_by_heavy && (count == 0 || count + weight <= budget) {
                 if announced {
                     eprintln!(
                         "nix-ninja: job permit acquired after {}s wait",
                         t0.elapsed().as_secs()
                     );
                 }
-                break;
+                state.count += weight;
+                if heavy {
+                    state.heavy = state.heavy.saturating_sub(1);
+                }
+                break Ok(JobPermit {
+                    inner: self.inner.clone(),
+                    weight,
+                });
             }
-            if *count < prev_count {
+            if count < prev_count {
                 last_drain = std::time::Instant::now();
             }
-            prev_count = *count;
+            prev_count = count;
             let announce_due = if announced {
                 last_announce.elapsed() >= reannounce
             } else {
@@ -1136,27 +1165,26 @@ impl JobPermits {
             if last_drain.elapsed() >= zero_drain_bail {
                 let oom_clause =
                     oom_delta_clause(oom_at_park, current_oom_kills(), "during the park");
-                anyhow::bail!(
+                if heavy {
+                    state.heavy = state.heavy.saturating_sub(1);
+                }
+                cvar.notify_all();
+                return Err(anyhow::anyhow!(
                     "job permit acquisition stalled with no released permits for {}s (held {count} / budget {budget}, weight {weight}){oom_clause}",
                     last_drain.elapsed().as_secs()
-                );
+                ));
             }
-            let (c, _) = cvar.wait_timeout(count, tick).unwrap();
-            count = c;
+            let (s, _) = cvar.wait_timeout(state, tick).unwrap();
+            state = s;
         }
-        *count += weight;
-        Ok(JobPermit {
-            inner: self.inner.clone(),
-            weight,
-        })
     }
 }
 
 impl Drop for JobPermit {
     fn drop(&mut self) {
         let (lock, cvar) = &*self.inner;
-        let mut count = lock.lock().unwrap();
-        *count = count.saturating_sub(self.weight);
+        let mut state = lock.lock().unwrap();
+        state.count = state.count.saturating_sub(self.weight);
         cvar.notify_all();
     }
 }
@@ -25144,10 +25172,15 @@ mod job_permits_tests {
     /// admission. The waiter must stay silent through the cycling and bail
     /// only after it stops. A bail keyed on elapsed time fires mid-cycle and
     /// a deleted bail never fires at all, so this arm fails on both mutants.
+    ///
+    /// Weight 2 of cap 3 with two units held: the waiter can never admit
+    /// (2+2 > 3) while the helper cycles the third unit, and neither is
+    /// the full-budget class so the exclusive latch stays out of it.
     #[test]
     fn permit_wait_resets_drain_on_release() {
-        let permits = Arc::new(JobPermits::roomy(2));
-        let _held = permits.acquire_weighted(1).unwrap();
+        let permits = Arc::new(JobPermits::roomy(3));
+        let _held1 = permits.acquire_weighted(1).unwrap();
+        let _held2 = permits.acquire_weighted(1).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = permits.clone();
         std::thread::spawn(move || {
@@ -25239,6 +25272,59 @@ mod job_permits_tests {
             "waiter answered after {}ms: completions reset the drain clock",
             t0.elapsed().as_millis()
         );
+    }
+
+    /// An exclusive waiter must not starve behind a stream of small tasks.
+    /// The link class takes the full budget so it runs alone once held is
+    /// zero; without fairness small tasks re-acquire on every wakeup, held
+    /// never rests at zero, and the exclusive waiter rides the zero-drain
+    /// bail (qtwebengine's QuickDelegatesQml link: held 24/budget 24 for
+    /// 1800s while completions rose). With the latch, light waiters queue
+    /// behind a parked exclusive waiter instead of racing ahead.
+    ///
+    /// Deterministic shape: two units statically held, third free. A parked
+    /// exclusive waiter (needs all three) latches; a newly arriving light
+    /// waiter would admit at once pre-fix (2+1 <= 3) and must bail post-fix.
+    /// Releasing the held units then admits the exclusive waiter.
+    #[test]
+    fn light_waiters_queue_behind_a_parked_exclusive_waiter() {
+        let permits = Arc::new(JobPermits::roomy(3));
+        let _held1 = permits.acquire_weighted(1).unwrap();
+        let _held2 = permits.acquire_weighted(1).unwrap();
+        let waiter = permits.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = waiter
+                .acquire_weighted_with(
+                    3,
+                    std::time::Duration::from_millis(10),
+                    std::time::Duration::from_millis(10),
+                    std::time::Duration::from_millis(4000),
+                    std::time::Duration::from_millis(5),
+                )
+                .map(|_| ());
+            let _ = tx.send(res);
+        });
+        // Let the exclusive waiter park and latch before the light one arrives.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let light = permits.acquire_weighted_with(
+            1,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(5),
+        );
+        assert!(
+            light.is_err(),
+            "light waiter must queue behind a parked exclusive waiter, not race ahead",
+        );
+        // Drain to zero: the exclusive waiter must admit.
+        drop(_held1);
+        drop(_held2);
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a starved waiter must answer, not park forever");
+        res.expect("exclusive waiter must admit once held drains to zero");
     }
 }
 
