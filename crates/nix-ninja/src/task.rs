@@ -934,6 +934,14 @@ fn live_cgroup_avail_gib() -> Option<u64> {
 struct PermitState {
     count: usize,
     heavy: usize,
+    /// Who holds what, so a stalled wait can NAME its holders instead of
+    /// printing three numbers that say nothing about which edges never
+    /// released. qtwebengine 6.11.2 on pin 4823a3b (leaf 2026-11-05): 1800 s
+    /// with held 24 / budget 24 / weight 24 and no release, and the log
+    /// could not say which 24 edges held, because only the count was
+    /// recorded.
+    held: Vec<Holder>,
+    next_id: u64,
 }
 
 struct JobPermits {
@@ -976,8 +984,16 @@ struct Readings {
     full_gib: u64,
 }
 
+struct Holder {
+    id: u64,
+    label: String,
+    weight: usize,
+    since: std::time::Instant,
+}
+
 struct JobPermit {
     inner: Arc<(Mutex<PermitState>, Condvar)>,
+    id: u64,
     weight: usize,
 }
 
@@ -991,7 +1007,12 @@ impl JobPermits {
     fn new(cap: usize) -> Self {
         JobPermits {
             inner: Arc::new((
-                Mutex::new(PermitState { count: 0, heavy: 0 }),
+                Mutex::new(PermitState {
+                    count: 0,
+                    heavy: 0,
+                    held: Vec::new(),
+                    next_id: 0,
+                }),
                 Condvar::new(),
             )),
             cap,
@@ -1045,7 +1066,9 @@ impl JobPermits {
     /// zero drain (no released permit). Blocking in the scheduler's start()
     /// is deliberate backpressure: running task threads complete and release
     /// without needing the main loop. The bail turns a wedged round into a
-    /// loud error naming held/budget/weight instead of a silent hang.
+    /// loud error naming held/budget/weight INSTEAD of a silent hang, and
+    /// names the holding edges so the next stall is answerable from the log
+    /// alone.
     /// silent park; elapsed time alone never triggers it, so a healthy slow
     /// link waits out a whole compile wave.
     ///
@@ -1055,9 +1078,14 @@ impl JobPermits {
     /// to the FULL budget can still exceed the shrunken one, so the wait
     /// admits it once nothing else holds a unit - otherwise low memory would
     /// hang the round rather than slow it.
-    fn acquire_weighted(&self, weight: usize) -> Result<JobPermit> {
+    ///
+    /// `label` names the waiting edge on the wait/bail lines and is recorded
+    /// on admission, so a stall names who held, not just how many units.
+    /// It reaches stderr only, never the derivation, so naming is emission-free.
+    fn acquire_weighted(&self, weight: usize, label: &str) -> Result<JobPermit> {
         self.acquire_weighted_with(
             weight,
+            label,
             Self::PERMIT_FIRST_ANNOUNCE,
             Self::PERMIT_REANNOUNCE,
             Self::PERMIT_ZERO_DRAIN_BAIL,
@@ -1070,6 +1098,7 @@ impl JobPermits {
     fn acquire_weighted_with(
         &self,
         weight: usize,
+        label: &str,
         first_announce: std::time::Duration,
         reannounce: std::time::Duration,
         zero_drain_bail: std::time::Duration,
@@ -1132,12 +1161,21 @@ impl JobPermits {
                         t0.elapsed().as_secs()
                     );
                 }
+                let id = state.next_id;
+                state.next_id += 1;
                 state.count += weight;
+                state.held.push(Holder {
+                    id,
+                    label: label.to_string(),
+                    weight,
+                    since: std::time::Instant::now(),
+                });
                 if heavy {
                     state.heavy = state.heavy.saturating_sub(1);
                 }
                 break Ok(JobPermit {
                     inner: self.inner.clone(),
+                    id,
                     weight,
                 });
             }
@@ -1151,13 +1189,14 @@ impl JobPermits {
                 t0.elapsed() >= first_announce
             };
             if announce_due {
+                let holders = summarize_holders(&state.held);
                 if announced {
                     eprintln!(
-                        "nix-ninja: still waiting for job permits (held {count} / budget {budget}, weight {weight}, waited {}s)...",
+                        "nix-ninja: still waiting for job permits (held {count} / budget {budget}, weight {weight}, waited {}s)... {holders}",
                         t0.elapsed().as_secs()
                     );
                 } else {
-                    eprintln!("nix-ninja: waiting for job permits (held {count} / budget {budget}, weight {weight})...");
+                    eprintln!("nix-ninja: waiting for job permits (held {count} / budget {budget}, weight {weight}) for {label}... {holders}");
                     announced = true;
                 }
                 last_announce = std::time::Instant::now();
@@ -1168,9 +1207,10 @@ impl JobPermits {
                 if heavy {
                     state.heavy = state.heavy.saturating_sub(1);
                 }
+                let holders = summarize_holders(&state.held);
                 cvar.notify_all();
                 return Err(anyhow::anyhow!(
-                    "job permit acquisition stalled with no released permits for {}s (held {count} / budget {budget}, weight {weight}){oom_clause}",
+                    "job permit acquisition stalled with no released permits for {}s (held {count} / budget {budget}, weight {weight}) for {label}; holders: {holders}{oom_clause}",
                     last_drain.elapsed().as_secs()
                 ));
             }
@@ -1185,7 +1225,36 @@ impl Drop for JobPermit {
         let (lock, cvar) = &*self.inner;
         let mut state = lock.lock().unwrap();
         state.count = state.count.saturating_sub(self.weight);
+        state.held.retain(|h| h.id != self.id);
         cvar.notify_all();
+    }
+}
+
+/// Up to five holder labels with age, then a count: a stall over dozens of
+/// edges names its longest waiters without dumping the whole pool into the
+/// log. Pure, so the format is unit-tested without a scheduler.
+fn summarize_holders(held: &[Holder]) -> String {
+    let mut ordered: Vec<&Holder> = held.iter().collect();
+    ordered.sort_by_key(|h| std::cmp::Reverse(h.since.elapsed().as_secs()));
+    let mut shown: Vec<String> = ordered
+        .iter()
+        .take(5)
+        .map(|h| {
+            format!(
+                "{} ({}u, {}s)",
+                h.label,
+                h.weight,
+                h.since.elapsed().as_secs()
+            )
+        })
+        .collect();
+    if ordered.len() > shown.len() {
+        shown.push(format!("(+{} more)", ordered.len() - shown.len()));
+    }
+    if shown.is_empty() {
+        "holders: none".to_string()
+    } else {
+        format!("holders: {}", shown.join(", "))
     }
 }
 
@@ -1713,17 +1782,18 @@ impl Runner {
         self.in_flight_oom.insert(bid, current_oom_kills());
 
         let width = self.permits.cap;
-        let permit = self.permits.acquire_weighted(width).with_context(|| {
-            format!("local edge {label} ({member}): stalled waiting for job permits")
-        })?;
+        let local_label = format!("local edge {label} ({member})");
+        let permit = self
+            .permits
+            .acquire_weighted(width, &local_label)
+            .with_context(|| format!("{local_label}: stalled waiting for job permits"))?;
         let pool_permit = build
             .pool
             .as_ref()
             .and_then(|name| {
                 self.pool_permits.get(name).map(|p| {
-                    p.acquire_weighted(1).with_context(|| {
-                        format!("local edge {label} ({member}): stalled waiting for pool {name}")
-                    })
+                    p.acquire_weighted(1, &local_label)
+                        .with_context(|| format!("{local_label}: stalled waiting for pool {name}"))
                 })
             })
             .transpose()?;
@@ -2123,15 +2193,19 @@ impl Runner {
             .first()
             .map(|fid| task.files[fid].name.clone())
             .unwrap_or_else(|| format!("{bid:?}"));
+        let pool_label = format!("edge {label}");
         let permit = self
             .permits
-            .acquire_weighted(task_admission_weight(
-                task.cmdline.as_deref(),
-                task.outputs.iter().filter_map(|p| p.to_str()),
-                task.inputs.len(),
-                self.permits.cap,
-            ))
-            .with_context(|| format!("edge {label}: stalled waiting for job permits"))?;
+            .acquire_weighted(
+                task_admission_weight(
+                    task.cmdline.as_deref(),
+                    task.outputs.iter().filter_map(|p| p.to_str()),
+                    task.inputs.len(),
+                    self.permits.cap,
+                ),
+                &pool_label,
+            )
+            .with_context(|| format!("{pool_label}: stalled waiting for job permits"))?;
 
         resolve_section("pool");
         let pool_permit = build
@@ -2139,8 +2213,8 @@ impl Runner {
             .as_ref()
             .and_then(|name| {
                 self.pool_permits.get(name).map(|p| {
-                    p.acquire_weighted(1)
-                        .with_context(|| format!("edge {label}: stalled waiting for pool {name}"))
+                    p.acquire_weighted(1, &pool_label)
+                        .with_context(|| format!("{pool_label}: stalled waiting for pool {name}"))
                 })
             })
             .transpose()?;
@@ -24783,7 +24857,7 @@ mod job_permits_tests {
             let running = running.clone();
             let peak = peak.clone();
             handles.push(std::thread::spawn(move || {
-                let _permit = permits.acquire_weighted(1).unwrap();
+                let _permit = permits.acquire_weighted(1, "test").unwrap();
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -24902,7 +24976,7 @@ mod job_permits_tests {
     #[test]
     fn an_oversized_task_still_runs_alone() {
         let permits = std::sync::Arc::new(JobPermits::roomy(2));
-        let _p = permits.acquire_weighted(usize::MAX).unwrap();
+        let _p = permits.acquire_weighted(usize::MAX, "test").unwrap();
         // Acquiring it at all proves the empty-pool escape hatch works.
     }
 
@@ -24942,7 +25016,7 @@ mod job_permits_tests {
         for _ in 0..24 {
             let (permits, running, peak) = (permits.clone(), running.clone(), peak.clone());
             handles.push(std::thread::spawn(move || {
-                let _permit = permits.acquire_weighted(1).unwrap();
+                let _permit = permits.acquire_weighted(1, "test").unwrap();
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -24991,7 +25065,7 @@ mod job_permits_tests {
         for _ in 0..8 {
             let (permits, running, peak) = (permits.clone(), running.clone(), peak.clone());
             handles.push(std::thread::spawn(move || {
-                let _permit = permits.acquire_weighted(1).unwrap();
+                let _permit = permits.acquire_weighted(1, "test").unwrap();
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -25051,7 +25125,7 @@ mod job_permits_tests {
         for _ in 0..8 {
             let (permits, running, peak) = (permits.clone(), running.clone(), peak.clone());
             handles.push(std::thread::spawn(move || {
-                let _permit = permits.acquire_weighted(1).unwrap();
+                let _permit = permits.acquire_weighted(1, "test").unwrap();
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -25120,13 +25194,13 @@ mod job_permits_tests {
         let permits = Arc::new(JobPermits::roomy(1));
         let p2 = permits.clone();
         let _ = std::thread::spawn(move || {
-            let _permit = p2.acquire_weighted(1).unwrap();
+            let _permit = p2.acquire_weighted(1, "test").unwrap();
             panic!("task died");
         })
         .join();
         // If the panicking thread leaked its permit, this blocks forever
         // and the test times out; acquiring proves the Drop ran.
-        let _permit = permits.acquire_weighted(1).unwrap();
+        let _permit = permits.acquire_weighted(1, "test").unwrap();
     }
 
     /// The bail: a wait with zero drain must fail loudly instead of parking
@@ -25137,13 +25211,14 @@ mod job_permits_tests {
     #[test]
     fn permit_wait_bails_on_zero_drain() {
         let permits = Arc::new(JobPermits::roomy(1));
-        let _held = permits.acquire_weighted(1).unwrap();
+        let _held = permits.acquire_weighted(1, "test").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = permits.clone();
         std::thread::spawn(move || {
             let res = waiter
                 .acquire_weighted_with(
                     1,
+                    "test",
                     std::time::Duration::from_millis(10),
                     std::time::Duration::from_millis(10),
                     std::time::Duration::from_millis(100),
@@ -25179,14 +25254,15 @@ mod job_permits_tests {
     #[test]
     fn permit_wait_resets_drain_on_release() {
         let permits = Arc::new(JobPermits::roomy(3));
-        let _held1 = permits.acquire_weighted(1).unwrap();
-        let _held2 = permits.acquire_weighted(1).unwrap();
+        let _held1 = permits.acquire_weighted(1, "test").unwrap();
+        let _held2 = permits.acquire_weighted(1, "test").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = permits.clone();
         std::thread::spawn(move || {
             let res = waiter
                 .acquire_weighted_with(
                     2,
+                    "test",
                     std::time::Duration::from_millis(10),
                     std::time::Duration::from_millis(50),
                     std::time::Duration::from_millis(300),
@@ -25202,7 +25278,7 @@ mod job_permits_tests {
         let helper_permits = permits.clone();
         let helper = std::thread::spawn(move || {
             while !helper_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let p = helper_permits.acquire_weighted(1).unwrap();
+                let p = helper_permits.acquire_weighted(1, "test").unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 drop(p);
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -25235,7 +25311,7 @@ mod job_permits_tests {
     #[test]
     fn permit_wait_ignores_completions() {
         let permits = Arc::new(JobPermits::roomy(1));
-        let _held = permits.acquire_weighted(1).unwrap();
+        let _held = permits.acquire_weighted(1, "test").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = permits.clone();
         let t0 = std::time::Instant::now();
@@ -25243,6 +25319,7 @@ mod job_permits_tests {
             let res = waiter
                 .acquire_weighted_with(
                     1,
+                    "test",
                     std::time::Duration::from_millis(10),
                     std::time::Duration::from_millis(10),
                     std::time::Duration::from_millis(300),
@@ -25289,14 +25366,15 @@ mod job_permits_tests {
     #[test]
     fn light_waiters_queue_behind_a_parked_exclusive_waiter() {
         let permits = Arc::new(JobPermits::roomy(3));
-        let _held1 = permits.acquire_weighted(1).unwrap();
-        let _held2 = permits.acquire_weighted(1).unwrap();
+        let _held1 = permits.acquire_weighted(1, "test").unwrap();
+        let _held2 = permits.acquire_weighted(1, "test").unwrap();
         let waiter = permits.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let res = waiter
                 .acquire_weighted_with(
                     3,
+                    "test",
                     std::time::Duration::from_millis(10),
                     std::time::Duration::from_millis(10),
                     std::time::Duration::from_millis(4000),
@@ -25309,6 +25387,7 @@ mod job_permits_tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let light = permits.acquire_weighted_with(
             1,
+            "test",
             std::time::Duration::from_millis(10),
             std::time::Duration::from_millis(10),
             std::time::Duration::from_millis(500),
@@ -25325,6 +25404,34 @@ mod job_permits_tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("a starved waiter must answer, not park forever");
         res.expect("exclusive waiter must admit once held drains to zero");
+    }
+
+    /// A stalled wait names WHO held, not just how many units: the 4823a3b
+    /// qtwebengine bail (held 24 / budget 24 for 1800 s) answered nothing
+    /// about which edges the 24 units belonged to, because the state kept a
+    /// count only. Held labels ride `summarize_holders` on the wait and bail
+    /// lines; released permits leave the list on drop.
+    #[test]
+    fn bail_names_the_edges_that_held() {
+        let permits = JobPermits::roomy(2);
+        let _held = permits.acquire_weighted(2, "edge-foo.o").unwrap();
+        let inner = permits.inner.as_ref().0.lock().unwrap();
+        let line = super::summarize_holders(&inner.held);
+        assert!(
+            line.contains("edge-foo.o"),
+            "holder list must name the holding edge, got: {line}"
+        );
+        assert!(
+            line.contains("2u"),
+            "holder list must name the held weight, got: {line}"
+        );
+        drop(inner);
+        drop(_held);
+        let inner = permits.inner.as_ref().0.lock().unwrap();
+        assert!(
+            inner.held.is_empty(),
+            "a released permit must leave the holder list"
+        );
     }
 }
 
@@ -27039,7 +27146,7 @@ mod bom_first_line_tests {
 
 #[cfg(test)]
 mod generated_not_yet_written_tests {
-    use super::generated_not_yet_written;
+    use super::{fallback_tu_is_generated_absent, generated_not_yet_written};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -27081,6 +27188,78 @@ mod generated_not_yet_written_tests {
         assert!(!generated_not_yet_written(&bd, &rel, Some(&vp)));
         std::fs::remove_dir_all(&bd).ok();
     }
+
+    /// The qtwebengine 6.11.2 jumbo shape (leaf 2026-11-05): the compile
+    /// names a generated TU that is declared on the edge but unwritten at
+    /// resolve time. The fallback gcc would die on the TU itself, so it is
+    /// skipped and the scan's answer stands.
+    #[test]
+    fn a_generated_tu_absent_from_disk_skips_the_fallback() {
+        let bd = std::env::temp_dir();
+        let g = PathBuf::from("gen/ui/gfx/memory_buffer_sources_jumbo_1.cc");
+        let mut vp = HashMap::new();
+        vp.insert(g.clone(), g.clone());
+        let cmd = format!("cc -c {g} -o out.o -Igen", g = g.display());
+        assert!(fallback_tu_is_generated_absent(&cmd, &bd, Some(&vp)));
+    }
+
+    /// NEGATIVE CONTROL ONE: the TU exists, so the fallback must still run
+    /// (a computed include in a present TU is what it exists for).
+    #[test]
+    fn a_present_tu_still_runs_the_fallback() {
+        let bd = std::env::temp_dir().join(format!("nntu{}", std::process::id()));
+        std::fs::create_dir_all(&bd).unwrap();
+        let rel = PathBuf::from("tu.c");
+        std::fs::write(bd.join(&rel), b"int x;\n").unwrap();
+        let mut vp = HashMap::new();
+        vp.insert(rel.clone(), rel.clone());
+        let cmd = "cc -c tu.c -o tu.o";
+        assert!(!fallback_tu_is_generated_absent(cmd, &bd, Some(&vp)));
+        std::fs::remove_dir_all(&bd).ok();
+    }
+
+    /// NEGATIVE CONTROL TWO: the TU is absent but nobody declared it. That
+    /// is a broken edge, not a generated one, and the fallback must still
+    /// run loud rather than vanish into a skip.
+    #[test]
+    fn an_undeclared_absent_tu_still_runs_the_fallback() {
+        let bd = std::env::temp_dir();
+        let vp: HashMap<PathBuf, PathBuf> = HashMap::new();
+        assert!(!fallback_tu_is_generated_absent(
+            "cc -c no-such-tu.cc -o tu.o",
+            &bd,
+            Some(&vp)
+        ));
+        assert!(!fallback_tu_is_generated_absent(
+            "cc -c no-such-tu.cc -o tu.o",
+            &bd,
+            None,
+        ));
+    }
+
+    /// NEGATIVE CONTROL THREE: the output must not read as the TU. The
+    /// fallback's own rule takes the last non-flag dotted word skipping
+    /// `-o`/`-MF`/`-MQ`/`-MT` values; this pins the same rule, so a TU
+    /// followed by `-o out.o` still resolves to the TU.
+    #[test]
+    fn the_output_is_not_mistaken_for_the_tu() {
+        let bd = std::env::temp_dir();
+        let g = PathBuf::from("gen/jumbo_1.cc");
+        let mut vp = HashMap::new();
+        vp.insert(g.clone(), g.clone());
+        // TU before -o: must skip.
+        assert!(fallback_tu_is_generated_absent(
+            "cc -I. -c gen/jumbo_1.cc -o jumbo_1.o",
+            &bd,
+            Some(&vp)
+        ));
+        // No TU at all: must not skip.
+        assert!(!fallback_tu_is_generated_absent(
+            "cc -o jumbo_1.o -MF jumbo_1.o.d",
+            &bd,
+            Some(&vp)
+        ));
+    }
 }
 
 /// The paths the upload loop skips as ALREADY DECLARED: the scan's seeds
@@ -27120,6 +27299,48 @@ fn generated_not_yet_written(
         build_dir.join(include)
     };
     !abs.exists()
+}
+
+/// Whether the preprocessor fallback would die on the translation unit
+/// itself, before reaching any include. The fallback's `create_deps_command`
+/// takes the LAST non-flag dotted argv word as its input file (skipping the
+/// values of `-o`/`-MF`/`-MQ`/`-MT`); this mirrors that rule so the driver
+/// and the fallback agree on which file gcc would open. When that file is a
+/// declared-but-unwritten generated TU, the spawn cannot succeed: gcc exits
+/// on the missing TU and the scan's answer is kept anyway. Pure, so the
+/// rule is unit-tested without a daemon.
+///
+/// NOT factored into deps-infer's `gcc_depfile_parser`: that crate ships in
+/// the task binary's fileset, and any edit there re-keys every banked
+/// compile. The rule is duplicated deliberately, with this comment as the
+/// reason; `create_deps_command`'s own tests pin the shape it mirrors.
+fn fallback_tu_is_generated_absent(
+    cmdline: &str,
+    build_dir: &Path,
+    virtual_declared: Option<&HashMap<PathBuf, PathBuf>>,
+) -> bool {
+    let Ok(args) = shell_words::split(cmdline) else {
+        return false;
+    };
+    let mut input: Option<&str> = None;
+    let mut skip_next = false;
+    for arg in &args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "-o" || arg == "-MF" || arg == "-MQ" || arg == "-MT" {
+            skip_next = true;
+            continue;
+        }
+        if !arg.starts_with('-') && arg.contains('.') {
+            input = Some(arg);
+        }
+    }
+    let Some(tu) = input else {
+        return false;
+    };
+    generated_not_yet_written(build_dir, Path::new(tu), virtual_declared)
 }
 
 /// What one task's dependency discovery produced.
@@ -28397,50 +28618,79 @@ pub fn discover_c_includes(
             // would turn a build error into a wrong artifact, which is the
             // one outcome worse than the bug being fixed.
             if incomplete {
-                match deps_infer::gcc_depfile::retrieve_c_includes(cmdline) {
-                    Ok(deps) => {
-                        // THE PREPROCESSOR ADDS TO THE SCAN, IT DOES NOT REPLACE IT.
-                        // `-MM` (include_system_headers: false) omits every header gcc
-                        // considers a SYSTEM header, and that is a property of the
-                        // FILE rather than of where it lives: gnulib writes
-                        // `#pragma GCC system_header` into the replacement headers it
-                        // GENERATES INTO THE BUILD DIRECTORY. So the depfile answer
-                        // silently drops build-dir files that must be materialized.
-                        // Measured 2026-08-24 on gnum4-1.4.21: `gcc -MM -I. quotearg.c`
-                        // declares 15 headers with lib/wchar.h and lib/limits.h absent,
-                        // `gcc -M` lists both, and the textual scan finds both. The
-                        // task then compiled against the SYSTEM wchar.h and died
-                        // `implicit declaration of function 'mbszero'` - a wrong-header
-                        // failure wearing a missing-prototype message, because an angle
-                        // include that was never materialized SUCCEEDS at finding the
-                        // wrong file.
-                        //
-                        // Neither answer is a superset of the other: the scan is blind
-                        // to computed includes (cmake's kwsys), the depfile is blind to
-                        // pragma-marked build-dir headers (every autotools package
-                        // carrying gnulib). Union them, scan order first. Over-declaring
-                        // is the pipeline's safe polarity - an extra input costs one
-                        // upload - while under-declaring is silent and ships the wrong
-                        // artifact.
-                        answer_source = "the scan and the preprocessor".to_string();
-                        let merged = merge_scan_and_preprocessor(scanned, deps);
+                // A GENERATED TU IS NEVER ON THE DRIVER'S DISK, so the
+                // confirming preprocess cannot run for it: cc1plus dies on
+                // the TU itself before reaching any include, and the scan's
+                // answer is kept anyway. Spawning it anyway costs a dead
+                // cc1plus per TU (87 in one qtwebengine round, leaf
+                // 2026-11-05) and prints a loud warning the task's fate does
+                // not deserve: the task carries the TU as a Built input
+                // (scheduler-ordered behind its producer) and the dynamic
+                // arm recovers the TU's content at build time from realised
+                // inputs. Skip the spawn when the TU names a declared-but-
+                // unwritten generated file; a present TU, or a missing one
+                // nobody declared (a real defect), still runs the fallback
+                // exactly as before.
+                let tu_generated_absent =
+                    fallback_tu_is_generated_absent(cmdline, build_dir, virtual_declared.as_ref());
+                if tu_generated_absent {
+                    answer_source = "the scan (preprocessor fallback skipped: \
+                        translation unit is generated and not yet written)"
+                        .to_string();
+                    if explain {
                         eprintln!(
-                            "nix-ninja: computed include unresolvable by scan; \
-                             scan and preprocessor union to {} input(s)",
-                            merged.len()
-                        );
-                        merged
-                    }
-                    Err(e) => {
-                        answer_source = "the scan, the preprocessor having failed".to_string();
-                        eprintln!(
-                            "nix-ninja: computed include unresolvable by scan and the \
-                             preprocessor fallback failed ({e}); keeping the scan's {} \
-                             input(s), so the task fails loudly rather than silently \
-                             building with the wrong ones",
+                            "nix-ninja: discovery {seed}: skipping preprocessor \
+                             fallback for generated TU, keeping the scan's {} input(s)",
                             scanned.len()
                         );
-                        scanned
+                    }
+                    scanned
+                } else {
+                    match deps_infer::gcc_depfile::retrieve_c_includes(cmdline) {
+                        Ok(deps) => {
+                            // THE PREPROCESSOR ADDS TO THE SCAN, IT DOES NOT REPLACE IT.
+                            // `-MM` (include_system_headers: false) omits every header gcc
+                            // considers a SYSTEM header, and that is a property of the
+                            // FILE rather than of where it lives: gnulib writes
+                            // `#pragma GCC system_header` into the replacement headers it
+                            // GENERATES INTO THE BUILD DIRECTORY. So the depfile answer
+                            // silently drops build-dir files that must be materialized.
+                            // Measured 2026-08-24 on gnum4-1.4.21: `gcc -MM -I. quotearg.c`
+                            // declares 15 headers with lib/wchar.h and lib/limits.h absent,
+                            // `gcc -M` lists both, and the textual scan finds both. The
+                            // task then compiled against the SYSTEM wchar.h and died
+                            // `implicit declaration of function 'mbszero'` - a wrong-header
+                            // failure wearing a missing-prototype message, because an angle
+                            // include that was never materialized SUCCEEDS at finding the
+                            // wrong file.
+                            //
+                            // Neither answer is a superset of the other: the scan is blind
+                            // to computed includes (cmake's kwsys), the depfile is blind to
+                            // pragma-marked build-dir headers (every autotools package
+                            // carrying gnulib). Union them, scan order first. Over-declaring
+                            // is the pipeline's safe polarity - an extra input costs one
+                            // upload - while under-declaring is silent and ships the wrong
+                            // artifact.
+                            answer_source = "the scan and the preprocessor".to_string();
+                            let merged = merge_scan_and_preprocessor(scanned, deps);
+                            eprintln!(
+                                "nix-ninja: computed include unresolvable by scan; \
+                             scan and preprocessor union to {} input(s)",
+                                merged.len()
+                            );
+                            merged
+                        }
+                        Err(e) => {
+                            answer_source = "the scan, the preprocessor having failed".to_string();
+                            eprintln!(
+                                "nix-ninja: computed include unresolvable by scan and the \
+                                 preprocessor fallback failed ({e}); keeping the scan's {} \
+                                 input(s), so the task fails loudly rather than silently \
+                                 building with the wrong ones",
+                                scanned.len()
+                            );
+                            scanned
+                        }
                     }
                 }
             } else {
