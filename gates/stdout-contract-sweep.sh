@@ -8,6 +8,11 @@
 # one is a diagnostic by its own declaration, and a diagnostic on stdout is
 # the defect. Nothing here has to guess intent.
 #
+# The permit wait and bail lines name their holders: `holders:` followed by
+# up to five `label (weightu, ages)` entries, longest-held first, then a
+# `(+N more)` count. A released permit leaves the list, so an empty pool
+# reads `holders: none`. The shape is fixed; the names are the edges.
+#
 # WHY A STATIC ARM WHEN logging-contract-repro.sh ALREADY EXISTS. That gate is
 # dynamic and correct, and it can only see the call sites its fixture reaches:
 # it drives one build and one `-t drv`, so a diagnostic on a path no fixture

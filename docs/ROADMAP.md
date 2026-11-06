@@ -600,6 +600,13 @@ original environment before the second depends on it.
   generator's own data directory is the driver's to carry, which is a design
   question before it is a code one.
 
+Not a fifth class: the preprocessor fallback is now skipped when the TU is a
+declared-but-unwritten generated file (the confirming `gcc -M` would die on
+the absent TU itself, so the scan answer is kept without the spawn). That is
+a refinement of the fallback's polarity, not a new failure shape: the static
+scan still excludes Built inputs by design and the dynamic arm still covers
+the TU at build time, so the class count above stands.
+
 ### 3. Narrow the configure derivation's source
 
 LANDED. The configure cache was built and did not pay because `src` was an input, so any source edit rebuilt it.
@@ -803,7 +810,9 @@ Unit tests pin the predicate against `Readings` including every ambiguous
 case plus the no-outputs and no-`.so`-output halves; the negative control
 is the predicate reverted, which overlaps. Consumer wiring (governor
 bounds, retry-loop classification, the fixed driver rev) stays
-consumer-side.
+consumer-side. A parked exclusive waiter additionally latches light waiters
+behind it, so a small-task stream cannot starve the link past the bail;
+what the latch orders, the holder lines in item 15 name.
 
 ### 13. Make a signal-9 retry resume instead of restart (qtwebengine priority)
 
@@ -847,7 +856,8 @@ carries the cgroup path; admission and the heap default take the min with its
 ceiling, and FAILED, permit-bail and stall lines name the `oom_kill` rise
 while an edge is in flight. A permit wait with zero drain re-announces every
 minute as a heartbeat and bails after thirty minutes naming held, budget,
-weight and the waiting edge; the drain clock resets on every release and
+weight, the waiting edge, and the five longest-held holder edges with their
+weights and ages; the drain clock resets on every release and
 every finished build, so a healthy slow link never trips it. Unset keeps
 host-only behavior. Scheduling and stderr only, so emission-free by
 construction and proved by `emission-price.sh df404f1` (task `drvPath`
