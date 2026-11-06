@@ -11,6 +11,10 @@ Incremental compilation of [Ninja build files][ninja-build] using
 graph representation lets us support any build system that outputs ninja like
 CMake, meson, premake, gn, etc.
 
+This tree is maintained here, alongside upstream rather than in place of
+it: upstream has not committed since May 2026, so development continues in
+this fork in the meantime. See [Origins](#origins) for the lineage.
+
 [![Demo](docs/demo.gif)](https://asciinema.org/a/711344)
 
 *An incremental rebuild driven by nix-ninja. The recording is the project's
@@ -115,6 +119,11 @@ experimental features are not enabled in the DAEMON's configuration; the
 Without cloning, every attribute works through the flake URL
 (`nix build github:jdmanring/nix-ninja#legacyPackages.x86_64-linux.example-hello`);
 the clone form is used throughout because it is what a contributor runs.
+
+To iterate without touching the system daemon, use the throwaway store
+(`contrib/devstore.sh selftest`, then `contrib/devstore.sh run -- <cmd>`);
+see [CONTRIBUTING](CONTRIBUTING.md). It builds against the repository's
+pinned nix and never syncs back to the global store.
 
 You can also try running `nix-ninja` outside of Nix, but you'll need both
 `nix-ninja` and `nix-ninja-task` to be in your `$PATH`. Make sure

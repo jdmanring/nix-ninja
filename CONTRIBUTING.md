@@ -11,6 +11,17 @@ into a fix. For a question, or a design space that is still wide, use
 [discussions](https://github.com/jdmanring/nix-ninja/discussions) before writing
 code.
 
+### How to read the evidence in rows and logs
+
+A CHANGELOG row or status line names the package that carried the measured
+case (often a large Chromium-family build); the fix it records is the
+mechanism, never the package. A store hash in prose proves byte-identity
+between two derivations, not a fact about the package beside it. A "leaf
+log" is `nix log <drv>` on the failing derivation. Paths under `local/`
+name the private development half (round logs, price records); they are
+never required to verify a public claim, which always cites a commit and a
+gate or test in this repository.
+
 ## Project Structure
 
 The implementation is split into four crates, plus a vendored dependency:

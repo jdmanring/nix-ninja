@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a capability, a new edge class, or a verification instrument.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What should it do
+      description: The capability or class, stated as behavior, not mechanism.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: The failing package or missing verification that motivates it.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: How would we know it works
+      description: The gate, test, or measured run that would verify it.
+    validations:
+      required: false
