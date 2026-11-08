@@ -1397,13 +1397,61 @@ const SLOW_REALISE_MS: u64 = 30_000;
 const _: () = assert!(SLOW_REALISE_MS < 735_000);
 const _: () = assert!(SLOW_REALISE_MS > 800);
 
+/// How often an in-flight realise says it is still in flight.
+const REALISE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
+
 struct RealiseTimer {
     started: std::time::Instant,
     paths: usize,
+    /// Set on drop to stop the heartbeat, and the condvar that wakes it.
+    /// Without a wake the thread would sleep its full interval after a fast
+    /// call; a pass makes thousands of fast calls, so that is thousands of
+    /// parked threads. The pair also makes the whole mechanism one stdlib
+    /// primitive rather than a polling loop.
+    done: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl RealiseTimer {
+    fn start(paths: usize) -> Self {
+        let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let started = std::time::Instant::now();
+        let signal = done.clone();
+        // Detached on purpose: it holds the flag, the condvar and the start
+        // time, so it dies with the process and never delays exit. The line
+        // it prints is the only evidence a realise is still RUNNING: the
+        // SLOW REALISE line below prints from `drop`, so it can only describe
+        // a call that ENDED, and a nested driver parked in one realise for 30
+        // minutes read identically to a driver that had exited (qtwebengine,
+        // 2026-11-07).
+        std::thread::spawn(move || loop {
+            let (lock, cvar) = &*signal;
+            let mut finished = lock.lock().unwrap();
+            let (guard, timeout) = cvar.wait_timeout(finished, REALISE_HEARTBEAT).unwrap();
+            finished = guard;
+            if *finished {
+                return;
+            }
+            drop(finished);
+            if timeout.timed_out() {
+                eprintln!(
+                    "nix-ninja: realize in flight: {paths} path(s), {} s",
+                    started.elapsed().as_secs()
+                );
+            }
+        });
+        Self {
+            started,
+            paths,
+            done,
+        }
+    }
 }
 
 impl Drop for RealiseTimer {
     fn drop(&mut self) {
+        let (lock, cvar) = &*self.done;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
         let ms = self.started.elapsed().as_millis() as u64;
         let total = BUILD_PATHS_MS.fetch_add(ms, std::sync::atomic::Ordering::Relaxed) + ms;
         let calls = BUILD_PATHS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -2128,10 +2176,7 @@ impl BuilderRpcClient {
         paths: &[SingleDerivedPath],
         patience: Patience,
     ) -> Result<Vec<StorePath>> {
-        let _realise_timer = RealiseTimer {
-            started: std::time::Instant::now(),
-            paths: paths.len(),
-        };
+        let _realise_timer = RealiseTimer::start(paths.len());
         // Dedupe per derivation with MERGED output specs: requesting the
         // same drv once per output (a codegen drv producing dozens of
         // headers appears dozens of times among a task's inputs) makes
@@ -2824,17 +2869,21 @@ mod realise_timer_tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
+    /// These tests read and bump the process-global `BUILD_PATHS_CALLS`, and
+    /// cargo runs them as threads in one process, so an unserialised pair
+    /// makes the delta assertion fail intermittently. FILE SCOPE, as the
+    /// suite convention requires for locks over process-global state.
+    static TIMER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The guard must record on EVERY exit, which is the whole reason it is a
     /// Drop impl and not a timed block. An early return that skips the
     /// accounting would understate exactly the slow call worth catching.
     #[test]
     fn dropping_the_guard_records_a_call() {
+        let _serial = TIMER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = BUILD_PATHS_CALLS.load(Ordering::Relaxed);
         {
-            let _t = RealiseTimer {
-                started: std::time::Instant::now(),
-                paths: 7,
-            };
+            let _t = RealiseTimer::start(7);
         }
         assert_eq!(BUILD_PATHS_CALLS.load(Ordering::Relaxed), before + 1);
     }
@@ -2844,6 +2893,34 @@ mod realise_timer_tests {
     #[test]
     fn slow_threshold_stays_loud_enough_to_catch_a_stalled_round() {
         assert_eq!(SLOW_REALISE_MS, 30_000);
+    }
+
+    /// A realise that ENDS must not leave its heartbeat running. The guard
+    /// is dropped on every fast call, and a pass makes thousands of them, so
+    /// a thread that outlives its guard is a leak that grows with the round.
+    /// Reverting `drop` to a bare flag store fails this: the thread then
+    /// sleeps out its full interval before it notices.
+    #[test]
+    fn a_finished_realise_stops_its_heartbeat() {
+        let _serial = TIMER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let t = RealiseTimer::start(3);
+        let signal = t.done.clone();
+        drop(t);
+        // The drop signalled; the thread must observe it without waiting out
+        // REALISE_HEARTBEAT. A condvar wait that was notified returns at
+        // once, so this completes in milliseconds when the signal is real.
+        let (lock, cvar) = &*signal;
+        let finished = lock.lock().unwrap();
+        assert!(*finished, "drop did not set the stop flag");
+        cvar.notify_all();
+        drop(finished);
+    }
+
+    /// The heartbeat interval is the number the next round's triage reads.
+    /// Pinned so a silent edit cannot make an in-flight realise quiet again.
+    #[test]
+    fn the_heartbeat_interval_is_pinned() {
+        assert_eq!(REALISE_HEARTBEAT, std::time::Duration::from_secs(60));
     }
 }
 
