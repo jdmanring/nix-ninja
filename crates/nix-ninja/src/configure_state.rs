@@ -230,7 +230,21 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
                     first.join(" ")
                 )))
             }
-            Some(_) => {}
+            // THE SAME DRIVER, and the only branch that used to be silent.
+            // A sweep sums `later-pass reused` across every class of a kept
+            // tree, so it cannot tell a pass that reused state the MAPPED
+            // driver wrote from one that reused another driver's. Branch 1
+            // above names the driver it rejected; this names the one it
+            // accepted, so the same sum can be attributed. Only on a later
+            // pass: a first pass reuses nothing and has nothing to attribute.
+            Some(_) => {
+                if later {
+                    eprintln!(
+                        "nix-ninja: later pass under the same driver (`{invocation}`): \
+                         reusing its task derivations"
+                    );
+                }
+            }
             None if later => {
                 return Err(std::io::Error::other(format!(
                     "a later pass found no record of how the first ran in {}",

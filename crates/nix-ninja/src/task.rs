@@ -967,6 +967,20 @@ struct JobPermits {
     /// would leave the expected budget a function of whichever machine ran
     /// the test.
     readings: Option<Readings>,
+    /// Whether a SPAWNED local edge can complete work while a waiter parks.
+    ///
+    /// A task waiter parked in `start` shares the scheduler thread with
+    /// `wait`, so no completion can land under it and the drain clock must
+    /// read releases only - that is why the completion read was removed in
+    /// `9edebbb`. A LOCAL EDGE waiter does not share that thread:
+    /// `start_local_edge` acquires on the scheduler thread and only then
+    /// spawns the child, so an edge already spawned keeps completing on its
+    /// own thread. Without the read, a full-budget local edge holding every
+    /// unit for a legitimately long pass produces zero drain for its whole
+    /// life and the bail fires on a healthy edge (qtwebengine, 2026-11-07:
+    /// 21.1 min of build plus 10.6 min of tail, 1904 s against an 1800 s
+    /// window).
+    local_edges_in_flight: bool,
 }
 
 /// What admission reads about the machine. One struct so a test supplies the
@@ -1018,7 +1032,16 @@ impl JobPermits {
             cap,
             load_limit: 0.0,
             readings: None,
+            local_edges_in_flight: false,
         }
+    }
+
+    /// A pool whose waiters may see completions move under them, because a
+    /// spawned local edge completes on its own thread. The runner's pool sets
+    /// it; a test constructing `roomy` keeps the task-path behaviour.
+    fn with_local_edges(mut self) -> Self {
+        self.local_edges_in_flight = true;
+        self
     }
 
     /// Ninja's `-l`. 0.0 leaves it disabled.
@@ -1095,6 +1118,7 @@ impl JobPermits {
 
     /// The wait, with its clocks as parameters so a test drives it in
     /// milliseconds instead of half an hour.
+    ///
     fn acquire_weighted_with(
         &self,
         weight: usize,
@@ -1110,14 +1134,25 @@ impl JobPermits {
         let t0 = std::time::Instant::now();
         let mut last_announce = t0;
         let mut announced = false;
-        // The zero-drain clock resets on every observed release (held count
-        // falling) and nothing else. Finished builds do NOT reset it: the
-        // completions counter is bumped by wait() on this same thread, and
-        // while this waiter is parked in start() wait() cannot run, so the
-        // counter cannot move under it. An arm that consulted it would read
-        // dead for the whole park - honest only if it says releases.
+        // The zero-drain clock resets on an observed release (held count
+        // falling) and, WHERE THE COMPLETING THREAD IS NOT THIS ONE, on a
+        // finished build too.
+        //
+        // A task waiter parked in `start` shares the scheduler thread with
+        // `wait`, so no completion can land under it and reading the counter
+        // there would be dead - that is why the read was removed in `9edebbb`.
+        // A LOCAL EDGE waiter does not: `start_local_edge` acquires on the
+        // scheduler thread and only then spawns the child, so an edge already
+        // spawned keeps completing on its own thread while this one parks.
+        // Without the read, a full-budget local edge holding all units for a
+        // legitimately long pass produces zero drain for its whole life and
+        // the bail fires on a healthy edge (qtwebengine, 2026-11-07: 21.1 min
+        // of build plus 10.6 min of tail, 1904 s against an 1800 s window).
         let mut last_drain = t0;
         let mut prev_count = state.count;
+        let mut prev_completed = self
+            .local_edges_in_flight
+            .then(|| COMPLETED_BUILDS.load(std::sync::atomic::Ordering::Relaxed));
         // The OOM counter at the moment this waiter parked, so the bail can
         // name churn during the park rather than asserting stuckness from
         // silence alone. One file read per park, never on the tick.
@@ -1183,6 +1218,13 @@ impl JobPermits {
                 last_drain = std::time::Instant::now();
             }
             prev_count = count;
+            if let Some(seen) = prev_completed {
+                let now = COMPLETED_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+                if now != seen {
+                    last_drain = std::time::Instant::now();
+                    prev_completed = Some(now);
+                }
+            }
             let announce_due = if announced {
                 last_announce.elapsed() >= reannounce
             } else {
@@ -1486,7 +1528,13 @@ impl Runner {
         }
 
         let (tx, rx) = mpsc::channel();
-        let permits = JobPermits::new(config.jobs.max(1)).with_load_limit(config.load_limit);
+        // `with_local_edges` unconditionally: any graph this driver builds may
+        // spawn a local edge, and reading completions is only wrong where the
+        // completer shares the waiter's thread, which the local-edge path
+        // never does.
+        let permits = JobPermits::new(config.jobs.max(1))
+            .with_load_limit(config.load_limit)
+            .with_local_edges();
         let pool_permits = pool_permits_from_depths(&config.pools);
         Ok(Runner {
             derived_files: HashMap::new(),
@@ -25349,6 +25397,83 @@ mod job_permits_tests {
             "waiter answered after {}ms: completions reset the drain clock",
             t0.elapsed().as_millis()
         );
+    }
+
+    /// THE ARM THE ABORT NEEDED.
+    ///
+    /// `permit_wait_ignores_completions` above encodes the removal's premise:
+    /// a waiter parked in `start` shares the scheduler thread with the
+    /// completer, so completions cannot move under the park. That premise is
+    /// FALSE for a local edge. `start_local_edge` acquires on the scheduler
+    /// thread and only then spawns the child, so an already-spawned edge keeps
+    /// completing on its own thread while this waiter parks. Reading
+    /// completions there is not dead, and not reading them is what bailed a
+    /// healthy qtwebengine round after 1800 s (21.1 min of build plus 10.6 min
+    /// of tail, 1904 s against the window).
+    ///
+    /// Shape: a full-budget edge holds every unit for the whole test, a
+    /// lighter waiter parks behind it, and the holder's child keeps
+    /// completing. Nothing is released, so the releases clock never resets,
+    /// and the waiter must NOT bail while completions rise.
+    ///
+    /// A positive arm cannot catch this: any test that passes before and after
+    /// the fix is not an arm. This one fails on the code that removed the read.
+    #[test]
+    fn a_local_edge_holder_completing_work_holds_the_bail_off() {
+        let permits = Arc::new(JobPermits::roomy(2).with_local_edges());
+        // The local edge: full budget, held for the whole test. This is
+        // `start_local_edge`'s acquire (width == cap).
+        let edge = permits.acquire_weighted(2, "local edge test (nested ninja)");
+        let _edge = edge.unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = permits.clone();
+        let t0 = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let res = waiter
+                .acquire_weighted_with(
+                    1,
+                    "test",
+                    std::time::Duration::from_millis(10),
+                    std::time::Duration::from_millis(10),
+                    // Bail window well shorter than the test's run, so a
+                    // releases-only clock fires and a completion-aware one
+                    // does not.
+                    std::time::Duration::from_millis(300),
+                    std::time::Duration::from_millis(5),
+                )
+                .map(|_| ());
+            let _ = tx.send(res);
+        });
+        // The holder's child completing work, exactly as a nested pass does
+        // while the outer scheduler is parked.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let child_stop = stop.clone();
+        let child = std::thread::spawn(move || {
+            while !child_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                super::note_build_completed();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        // Longer than the bail window: on releases-only code the waiter
+        // answers here with the stall error.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let early = rx.try_recv();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        child.join().unwrap();
+        assert!(
+            early.is_err(),
+            "the waiter bailed after {}ms while the local edge's child was \
+             still completing work: the drain clock ignores completions on \
+             the local-edge path",
+            t0.elapsed().as_millis()
+        );
+        // Drop the holder and the waiter must be admitted, so this asserts
+        // the waiter was genuinely parked rather than never started.
+        drop(_edge);
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the waiter must be admitted once the edge releases");
+        res.expect("the waiter must be admitted, not answered with a bail");
     }
 
     /// An exclusive waiter must not starve behind a stream of small tasks.
