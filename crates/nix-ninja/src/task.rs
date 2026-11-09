@@ -22151,26 +22151,20 @@ fn phys_mem_mib() -> Option<u64> {
         .map(|kb| kb / 1024)
 }
 
-/// Linear projection of resolve-phase live heap at schedule end, in MiB.
-/// None when there is nothing to project from (no sample yet) or nothing
-/// left (the schedule is drained). Integer MiB means sub-MiB growth over
-/// the sample reads as zero per task and the projection is just now: an
-/// honest floor, not a promise the leak stopped. LIVE, not retained: the
-/// allocator's free-but-held high-water mark is not a working set and
-/// refusing on it would kill schedules with room to finish.
-fn projected_live_mib(base_live: u64, now_live: u64, n: u64, total: u64) -> Option<u64> {
-    if n == 0 || total <= n {
-        return None;
-    }
-    let growth = now_live.saturating_sub(base_live);
-    Some(now_live.saturating_add(growth.saturating_mul(total - n) / n))
-}
-
-/// Refuse a schedule whose resolve heap projects past the limit. Called on
-/// the progress tick, so the earliest projection lands after 500 tasks -
+/// Refuse a schedule whose resolve LIVE heap is past the limit. Called on
+/// the progress tick, so the earliest refusal lands after 500 tasks -
 /// minutes, not the hours a full qtwebengine resolve burns before dying.
-/// A bail here aborts the run through `start`'s caller with the projected
-/// peak named, which is the verdict the OOM kill never prints.
+/// A bail here aborts the run through `start`'s caller with the peak named,
+/// which is the verdict the OOM kill never prints.
+///
+/// The measurement, never an extrapolation of it. A linear projection from
+/// the first 500 tasks refused qtwebengine's 24,410-task schedule at 2,272
+/// MiB live against a 47,825 MiB limit, projecting 82,657 MiB from a sample
+/// that had not yet shown whether the schedule plateaus; the drive died in
+/// 74 s on a number no run ever reached. Growth from a prefix does not
+/// describe a schedule whose allocations are freed as it goes. LIVE, not
+/// retained: the allocator's free-but-held high-water mark is not a working
+/// set and refusing on it would kill schedules with room to finish.
 fn check_heap_bound(n_tasks: u64) -> Result<()> {
     let total = TOTAL_TASKS.load(std::sync::atomic::Ordering::Relaxed);
     if total == 0 || n_tasks < 500 || total <= n_tasks {
@@ -22179,58 +22173,22 @@ fn check_heap_bound(n_tasks: u64) -> Result<()> {
     let Some((live, _)) = self_heap_mib() else {
         return Ok(());
     };
-    if !HEAP_BASE_SET.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok(());
-    }
-    let base = HEAP_BASE_LIVE.load(std::sync::atomic::Ordering::Relaxed);
     let limit = heap_limit_mib();
-    if let Some(proj) = projected_live_mib(base, live, n_tasks, total) {
-        if proj > limit {
-            anyhow::bail!(
-                "nix-ninja: heap bound refused: resolve live heap projects to {proj} MiB at task {total} ({live} MiB live at task {n_tasks}/{total}, limit {limit} MiB); set NIX_NINJA_HEAP_LIMIT_MIB to raise it"
-            );
-        }
+    if live > limit {
+        anyhow::bail!(
+            "nix-ninja: heap bound refused: resolve live heap is {live} MiB at task {n_tasks}/{total}, limit {limit} MiB; set NIX_NINJA_HEAP_LIMIT_MIB to raise it"
+        );
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod heap_bound_tests {
-    //! The bound refuses on a projection, never on a feeling: flat growth
-    //! projects flat, linear growth projects linearly, and a drained
-    //! schedule or an empty sample projects nothing. The env knob wins over
-    //! the machine-derived default, and garbage in the knob falls back to
-    //! the default rather than refusing everything or nothing.
-    use super::{parse_heap_limit, progress_tasks_fragment, projected_live_mib};
-
-    #[test]
-    fn flat_growth_projects_now() {
-        // Sub-MiB growth over the sample is the same case in integer MiB:
-        // zero per task, so the projection is the floor, not a promise
-        // the leak stopped.
-        assert_eq!(projected_live_mib(100, 100, 500, 15500), Some(100));
-    }
-
-    #[test]
-    fn linear_growth_projects_to_end() {
-        // 100 MiB over the first 500 of 15,500 tasks: 30 MiB/task over
-        // 15,000 left, 450,100 MiB at the end.
-        assert_eq!(
-            projected_live_mib(100, 200, 500, 15500),
-            Some(200 + 100 * 15000 / 500)
-        );
-    }
-
-    #[test]
-    fn drained_or_empty_sample_projects_nothing() {
-        assert_eq!(projected_live_mib(100, 200, 15500, 15500), None);
-        assert_eq!(projected_live_mib(100, 200, 0, 15500), None);
-    }
-
-    #[test]
-    fn freed_heap_does_not_project_negative() {
-        assert_eq!(projected_live_mib(200, 100, 500, 15500), Some(100));
-    }
+    //! The bound refuses on the live heap it measured, never on a
+    //! projection of it. The env knob wins over the machine-derived
+    //! default, and garbage in the knob falls back to the default rather
+    //! than refusing everything or nothing.
+    use super::{parse_heap_limit, progress_tasks_fragment};
 
     #[test]
     fn the_knob_wins_garbage_falls_back() {
@@ -22250,15 +22208,14 @@ mod heap_bound_tests {
 
     #[test]
     fn the_bound_fires_on_a_live_schedule_and_not_without_one() {
-        use super::{check_heap_bound, HEAP_BASE_LIVE, HEAP_BASE_SET, OUT_ENV_LOCK, TOTAL_TASKS};
+        use super::{check_heap_bound, self_heap_mib, HEAP_BASE_LIVE, OUT_ENV_LOCK, TOTAL_TASKS};
         use std::sync::atomic::Ordering;
         // Under the lock every other env-mutating test takes; the globals
-        // rigged here are read by no other test, and all four are restored
-        // before asserting so a failure still leaves the process clean.
+        // rigged here are restored before asserting so a failure still
+        // leaves the process clean.
         let _env = OUT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_total = TOTAL_TASKS.load(Ordering::Relaxed);
         let old_base = HEAP_BASE_LIVE.load(Ordering::Relaxed);
-        let old_set = HEAP_BASE_SET.load(Ordering::Relaxed);
         let old_var = std::env::var("NIX_NINJA_HEAP_LIMIT_MIB").ok();
         // Four live MiB the allocator cannot round away. The seed comes
         // from black_box: with a literal fill the optimizer knows every
@@ -22270,21 +22227,37 @@ mod heap_bound_tests {
         let checksum: u64 = hold.iter().map(|&b| b as u64).sum();
         std::hint::black_box(checksum);
         TOTAL_TASKS.store(15500, Ordering::Relaxed);
-        HEAP_BASE_LIVE.store(0, Ordering::Relaxed);
-        HEAP_BASE_SET.store(true, Ordering::Relaxed);
+        // The baseline is what a projection would grow from. It is set
+        // below the measured live heap so a reintroduced projection reads
+        // real growth rather than zero: an arm that leaves the baseline at
+        // live, or inherits whatever a prior test stored, passes under the
+        // mutant because there is nothing to extrapolate.
+        let (live_now, _) = self_heap_mib().expect("glibc allocator");
+        HEAP_BASE_LIVE.store(live_now.saturating_sub(4), Ordering::Relaxed);
         std::env::set_var("NIX_NINJA_HEAP_LIMIT_MIB", "1");
         let refused = check_heap_bound(500);
         std::env::set_var("NIX_NINJA_HEAP_LIMIT_MIB", "18446744073709551615");
         let allowed = check_heap_bound(500);
+        // A schedule the measurement admits and a projection refuses: the
+        // limit sits just above live, so any growth read from a prefix
+        // crosses it. This is the qtwebengine shape - 2,272 MiB live at
+        // task 500 of 24,410, refused at a projected 82,657 MiB against a
+        // 47,825 MiB limit - in miniature, and the drive it killed ran 74 s.
+        std::env::set_var("NIX_NINJA_HEAP_LIMIT_MIB", (live_now + 1).to_string());
+        let admitted = check_heap_bound(500);
         TOTAL_TASKS.store(old_total, Ordering::Relaxed);
         HEAP_BASE_LIVE.store(old_base, Ordering::Relaxed);
-        HEAP_BASE_SET.store(old_set, Ordering::Relaxed);
         match old_var {
             Some(v) => std::env::set_var("NIX_NINJA_HEAP_LIMIT_MIB", v),
             None => std::env::remove_var("NIX_NINJA_HEAP_LIMIT_MIB"),
         }
         assert!(refused.is_err(), "a 1 MiB limit refuses a live schedule");
         assert!(allowed.is_ok(), "no bound means no refusal");
+        assert!(
+            admitted.is_ok(),
+            "a live heap far under the limit is admitted whatever the schedule size: {}",
+            admitted.unwrap_err()
+        );
     }
 
     /// The heap default reads the killer's ceiling: a 1 GiB cgroup caps
