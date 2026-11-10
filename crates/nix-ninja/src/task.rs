@@ -899,9 +899,17 @@ fn current_oom_kills() -> Option<u64> {
 /// load. 0 on failure is safe here because the caller compares consecutive
 /// readings for CHANGE, and a vanished child means the permit is about to
 /// drop and show as a release instead.
-fn child_cpu_ticks(pid: u32) -> u64 {
+/// What a subtree reading covers. `capped` says the walk hit a bound, so
+/// `ticks` is a PARTIAL sum and must not be printed as an absolute.
+#[derive(Clone, Copy, Default)]
+struct SubtreeCpu {
+    ticks: u64,
+    capped: bool,
+}
+
+fn subtree_cpu(pid: u32) -> SubtreeCpu {
     if pid == 0 {
-        return 0;
+        return SubtreeCpu::default();
     }
     // THE PROCESS THAT BURNS THE CPU IS OFTEN NOT THE ONE SPAWNED. A nested
     // ninja's cmdline is `cmake -E env NODEJS_EXECUTABLE=... ninja -C ...`,
@@ -924,18 +932,28 @@ fn child_cpu_ticks(pid: u32) -> u64 {
         let mut next = Vec::new();
         for p in frontier {
             if seen >= SUBTREE_MAX_NODES {
-                return total;
+                return SubtreeCpu {
+                    ticks: total,
+                    capped: true,
+                };
             }
             seen += 1;
             total += single_pid_cpu_ticks(p);
             next.extend(child_pids(p));
         }
         if next.is_empty() {
-            break;
+            return SubtreeCpu {
+                ticks: total,
+                capped: false,
+            };
         }
         frontier = next;
     }
-    total
+    // The frontier was still populated when the depth bound ran out.
+    SubtreeCpu {
+        ticks: total,
+        capped: true,
+    }
 }
 
 /// How deep the subtree sum walks. `sh` -> `cmake -E env` -> `nix-ninja` ->
@@ -974,23 +992,28 @@ fn kill_subtree(pid: u32) {
     }
 }
 
-/// The direct children of `pid`, from `/proc/<pid>/task/<tid>/children`.
-/// Empty where the kernel does not offer it (no CONFIG_PROC_CHILDREN) or the
-/// process is gone, which ends the walk rather than failing it.
+/// The direct children of `pid`, from every thread's
+/// `/proc/<pid>/task/<tid>/children`.
+///
+/// EVERY tid, not the first one that has a `children` file: a thread forked
+/// from a non-first tid would be invisible, and a multithreaded process in
+/// the tree would then read as idle. Empty where the kernel does not offer
+/// the file (no CONFIG_PROC_CHILDREN) or the process is gone, which ends the
+/// walk rather than failing it.
 fn child_pids(pid: u32) -> Vec<u32> {
     let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
         return Vec::new();
     };
+    let mut out = Vec::new();
     for task in tasks.flatten() {
-        let path = task.path().join("children");
-        if let Ok(list) = std::fs::read_to_string(&path) {
-            return list
-                .split_whitespace()
-                .filter_map(|p| p.parse::<u32>().ok())
-                .collect();
+        if let Ok(list) = std::fs::read_to_string(task.path().join("children")) {
+            out.extend(
+                list.split_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok()),
+            );
         }
     }
-    Vec::new()
+    out
 }
 
 /// The utime + stime sum from one `/proc/<pid>/stat` line. Split out so the
@@ -1118,6 +1141,15 @@ struct Holder {
     /// cumulative CPU is the one signal that separates a long pass from a
     /// wedged one, and it is readable from here by pid.
     child_pid: Option<Arc<ChildPid>>,
+    /// This holder's subtree CPU at the last tick, and how long ago, so the
+    /// bail line can say whether it moved rather than only what it read. A
+    /// flat number on the bail line is the difference between one log read
+    /// and process archaeology on the next round.
+    last_cpu: u64,
+    last_cpu_at: Option<std::time::Instant>,
+    /// Whether `last_cpu` came from a capped walk, so the line never prints
+    /// a partial sum as an absolute.
+    last_cpu_capped: bool,
 }
 
 /// The pid of a local edge's child, published by the thread that spawns it
@@ -1336,6 +1368,9 @@ impl JobPermits {
                     weight,
                     since: std::time::Instant::now(),
                     child_pid: None,
+                    last_cpu: 0,
+                    last_cpu_at: None,
+                    last_cpu_capped: false,
                 });
                 if heavy {
                     state.heavy = state.heavy.saturating_sub(1);
@@ -1356,12 +1391,19 @@ impl JobPermits {
             // the held permit proves the thread that waits on it is alive.
             // Read as a SUM over held children, so one child finishing and
             // another starting cannot read as no progress.
-            let child_cpu: u64 = state
-                .held
-                .iter()
-                .filter_map(|h| h.child_pid.as_ref())
-                .map(|pid| child_cpu_ticks(pid.0.load(std::sync::atomic::Ordering::Relaxed)))
-                .sum();
+            let mut child_cpu: u64 = 0;
+            for holder in state.held.iter_mut() {
+                let Some(pid) = holder.child_pid.as_ref() else {
+                    continue;
+                };
+                let reading = subtree_cpu(pid.0.load(std::sync::atomic::Ordering::Relaxed));
+                if reading.ticks != holder.last_cpu || holder.last_cpu_at.is_none() {
+                    holder.last_cpu_at = Some(std::time::Instant::now());
+                }
+                holder.last_cpu = reading.ticks;
+                holder.last_cpu_capped = reading.capped;
+                child_cpu += reading.ticks;
+            }
             if child_cpu != prev_child_cpu {
                 last_drain = std::time::Instant::now();
                 prev_child_cpu = child_cpu;
@@ -1423,11 +1465,28 @@ fn summarize_holders(held: &[Holder]) -> String {
         .iter()
         .take(5)
         .map(|h| {
+            // A local edge's subtree CPU, and how long since it last moved.
+            // `cpu flat` is the wedge signature; a rising number on a bail
+            // means the signal is wrong rather than the edge. Marked partial
+            // where the walk was capped, so the number never reads as an
+            // absolute it is not.
+            let cpu = match h.last_cpu_at {
+                Some(at) if h.child_pid.is_some() => {
+                    let partial = if h.last_cpu_capped { ", partial" } else { "" };
+                    format!(
+                        ", cpu {} ticks{partial}, last moved {}s ago",
+                        h.last_cpu,
+                        at.elapsed().as_secs()
+                    )
+                }
+                _ => String::new(),
+            };
             format!(
-                "{} ({}u, {}s)",
+                "{} ({}u, {}s{})",
                 h.label,
                 h.weight,
-                h.since.elapsed().as_secs()
+                h.since.elapsed().as_secs(),
+                cpu
             )
         })
         .collect();
@@ -25663,8 +25722,8 @@ mod job_permits_tests {
         // ')' they are the 12th and 13th tokens.
         let stat = "1234 (a (b) c) S 1 1234 1234 0 -1 4194560 100 0 0 0 7 5 0 0 20 0 1 0";
         assert_eq!(super::child_cpu_ticks_from_stat(stat), 12);
-        assert_eq!(super::child_cpu_ticks(0), 0);
-        assert_eq!(super::child_cpu_ticks(u32::MAX), 0);
+        assert_eq!(super::subtree_cpu(0).ticks, 0);
+        assert_eq!(super::subtree_cpu(u32::MAX).ticks, 0);
     }
 
     /// An exclusive waiter must not starve behind a stream of small tasks.
@@ -25747,6 +25806,74 @@ mod job_permits_tests {
         assert!(
             inner.held.is_empty(),
             "a released permit must leave the holder list"
+        );
+    }
+
+    /// A bail on a local edge must say what the holder's subtree CPU READ and
+    /// whether it MOVED, so the next round is one log read rather than
+    /// process archaeology. A partial sum is marked, because an unmarked
+    /// partial reads as an absolute it is not.
+    ///
+    /// A task holder has no child, so it carries no CPU clause: printing
+    /// `cpu 0 ticks` for an edge that has no child would be a reading that
+    /// claims something it never measured.
+    #[test]
+    fn the_holder_line_names_subtree_cpu_and_whether_it_moved() {
+        let now = std::time::Instant::now();
+        let local = super::Holder {
+            id: 0,
+            label: "local edge foo (nested ninja)".to_string(),
+            weight: 2,
+            since: now,
+            child_pid: Some(std::sync::Arc::new(super::ChildPid::default())),
+            last_cpu: 277_325,
+            last_cpu_at: Some(now),
+            last_cpu_capped: false,
+        };
+        let line = super::summarize_holders(&[local]);
+        assert!(
+            line.contains("cpu 277325 ticks"),
+            "the line must name the subtree CPU, got: {line}"
+        );
+        assert!(
+            line.contains("last moved 0s ago"),
+            "the line must say how long since it moved, got: {line}"
+        );
+        assert!(
+            !line.contains("partial"),
+            "an uncapped walk must not be marked partial, got: {line}"
+        );
+
+        let capped = super::Holder {
+            id: 0,
+            label: "local edge foo (nested ninja)".to_string(),
+            weight: 2,
+            since: now,
+            child_pid: Some(std::sync::Arc::new(super::ChildPid::default())),
+            last_cpu: 277_325,
+            last_cpu_at: Some(now),
+            last_cpu_capped: true,
+        };
+        let line = super::summarize_holders(&[capped]);
+        assert!(
+            line.contains("partial"),
+            "a capped walk must be marked, got: {line}"
+        );
+
+        let task = super::Holder {
+            id: 0,
+            label: "edge-foo.o".to_string(),
+            weight: 1,
+            since: now,
+            child_pid: None,
+            last_cpu: 0,
+            last_cpu_at: None,
+            last_cpu_capped: false,
+        };
+        let line = super::summarize_holders(&[task]);
+        assert!(
+            !line.contains("cpu"),
+            "a task holder has no child and must carry no CPU clause, got: {line}"
         );
     }
 }
