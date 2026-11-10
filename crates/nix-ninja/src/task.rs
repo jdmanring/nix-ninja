@@ -903,10 +903,94 @@ fn child_cpu_ticks(pid: u32) -> u64 {
     if pid == 0 {
         return 0;
     }
+    // THE PROCESS THAT BURNS THE CPU IS OFTEN NOT THE ONE SPAWNED. A nested
+    // ninja's cmdline is `cmake -E env NODEJS_EXECUTABLE=... ninja -C ...`,
+    // and `cmake -E env` FORKS rather than execs, so the stored pid sits at
+    // zero CPU while its child does the work (qtwebengine, 2026-11-10: the
+    // stored pid read 0 every tick while its child moved 277,325 -> 278,638
+    // ticks in ten seconds). Sum the subtree, not the pid.
+    //
+    // A process GROUP would be cheaper, but `sh -c` does not put the edge in
+    // its own group: measured here, the group is the driver's own, so a
+    // group sum would count the driver and every sibling edge.
+    // A capped walk returns a PARTIAL sum. That is safe for this caller,
+    // which only asks whether the number CHANGED, and a partial sum over a
+    // live tree still changes while work happens. It would not be safe for a
+    // caller reading an absolute total.
+    let mut total = 0;
+    let mut seen = 0;
+    let mut frontier = vec![pid];
+    for _ in 0..SUBTREE_DEPTH {
+        let mut next = Vec::new();
+        for p in frontier {
+            if seen >= SUBTREE_MAX_NODES {
+                return total;
+            }
+            seen += 1;
+            total += single_pid_cpu_ticks(p);
+            next.extend(child_pids(p));
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    total
+}
+
+/// How deep the subtree sum walks. `sh` -> `cmake -E env` -> `nix-ninja` ->
+/// a task is four; a deeper tree is not a local edge this driver spawns.
+const SUBTREE_DEPTH: usize = 4;
+/// A ceiling on processes read per tick, so a pathological tree cannot make
+/// the instrument the load. A real edge is a handful.
+const SUBTREE_MAX_NODES: usize = 64;
+
+/// One process's cumulative CPU, or 0 where it cannot be read.
+fn single_pid_cpu_ticks(pid: u32) -> u64 {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => child_cpu_ticks_from_stat(&stat),
         Err(_) => 0,
     }
+}
+
+/// SIGKILL every descendant of `pid`, deepest first, so a fixture that
+/// forks cannot leave a spinner behind. Test scaffolding only; production
+/// never kills a local edge.
+#[cfg(test)]
+fn kill_subtree(pid: u32) {
+    fn walk(pid: u32, depth: usize) -> Vec<u32> {
+        if depth > SUBTREE_DEPTH {
+            return Vec::new();
+        }
+        let kids = child_pids(pid);
+        let mut all: Vec<u32> = kids.iter().flat_map(|k| walk(*k, depth + 1)).collect();
+        all.extend(kids);
+        all
+    }
+    for p in walk(pid, 0) {
+        if let Ok(p) = i32::try_from(p) {
+            unsafe { libc::kill(p, libc::SIGKILL) };
+        }
+    }
+}
+
+/// The direct children of `pid`, from `/proc/<pid>/task/<tid>/children`.
+/// Empty where the kernel does not offer it (no CONFIG_PROC_CHILDREN) or the
+/// process is gone, which ends the walk rather than failing it.
+fn child_pids(pid: u32) -> Vec<u32> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    for task in tasks.flatten() {
+        let path = task.path().join("children");
+        if let Ok(list) = std::fs::read_to_string(&path) {
+            return list
+                .split_whitespace()
+                .filter_map(|p| p.parse::<u32>().ok())
+                .collect();
+        }
+    }
+    Vec::new()
 }
 
 /// The utime + stime sum from one `/proc/<pid>/stat` line. Split out so the
@@ -25453,29 +25537,50 @@ mod job_permits_tests {
         // Killed on DROP, because a failing assert unwinds past the explicit
         // kill: a surviving spinner burned a core for two minutes while this
         // arm was being mutation-tested.
+        //
+        // KILLS THE WHOLE SUBTREE, which killing the child alone does not:
+        // the fixture forks, so the spinner is a GRANDCHILD and survives a
+        // kill of its parent (measured: one outlived the test by three
+        // minutes at PPID 1, burning a core). No `setsid` either: the nix
+        // build sandbox does not ship it, and a fixture that needs a tool the
+        // toolchain may lack fails in the pricer rather than here. The
+        // descendants are walked with the same helper the subject uses.
         struct KillChild(std::process::Child);
+        impl KillChild {
+            fn spawn(cmd: &str) -> Self {
+                KillChild(
+                    std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(cmd)
+                        .spawn()
+                        .expect("spawn the fixture child"),
+                )
+            }
+        }
         impl Drop for KillChild {
             fn drop(&mut self) {
+                super::kill_subtree(self.0.id());
                 let _ = self.0.kill();
                 let _ = self.0.wait();
             }
         }
-        // A child that burns CPU for as long as it lives.
-        let busy = KillChild(
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg("while :; do :; done")
-                .spawn()
-                .expect("spawn the busy child"),
-        );
+        // A child that burns CPU ONE LEVEL BELOW the pid the driver stores.
+        //
+        // This is the shape every nested-ninja local edge has here: the
+        // cmdline forks (production's is `cmake -E env ... ninja`), so the
+        // stored pid idles at zero CPU while its child works. A fixture that
+        // spawns the loop directly passes on a single-pid reader and proves
+        // nothing (qtwebengine, 2026-11-10: the stored pid read 0 every tick
+        // while its child moved 277,325 -> 278,638 ticks).
+        //
+        // The fork is a pure-shell SUBSHELL, not `cmake -E env`: the nix
+        // build sandbox has no cmake, and a fixture that needs a tool the
+        // toolchain may lack fails in the pricer rather than here. Measured:
+        // `( loop ) & wait` leaves the stored pid at 0 ticks and its child
+        // at 79.
+        let busy = KillChild::spawn("( while :; do :; done ) & wait");
         // A child that does nothing at all, so its CPU never moves.
-        let idle = KillChild(
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg("sleep 30")
-                .spawn()
-                .expect("spawn the idle child"),
-        );
+        let idle = KillChild::spawn("sleep 30");
 
         let permits = Arc::new(JobPermits::roomy(2));
         let (busy_edge, busy_pid) = permits
