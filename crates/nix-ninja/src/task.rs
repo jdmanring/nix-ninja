@@ -891,6 +891,41 @@ fn current_oom_kills() -> Option<u64> {
     cgroup_oom_kills(&memory_cgroup_dir()?)
 }
 
+/// A process's cumulative CPU in clock ticks, from `/proc/<pid>/stat`
+/// fields 14 and 15, or 0 where it cannot be read (exited, or no procfs).
+///
+/// A single file read rather than `ps`, because this runs on the permit
+/// waiter's tick: spawning a process per tick would make the instrument the
+/// load. 0 on failure is safe here because the caller compares consecutive
+/// readings for CHANGE, and a vanished child means the permit is about to
+/// drop and show as a release instead.
+fn child_cpu_ticks(pid: u32) -> u64 {
+    if pid == 0 {
+        return 0;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => child_cpu_ticks_from_stat(&stat),
+        Err(_) => 0,
+    }
+}
+
+/// The utime + stime sum from one `/proc/<pid>/stat` line. Split out so the
+/// parse is testable without a live process.
+fn child_cpu_ticks_from_stat(stat: &str) -> u64 {
+    // The comm field is parenthesised and may contain spaces AND parentheses,
+    // so the fields after it are counted from the LAST ')' rather than split
+    // naively.
+    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+        return 0;
+    };
+    let mut fields = rest.split_whitespace();
+    // After comm: state is field 3, so utime (14) and stime (15) are the
+    // 12th and 13th tokens of what follows.
+    let utime = fields.nth(11).and_then(|v| v.parse::<u64>().ok());
+    let stime = fields.next().and_then(|v| v.parse::<u64>().ok());
+    utime.unwrap_or(0) + stime.unwrap_or(0)
+}
+
 /// The OOM clause for a failure, bail or stall line: names the rise only
 /// when both ends read. Either end unreadable prints nothing rather than a
 /// zero that exonerates a cgroup nobody looked at. Pure so the wording is
@@ -967,20 +1002,6 @@ struct JobPermits {
     /// would leave the expected budget a function of whichever machine ran
     /// the test.
     readings: Option<Readings>,
-    /// Whether a SPAWNED local edge can complete work while a waiter parks.
-    ///
-    /// A task waiter parked in `start` shares the scheduler thread with
-    /// `wait`, so no completion can land under it and the drain clock must
-    /// read releases only - that is why the completion read was removed in
-    /// `9edebbb`. A LOCAL EDGE waiter does not share that thread:
-    /// `start_local_edge` acquires on the scheduler thread and only then
-    /// spawns the child, so an edge already spawned keeps completing on its
-    /// own thread. Without the read, a full-budget local edge holding every
-    /// unit for a legitimately long pass produces zero drain for its whole
-    /// life and the bail fires on a healthy edge (qtwebengine, 2026-11-07:
-    /// 21.1 min of build plus 10.6 min of tail, 1904 s against an 1800 s
-    /// window).
-    local_edges_in_flight: bool,
 }
 
 /// What admission reads about the machine. One struct so a test supplies the
@@ -1003,7 +1024,22 @@ struct Holder {
     label: String,
     weight: usize,
     since: std::time::Instant,
+    /// The pid of this holder's child process, for a local edge. `None` for
+    /// a task.
+    ///
+    /// A local edge runs its work in a CHILD PROCESS (`nn-ninja-shim.sh`
+    /// execs a separate driver), so nothing in this process's counters moves
+    /// while it runs: `COMPLETED_BUILDS` is the outer scheduler's and the
+    /// child's realizes are in the child's address space. The child's own
+    /// cumulative CPU is the one signal that separates a long pass from a
+    /// wedged one, and it is readable from here by pid.
+    child_pid: Option<Arc<ChildPid>>,
 }
+
+/// The pid of a local edge's child, published by the thread that spawns it
+/// and read by a waiter parked behind it. 0 until the spawn.
+#[derive(Default)]
+struct ChildPid(std::sync::atomic::AtomicU32);
 
 struct JobPermit {
     inner: Arc<(Mutex<PermitState>, Condvar)>,
@@ -1032,16 +1068,7 @@ impl JobPermits {
             cap,
             load_limit: 0.0,
             readings: None,
-            local_edges_in_flight: false,
         }
-    }
-
-    /// A pool whose waiters may see completions move under them, because a
-    /// spawned local edge completes on its own thread. The runner's pool sets
-    /// it; a test constructing `roomy` keeps the task-path behaviour.
-    fn with_local_edges(mut self) -> Self {
-        self.local_edges_in_flight = true;
-        self
     }
 
     /// Ninja's `-l`. 0.0 leaves it disabled.
@@ -1081,12 +1108,14 @@ impl JobPermits {
         )
     }
 
-    /// Thirty minutes with no released permit. Elapsed time alone never
-    /// bails: a healthy slow link waits out a whole wave.
+    /// Thirty minutes with no drain. Drain is a released permit, or a held
+    /// local edge's child process still burning CPU. Elapsed time alone
+    /// never bails: a healthy slow link waits out a whole wave.
     const PERMIT_ZERO_DRAIN_BAIL: std::time::Duration = std::time::Duration::from_secs(1800);
     ///
     /// Blocks until `weight` units free, or bails after thirty minutes with
-    /// zero drain (no released permit). Blocking in the scheduler's start()
+    /// zero drain (no released permit and no held child making progress).
+    /// Blocking in the scheduler's start()
     /// is deliberate backpressure: running task threads complete and release
     /// without needing the main loop. The bail turns a wedged round into a
     /// loud error naming held/budget/weight INSTEAD of a silent hang, and
@@ -1114,6 +1143,26 @@ impl JobPermits {
             Self::PERMIT_ZERO_DRAIN_BAIL,
             Self::PERMIT_WAIT_TICK,
         )
+    }
+
+    /// A permit whose holder runs in a CHILD PROCESS, so a waiter parked
+    /// behind it can read that child's cumulative CPU and tell a long pass
+    /// from a wedged one. `start_local_edge` uses this; the task path does
+    /// not, because a task completes on the scheduler thread its waiter
+    /// parks on.
+    fn acquire_local_edge(&self, weight: usize, label: &str) -> Result<(JobPermit, Arc<ChildPid>)> {
+        let permit = self.acquire_weighted(weight, label)?;
+        let slot = Arc::new(ChildPid::default());
+        {
+            let (lock, _) = &*self.inner;
+            let mut state = lock.lock().unwrap();
+            for holder in state.held.iter_mut() {
+                if holder.id == permit.id {
+                    holder.child_pid = Some(slot.clone());
+                }
+            }
+        }
+        Ok((permit, slot))
     }
 
     /// The wait, with its clocks as parameters so a test drives it in
@@ -1150,9 +1199,7 @@ impl JobPermits {
         // of build plus 10.6 min of tail, 1904 s against an 1800 s window).
         let mut last_drain = t0;
         let mut prev_count = state.count;
-        let mut prev_completed = self
-            .local_edges_in_flight
-            .then(|| COMPLETED_BUILDS.load(std::sync::atomic::Ordering::Relaxed));
+        let mut prev_child_cpu = 0u64;
         // The OOM counter at the moment this waiter parked, so the bail can
         // name churn during the park rather than asserting stuckness from
         // silence alone. One file read per park, never on the tick.
@@ -1204,6 +1251,7 @@ impl JobPermits {
                     label: label.to_string(),
                     weight,
                     since: std::time::Instant::now(),
+                    child_pid: None,
                 });
                 if heavy {
                     state.heavy = state.heavy.saturating_sub(1);
@@ -1218,12 +1266,21 @@ impl JobPermits {
                 last_drain = std::time::Instant::now();
             }
             prev_count = count;
-            if let Some(seen) = prev_completed {
-                let now = COMPLETED_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
-                if now != seen {
-                    last_drain = std::time::Instant::now();
-                    prev_completed = Some(now);
-                }
+            // A LOCAL EDGE'S CHILD IS A SEPARATE PROCESS, so its work moves
+            // none of this process's counters. Its cumulative CPU is the one
+            // signal that says it is still working rather than wedged, and
+            // the held permit proves the thread that waits on it is alive.
+            // Read as a SUM over held children, so one child finishing and
+            // another starting cannot read as no progress.
+            let child_cpu: u64 = state
+                .held
+                .iter()
+                .filter_map(|h| h.child_pid.as_ref())
+                .map(|pid| child_cpu_ticks(pid.0.load(std::sync::atomic::Ordering::Relaxed)))
+                .sum();
+            if child_cpu != prev_child_cpu {
+                last_drain = std::time::Instant::now();
+                prev_child_cpu = child_cpu;
             }
             let announce_due = if announced {
                 last_announce.elapsed() >= reannounce
@@ -1528,13 +1585,7 @@ impl Runner {
         }
 
         let (tx, rx) = mpsc::channel();
-        // `with_local_edges` unconditionally: any graph this driver builds may
-        // spawn a local edge, and reading completions is only wrong where the
-        // completer shares the waiter's thread, which the local-edge path
-        // never does.
-        let permits = JobPermits::new(config.jobs.max(1))
-            .with_load_limit(config.load_limit)
-            .with_local_edges();
+        let permits = JobPermits::new(config.jobs.max(1)).with_load_limit(config.load_limit);
         let pool_permits = pool_permits_from_depths(&config.pools);
         Ok(Runner {
             derived_files: HashMap::new(),
@@ -1831,9 +1882,9 @@ impl Runner {
 
         let width = self.permits.cap;
         let local_label = format!("local edge {label} ({member})");
-        let permit = self
+        let (permit, child_pid) = self
             .permits
-            .acquire_weighted(width, &local_label)
+            .acquire_local_edge(width, &local_label)
             .with_context(|| format!("{local_label}: stalled waiting for job permits"))?;
         let pool_permit = build
             .pool
@@ -1862,14 +1913,21 @@ impl Runner {
                 .context("placing the outputs the edge orders after")?;
                 // stdout carries data in this driver; the command's chatter
                 // goes to stderr.
-                let status = std::process::Command::new("sh")
+                let mut child = std::process::Command::new("sh")
                     .arg("-c")
                     .arg(&cmdline)
                     .current_dir(&config.build_dir)
                     .env(crate::local_edge::JOBS_VAR, width.to_string())
                     .stdout(std::process::Stdio::from(std::io::stderr()))
-                    .status()
+                    .spawn()
                     .context("spawning sh")?;
+                // Published so a waiter parked behind this edge can read the
+                // child's cumulative CPU: the child is a separate process and
+                // moves none of this driver's counters.
+                child_pid
+                    .0
+                    .store(child.id(), std::sync::atomic::Ordering::Relaxed);
+                let status = child.wait().context("waiting for sh")?;
                 if !status.success() {
                     anyhow::bail!("the command exited with {status}");
                 }
@@ -25322,13 +25380,18 @@ mod job_permits_tests {
         res.expect_err("a wait with zero drain must bail once releases stop");
     }
 
-    /// Finished builds must NOT hold the bail off. The completions counter
-    /// is bumped by wait() on the scheduler thread, and a waiter parked in
-    /// start() shares that thread, so no completion can land mid-park: an
-    /// arm consulting it reads dead for the whole wait. This arm bumps the
-    /// counter hard for longer than the bail window; the waiter must still
-    /// answer on the releases clock. Restoring the completions arm holds the
-    /// bail off past the window and fails the elapsed assertion.
+    /// Finished builds must NOT hold the bail off, because the counter they
+    /// land in can never move while a waiter parks.
+    ///
+    /// `build.rs`'s scheduler runs `start`, `start_local_edge` and `wait` on
+    /// ONE thread, and `note_build_completed` is called only from `wait`'s
+    /// success path. A waiter parked inside `acquire_weighted` is that same
+    /// thread, so `COMPLETED_BUILDS` is frozen for the whole park on BOTH
+    /// paths - which is why the read `449c1ca` added was dead and has been
+    /// removed. This arm bumps the counter hard for longer than the bail
+    /// window; the waiter must still answer on the releases clock.
+    /// Reinstating a completions read holds the bail off past the window and
+    /// fails the elapsed assertion.
     #[test]
     fn permit_wait_ignores_completions() {
         let permits = Arc::new(JobPermits::roomy(1));
@@ -25372,81 +25435,131 @@ mod job_permits_tests {
         );
     }
 
-    /// THE ARM THE ABORT NEEDED.
+    /// THE ARM THE ABORT NEEDED, and the control it lacked.
     ///
-    /// `permit_wait_ignores_completions` above encodes the removal's premise:
-    /// a waiter parked in `start` shares the scheduler thread with the
-    /// completer, so completions cannot move under the park. That premise is
-    /// FALSE for a local edge. `start_local_edge` acquires on the scheduler
-    /// thread and only then spawns the child, so an already-spawned edge keeps
-    /// completing on its own thread while this waiter parks. Reading
-    /// completions there is not dead, and not reading them is what bailed a
-    /// healthy qtwebengine round after 1800 s (21.1 min of build plus 10.6 min
-    /// of tail, 1904 s against the window).
+    /// A local edge's work runs in a CHILD PROCESS (`nn-ninja-shim.sh` execs
+    /// a separate driver), so no counter in this process moves while it runs:
+    /// neither `COMPLETED_BUILDS` (the outer scheduler's) nor the rpc client's
+    /// realise totals (the child's). The signal the waiter can read is the
+    /// child's own cumulative CPU.
     ///
-    /// Shape: a full-budget edge holds every unit for the whole test, a
-    /// lighter waiter parks behind it, and the holder's child keeps
-    /// completing. Nothing is released, so the releases clock never resets,
-    /// and the waiter must NOT bail while completions rise.
-    ///
-    /// A positive arm cannot catch this: any test that passes before and after
-    /// the fix is not an arm. This one fails on the code that removed the read.
+    /// Both directions, because either alone is passable by a clock that
+    /// ignores the child: a child BURNING CPU must hold the bail off, and a
+    /// child doing NOTHING must still bail. The second is what a
+    /// "reset on any held child" reading fails.
     #[test]
-    fn a_local_edge_holder_completing_work_holds_the_bail_off() {
-        let permits = Arc::new(JobPermits::roomy(2).with_local_edges());
-        // The local edge: full budget, held for the whole test. This is
-        // `start_local_edge`'s acquire (width == cap).
-        let edge = permits.acquire_weighted(2, "local edge test (nested ninja)");
-        let _edge = edge.unwrap();
+    fn a_local_edge_childs_cpu_decides_the_bail() {
+        use std::time::Duration;
+        // Killed on DROP, because a failing assert unwinds past the explicit
+        // kill: a surviving spinner burned a core for two minutes while this
+        // arm was being mutation-tested.
+        struct KillChild(std::process::Child);
+        impl Drop for KillChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        // A child that burns CPU for as long as it lives.
+        let busy = KillChild(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("while :; do :; done")
+                .spawn()
+                .expect("spawn the busy child"),
+        );
+        // A child that does nothing at all, so its CPU never moves.
+        let idle = KillChild(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .spawn()
+                .expect("spawn the idle child"),
+        );
+
+        let permits = Arc::new(JobPermits::roomy(2));
+        let (busy_edge, busy_pid) = permits
+            .acquire_local_edge(2, "local edge busy (nested ninja)")
+            .unwrap();
+        busy_pid
+            .0
+            .store(busy.0.id(), std::sync::atomic::Ordering::Relaxed);
+        // The busy child must be admitted by the clock: park a lighter waiter
+        // behind a full-budget holder for longer than the bail window.
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = permits.clone();
-        let t0 = std::time::Instant::now();
         std::thread::spawn(move || {
             let res = waiter
                 .acquire_weighted_with(
                     1,
                     "test",
-                    std::time::Duration::from_millis(10),
-                    std::time::Duration::from_millis(10),
-                    // Bail window well shorter than the test's run, so a
-                    // releases-only clock fires and a completion-aware one
-                    // does not.
-                    std::time::Duration::from_millis(300),
-                    std::time::Duration::from_millis(5),
+                    Duration::from_millis(10),
+                    Duration::from_millis(10),
+                    Duration::from_millis(300),
+                    Duration::from_millis(5),
                 )
                 .map(|_| ());
             let _ = tx.send(res);
         });
-        // The holder's child completing work, exactly as a nested pass does
-        // while the outer scheduler is parked.
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let child_stop = stop.clone();
-        let child = std::thread::spawn(move || {
-            while !child_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                super::note_build_completed();
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        });
-        // Longer than the bail window: on releases-only code the waiter
-        // answers here with the stall error.
-        std::thread::sleep(std::time::Duration::from_millis(600));
+        std::thread::sleep(Duration::from_millis(600));
         let early = rx.try_recv();
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        child.join().unwrap();
         assert!(
             early.is_err(),
-            "the waiter bailed after {}ms while the local edge's child was \
-             still completing work: the drain clock ignores completions on \
-             the local-edge path",
-            t0.elapsed().as_millis()
+            "the waiter bailed while the local edge's child was burning CPU: \
+             the drain clock cannot see a child process's work"
         );
-        // Drop the holder and the waiter must be admitted, so this asserts
-        // the waiter was genuinely parked rather than never started.
-        drop(_edge);
+        drop(busy_edge);
         let res = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(5))
             .expect("the waiter must be admitted once the edge releases");
         res.expect("the waiter must be admitted, not answered with a bail");
+
+        // The control: the same shape with a child whose CPU never moves must
+        // still bail, or the clock is resetting on the child's EXISTENCE.
+        let (idle_edge, idle_pid) = permits
+            .acquire_local_edge(2, "local edge idle (nested ninja)")
+            .unwrap();
+        idle_pid
+            .0
+            .store(idle.0.id(), std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = permits.clone();
+        std::thread::spawn(move || {
+            let res = waiter
+                .acquire_weighted_with(
+                    1,
+                    "test",
+                    Duration::from_millis(10),
+                    Duration::from_millis(10),
+                    Duration::from_millis(300),
+                    Duration::from_millis(5),
+                )
+                .map(|_| ());
+            let _ = tx.send(res);
+        });
+        let res = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a waiter behind an idle child must answer, not park forever");
+        assert!(
+            res.is_err(),
+            "the waiter was admitted past the bail window while the local \
+             edge's child did nothing: the clock resets on the child's \
+             existence rather than its work"
+        );
+        drop(idle_edge);
+    }
+
+    /// The pid parse reads the field layout the kernel actually writes, with
+    /// a comm containing a space and a parenthesis, which is where a naive
+    /// split lands one field off.
+    #[test]
+    fn child_cpu_ticks_reads_past_a_hostile_comm() {
+        // Field 3 is state; utime and stime are 14 and 15, so after the last
+        // ')' they are the 12th and 13th tokens.
+        let stat = "1234 (a (b) c) S 1 1234 1234 0 -1 4194560 100 0 0 0 7 5 0 0 20 0 1 0";
+        assert_eq!(super::child_cpu_ticks_from_stat(stat), 12);
+        assert_eq!(super::child_cpu_ticks(0), 0);
+        assert_eq!(super::child_cpu_ticks(u32::MAX), 0);
     }
 
     /// An exclusive waiter must not starve behind a stream of small tasks.
