@@ -925,6 +925,36 @@ mod bounded_exchange_tests {
         );
     }
 
+    /// THE FLAG IS NOT DECORATION: a client built with retention off must not
+    /// retain, and the only reader (`clone_drv`) must then answer None. This
+    /// is the arm that fails if the `retain_drvs` guard is deleted while the
+    /// field stays, which is the half the source-text test cannot see.
+    ///
+    /// The map is written in `add_drv_to_store`, which needs a live daemon, so
+    /// this drives the insert directly and reads through the public reader.
+    #[test]
+    fn a_client_that_does_not_retain_answers_no_drv() {
+        use super::BuilderRpcClient;
+        let path = std::path::Path::new("/nonexistent/nn-no-daemon.sock");
+        let keeps = BuilderRpcClient::connect_unix_sized_retaining(path, true, 2, true).unwrap();
+        let drops = BuilderRpcClient::connect_unix_sized_retaining(path, true, 2, false).unwrap();
+        assert!(keeps.retain_drvs, "an explicit true must retain");
+        assert!(!drops.retain_drvs, "an explicit false must not");
+        // The default follows `in_drv`, so today's callers are unchanged.
+        assert!(
+            BuilderRpcClient::connect_unix_sized(path, true, 2)
+                .unwrap()
+                .retain_drvs,
+            "inside a derivation the default retains, as before"
+        );
+        assert!(
+            !BuilderRpcClient::connect_unix_sized(path, false, 2)
+                .unwrap()
+                .retain_drvs,
+            "outside one there is no reader, as before"
+        );
+    }
+
     /// EVERY QUOTA-TH RELEASE CLOSES ITS CONNECTION AND EVERY OTHER PARKS
     /// IT. A one-slot pool makes each reading exact: after a retiring
     /// release nothing is parked, after any other the one connection is.
@@ -1075,6 +1105,25 @@ pub struct BuilderRpcClient {
     /// Whether or not nix-ninja is running within a derivation
     /// Needed since scanning is not available outside derivations
     in_drv: bool,
+
+    /// Whether uploaded ATerm bytes are retained at all.
+    ///
+    /// `clone_drv` is the ONLY reader, and it serves two call sites, both in
+    /// the outer driver: `submit_outer_output` (one drv, the outer's) and
+    /// `-t drv` (one drv, the named target's). Retention is therefore
+    /// worthwhile only for a client that will read one back.
+    ///
+    /// A client that will not - the nested `-t dynamic-task` builder, which
+    /// exits without touching `clone_drv` - retains nothing. That distinction
+    /// matters because this map is monotonic and `in_drv`-gated, so on the
+    /// consumer's route (configuration B, local mode inside recursive-nix) it
+    /// holds one ATerm per task for the life of the process: 16,020 MiB at
+    /// 20,000 tasks on qtwebengine, 39.6% of live heap, in the run the kernel
+    /// OOM-killed after 6h40m.
+    ///
+    /// Default true, so a caller that does not think about it keeps today's
+    /// behaviour exactly.
+    retain_drvs: bool,
 
     /// ATerm bytes kept because builder-rpc-v0 does not materialize uploaded .drv files in the sandbox.
     uploaded_drvs: Mutex<HashMap<StorePath, Vec<u8>>>,
@@ -1588,8 +1637,15 @@ mod host_route_notice_tests {
 }
 
 impl BuilderRpcClient {
-    /// Connect to `$NIX_REMOTE` if set, otherwise the standard daemon
+    /// Connect to `$NIX_REMOTE` if set, otherwise the standard daemon.
+    /// Retains uploaded ATerm bytes; see `retain_drvs`.
     pub fn connect_from_env(pool_max: Option<usize>) -> Result<Self> {
+        Self::connect_from_env_retaining(pool_max, true)
+    }
+
+    /// `connect_from_env` with retention decided by the caller. Pass false
+    /// where nothing will read a drv back; see `retain_drvs`.
+    pub fn connect_from_env_retaining(pool_max: Option<usize>, retain_drvs: bool) -> Result<Self> {
         let path = match std::env::var(SOCKET_ENV) {
             Ok(remote) => parse_unix_remote(&remote)?,
             Err(_) => PathBuf::from(DEFAULT_DAEMON_SOCKET),
@@ -1613,10 +1669,14 @@ impl BuilderRpcClient {
         }
         let in_drv = build_top && !forced;
 
-        Self::connect_unix_sized(
+        Self::connect_unix_sized_retaining(
             &path,
             in_drv,
             pool_max.unwrap_or(PoolConfig::default().max_size),
+            // Retaining outside a derivation is pointless: the file is on
+            // disk and `clone_drv` reads it back. Retaining inside one is
+            // pointless too when the caller says it will never read.
+            retain_drvs && in_drv,
         )
     }
 
@@ -1632,6 +1692,17 @@ impl BuilderRpcClient {
     /// 24-thread machine: the default is 25, so every `-j` from 26 up ran
     /// at 25 with no message.
     pub fn connect_unix_sized(path: &Path, in_drv: bool, pool_max: usize) -> Result<Self> {
+        Self::connect_unix_sized_retaining(path, in_drv, pool_max, in_drv)
+    }
+
+    /// `connect_unix_sized` with retention decided by the caller rather than
+    /// by `in_drv`. See `retain_drvs`.
+    pub fn connect_unix_sized_retaining(
+        path: &Path,
+        in_drv: bool,
+        pool_max: usize,
+        retain_drvs: bool,
+    ) -> Result<Self> {
         let runtime = RuntimeBuilder::new_multi_thread()
             .worker_threads(rpc_worker_threads(pool_max))
             .enable_all()
@@ -1660,6 +1731,7 @@ impl BuilderRpcClient {
             pool,
             pool_max: pool_max.max(1),
             in_drv,
+            retain_drvs,
             uploaded_drvs: Default::default(),
             realised: Default::default(),
             failed: Default::default(),
@@ -1718,21 +1790,20 @@ impl BuilderRpcClient {
             .await
         })?;
 
-        // Retained ONLY inside a derivation, where builder-rpc-v0 does not
-        // materialize the uploaded .drv and this is the sole copy. Outside
-        // one the file is on disk and clone_drv reads it back, so retaining
-        // is cost with no reader: both call sites are sandbox-only and
-        // neither runs on the full-graph path this campaign uses.
+        // Retained only where a reader exists: `clone_drv`, whose two call
+        // sites are both in the outer driver and each want ONE drv. Outside
+        // a derivation the file is on disk and `clone_drv` reads it back, so
+        // retaining there is cost with no reader.
         //
         // NO SIZE FIGURE HERE ON PURPOSE. The first version of this comment
         // claimed ~6 GiB, extrapolated from a 384 KiB mean over every
         // ninja-build.drv in the store, and the next progress tick falsified
         // it: driver RSS fell from 13,335 to 4,568 MiB between two 500-task
         // windows, and a monotonic map cannot exceed a resident size that
-        // drops below it. The saving is real and unmeasured; measure it by
-        // comparing RSS at equal task counts across a round with and without
-        // this branch, which is the only reading that isolates it.
-        if self.in_drv {
+        // drops below it. The measured figure now is 16,020 MiB at 20,000
+        // tasks of qtwebengine, and the distribution that makes it large is
+        // in `local/pending/next-rekey-batch.md`.
+        if self.retain_drvs {
             UPLOADED_DRV_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             UPLOADED_DRV_BYTES.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             self.uploaded_drvs
@@ -3051,12 +3122,17 @@ mod realise_memo_tests {
 
 #[cfg(test)]
 mod uploaded_drv_retention_tests {
-    /// Retention is gated on `in_drv`, and the reason is asymmetric: inside a
-    /// derivation the uploaded .drv is not materialized and the retained copy
-    /// is the only one, so dropping it there loses data. Outside, the file is
-    /// on disk. A future edit that flips this to an unconditional skip would
-    /// break the sandbox path silently - the failure is a missing drv late in
-    /// a build, nowhere near the cache.
+    /// Retention is gated on `retain_drvs`, which defaults to `in_drv`: inside
+    /// a derivation the caller may be the one that reads a drv back, so
+    /// dropping it there loses data; outside, the file is on disk. A future
+    /// edit that flips this to an unconditional skip would break the sandbox
+    /// path silently - the failure is a missing drv late in a build, nowhere
+    /// near the cache.
+    ///
+    /// The gate was `in_drv` alone until the qtwebengine OOM, which showed the
+    /// map costing 16,020 MiB at 20,000 tasks with nothing on that route ever
+    /// reading it back. `in_drv` is now the DEFAULT and the driver's own
+    /// knowledge of its reader is the override.
     ///
     /// Asserted on the source because the branch needs a live daemon to
     /// exercise and the INVARIANT is what must not drift.
@@ -3087,7 +3163,7 @@ mod uploaded_drv_retention_tests {
     #[test]
     fn the_matchers_survive_a_reformat_and_fail_without_the_guard() {
         let reformatted: Vec<&str> = vec![
-            "        if self.in_drv {",
+            "        if self.retain_drvs {",
             "                        self.uploaded_drvs.lock().unwrap()",
             "            .insert(info.path.clone(), bytes);",
             "        }",
@@ -3128,9 +3204,9 @@ mod uploaded_drv_retention_tests {
         })
     }
 
-    /// The nearest `in_drv` guard above a given insert.
+    /// The nearest `retain_drvs` guard above a given insert.
     fn find_guard(lines: &[&str], insert: usize) -> Option<usize> {
-        let needle = concat!("if self.", "in_drv {");
+        let needle = concat!("if self.", "retain_drvs {");
         lines[..insert].iter().rposition(|l| l.contains(needle))
     }
 }

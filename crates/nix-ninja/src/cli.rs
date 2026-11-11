@@ -610,9 +610,17 @@ pub fn run() -> Result<()> {
         )
         .context("reading the build directory as the first pass found it")?
     };
-    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
-        resolved_connections(&cli, crate::task::available_gib()),
-    ))?);
+    // RETAIN ONLY WHERE A READER CAN RUN. The map's sole reader is
+    // `clone_drv`, and it is reached from two places: `submit_outer_output`,
+    // which needs ONE drv and only exists on the output-derivation path, and
+    // `-t drv`, which is a different process. A local-mode drive (the
+    // consumer's route) therefore retains one ATerm per task with nothing
+    // that will ever read one, and the map is monotonic for the life of the
+    // process: 16,020 MiB at 20,000 tasks of qtwebengine.
+    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env_retaining(
+        Some(resolved_connections(&cli, crate::task::available_gib())),
+        cli.is_output_derivation,
+    )?);
     // Before any input is read: ninja's records are stamped with it.
     let start = crate::ninja_state::mark_start(&build_dir);
     let (derived_files, all_outputs) = build(&cli, &build_dir, &rpc_client)?;

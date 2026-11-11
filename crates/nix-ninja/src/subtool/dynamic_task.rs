@@ -24,7 +24,12 @@ pub fn run(store_dir: &StoreDir, targets: Vec<String>) -> Result<()> {
     let mut drv: Derivation = serde_json::from_str(&drv_json)?;
     println!("nix-ninja-dynamic-task: Processing derivation {}", drv.name);
 
-    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(None)?);
+    // RETAINS NOTHING: this process exits through `run` without touching
+    // `clone_drv`, which is the map's only reader, so every ATerm it kept
+    // here would live until exit with nothing to serve. It is still
+    // `in_drv`-derived, which on the consumer's route means one retained
+    // ATerm per task on a 24,410-task package.
+    let rpc_client = Arc::new(BuilderRpcClient::connect_from_env_retaining(None, false)?);
 
     // Stage 1: Prepare build environment
     let (build_dir, built_paths) = prepare_build_environment(store_dir)?;
