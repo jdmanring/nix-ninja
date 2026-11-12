@@ -177,6 +177,12 @@ issues that came with the project.
     and the candidates - the resolve cache's `unvalidated` map, the retained
     `Derivation` per task - are guesses until somebody profiles. Do not write
     a fix against this entry, write a measurement.
+  - One large retained term on the consumer's route was found since, and it is
+    NOT this slope: `uploaded_drvs` holds one ATerm per task, is never evicted,
+    and measured 16,020 MiB at 20,000 tasks of qtwebengine. `ba02a6a` decides
+    retention at connect, so the callers that never read a drv back keep none.
+    This entry's 0.074 MiB/task is a separate reading from small builds and is
+    still open.
 - [x] ~~The dynamic task copies the whole source tree~~ - RETIRED 2026-08-29,
   and the retirement is worth more than the entry was
   - `copy_dir_all` in `dynamic_task.rs` really does copy the whole tree per
