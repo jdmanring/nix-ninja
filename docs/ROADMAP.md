@@ -857,15 +857,15 @@ ceiling, and FAILED, permit-bail and stall lines name the `oom_kill` rise
 while an edge is in flight. A permit wait with zero drain re-announces every
 minute as a heartbeat and bails after thirty minutes naming held, budget,
 weight, the waiting edge, and the five longest-held holder edges with their
-weights and ages; the drain clock resets on every release and, where the
-completing thread is not the waiting one, on a finished build, and for a
-local edge on the cumulative CPU of the edge's child processes read as a
-subtree, so a healthy slow link does not trip it. Unset keeps
-host-only behavior. Scheduling and stderr only, so emission-free by
-construction and proved by `emission-price.sh df404f1` (task `drvPath`
-`sgx22gc5` unmoved, five shapes identical). Unit tests pin the ceiling
-readers, the min, the bail and the drain reset; `logging-contract-repro.sh`
-holds the stderr contract.
+weights and ages; the drain clock resets on a released permit and, for a
+local edge, on the cumulative CPU of the edge's child processes read as a
+subtree. A finished build does not reset it: the completions counter moves
+on the scheduler thread the waiter itself parks, so that read was dead and
+was removed in `9edebbb`. Unset keeps host-only behavior. Scheduling and
+stderr only, so emission-free by construction and proved by
+`emission-price.sh df404f1` (task `drvPath` `sgx22gc5` unmoved, five shapes
+identical). Unit tests pin the ceiling readers, the min, the bail and the
+drain reset; `logging-contract-repro.sh` holds the stderr contract.
 
 ## What could stop this
 
