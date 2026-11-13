@@ -1679,6 +1679,13 @@ pub struct Runner {
     /// without sending parked the driver for hours with CPU flat, no FAILED
     /// and no watchdog line. The wait announces from this list instead.
     in_flight: Vec<(BuildId, String, std::time::Instant)>,
+    /// The in-flight SET as it stood at the last announcement, and when that
+    /// set was first seen unchanged. A FIELD, not a local of `wait`: `wait` is
+    /// called once per completion (`build.rs:805`), so a local would be
+    /// re-initialised on every finished edge and the clock could never reach
+    /// `WAIT_ANNOUNCE_EVERY`. That is the fail-open this field closes, and an
+    /// automated review caught the local version.
+    still_set: Option<(Vec<BuildId>, std::time::Instant)>,
     /// The OOM count when the oldest in-flight edge started, captured at push
     /// time. Used by the stall watcher to report OOM growth during a hang.
     in_flight_oom: HashMap<BuildId, Option<u64>>,
@@ -1830,6 +1837,7 @@ impl Runner {
             tx,
             rx,
             in_flight: Vec::new(),
+            still_set: None,
             in_flight_oom: HashMap::new(),
             last_stall_oom: None,
             tools,
@@ -2837,11 +2845,21 @@ impl Runner {
         still: &mut Option<(Vec<BuildId>, std::time::Instant)>,
         in_flight: &[(BuildId, String, std::time::Instant)],
     ) -> Option<String> {
+        Self::still_set_line_with(still, in_flight, Self::WAIT_ANNOUNCE_EVERY)
+    }
+
+    /// `still_set_line` with the interval as a parameter, so a test drives the
+    /// real clock and real `Instant` arithmetic instead of backdating one.
+    fn still_set_line_with(
+        still: &mut Option<(Vec<BuildId>, std::time::Instant)>,
+        in_flight: &[(BuildId, String, std::time::Instant)],
+        announce_every: std::time::Duration,
+    ) -> Option<String> {
         let mut ids: Vec<BuildId> = in_flight.iter().map(|(bid, _, _)| *bid).collect();
         ids.sort_by_key(|b| b.index());
         match still {
             Some((prev, since)) if *prev == ids => {
-                if since.elapsed() < Self::WAIT_ANNOUNCE_EVERY {
+                if since.elapsed() < announce_every {
                     return None;
                 }
                 let labels: Vec<String> = in_flight
@@ -2917,17 +2935,12 @@ impl Runner {
         // carried across completions) attributes ancient kills to a new
         // stall.
         self.last_stall_oom = current_oom_kills();
-        // The in-flight SET as it stood at the last announcement, and when.
-        // The stalled-wait line below cannot be triggered from the timeout arm
-        // alone: a driver that keeps completing OTHER work receives a message
-        // inside every interval, so the arm never runs and the line never
-        // prints. qtwebengine 6.11.2 (2026-11-12) sat at `completed=150
-        // total=278 active=6` for 34,539 s while its own scheduler retired
-        // builds elsewhere; `grep -c 'still waiting on'` on that log is 0.
-        // So the still-set is compared on WALL TIME, independent of traffic.
-        let mut still: Option<(Vec<BuildId>, std::time::Instant)> = None;
+        // NOT reset here. `wait` is called once per completion (`build.rs:805`),
+        // so clearing the still-set at entry would restart its clock on every
+        // finished edge and the line could never fire. The baseline lives on
+        // the Runner and is deliberately left alone across calls.
         let result = loop {
-            if let Some(line) = Self::still_set_line(&mut still, &self.in_flight) {
+            if let Some(line) = Self::still_set_line(&mut self.still_set, &self.in_flight) {
                 eprintln!("{line}");
             }
             match self.rx.recv_timeout(Self::WAIT_ANNOUNCE_EVERY) {
@@ -5909,20 +5922,27 @@ impl Runner {
 #[test]
 fn a_still_set_is_named_even_while_other_work_completes() {
     // The defect: the timeout-based line is unreachable when completions keep
-    // arriving. This line is driven by the set, not by traffic, so it fires.
+    // arriving. This one is driven by the set and by wall time, so it fires.
+    //
+    // The interval is a PARAMETER here because production owns the clock: a
+    // test that backdated an `Instant` would assert on arithmetic production
+    // never performs, and an earlier version of this test did exactly that.
     use n2::graph::BuildId;
     let now = std::time::Instant::now();
     let stuck = vec![
         (BuildId::from(1usize), "stuck_a.o".to_string(), now),
         (BuildId::from(2usize), "stuck_b.o".to_string(), now),
     ];
+    let tick = std::time::Duration::from_millis(20);
     let mut still = None;
     // First observation records the set and prints nothing.
-    assert!(Runner::still_set_line(&mut still, &stuck).is_none());
-    // Pretend two intervals passed without the set changing.
-    let (ids, _) = still.clone().expect("recorded");
-    still = Some((ids, now - std::time::Duration::from_secs(301)));
-    let line = Runner::still_set_line(&mut still, &stuck).expect("a frozen set is reported");
+    assert!(Runner::still_set_line_with(&mut still, &stuck, tick).is_none());
+    // Wait for the real interval to elapse, with the set UNCHANGED. A
+    // completion elsewhere does not touch `still`, which is the whole point:
+    // it lives on the Runner, not in `wait`.
+    std::thread::sleep(tick * 3);
+    let line =
+        Runner::still_set_line_with(&mut still, &stuck, tick).expect("a frozen set is reported");
     assert!(line.contains("stuck_a.o"), "{line}");
     assert!(line.contains("2 edge(s)"), "{line}");
 }
@@ -5930,21 +5950,23 @@ fn a_still_set_is_named_even_while_other_work_completes() {
 #[test]
 fn a_changing_set_is_not_reported() {
     // The negative control: a healthy build retires and starts edges, so the
-    // set moves every interval and nothing must print.
+    // set moves every interval and nothing must print. Same real-clock shape
+    // as the positive test.
     use n2::graph::BuildId;
     let now = std::time::Instant::now();
+    let tick = std::time::Duration::from_millis(20);
     let mut still = None;
     let first = vec![(BuildId::from(1usize), "a.o".to_string(), now)];
-    assert!(Runner::still_set_line(&mut still, &first).is_none());
-    // Long past the interval, but the set has changed, so the clock restarts.
-    let (ids, _) = still.clone().expect("recorded");
-    still = Some((ids, now - std::time::Duration::from_secs(301)));
+    assert!(Runner::still_set_line_with(&mut still, &first, tick).is_none());
+    std::thread::sleep(tick * 3);
+    // Long past the interval, but the set has changed, so the clock restarts
+    // and nothing prints even though the elapsed time exceeds the interval.
     let second = vec![
         (BuildId::from(1usize), "a.o".to_string(), now),
         (BuildId::from(2usize), "b.o".to_string(), now),
     ];
     assert!(
-        Runner::still_set_line(&mut still, &second).is_none(),
+        Runner::still_set_line_with(&mut still, &second, tick).is_none(),
         "a set that changed must not report a stall"
     );
 }
