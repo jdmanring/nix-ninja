@@ -2820,6 +2820,54 @@ impl Runner {
         shown.join(", ")
     }
 
+    /// The line printed when the SAME edges have been in flight for two whole
+    /// announcement intervals, whatever else the driver completed meanwhile.
+    ///
+    /// `wait_stall_line` cannot serve this: it is reachable only from the
+    /// timeout arm, and a driver that completes other work receives a message
+    /// in every interval, so its arm never runs. This one is driven by wall
+    /// time and an unchanged in-flight SET.
+    ///
+    /// `still` carries the set and the instant it was first seen. Returns
+    /// `None` while the set is changing (a healthy build), and the line once
+    /// it has been unchanged for `WAIT_ANNOUNCE_EVERY`. The set is compared as
+    /// `BuildId`s, so an edge finishing and a DIFFERENT edge starting is a
+    /// change, which is right: the reader wants the stuck ones, not a count.
+    fn still_set_line(
+        still: &mut Option<(Vec<BuildId>, std::time::Instant)>,
+        in_flight: &[(BuildId, String, std::time::Instant)],
+    ) -> Option<String> {
+        let mut ids: Vec<BuildId> = in_flight.iter().map(|(bid, _, _)| *bid).collect();
+        ids.sort_by_key(|b| b.index());
+        match still {
+            Some((prev, since)) if *prev == ids => {
+                if since.elapsed() < Self::WAIT_ANNOUNCE_EVERY {
+                    return None;
+                }
+                let labels: Vec<String> =
+                    in_flight.iter().map(|(_, label, _)| label.clone()).collect();
+                let oldest = in_flight.iter().map(|(_, _, at)| *at).min()?;
+                Some(format!(
+                    "nix-ninja: {n} edge(s) have been in flight unchanged for {held}s while other \
+                     work completed, oldest {oldest}s: {labels}",
+                    n = ids.len(),
+                    held = since.elapsed().as_secs(),
+                    oldest = oldest.elapsed().as_secs(),
+                    labels = Self::summarize_labels(&labels),
+                ))
+            }
+            Some(_) => {
+                // The set moved, so the clock restarts from this set.
+                *still = Some((ids, std::time::Instant::now()));
+                None
+            }
+            None => {
+                *still = Some((ids, std::time::Instant::now()));
+                None
+            }
+        }
+    }
+
     /// The line `wait` prints when no edge reports for a whole interval.
     /// None before the interval elapses: a slow link is not a stall. The
     /// OOM pair names kills during the stall; either end unreadable prints
@@ -2867,7 +2915,19 @@ impl Runner {
         // carried across completions) attributes ancient kills to a new
         // stall.
         self.last_stall_oom = current_oom_kills();
+        // The in-flight SET as it stood at the last announcement, and when.
+        // The stalled-wait line below cannot be triggered from the timeout arm
+        // alone: a driver that keeps completing OTHER work receives a message
+        // inside every interval, so the arm never runs and the line never
+        // prints. qtwebengine 6.11.2 (2026-11-12) sat at `completed=150
+        // total=278 active=6` for 34,539 s while its own scheduler retired
+        // builds elsewhere; `grep -c 'still waiting on'` on that log is 0.
+        // So the still-set is compared on WALL TIME, independent of traffic.
+        let mut still: Option<(Vec<BuildId>, std::time::Instant)> = None;
         let result = loop {
+            if let Some(line) = Self::still_set_line(&mut still, &self.in_flight) {
+                eprintln!("{line}");
+            }
             match self.rx.recv_timeout(Self::WAIT_ANNOUNCE_EVERY) {
                 Ok(result) => break result,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -5844,6 +5904,49 @@ impl Runner {
 /// and namelink out, made by `cmake -E cmake_symlink_library`. Keyed on the
 /// COMMAND, since the rule name is the generator's and the shape alone (one
 /// `.so` in, `.so` out) also fits a real link of one object-less library.
+#[test]
+fn a_still_set_is_named_even_while_other_work_completes() {
+    // The defect: the timeout-based line is unreachable when completions keep
+    // arriving. This line is driven by the set, not by traffic, so it fires.
+    use n2::graph::BuildId;
+    let now = std::time::Instant::now();
+    let stuck = vec![
+        (BuildId::from(1usize), "stuck_a.o".to_string(), now),
+        (BuildId::from(2usize), "stuck_b.o".to_string(), now),
+    ];
+    let mut still = None;
+    // First observation records the set and prints nothing.
+    assert!(Runner::still_set_line(&mut still, &stuck).is_none());
+    // Pretend two intervals passed without the set changing.
+    let (ids, _) = still.clone().expect("recorded");
+    still = Some((ids, now - std::time::Duration::from_secs(301)));
+    let line = Runner::still_set_line(&mut still, &stuck).expect("a frozen set is reported");
+    assert!(line.contains("stuck_a.o"), "{line}");
+    assert!(line.contains("2 edge(s)"), "{line}");
+}
+
+#[test]
+fn a_changing_set_is_not_reported() {
+    // The negative control: a healthy build retires and starts edges, so the
+    // set moves every interval and nothing must print.
+    use n2::graph::BuildId;
+    let now = std::time::Instant::now();
+    let mut still = None;
+    let first = vec![(BuildId::from(1usize), "a.o".to_string(), now)];
+    assert!(Runner::still_set_line(&mut still, &first).is_none());
+    // Long past the interval, but the set has changed, so the clock restarts.
+    let (ids, _) = still.clone().expect("recorded");
+    still = Some((ids, now - std::time::Duration::from_secs(301)));
+    let second = vec![
+        (BuildId::from(1usize), "a.o".to_string(), now),
+        (BuildId::from(2usize), "b.o".to_string(), now),
+    ];
+    assert!(
+        Runner::still_set_line(&mut still, &second).is_none(),
+        "a set that changed must not report a stall"
+    );
+}
+
 #[test]
 fn stall_line_names_the_blocker() {
     let labels = vec!["a.o".to_string(), "b.o".to_string()];
