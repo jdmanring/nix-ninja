@@ -58,11 +58,9 @@ decide whether an edit spends them; passing the first is not enough.
    the forwarded environment, the discovered input set. Any of those
    re-keys every emitted derivation whatever the fileset says.
 
-**Price by `drvPath`, from this directory, never by reasoning:**
-
-    nix eval --impure --max-jobs 0 --raw \
-      .#packages.x86_64-linux.nix-ninja-task.drvPath
-
+**Price an edit by `local/gates/emission-price.sh`, from this directory,
+never by reasoning.** It holds both questions and the controls; the bare
+`nix eval` it wraps does not.
 `local/gates/emission-price.sh [BASE_REV]` asks both questions against a
 revision (A): the task `drvPath` plus the emitted derivation for five shapes
 (compile, `deps = gcc` compile, link, generator, app); three control arms
@@ -100,11 +98,11 @@ BUILDER, not name). `nix derivation show` on these needs
 `dynamic-derivations`, `ca-derivations` and `recursive-nix` TOGETHER
 (missing one exits 1 printing only the refusal).
 
-**Derivation JSON** reading traps are in the detail file: deps are
-`entry["inputs"]["drvs"]` (`inputDrvs` is ABSENT), `__structuredAttrs`
-hides inputs from `env`, a task drv has THREE input lists (read the one
-the code CONSUMES), and `ninja-build` in a name is generic: identity is
-the DRV HASH.
+**Derivation JSON** traps are in the detail file, but one costs a wrong
+price every time: the task `drvPath` does not move for ANY edit to
+`crates/nix-ninja`, so it prices the fileset and is blind to the driver.
+Deps are `entry["inputs"]["drvs"]` (`inputDrvs` ABSENT);
+a `ninja-build` name is generic.
 
 **The stable-builder knob.** Both binaries sit in every task derivation as
 `builder` and in `drv.inputs` though outputs do not change when they move
