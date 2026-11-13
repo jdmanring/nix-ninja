@@ -170,6 +170,9 @@ struct Pass {
     /// (placement writes it over) and stays on the reuse-and-count path,
     /// policed at exit; only an edit outside this set re-derives.
     managed: std::collections::HashSet<String>,
+    /// Every directory prefix of every path in `managed`, so the hot
+    /// membership test is two hash lookups rather than a scan.
+    managed_ancestors: std::collections::HashSet<String>,
 }
 
 /// The record's key for an edge: its outputs, joined on NUL, which no path
@@ -327,6 +330,7 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
                 .filter_map(|l| parse_journal(l).map(|(_, rel, _)| rel.to_string())),
         );
     }
+    let managed_ancestors = managed_ancestors(&managed);
     *PASS.lock().unwrap() = Some(Pass {
         state,
         build_dir: build_dir.to_path_buf(),
@@ -339,6 +343,7 @@ pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> st
         files,
         reused_edges: Vec::new(),
         managed,
+        managed_ancestors,
     });
     Ok(())
 }
@@ -573,7 +578,7 @@ fn inputs_changed(pass: &Pass, key: &str) -> bool {
             .map(|r| r.to_path_buf())
             .unwrap_or_else(|_| std::path::Path::new(p).to_path_buf());
         let p = written_at(&pass.build_dir, &rel).unwrap_or_else(|| p.clone());
-        if placement_managed(&pass.managed, &p) {
+        if placement_managed(&pass.managed, &pass.managed_ancestors, &p) {
             return false;
         }
         // Present now and different: changed. Absent now: reuse as before;
@@ -584,8 +589,39 @@ fn inputs_changed(pass: &Pass, key: &str) -> bool {
 
 /// Whether placement manages `p`: it is a recorded output, or a directory
 /// holding one. Component-wise, so `gen2/x.h` is not inside `gen`.
-fn placement_managed(managed: &std::collections::HashSet<String>, p: &str) -> bool {
-    managed.contains(p) || managed.iter().any(|o| o.starts_with(&format!("{p}/")))
+///
+/// THE SCAN HERE WAS THE WHOLE COST OF A REUSE PASS. This used to read
+/// `managed.iter().any(|o| o.starts_with(&format!("{p}/")))`, which allocates
+/// one String per element on every MISS, and it is called once per recorded
+/// input of every edge considered for reuse. Chromium compile edges record
+/// thousands of headers each, so the pass did edges x inputs x |managed|
+/// allocations, about 29k elements deep: qtwebengine spent 31 minutes on
+/// `resolved 500/24410` with `discover 0 s` and no section timer accounting
+/// for it (eu-stack put 14/15 innermost driver frames in this function).
+/// `ancestors` holds every directory prefix of every managed path, built once
+/// where `managed` is, so both halves are O(1) lookups and this allocates
+/// nothing. The trailing `/` is what keeps `gen2/x.h` out of `gen`.
+fn placement_managed(
+    managed: &std::collections::HashSet<String>,
+    ancestors: &std::collections::HashSet<String>,
+    p: &str,
+) -> bool {
+    managed.contains(p) || ancestors.contains(p)
+}
+
+/// Every directory prefix of every managed path: `a/b/c` contributes `a` and
+/// `a/b`. Built beside `managed` because the membership test above is run on
+/// the hot path of every reuse pass.
+fn managed_ancestors(
+    managed: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for m in managed {
+        for (i, _) in m.match_indices('/') {
+            out.insert(m[..i].to_string());
+        }
+    }
+    out
 }
 
 /// Notes the task derivation written for an edge with `outputs`, and the
@@ -2242,14 +2278,62 @@ impl Drop for Rewind {
 #[cfg(test)]
 mod tests {
     use super::{
-        journal_in, keep_originals_in, load_in, placed_paths, save_in, state_dir_in,
-        ConfigureState, Rewind,
+        journal_in, keep_originals_in, load_in, managed_ancestors, placed_paths, placement_managed,
+        save_in, state_dir_in, ConfigureState, Rewind,
     };
     use harmonia_store_derivation::derived_path::SingleDerivedPath;
     use harmonia_store_path::StoreDir;
     use nix_ninja_task::derived_file::DerivedFile;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+
+    /// THE PRECOMPUTED ANCESTOR SET ANSWERS EXACTLY WHAT THE SCAN DID, AND
+    /// THE `obj` ROW IS THE CONTROL THAT MAKES THAT A CLAIM RATHER THAN A
+    /// HOPE. A naive "does any managed path start with p" reports `obj` as
+    /// holding `obj2/a.o`, which the old code's trailing `/` prevented and
+    /// this one's component-wise prefixes prevent. WITHOUT that row THIS TEST
+    /// PASSES AGAINST THE NAIVE IMPLEMENTATION, measured rather than assumed:
+    /// the first version used `gen2` as its control, and `gen2` as a QUERY is
+    /// a different string from `gen` as a query, so it discriminated nothing.
+    /// The disagreement is on the MANAGED side, and the query has to be a
+    /// directory that holds nothing while a SIBLING name starts with it.
+    #[test]
+    fn the_ancestor_set_answers_what_the_scan_answered() {
+        let managed: std::collections::HashSet<String> = [
+            "gen/h.h",
+            "gen/sub/deep.h",
+            // Sits beside the query `obj` below, sharing its first three
+            // characters, and nothing at all is under `obj/`. That is what
+            // separates component-wise matching from prefix matching: a
+            // prefix test sees `objs/a.o` start with `obj` and claims `obj`
+            // holds it.
+            "objs/a.o",
+            "top.h",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let anc = managed_ancestors(&managed);
+        let hit = |p: &str| placement_managed(&managed, &anc, p);
+
+        // Exact members, at the top level and nested.
+        assert!(hit("gen/h.h"));
+        assert!(hit("objs/a.o"));
+        assert!(hit("top.h"));
+        // A directory holding a managed file, though the directory itself is
+        // not a member.
+        assert!(hit("gen"));
+        assert!(hit("gen/sub"));
+        assert!(hit("objs"));
+        // THE CONTROL: nothing is under `obj`, though `objs/a.o` starts with
+        // it. A prefix test says `obj` holds that file; a component-wise test
+        // says it does not.
+        assert!(!hit("obj"));
+        assert!(!hit("absent"));
+        // A managed path's own parent must not be reachable by a longer name:
+        // nothing is under `gen/h.h/`.
+        assert!(!hit("gen/h.h/inner"));
+    }
 
     /// A record holding `files` and every directory above them.
     fn record_of(files: &std::collections::HashSet<String>) -> ConfigureState {
