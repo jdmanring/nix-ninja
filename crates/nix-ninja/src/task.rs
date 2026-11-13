@@ -2844,8 +2844,10 @@ impl Runner {
                 if since.elapsed() < Self::WAIT_ANNOUNCE_EVERY {
                     return None;
                 }
-                let labels: Vec<String> =
-                    in_flight.iter().map(|(_, label, _)| label.clone()).collect();
+                let labels: Vec<String> = in_flight
+                    .iter()
+                    .map(|(_, label, _)| label.clone())
+                    .collect();
                 let oldest = in_flight.iter().map(|(_, _, at)| *at).min()?;
                 Some(format!(
                     "nix-ninja: {n} edge(s) have been in flight unchanged for {held}s while other \
