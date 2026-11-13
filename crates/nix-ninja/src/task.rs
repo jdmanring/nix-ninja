@@ -22846,6 +22846,25 @@ static DYN_UPLOAD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 
 static DYN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A phase clock that reports ONCE. `report` consumes it, so a second add of
+/// the same clock does not compile: the first version read one `Instant` at
+/// both upload sites, counted the first elapsed twice, and printed 35,261 ms
+/// inside a 13,277 ms span on a live round. The invariant the comment above
+/// states is the one this type enforces.
+struct PhaseTimer(std::time::Instant, &'static std::sync::atomic::AtomicU64);
+
+impl PhaseTimer {
+    fn new(counter: &'static std::sync::atomic::AtomicU64) -> Self {
+        Self(std::time::Instant::now(), counter)
+    }
+    fn report(self) {
+        self.1.fetch_add(
+            self.0.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 struct DynDiscoveryTimer(std::time::Instant);
 
 impl Drop for DynDiscoveryTimer {
@@ -29506,7 +29525,7 @@ pub fn discover_c_includes(
             deps
         }
         None => {
-            let t_scan = std::time::Instant::now();
+            let t_scan = PhaseTimer::new(&DYN_SCAN_MS);
             let c_include_parser::Scan {
                 includes: scanned,
                 incomplete,
@@ -29518,10 +29537,7 @@ pub fn discover_c_includes(
                 virtual_declared.as_ref(),
                 store_dir.to_path(),
             )?;
-            DYN_SCAN_MS.fetch_add(
-                t_scan.elapsed().as_millis() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            t_scan.report();
             // THE SCAN NOW SAYS WHEN IT CANNOT ANSWER, AND THIS IS WHAT
             // ACTS ON IT. A computed include through a function-like macro
             // needs real expansion against the command line's -D set, which
@@ -29703,16 +29719,13 @@ pub fn discover_c_includes(
             // process cwd here) exactly as the compiler resolves it, and the
             // path the reader emits from it stays relative.
             let dirs = macro_arm_include_dirs(cmdline, build_dir);
-            let t_macro = std::time::Instant::now();
+            let t_macro = PhaseTimer::new(&DYN_MACRO_ARM_MS);
             for extra in macro_arm_headers(build_dir, &dirs, &declaring) {
                 if !v.contains(&extra) {
                     v.push(extra);
                 }
             }
-            DYN_MACRO_ARM_MS.fetch_add(
-                t_macro.elapsed().as_millis() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            t_macro.report();
         }
         v
     };
@@ -29748,12 +29761,9 @@ pub fn discover_c_includes(
     // never saw them. Store paths are left out: a system header cannot spell
     // a header this project generates.
     let defer_miss = producer.as_ref().and_then(|idx| {
-        let t_walk = std::time::Instant::now();
+        let t_walk = PhaseTimer::new(&DYN_DEFER_WALK_MS);
         let walk = defer_walk(&files, &c_includes, store_dir.to_path());
-        DYN_DEFER_WALK_MS.fetch_add(
-            t_walk.elapsed().as_millis() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        t_walk.report();
         let candidates = find_unresolved_miss(
             idx,
             &walk,
@@ -29967,7 +29977,7 @@ pub fn discover_c_includes(
     // log, and only strace could see it. The watchdog names the phase; the
     // upload line above names the size.
     resolve_section("upload: discovered includes");
-    let t_upload = std::time::Instant::now();
+    let t_upload = PhaseTimer::new(&DYN_UPLOAD_MS);
     discovered_deps.extend(
         new_opaque_files_because(
             rpc_client,
@@ -29989,10 +29999,6 @@ pub fn discover_c_includes(
                 c_include_count, answer_source, seed_count, absent_note,
             )
         })?,
-    );
-    DYN_UPLOAD_MS.fetch_add(
-        t_upload.elapsed().as_millis() as u64,
-        std::sync::atomic::Ordering::Relaxed,
     );
 
     // A HEADER THE PACKAGE STAGED INTO ITS OWN OUTPUT IS CARRIED AS BYTES.
@@ -30016,10 +30022,7 @@ pub fn discover_c_includes(
     // BOTH upload sites, one span: the discovered includes above and the
     // outer-staged headers here are the two ways a discovery result becomes
     // store paths, and a round cannot tell which one it paid for.
-    DYN_UPLOAD_MS.fetch_add(
-        t_upload.elapsed().as_millis() as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    t_upload.report();
 
     USED_HEADERS.fetch_add(
         used_declared.len() as u64,
