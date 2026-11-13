@@ -9208,7 +9208,7 @@ fn add_produced_qrc_members(
     if members.is_empty() {
         return Ok(());
     }
-    let deps = new_opaque_files(rpc_client, build_dir, members)
+    let deps = new_opaque_files_because(rpc_client, build_dir, members, "grd members")
         .context("uploading the files a produced qrc lists")?;
     dynamic_task::update_derivation_with_discoveries(drv, deps, Vec::new(), store_dir)?;
     Ok(())
@@ -10402,11 +10402,45 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// sites use it rather than each growing its own knob.
 const PER_TASK_ADDS: usize = 8;
 
+/// Paths above this are announced before upload. A batch this large is the
+/// shape that cost a round: the same ~9,700-file tool trees re-added about
+/// four times a minute, invisible in the log. The threshold keeps the line
+/// at zero volume on ordinary edges.
+const UPLOAD_ANNOUNCE_AT: usize = 1_000;
+
 pub(crate) fn new_opaque_files(
     rpc_client: &Arc<BuilderRpcClient>,
     build_dir: &std::path::Path,
     paths: Vec<PathBuf>,
 ) -> Result<Vec<DerivedFile>> {
+    new_opaque_files_because(rpc_client, build_dir, paths, "")
+}
+
+/// `new_opaque_files` naming WHY the batch exists, so a repeat is countable
+/// from the log: the caller's reason (the walk, discovered includes for a
+/// seed, grd members, outer-staged headers) and the size. `what` is empty
+/// where the caller has nothing to add.
+pub(crate) fn new_opaque_files_because(
+    rpc_client: &Arc<BuilderRpcClient>,
+    build_dir: &std::path::Path,
+    paths: Vec<PathBuf>,
+    what: &str,
+) -> Result<Vec<DerivedFile>> {
+    if paths.len() >= UPLOAD_ANNOUNCE_AT {
+        eprintln!(
+            "nix-ninja: uploading {} opaque file(s){}",
+            paths.len(),
+            if what.is_empty() {
+                String::new()
+            } else {
+                format!(" ({what})")
+            }
+        );
+        // The resolve watchdog reads this: an upload of a tool tree is a
+        // phase, and a driver stuck in one must say so rather than sit
+        // silent for the round's whole length.
+        resolve_section("upload");
+    }
     let mut out = Vec::with_capacity(paths.len());
     for chunk in paths.chunks(PER_TASK_ADDS) {
         let results: Vec<Result<DerivedFile>> = std::thread::scope(|scope| {
@@ -22870,6 +22904,38 @@ fn resolve_watch(label: &str) -> ResolveWatch {
                 "{}",
                 resolve_stall_line(&label, &sec, resolve_elapsed_ms().saturating_sub(started))
             );
+            // A RESOLVE CAN OUTLIVE ITS ONE LINE BY HOURS, and the first line
+            // names the phase it was in at 30 s, not the one it is stuck in.
+            // qtwebengine 2026-11-12: 35 minutes with the line printed once,
+            // and the phase it died in never named. Re-announce on EVERY
+            // PHASE CHANGE for the life of the resolve: the watchdog thread
+            // already ticks, so this costs one string compare per 5 s and
+            // nothing at all on the resolve path.
+            let mut last_sec = sec;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let live_gen = RESOLVE_GEN.load(std::sync::atomic::Ordering::Relaxed);
+                let live_started = RESOLVE_STARTED_MS.load(std::sync::atomic::Ordering::Relaxed);
+                if live_started == 0 || live_gen != gen {
+                    // The resolve finished or a different one began.
+                    break;
+                }
+                let now_sec = RESOLVE_SECTION
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_default();
+                if now_sec != last_sec {
+                    last_sec = now_sec.clone();
+                    eprintln!(
+                        "{}",
+                        resolve_stall_line(
+                            &RESOLVE_LABEL.lock().map(|l| l.clone()).unwrap_or_default(),
+                            &now_sec,
+                            resolve_elapsed_ms().saturating_sub(live_started),
+                        )
+                    );
+                }
+            }
         });
     });
     *RESOLVE_LABEL.lock().unwrap() = label.to_string();
@@ -24207,12 +24273,13 @@ fn walk_dir_capped_uncached(
     // scan side gained this after svt-av1 died with a chain that could not be
     // attributed; this is its sibling, and it had none.
     let count = paths.len();
-    let out = new_opaque_files(rpc_client, build_dir, paths).with_context(|| {
-        format!(
-            "uploading {count} file(s) found by the build-directory walk of {}",
-            dir.display()
-        )
-    })?;
+    let out = new_opaque_files_because(rpc_client, build_dir, paths, "build-dir walk")
+        .with_context(|| {
+            format!(
+                "uploading {count} file(s) found by the build-directory walk of {}",
+                dir.display()
+            )
+        })?;
     Ok(Some(out))
 }
 
@@ -29819,8 +29886,19 @@ pub fn discover_c_includes(
     // scan, or which file was being scanned when it was resolved. Those are
     // different defects in different crates. The failure path costs one
     // format, runs once per failing task, and answers both.
+    // A NAMED SECTION, because this is where a round went silent: the
+    // qtwebengine 2026-11-12 driver spent 35 minutes here with no line in the
+    // log, and only strace could see it. The watchdog names the phase; the
+    // upload line above names the size.
+    resolve_section("upload: discovered includes");
     discovered_deps.extend(
-        new_opaque_files(rpc_client, build_dir, to_upload).with_context(|| {
+        new_opaque_files_because(
+            rpc_client,
+            build_dir,
+            to_upload,
+            &format!("discovered includes for {seed}"),
+        )
+        .with_context(|| {
             let absent_note = match absent.first() {
                 None => String::new(),
                 Some(first) => format!(
@@ -29846,8 +29924,9 @@ pub fn discover_c_includes(
     // the directory to the command.
     if !outer_files.is_empty() {
         let (sources, staged): (Vec<PathBuf>, Vec<PathBuf>) = outer_files.into_iter().unzip();
-        let uploaded = new_opaque_files(rpc_client, build_dir, sources)
-            .context("uploading headers staged in the outer derivation's own output")?;
+        let uploaded =
+            new_opaque_files_because(rpc_client, build_dir, sources, "outer-staged headers")
+                .context("uploading headers staged in the outer derivation's own output")?;
         for (mut file, stage) in uploaded.into_iter().zip(staged) {
             file.build_path = stage;
             discovered_deps.push(file);
@@ -35410,6 +35489,36 @@ mod unresolved_include_defer_tests {
         assert!(!resolve_stall_due(100 + T - 1, 100, 1, 0));
         // A later resolve is a new subject even though an earlier one spoke.
         assert!(resolve_stall_due(100 + T, 100, 8, 7));
+    }
+
+    /// A PHASE CHANGE MUST REACH THE LINE, which is the half that failed
+    /// tonight: the watchdog printed once at 30 s naming the section it was
+    /// in then, and the phase it was actually stuck in was never named. This
+    /// drives the real `resolve_section` and reads it back through the same
+    /// lock the watchdog reads, so a section set anywhere in the resolve is
+    /// what the line prints.
+    #[test]
+    fn a_section_set_during_a_resolve_is_what_the_line_reports() {
+        let _g = super::RESOLVE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        super::resolve_section("upload: discovered includes");
+        let read = super::RESOLVE_SECTION
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        assert_eq!(read, "upload: discovered includes");
+        let line = super::resolve_stall_line("edge.o", &read, 90_000);
+        assert!(
+            line.contains("[section: upload: discovered includes]"),
+            "{line}"
+        );
+        assert!(line.contains("after 90 s"), "{line}");
+        // Negative control: a different section must not be reported.
+        assert!(
+            !line.contains("[section: grd]"),
+            "the line names one section"
+        );
     }
 
     #[test]
