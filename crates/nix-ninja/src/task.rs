@@ -7762,6 +7762,14 @@ fn build_task_derivation(
     }
     {
         let wants_discovery = wants_dependency_discovery(&task);
+        // The edge label for every line discovery prints. `outputs` first,
+        // because an output names the edge's product and a task's inputs are
+        // shared across many edges.
+        let edge = task
+            .outputs
+            .first()
+            .map(|o| o.to_string_lossy().into_owned())
+            .unwrap_or_default();
         if wants_discovery {
             // Only opaque inputs are processed by gcc
             let files: Vec<PathBuf> = task
@@ -7818,12 +7826,20 @@ fn build_task_derivation(
                     .then_some(task.producer_index.as_deref())
                     .flatten(),
                 &carried_module_trees(&task.inputs),
-                &|| {
-                    task.local_mode
-                        .then(|| {
-                            task_view(rpc_client, &task.store_dir, &task.build_dir, &task.inputs)
-                        })
-                        .flatten()
+                &EdgeView {
+                    label: &edge,
+                    task_view: &|| {
+                        task.local_mode
+                            .then(|| {
+                                task_view(
+                                    rpc_client,
+                                    &task.store_dir,
+                                    &task.build_dir,
+                                    &task.inputs,
+                                )
+                            })
+                            .flatten()
+                    },
                 },
             )?;
             // A miss the producer index answers ends the emission here,
@@ -13201,7 +13217,10 @@ fn moc_walk(
         None,
         None,
         &[],
-        &|| None,
+        &EdgeView {
+            label: "moc",
+            task_view: &|| None,
+        },
     )?;
     Ok(found)
 }
@@ -29299,6 +29318,24 @@ fn defer_walk(files: &[PathBuf], c_includes: &[PathBuf], store_dir: &Path) -> Ve
     walk
 }
 
+/// ` (edge: <label>)` for a caller that has one, empty otherwise, so a line
+/// that names an edge stays a single format rather than two wordings.
+fn edge_clause(edge: &str) -> String {
+    if edge.is_empty() {
+        String::new()
+    } else {
+        format!(" (edge: {edge})")
+    }
+}
+
+/// What a caller knows about the edge it is resolving. `label` is printed
+/// on every line discovery emits; `task_view` resolves a realised path for a
+/// local-mode drive.
+pub struct EdgeView<'a> {
+    pub label: &'a str,
+    pub task_view: &'a dyn Fn() -> Option<PathBuf>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn discover_c_includes(
     rpc_client: &Arc<BuilderRpcClient>,
@@ -29310,7 +29347,11 @@ pub fn discover_c_includes(
     depfile: Option<&Path>,
     producer: Option<&ProducerIndex>,
     carried_trees: &[PathBuf],
-    task_view: &dyn Fn() -> Option<PathBuf>,
+    // The caller's own view of this edge: the label every line prints, and
+    // the local-mode task view. One struct rather than two parameters,
+    // because `discover_c_includes` already sits at clippy's argument limit
+    // and the two travel together.
+    view: &EdgeView,
 ) -> Result<(Discovered, Option<DeferMiss>)> {
     // The virtual set is consumed by the scan below; the UPLOAD filter
     // further down needs it too, so keep a copy. See generated_not_yet_written.
@@ -29543,9 +29584,10 @@ pub fn discover_c_includes(
                             answer_source = "the scan, the preprocessor having failed".to_string();
                             eprintln!(
                                 "nix-ninja: computed include unresolvable by scan and the \
-                                 preprocessor fallback failed ({e}); keeping the scan's {} \
+                                 preprocessor fallback failed ({e}){}; keeping the scan's {} \
                                  input(s), so the task fails loudly rather than silently \
                                  building with the wrong ones",
+                                edge_clause(view.label),
                                 scanned.len()
                             );
                             scanned
@@ -29695,7 +29737,7 @@ pub fn discover_c_includes(
         let names: Vec<String> = candidates.iter().map(|c| c.header.clone()).collect();
         // No input view (DRV mode, or the realise failed): nothing is
         // confirmed, the emission of before.
-        let view = task_view()?;
+        let view = (view.task_view)()?;
         let live = preprocessor_confirmed(cmdline, build_dir, Some(&view), candidates);
         if debug {
             let why = match preprocessor_deps(cmdline, build_dir, Some(&view)) {
@@ -29896,7 +29938,7 @@ pub fn discover_c_includes(
             rpc_client,
             build_dir,
             to_upload,
-            &format!("discovered includes for {seed}"),
+            &format!("discovered includes for {seed}{}", edge_clause(view.label)),
         )
         .with_context(|| {
             let absent_note = match absent.first() {
@@ -35519,6 +35561,29 @@ mod unresolved_include_defer_tests {
             !line.contains("[section: grd]"),
             "the line names one section"
         );
+    }
+
+    /// A LINE ABOUT A RESOLVE MUST NAME THE EDGE. 137 identical
+    /// `Unsupported compiler` lines in one round could not be attributed to
+    /// any edge, argv or rule, so the next round names it. This pins the
+    /// clause in both directions: a caller with a label gains one, a caller
+    /// without stays a single format rather than emitting a dangling paren.
+    #[test]
+    fn an_edge_label_appears_only_when_the_caller_has_one() {
+        assert_eq!(super::edge_clause("obj/x.o"), " (edge: obj/x.o)");
+        assert_eq!(super::edge_clause(""), "");
+        let with = format!(
+            "computed include unresolvable by scan and the preprocessor fallback \
+             failed (Unsupported compiler: py){}",
+            super::edge_clause("obj/x.o")
+        );
+        assert!(with.contains("(edge: obj/x.o)"), "{with}");
+        let without = format!(
+            "computed include unresolvable by scan and the preprocessor fallback \
+             failed (Unsupported compiler: py){}",
+            super::edge_clause("")
+        );
+        assert!(!without.contains("edge:"), "{without}");
     }
 
     #[test]

@@ -311,6 +311,7 @@ pub fn discover_dynamic_dependencies(
         .first()
         .ok_or_else(|| anyhow!("No command line found in derivation"))?;
     let cmdline = std::str::from_utf8(cmdline_bytes)?;
+    let drv_name = drv.name.clone();
 
     let (files, built_paths) = scan_inputs(built_paths);
     let through_trees = through_tree_headers(drv, build_dir, store_dir.to_path(), &built_paths);
@@ -331,7 +332,12 @@ pub fn discover_dynamic_dependencies(
         // A header absent from a tree the task carries is not a miss the
         // tree's producer could answer: it already ran.
         carried_trees,
-        task_view,
+        // The subtool runs one derivation per invocation, so the drv name is
+        // the edge identity here.
+        &crate::task::EdgeView {
+            label: &drv_name,
+            task_view,
+        },
     )?;
     if !through_trees.is_empty() {
         found
