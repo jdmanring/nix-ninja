@@ -22834,11 +22834,19 @@ static DYN_DISCOVER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 // every candidate phase an inference from a cap: this says which of the
 // scan, the macro arms, the defer walk and the uploads the time is in.
 // Each accumulates independently and rounds to whole ms, so a child can read
+// Each accumulates independently and rounds to whole ms, so a child can read
 // 1-2 ms where the enclosing `dyn_discover_ms` reads 0: that is rounding,
-// not a contradiction. They sum to at most the span; the remainder is the
-// work between them. A phase reports 0 both when it is cheap and when it did
-// not run, so read `dyn_scan_ms` beside `tasks`. Reported in the existing
-// stats line, never a new one, so a log stays one comparison.
+// not a contradiction. THEY ARE THREAD TIME, NOT SHARES OF ONE WALL CLOCK:
+// `handle_derivation_result` runs inside `std::thread::spawn` workers under a
+// permit, so both these and `dyn_discover_ms` sum elapsed time over tasks
+// that run CONCURRENTLY. The four can therefore exceed the span, and a
+// round's 51,948 ms of children against a 13,277 ms parent is concurrency,
+// not necessarily a double-count (the upload double-count in `83cadb9` was
+// the separate defect `b28979f` fixes; both were true at once). Read them as
+// where the thread time goes, never as a partition of wall clock. A phase
+// reports 0 both when it is cheap and when it did not run, so read
+// `dyn_scan_ms` beside `tasks`. Reported in the existing stats line, never a
+// new one, so a log stays one comparison.
 static DYN_SCAN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_MACRO_ARM_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_DEFER_WALK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
