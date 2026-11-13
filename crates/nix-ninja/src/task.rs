@@ -22833,9 +22833,12 @@ static DYN_DISCOVER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 // lines and no breakdown. A round measured 773 s of `dyn_discover_ms` with
 // every candidate phase an inference from a cap: this says which of the
 // scan, the macro arms, the defer walk and the uploads the time is in.
-// They sum to at most `dyn_discover_ms`; the remainder is the work between
-// them. Reported in the existing stats line, never a new one, so a log
-// stays one comparison.
+// Each accumulates independently and rounds to whole ms, so a child can read
+// 1-2 ms where the enclosing `dyn_discover_ms` reads 0: that is rounding,
+// not a contradiction. They sum to at most the span; the remainder is the
+// work between them. A phase reports 0 both when it is cheap and when it did
+// not run, so read `dyn_scan_ms` beside `tasks`. Reported in the existing
+// stats line, never a new one, so a log stays one comparison.
 static DYN_SCAN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_MACRO_ARM_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_DEFER_WALK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
