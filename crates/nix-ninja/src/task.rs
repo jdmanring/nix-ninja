@@ -25176,9 +25176,16 @@ mod job_permits_tests {
         // Working: burns CPU past the bail window and must NOT be killed.
         // Run it on its own thread and stop it from outside, since it never
         // exits on its own.
+        //
+        // `ulimit -t` bounds the fixture from INSIDE the shell. Cleanup here
+        // is a kill issued after an assertion, so any abort of this binary
+        // (a caller's timeout, a panic, Ctrl-C) used to orphan an unbounded
+        // loop to init: one burned a core for 95 minutes. SIGXCPU needs no
+        // tool the sandbox may lack, and the limit is far above the bail
+        // window so the kill decision is still the watchdog's.
         let mut busy = std::process::Command::new("sh")
             .arg("-c")
-            .arg("while :; do :; done")
+            .arg("ulimit -t 30; while :; do :; done")
             .spawn()
             .expect("spawn the busy fixture");
         let id = busy.id();
@@ -25200,6 +25207,40 @@ mod job_permits_tests {
         }
         // The busy child IS the shell (no descendants), and `kill_subtree`
         // kills descendants only, so the pid itself takes the signal.
+        if let Ok(p) = i32::try_from(id) {
+            unsafe { libc::kill(p, libc::SIGKILL) };
+        }
+        let _ = handles.join();
+    }
+
+    /// A LIVE WEDGE IS NOT KILLED, and that is the watchdog's real blind spot.
+    ///
+    /// The progress signal is CPU consumed, so a child that keeps burning CPU
+    /// while completing nothing reads as healthy forever. qtwebengine's nested
+    /// ninja did exactly that for 34,539 s: `completed=150 total=278` with no
+    /// further line, while its driver sat at 222% CPU and bought zero outputs
+    /// over 100 s of CPU (measured by counting, 2026-11-12). This arm PINS the
+    /// limitation rather than closing it, so the next reader does not mistake
+    /// "the watchdog is green" for "a wedge is now survivable".
+    #[test]
+    fn a_child_that_burns_cpu_without_completing_is_not_killed() {
+        let bail = std::time::Duration::from_millis(300);
+        let tick = std::time::Duration::from_millis(50);
+        let mut busy = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("ulimit -t 30; while :; do :; done")
+            .spawn()
+            .expect("spawn the live-wedge fixture");
+        let id = busy.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handles = std::thread::spawn(move || {
+            let out = wait_child_watched_with(&mut busy, id, bail, tick);
+            let _ = tx.send(out.map(|o| o.stalled_for));
+        });
+        match rx.recv_timeout(std::time::Duration::from_millis(900)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            other => panic!("a spinning child is not a stalled one; got {other:?}"),
+        }
         if let Ok(p) = i32::try_from(id) {
             unsafe { libc::kill(p, libc::SIGKILL) };
         }
@@ -25775,7 +25816,9 @@ mod job_permits_tests {
         // toolchain may lack fails in the pricer rather than here. Measured:
         // `( loop ) & wait` leaves the stored pid at 0 ticks and its child
         // at 79.
-        let busy = KillChild::spawn("( while :; do :; done ) & wait");
+        // Bounded the same way: `ulimit -t` reaches the subshell that burns,
+        // so an aborted binary leaves nothing running behind it.
+        let busy = KillChild::spawn("ulimit -t 30; ( while :; do :; done ) & wait");
         // A child that does nothing at all, so its CPU never moves.
         let idle = KillChild::spawn("sleep 30");
 
