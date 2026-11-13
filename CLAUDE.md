@@ -98,11 +98,10 @@ BUILDER, not name). `nix derivation show` on these needs
 `dynamic-derivations`, `ca-derivations` and `recursive-nix` TOGETHER
 (missing one exits 1 printing only the refusal).
 
-**Derivation JSON** traps are in the detail file, but one costs a wrong
-price every time: the task `drvPath` does not move for ANY edit to
-`crates/nix-ninja`, so it prices the fileset and is blind to the driver.
-Deps are `entry["inputs"]["drvs"]` (`inputDrvs` ABSENT);
-a `ninja-build` name is generic.
+**Derivation JSON** traps are in the detail file. One costs a wrong price
+every time: the task `drvPath` does not move for ANY edit to
+`crates/nix-ninja`: it prices the fileset, blind to the driver.
+Deps are `entry["inputs"]["drvs"]`; a `ninja-build` name is generic.
 
 **The stable-builder knob.** Both binaries sit in every task derivation as
 `builder` and in `drv.inputs` though outputs do not change when they move
@@ -443,12 +442,13 @@ binding rule; the long form is the detail file's mechanism notes.
   recorded (`.ninja_log` v7, `.ninja_deps` v4), stamped with the run START
   (`mark_start`); errors read DIRTY, never clean.
 - **Later passes** (`configure_state`; B): a pass after the first rewinds
-  earlier placements (`Rewind`, `placed.v1`) and REUSES each recorded task
-  derivation (`emitted.v1`), deriving unrecorded edges, edges whose recorded
+  earlier placements (`Rewind`, `placed.v1`) and REUSES each recorded
+  derivation (`emitted.v1`), deriving unrecorded edges, those whose
   inputs changed (`inputs_changed`), and consumers of replaced outputs
   (`replaced_outputs`). Every later-pass exit prints `nix-ninja:
-  later-pass reused R task(s), derived M fresh, F fallback, S stale: ...`;
-  the consumer's tripwire stops on F>0 or S>0. A missing, corrupt or
+  later-pass reused R task(s), derived M fresh, F fallback, S stale: ...;
+  re-derived N: ...`, counting recorded edges derived AGAIN (in neither R
+  nor M). The tripwire stops on F>0 or S>0. A missing, corrupt or
   other-configure record, or another invocation (`-v`, builder knobs), is a
   hard error; a record differing ONLY in `driver=` reuses NOTHING
   (`driver_moved`). Gate `install-pass-reuse-repro.sh`; open gaps in the
