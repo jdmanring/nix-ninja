@@ -989,6 +989,17 @@ struct ChildOutcome {
     /// `Some(secs)` when the watchdog killed a stalled child, `None` when the
     /// child exited on its own.
     stalled_for: Option<u64>,
+    /// The pid the watchdog sampled, and the subtree CPU ticks at the two ends
+    /// of the window that ended in a kill. Read only when `stalled_for` is
+    /// `Some`. These exist so a kill line says WHICH flat it was: a subtree
+    /// already at `cpu_at_open` when the window began did nothing at all,
+    /// while one that climbed to `cpu_at_kill` and then stopped was working
+    /// until it wedged. A compile is never in this sum (tasks are realised
+    /// through builder-rpc and forked by the DAEMON), so these ticks are the
+    /// driver's own threads.
+    watched_pid: u32,
+    cpu_at_open: u64,
+    cpu_at_kill: u64,
 }
 
 /// Wait for `child`, killing its subtree if it makes no progress.
@@ -1010,6 +1021,10 @@ fn wait_child_watched_with(
     tick: std::time::Duration,
 ) -> Result<ChildOutcome> {
     let mut last_cpu = subtree_cpu(pid).ticks;
+    // The value the window OPENED at, for the kill line. `last_cpu` cannot
+    // serve: it is updated on every move, so at kill time it equals the
+    // current value and the pair would always read "flat".
+    let first_cpu = last_cpu;
     let mut last_move = std::time::Instant::now();
     let mut since_sample = std::time::Instant::now();
     loop {
@@ -1017,6 +1032,9 @@ fn wait_child_watched_with(
             return Ok(ChildOutcome {
                 status,
                 stalled_for: None,
+                watched_pid: pid,
+                cpu_at_open: first_cpu,
+                cpu_at_kill: subtree_cpu(pid).ticks,
             });
         }
         if since_sample.elapsed() >= tick {
@@ -1033,6 +1051,15 @@ fn wait_child_watched_with(
                 return Ok(ChildOutcome {
                     status,
                     stalled_for: Some(stalled),
+                    // BOTH ENDS OF THE WINDOW, so the reader can tell the two
+                    // flats apart. A subtree that was already at this value
+                    // when the window opened never did anything; one that
+                    // reached it and stopped was working until it wedged.
+                    // Without the pair, "no progress" cannot distinguish a
+                    // dead child from a live driver that stopped ticking.
+                    watched_pid: pid,
+                    cpu_at_open: first_cpu,
+                    cpu_at_kill: now_cpu,
                 });
             }
         }
@@ -2156,7 +2183,11 @@ impl Runner {
                     eprintln!(
                         "nix-ninja: local edge {label} ({member}) made no progress for {secs}s; \
                          killed it and its subtree (the command is wedged, and it holds the \
-                         whole permit budget until it exits)"
+                         whole permit budget until it exits). watched pid {pid}, subtree cpu \
+                         {open} -> {at_kill} ticks",
+                        pid = status.watched_pid,
+                        open = status.cpu_at_open,
+                        at_kill = status.cpu_at_kill,
                     );
                 }
                 if !status.status.success() {
@@ -25298,6 +25329,16 @@ mod job_permits_tests {
         assert!(
             out.stalled_for.is_some(),
             "a child whose CPU never moves must be killed"
+        );
+        // The kill line's numbers must be real, and for a bare `sleep` they
+        // must show the dead-child shape: the watched pid is the child, and a
+        // subtree that never did anything sits at the same value at both ends.
+        assert_eq!(out.watched_pid, id, "the line must name the pid sampled");
+        assert_eq!(
+            out.cpu_at_open, out.cpu_at_kill,
+            "a never-active subtree is flat at both ends; \
+             got {} -> {}",
+            out.cpu_at_open, out.cpu_at_kill
         );
 
         // Working: burns CPU past the bail window and must NOT be killed.
