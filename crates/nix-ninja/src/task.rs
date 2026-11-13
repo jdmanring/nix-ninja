@@ -971,10 +971,85 @@ fn single_pid_cpu_ticks(pid: u32) -> u64 {
     }
 }
 
-/// SIGKILL every descendant of `pid`, deepest first, so a fixture that
-/// forks cannot leave a spinner behind. Test scaffolding only; production
-/// never kills a local edge.
-#[cfg(test)]
+/// How long a local edge's child may make no progress before it is killed.
+///
+/// The permit for a local edge is bound to the thread that waits on its child,
+/// so it is released only when that wait RETURNS. A wedged child therefore
+/// holds the whole budget indefinitely and every other waiter parks forever:
+/// qtwebengine's nested ninja went silent at 150 of 278 tasks while holding 6
+/// of 6 units, and the round sat there for 34,539 s until it was killed from
+/// outside. The permit bail cannot see this, because it measures whether ANY
+/// holder released, and unrelated edges releasing keep resetting it.
+const LOCAL_EDGE_STALL_BAIL: std::time::Duration = std::time::Duration::from_secs(1800);
+/// How often the watchdog samples the child's subtree CPU.
+const LOCAL_EDGE_STALL_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
+struct ChildOutcome {
+    status: std::process::ExitStatus,
+    /// `Some(secs)` when the watchdog killed a stalled child, `None` when the
+    /// child exited on its own.
+    stalled_for: Option<u64>,
+}
+
+/// Wait for `child`, killing its subtree if it makes no progress.
+///
+/// Progress is the cumulative CPU of the child's WHOLE subtree, not of the
+/// pid: `sh -c` and `cmake -E env` fork rather than exec, so the spawned pid
+/// routinely sits at zero while its child works (`subtree_cpu` carries the
+/// measurement). A child that is waiting on something never moves it.
+fn wait_child_watched(
+    child: &mut std::process::Child,
+    pid: u32,
+) -> Result<ChildOutcome> {
+    wait_child_watched_with(child, pid, LOCAL_EDGE_STALL_BAIL, LOCAL_EDGE_STALL_TICK)
+}
+
+/// The watchdog with its clocks as parameters, so a test drives it in
+/// milliseconds instead of half an hour.
+fn wait_child_watched_with(
+    child: &mut std::process::Child,
+    pid: u32,
+    bail: std::time::Duration,
+    tick: std::time::Duration,
+) -> Result<ChildOutcome> {
+    let mut last_cpu = subtree_cpu(pid).ticks;
+    let mut last_move = std::time::Instant::now();
+    let mut since_sample = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().context("polling sh")? {
+            return Ok(ChildOutcome {
+                status,
+                stalled_for: None,
+            });
+        }
+        if since_sample.elapsed() >= tick {
+            since_sample = std::time::Instant::now();
+            let now_cpu = subtree_cpu(pid).ticks;
+            if now_cpu != last_cpu {
+                last_cpu = now_cpu;
+                last_move = std::time::Instant::now();
+            } else if last_move.elapsed() >= bail {
+                let stalled = last_move.elapsed().as_secs();
+                kill_subtree(pid);
+                let _ = child.kill();
+                let status = child.wait().context("reaping a killed sh")?;
+                return Ok(ChildOutcome {
+                    status,
+                    stalled_for: Some(stalled),
+                });
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// SIGKILL every descendant of `pid`, deepest first.
+///
+/// Used by the local-edge watchdog: a nested ninja that stops making progress
+/// holds the whole permit budget until it exits, and nothing else can free it
+/// (qtwebengine, 2026-11-12: a nested edge wedged at 150 of 278 tasks and held
+/// 6 units for 34,539 s). Also used by test fixtures so a forked child cannot
+/// outlive the test.
 fn kill_subtree(pid: u32) {
     fn walk(pid: u32, depth: usize) -> Vec<u32> {
         if depth > SUBTREE_DEPTH {
@@ -2070,9 +2145,18 @@ impl Runner {
                 child_pid
                     .0
                     .store(child.id(), std::sync::atomic::Ordering::Relaxed);
-                let status = child.wait().context("waiting for sh")?;
-                if !status.success() {
-                    anyhow::bail!("the command exited with {status}");
+                let child_id = child.id();
+                let status = wait_child_watched(&mut child, child_id)
+                    .context("waiting for sh")?;
+                if let Some(secs) = status.stalled_for {
+                    eprintln!(
+                        "nix-ninja: local edge {label} ({member}) made no progress for {secs}s; \
+                         killed it and its subtree (the command is wedged, and it holds the \
+                         whole permit budget until it exits)"
+                    );
+                }
+                if !status.status.success() {
+                    anyhow::bail!("the command exited with {}", status.status);
                 }
                 // A declared output the command did not write is skipped, as
                 // ninja does: qtwebengine declares the nested target's NAME
@@ -25063,10 +25147,68 @@ mod compile_task_tests {
 mod job_permits_tests {
     use super::{
         admission_weight, budget_for_load, budget_for_memory, capped_available_gib,
-        cgroup_available_bytes, cgroup_max_mib, cgroup_oom_kills, JobPermits, OUT_ENV_LOCK,
+        cgroup_available_bytes, cgroup_max_mib, cgroup_oom_kills, wait_child_watched_with,
+        JobPermits, OUT_ENV_LOCK,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// A WEDGED CHILD IS KILLED AND A WORKING ONE IS NOT.
+    ///
+    /// The negative control is the working half: without it, a watchdog that
+    /// killed everything immediately would pass, and a local edge that
+    /// legitimately runs for hours is the common case (qtwebengine's nested
+    /// ninja is the whole build).
+    #[test]
+    fn a_stalled_local_edge_is_killed_and_a_working_one_is_not() {
+        let bail = std::time::Duration::from_millis(300);
+        let tick = std::time::Duration::from_millis(50);
+
+        // Wedged: sleeps, so its subtree CPU never moves.
+        let mut idle = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .spawn()
+            .expect("spawn the wedged fixture");
+        let id = idle.id();
+        let out = wait_child_watched_with(&mut idle, id, bail, tick).expect("watchdog returns");
+        assert!(
+            out.stalled_for.is_some(),
+            "a child whose CPU never moves must be killed"
+        );
+
+        // Working: burns CPU past the bail window and must NOT be killed.
+        // Run it on its own thread and stop it from outside, since it never
+        // exits on its own.
+        let mut busy = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("while :; do :; done")
+            .spawn()
+            .expect("spawn the busy fixture");
+        let id = busy.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handles = std::thread::spawn(move || {
+            let out = wait_child_watched_with(
+                &mut busy,
+                id,
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(50),
+            );
+            let _ = tx.send(out.map(|o| o.stalled_for));
+        });
+        // Well past bail + several ticks. A watchdog that killed on any quiet
+        // sample would have fired here.
+        match rx.recv_timeout(std::time::Duration::from_millis(900)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            other => panic!("a child still burning CPU must not be killed; got {other:?}"),
+        }
+        // The busy child IS the shell (no descendants), and `kill_subtree`
+        // kills descendants only, so the pid itself takes the signal.
+        if let Ok(p) = i32::try_from(id) {
+            unsafe { libc::kill(p, libc::SIGKILL) };
+        }
+        let _ = handles.join();
+    }
 
     #[test]
     fn concurrency_never_exceeds_cap() {
