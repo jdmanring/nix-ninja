@@ -8968,7 +8968,8 @@ fn report_progress(n_tasks: u64) {
          \"sandbox_adddrv_ms\":{},\"sandbox_adddrv_calls\":{},\
          \"outer_stage_placed\":{},\"outer_stage_restored\":{},\"rss_mib\":{},\
          \"drv_entries\":{},\"drv_bytes\":{},\"reaped\":{},\"recycled\":{},\
-         \"total_tasks\":{}}}",
+         \"total_tasks\":{},\"dyn_scan_ms\":{},\"dyn_macro_arm_ms\":{},\
+         \"dyn_defer_walk_ms\":{},\"dyn_upload_ms\":{}}}",
         n_tasks,
         RESOLVE_MS.load(Ordering::Relaxed),
         DYN_MS.load(Ordering::Relaxed),
@@ -8988,6 +8989,10 @@ fn report_progress(n_tasks: u64) {
         nix_builder_rpc_client::REAPED.load(Ordering::Relaxed),
         nix_builder_rpc_client::RECYCLED.load(Ordering::Relaxed),
         TOTAL_TASKS.load(Ordering::Relaxed),
+        DYN_SCAN_MS.load(Ordering::Relaxed),
+        DYN_MACRO_ARM_MS.load(Ordering::Relaxed),
+        DYN_DEFER_WALK_MS.load(Ordering::Relaxed),
+        DYN_UPLOAD_MS.load(Ordering::Relaxed),
     );
     // Persist resolve-cache entries computed since the last tick;
     // a killed driver loses at most one tick's worth.
@@ -22824,6 +22829,17 @@ static OUTER_STAGE_RESTORED_N: std::sync::atomic::AtomicU64 = std::sync::atomic:
 static DYN_ADDDRV_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_REALISE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DYN_DISCOVER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// THE FOUR PHASES INSIDE THE DISCOVER SPAN, which had one timer over 674
+// lines and no breakdown. A round measured 773 s of `dyn_discover_ms` with
+// every candidate phase an inference from a cap: this says which of the
+// scan, the macro arms, the defer walk and the uploads the time is in.
+// They sum to at most `dyn_discover_ms`; the remainder is the work between
+// them. Reported in the existing stats line, never a new one, so a log
+// stays one comparison.
+static DYN_SCAN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYN_MACRO_ARM_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYN_DEFER_WALK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DYN_UPLOAD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static DYN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -29487,6 +29503,7 @@ pub fn discover_c_includes(
             deps
         }
         None => {
+            let t_scan = std::time::Instant::now();
             let c_include_parser::Scan {
                 includes: scanned,
                 incomplete,
@@ -29498,6 +29515,10 @@ pub fn discover_c_includes(
                 virtual_declared.as_ref(),
                 store_dir.to_path(),
             )?;
+            DYN_SCAN_MS.fetch_add(
+                t_scan.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             // THE SCAN NOW SAYS WHEN IT CANNOT ANSWER, AND THIS IS WHAT
             // ACTS ON IT. A computed include through a function-like macro
             // needs real expansion against the command line's -D set, which
@@ -29679,11 +29700,16 @@ pub fn discover_c_includes(
             // process cwd here) exactly as the compiler resolves it, and the
             // path the reader emits from it stays relative.
             let dirs = macro_arm_include_dirs(cmdline, build_dir);
+            let t_macro = std::time::Instant::now();
             for extra in macro_arm_headers(build_dir, &dirs, &declaring) {
                 if !v.contains(&extra) {
                     v.push(extra);
                 }
             }
+            DYN_MACRO_ARM_MS.fetch_add(
+                t_macro.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         v
     };
@@ -29719,7 +29745,12 @@ pub fn discover_c_includes(
     // never saw them. Store paths are left out: a system header cannot spell
     // a header this project generates.
     let defer_miss = producer.as_ref().and_then(|idx| {
+        let t_walk = std::time::Instant::now();
         let walk = defer_walk(&files, &c_includes, store_dir.to_path());
+        DYN_DEFER_WALK_MS.fetch_add(
+            t_walk.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let candidates = find_unresolved_miss(
             idx,
             &walk,
@@ -29933,6 +29964,7 @@ pub fn discover_c_includes(
     // log, and only strace could see it. The watchdog names the phase; the
     // upload line above names the size.
     resolve_section("upload: discovered includes");
+    let t_upload = std::time::Instant::now();
     discovered_deps.extend(
         new_opaque_files_because(
             rpc_client,
@@ -29955,6 +29987,10 @@ pub fn discover_c_includes(
             )
         })?,
     );
+    DYN_UPLOAD_MS.fetch_add(
+        t_upload.elapsed().as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // A HEADER THE PACKAGE STAGED INTO ITS OWN OUTPUT IS CARRIED AS BYTES.
     // Declaring the outer output as an input is what the daemon refuses
@@ -29974,6 +30010,13 @@ pub fn discover_c_includes(
             discovered_deps.push(file);
         }
     }
+    // BOTH upload sites, one span: the discovered includes above and the
+    // outer-staged headers here are the two ways a discovery result becomes
+    // store paths, and a round cannot tell which one it paid for.
+    DYN_UPLOAD_MS.fetch_add(
+        t_upload.elapsed().as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     USED_HEADERS.fetch_add(
         used_declared.len() as u64,
