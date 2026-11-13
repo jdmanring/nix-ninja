@@ -1084,9 +1084,26 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
         );
     }
     let first3 = |v: Vec<&str>| v.into_iter().take(3).collect::<Vec<_>>().join(" ");
+    // EDGES AN EARLIER PASS RECORDED THAT THIS PASS DERIVED AGAIN. They are
+    // in `replaced` and in `emitted`, and in NEITHER `reused` nor `fresh`:
+    // `fresh` counts only keys no earlier pass recorded. Without this field
+    // the columns do not sum to the schedule and a round cannot see that a
+    // recorded edge came back (a source edited between passes, 87d6c6b).
+    // Read off `replaced` as it stands at exit, not a second counter, so it
+    // agrees with the set the rest of the line is derived from. ADDITIVE:
+    // `stale` keeps its meaning (what could not be re-derived at all) and
+    // this is never netted against it. Appended last, because the gates and
+    // the consumer match the earlier fields by prefix.
+    let rederived: std::collections::BTreeSet<String> = pass
+        .replaced
+        .iter()
+        .filter(|k| earlier.contains_key(*k))
+        .filter_map(|k| emitted.get(k).or_else(|| earlier.get(k)))
+        .cloned()
+        .collect();
     Ok(Some(format!(
         "nix-ninja: later-pass reused {} task(s), derived {} fresh, {} fallback, {} stale: \
-         {}; stale: {}; fresh: {}",
+         {}; stale: {}; fresh: {}; re-derived {}: {}",
         pass.reused,
         fresh.len(),
         pass.fallback.len(),
@@ -1094,6 +1111,8 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
         first3(pass.fallback.iter().map(String::as_str).collect()),
         first3(stale.iter().map(String::as_str).collect()),
         first3(fresh.iter().map(|d| d.as_str()).collect()),
+        rederived.len(),
+        first3(rederived.iter().map(String::as_str).collect()),
     )))
 }
 
@@ -3510,6 +3529,16 @@ mod tests {
         );
         assert!(
             line.contains("fff-x.drv") && line.contains("ggg-x.drv"),
+            "{line}"
+        );
+        // THE RE-DERIVED EDGES ARE NAMED, though they are in neither
+        // `reused` nor `fresh`: both were recorded by pass 1, so `fresh`
+        // (keys no earlier pass recorded) cannot see them. Without this
+        // field the columns could not sum and a round could not tell a
+        // re-derived recorded edge from one that was simply reused
+        // (measured on the real pass: schedule 8, reused 1, fresh 0).
+        assert!(
+            line.contains("; re-derived 2: ") && line.contains("aaa-x.drv"),
             "{line}"
         );
         // Pass 3, nothing changed since: the re-derived edges reuse, and
