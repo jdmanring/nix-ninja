@@ -997,10 +997,7 @@ struct ChildOutcome {
 /// pid: `sh -c` and `cmake -E env` fork rather than exec, so the spawned pid
 /// routinely sits at zero while its child works (`subtree_cpu` carries the
 /// measurement). A child that is waiting on something never moves it.
-fn wait_child_watched(
-    child: &mut std::process::Child,
-    pid: u32,
-) -> Result<ChildOutcome> {
+fn wait_child_watched(child: &mut std::process::Child, pid: u32) -> Result<ChildOutcome> {
     wait_child_watched_with(child, pid, LOCAL_EDGE_STALL_BAIL, LOCAL_EDGE_STALL_TICK)
 }
 
@@ -2146,8 +2143,7 @@ impl Runner {
                     .0
                     .store(child.id(), std::sync::atomic::Ordering::Relaxed);
                 let child_id = child.id();
-                let status = wait_child_watched(&mut child, child_id)
-                    .context("waiting for sh")?;
+                let status = wait_child_watched(&mut child, child_id).context("waiting for sh")?;
                 if let Some(secs) = status.stalled_for {
                     eprintln!(
                         "nix-ninja: local edge {label} ({member}) made no progress for {secs}s; \
