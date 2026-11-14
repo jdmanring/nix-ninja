@@ -28179,6 +28179,31 @@ mod generated_not_yet_written_tests {
             fallback_skip_reason("/nix/store/x-python3/bin/python3.14 tool.py", true),
             FallbackSkip::Skip("generated TU not yet written")
         );
+        // THE LINK ROW. `gcc -shared` IS provably not a compile, so this
+        // predicate says Skip - and the row is asserted because that answer
+        // is correct HERE and would be dangerous if this function were the
+        // only guard. It is not: `wants_dependency_discovery` refuses such an
+        // edge discovery entirely (link-shaped output AND no visible `-c`),
+        // so this row cannot be reached in production. Both facts belong
+        // together, or a later change to either one reads as safe.
+        assert_eq!(
+            fallback_skip_reason("gcc -shared -o lib.so a.o", false),
+            FallbackSkip::Skip("the command is not a compile")
+        );
+        // THE ROW THAT KEEPS THE ABOVE SAFE: a compile that NAMES its output
+        // like a library reaches discovery (`command_is_compile` is true), so
+        // it must run the fallback - and if its `-c` hides in an rspfile, the
+        // `@` test makes it Ambiguous and it runs then too.
+        assert_eq!(
+            fallback_skip_reason("gcc -c a.c -o a.so", false),
+            FallbackSkip::Run,
+            "krb5's .so-named object is a compile and reaches discovery"
+        );
+        assert_eq!(
+            fallback_skip_reason("gcc -c a.c -o a.so @more.nn-rsp", false),
+            FallbackSkip::Run,
+            "an rspfile beside a visible -c is still ambiguous, not No"
+        );
     }
 
     #[test]
