@@ -28192,8 +28192,9 @@ mod generated_not_yet_written_tests {
         );
         // THE ROW THAT KEEPS THE ABOVE SAFE: a compile that NAMES its output
         // like a library reaches discovery (`command_is_compile` is true), so
-        // it must run the fallback - and if its `-c` hides in an rspfile, the
-        // `@` test makes it Ambiguous and it runs then too.
+        // it must run the fallback. The row below it is a DIFFERENT branch:
+        // an `@`-path short-circuits the compile test entirely, so that edge
+        // arrives as Ambiguous rather than Yes and runs for that reason.
         assert_eq!(
             fallback_skip_reason("gcc -c a.c -o a.so", false),
             FallbackSkip::Run,
@@ -28202,7 +28203,7 @@ mod generated_not_yet_written_tests {
         assert_eq!(
             fallback_skip_reason("gcc -c a.c -o a.so @more.nn-rsp", false),
             FallbackSkip::Run,
-            "an rspfile beside a visible -c is still ambiguous, not No"
+            "the @ test fires first: Ambiguous, not Yes, and never No"
         );
     }
 
@@ -28365,6 +28366,13 @@ fn compile_test_says(cmdline: &str) -> CompileTest {
     if args.iter().any(|a| a.starts_with('@')) {
         // `@file` may carry the `-c` and every `-I`; the split argv cannot
         // see inside it, so this test cannot answer.
+        //
+        // THIS SHORT-CIRCUITS A POSSIBLE `Yes`, and the ordering is the
+        // point: any command carrying an `@`-path is Ambiguous even when it
+        // is provably a compile, so the `Yes` branch is unreachable for an
+        // edge whose flags live in a response file. Safe here (Ambiguous
+        // runs the fallback), deliberate, and worth knowing before reading
+        // the `Yes` arm as covering every compile.
         CompileTest::Ambiguous
     } else if command_is_compile(Some(cmdline)) {
         CompileTest::Yes
