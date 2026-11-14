@@ -279,8 +279,8 @@ on B without a pin bump.
 - `nix-ninja -t dynamic-task` (`subtool/dynamic_task.rs`): builder of
   dynamic task derivations; discovers (`discover_dynamic_dependencies`,
   `scan_seeds`) and resubmits. A `deps = gcc` edge in local mode discovers
-  here too with `built_paths` (REALISED inputs), not `virtual_paths`.
-  `discover_c_includes` has TWO callers (static and dynamic).
+  here too with `built_paths` (REALISED), not `virtual_paths`.
+  `discover_c_includes` has three callers (static, dynamic, moc).
 - `crates/nix-ninja-task`: builder of every task; materialises inputs
   (`derived_file.rs`, `create_symlinks`), runs, patches rpaths
   (`patchelf.rs`, `assemble_rpath`). `crates/deps-infer`: include scanner
