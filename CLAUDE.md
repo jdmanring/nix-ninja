@@ -353,9 +353,7 @@ binding rule; the long form is the detail file's mechanism notes.
   resolve against the directory the command RUNS in. A trigger handles
   every real flag spelling (a stripped flag can be empty: protoc's `-I .`)
   and parses to the delimiter; count the real population before writing
-  the fixture, which uses the argv shape production passes. A reader
-  calling `upload_referenced_dir` filters `starts_with(store_dir)`,
-  `!same_project_tree`, `!is_dir()` first (its `read_dir` is fatal).
+  the fixture, which uses the argv shape production passes.
 - **Reader WIRING, three steps; step two is the trap.** (1) a RELATIVE
   candidate is rebased by `rebase_post_cd`; (2) an ABSOLUTE one is dropped
   by `p.starts_with(store_dir)` and `!same_project_tree(build_dir, p)`;
