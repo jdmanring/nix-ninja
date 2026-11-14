@@ -28070,7 +28070,10 @@ mod bom_first_line_tests {
 
 #[cfg(test)]
 mod generated_not_yet_written_tests {
-    use super::{fallback_tu_is_generated_absent, generated_not_yet_written};
+    use super::{
+        fallback_skip_reason, fallback_tu_is_generated_absent, generated_not_yet_written,
+        FallbackSkip,
+    };
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -28117,6 +28120,67 @@ mod generated_not_yet_written_tests {
     /// names a generated TU that is declared on the edge but unwritten at
     /// resolve time. The fallback gcc would die on the TU itself, so it is
     /// skipped and the scan's answer stands.
+    /// THE LINE THIS GUARD REPLACES SAID THE TASK WOULD FAIL, and it did not:
+    /// 172 generation edges in the 2026-11-13 qtwebengine round kept a
+    /// complete scan answer and built.
+    ///
+    /// Pinned on every row, because each one is a different way this goes
+    /// silently wrong. The first version of this guard had two outcomes and
+    /// a mutant on the compile row, which caught the case its author thought
+    /// of and missed the two that mattered: an `@`-path whose flags the
+    /// classifier cannot see, and a command whose scan the fallback could
+    /// still have rescued.
+    #[test]
+    fn a_non_compile_skips_the_fallback_and_nothing_else_does() {
+        // A python generation step, as the round logged it.
+        assert_eq!(
+            fallback_skip_reason(
+                "/nix/store/x-python3/bin/python3.14 tool.py --out gen/a.cc",
+                false
+            ),
+            FallbackSkip::Skip("the command is not a compile")
+        );
+        // A shell-wrapped generation step carries no compiler either.
+        assert_eq!(
+            fallback_skip_reason("/bin/sh -c \"python3 tool.py --out gen/a.cc\"", false),
+            FallbackSkip::Skip("the command is not a compile")
+        );
+        // NEGATIVE CONTROL ON THE SUBJECT: a real compile must NOT be
+        // skipped. Delete the `command_is_compile` arm and this fails.
+        assert_eq!(
+            fallback_skip_reason("gcc -c a.c -o a.o -I.", false),
+            FallbackSkip::Run
+        );
+        // THE ROW THE FIRST VERSION GOT WRONG. `respell_rsp_args` appends
+        // `.nn-rsp`, so the split argv shows no `-c` even when the rspfile
+        // carries it; `create_deps_command` has no rsp expansion. The test
+        // cannot answer, so the fallback RUNS.
+        assert_eq!(
+            fallback_skip_reason("gcc @args.nn-rsp", false),
+            FallbackSkip::Run,
+            "an @-path may carry the -c: ambiguous must keep the fallback"
+        );
+        assert_eq!(
+            fallback_skip_reason("gcc @args.rsp -o a.o", false),
+            FallbackSkip::Run
+        );
+        // An unparseable command is not evidence of anything.
+        assert_eq!(
+            fallback_skip_reason("gcc -c 'unterminated", false),
+            FallbackSkip::Run
+        );
+        // The older reason still fires, and outranks the command test: gcc
+        // dies on an absent TU before reaching any include.
+        assert_eq!(
+            fallback_skip_reason("gcc -c gen/a.cc -o a.o", true),
+            FallbackSkip::Skip("generated TU not yet written")
+        );
+        assert_eq!(
+            fallback_skip_reason("/nix/store/x-python3/bin/python3.14 tool.py", true),
+            FallbackSkip::Skip("generated TU not yet written")
+        );
+    }
+
     #[test]
     fn a_generated_tu_absent_from_disk_skips_the_fallback() {
         let bd = std::env::temp_dir();
@@ -28238,6 +28302,73 @@ fn generated_not_yet_written(
 /// the task binary's fileset, and any edit there re-keys every banked
 /// compile. The rule is duplicated deliberately, with this comment as the
 /// reason; `create_deps_command`'s own tests pin the shape it mirrors.
+/// Whether the preprocessor fallback should be skipped, and why, when the
+/// scan has already reported itself INCOMPLETE.
+///
+/// THREE OUTCOMES, and the third is the whole point. The fallback's job is
+/// to answer an incomplete scan, so the only safe reason to skip it is that
+/// it provably cannot help. A command that is certainly not a compile
+/// cannot. Anything the compile test cannot decide is AMBIGUOUS and keeps
+/// the fallback, because this file already states the rule: "Discovery is
+/// the opposite: an unrecognised output that answers 'not a compile' runs NO
+/// discovery ... So this asks whether the output is provably a LINK, and
+/// anything unfamiliar falls to the side that still discovers"
+/// (`link_shaped_outputs`). An earlier two-outcome version of this function
+/// violated exactly that and silently withdrew the fallback from response-
+/// file edges: `command_is_compile` sees no `-c` in `gcc @args.nn-rsp`
+/// because `respell_rsp_args` appends `.nn-rsp`, and
+/// `create_deps_command` has no rsp expansion at all.
+///
+/// `tu_generated_absent` is a SEPARATE, older reason and still applies to a
+/// compile: gcc dies on a TU that is not on disk before it reaches any
+/// include, so the spawn cannot succeed whatever the scan said.
+///
+/// Pure, so the rule is unit-tested without a daemon or a build dir.
+#[derive(Debug, PartialEq, Eq)]
+enum FallbackSkip {
+    Skip(&'static str),
+    Run,
+}
+
+/// What the command says about being a compile: the two facts needed, kept
+/// apart because their combination is what decides.
+fn compile_test_says(cmdline: &str) -> CompileTest {
+    let Ok(args) = shell_words::split(cmdline) else {
+        // Unparseable is not evidence of anything.
+        return CompileTest::Ambiguous;
+    };
+    if args.iter().any(|a| a.starts_with('@')) {
+        // `@file` may carry the `-c` and every `-I`; the split argv cannot
+        // see inside it, so this test cannot answer.
+        CompileTest::Ambiguous
+    } else if command_is_compile(Some(cmdline)) {
+        CompileTest::Yes
+    } else {
+        CompileTest::No
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CompileTest {
+    Yes,
+    No,
+    /// An `@`-path hides the flags, or the command did not parse.
+    Ambiguous,
+}
+
+fn fallback_skip_reason(cmdline: &str, tu_generated_absent: bool) -> FallbackSkip {
+    // A TU that is not on disk makes the spawn fail whatever the scan said,
+    // so this reason outranks the command test and applies to all three.
+    if tu_generated_absent {
+        return FallbackSkip::Skip("generated TU not yet written");
+    }
+    match compile_test_says(cmdline) {
+        CompileTest::No => FallbackSkip::Skip("the command is not a compile"),
+        // YES runs it, and AMBIGUOUS runs it: "anything unfamiliar falls to
+        // the side that still discovers".
+        CompileTest::Yes | CompileTest::Ambiguous => FallbackSkip::Run,
+    }
+}
 fn fallback_tu_is_generated_absent(
     cmdline: &str,
     build_dir: &Path,
@@ -29581,17 +29712,41 @@ pub fn discover_c_includes(
                 // exactly as before.
                 let tu_generated_absent =
                     fallback_tu_is_generated_absent(cmdline, build_dir, virtual_declared.as_ref());
-                if tu_generated_absent {
-                    answer_source = "the scan (preprocessor fallback skipped: \
-                        translation unit is generated and not yet written)"
-                        .to_string();
-                    if explain {
-                        eprintln!(
-                            "nix-ninja: discovery {seed}: skipping preprocessor \
-                             fallback for generated TU, keeping the scan's {} input(s)",
-                            scanned.len()
-                        );
-                    }
+                // A COMMAND THAT DOES NOT COMPILE HAS NO PREPROCESSOR TO OFFER.
+                // The fallback runs `-MM` through the command's own first word,
+                // so a generation step (grit, rollup, lit) asks a python
+                // interpreter for a depfile. `create_deps_command` refuses it
+                // BEFORE spawning (`gcc_depfile_parser.rs:78-85`), so no
+                // process is wasted - but the refusal reached the log as
+                // `Unsupported compiler: .../python3.14` under a line saying
+                // the task "fails loudly", which sent four sessions hunting a
+                // defect that does not exist. Those edges keep a complete scan
+                // answer and build: 172 edges, 179 lines, 2026-11-13 round.
+                //
+                // ASKED AS A POSITIVE TEST, never a list of known
+                // non-compilers, which re-opens the class at the next
+                // generation tool. `command_is_compile` is the predicate
+                // `tree_reached_headers` already uses for the same reason; its
+                // documented blind spot (a compiler inside one quoted `sh -c`
+                // reads as NOT a compile) fails SAFE here, since such an edge
+                // keeps today's behaviour and still runs the fallback.
+                if let FallbackSkip::Skip(reason) =
+                    fallback_skip_reason(cmdline, tu_generated_absent)
+                {
+                    // NOT behind `explain`: the line this replaces claimed a
+                    // failure at full volume, so its replacement is too. The
+                    // `incomplete` flag rides it because an input COUNT cannot
+                    // tell "plenty" from "plenty and some known missing", and
+                    // that flag is what makes the skip safe to read back.
+                    answer_source = format!("the scan (preprocessor fallback skipped: {reason})");
+                    eprintln!(
+                        "nix-ninja: discovery {seed}: skipping the preprocessor \
+                         fallback ({reason}), keeping the scan's {} input(s) \
+                         (incomplete: {}){}",
+                        scanned.len(),
+                        incomplete,
+                        edge_clause(view.label)
+                    );
                     scanned
                 } else {
                     match deps_infer::gcc_depfile::retrieve_c_includes(cmdline) {
