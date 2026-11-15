@@ -524,6 +524,34 @@ mod tests {
     }
 
     #[test]
+    fn a_rewritten_manifest_moves_the_key_even_with_identical_bytes() {
+        // The key binds the manifest's mtime, not only its bytes: a
+        // build.ninja rewritten with identical content gets a new key, and
+        // `lookup` finds an entry by key alone.
+        let dir = std::env::temp_dir().join("nn-dc-mtime");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        write_seed(&dir, "build.ninja", "x");
+        let seeds = vec![PathBuf::from("a.c")];
+        let key_at = |secs: u64| {
+            let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            fs::File::options()
+                .write(true)
+                .open(dir.join("build.ninja"))
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+            cache_key(&dir, "cc a.c", &seeds, None, None, &[])
+        };
+        let first = key_at(1_000);
+        // Restamping to the same instant keeps the key: the write itself
+        // moves nothing, and every other section is constant here.
+        assert_eq!(first, key_at(1_000));
+        assert_ne!(first, key_at(2_000));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_recorded_answer_replays_identically() {
         let dir = std::env::temp_dir().join("nn-dc-replay");
         let _ = fs::remove_dir_all(&dir);
