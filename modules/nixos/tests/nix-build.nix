@@ -84,6 +84,12 @@ in {
       additionalPaths = [
         inputsClosure
       ] ++ extraCachedPaths ++ (builtins.attrValues self.inputs);
+
+      # With nothing set the guest gets 1024 MiB and runs with panic_on_oom.
+      # A run at that size panicked during the build with the `nix` process
+      # holding about 510 MiB and one compiler about 220 MiB. The peak is not
+      # measured, so this is headroom over that reading, not a derived bound.
+      memorySize = 2048;
     };
 
     environment.systemPackages = with pkgs; [
