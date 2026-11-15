@@ -476,10 +476,17 @@ nothing is outstanding.
 - **Nothing here has ever been built on more than one machine.** The capability
   is expected to come free from Nix, and an expectation is not a measurement.
   Item 9 is one afternoon that settles it.
-- **A qtwebengine retry re-walked every edge.** The resolve memo is off inside
-  a build by design and the stamps die with the failed derivation, so each
-  retry of the outer derivation paid the full `discover_c_includes` walk
-  again. Item 11 caches it, now landed.
+- **A qtwebengine retry starts cold. OPEN.** The resolve memo is off inside a
+  build by design and the NAR stamp file sits in the build's temporary
+  directory, which goes with the failed derivation, so a retry of the outer
+  derivation pays the `discover_c_includes` walk again. Item 11's cache is in
+  the driver and stays off unless `NIX_NINJA_DISCOVERY_CACHE_DIR` names a
+  directory. The consumer's build does not set it, so the cache has served
+  no round.
+- **A memory-cgroup kill can end a long recursive build with no task failed.
+  OPEN.** One qtwebengine round ended this way: the kernel killed a daemon
+  process and the client reported a daemon disconnect. What grew that process
+  is not measured, so no cause is named here.
 - **Heavy links could exhaust the box.** Final link steps admitted alongside
   compiles with no deterministic isolation, so a bounded round still met
   a cgroup kill. Item 12 serializes them, now landed.
