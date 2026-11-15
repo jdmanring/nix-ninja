@@ -30730,7 +30730,7 @@ pub fn script_bare_programs(cmdline: &str) -> Vec<String> {
         for part in seg.split('\n') {
             let word = part
                 .split_whitespace()
-                .find(|w| !(w.contains('=') && !w.starts_with('=')));
+                .find(|w| !w.contains('=') || w.starts_with('='));
             let Some(w) = word else { continue };
             let ok = w
                 .bytes()
