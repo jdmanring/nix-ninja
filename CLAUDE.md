@@ -552,10 +552,12 @@ The daemon (nix 2.36.0pre, `builder-rpc-v0`) needs `dynamic-derivations`,
 daemon pinned by literal store path in `/etc/s6/sv/nix-daemon-srv/run`
 (read the version THERE, never from this file; GC-rooted; a daemon bump is
 a third moving part at a boundary, root edit plus restart), this tree's
-client (gates), the consumer's client (rounds). A gate proves one
-client/daemon pair; say which. Compatibility is only established
-empirically (newest pair: `bea853d2` client, `3aef07e` daemon, corpus green
-at `df55697`).
+nix input (daemon and client in the VM tests; the client where an arm
+builds its PATH from the input), the consumer's client (rounds). A gate's
+outer `nix build`/`nix eval` lines run the HOST's `nix`, not the input's.
+A gate proves one client/daemon pair; say which. Compatibility is only
+established empirically; no pair is named here because it rots: the pairs
+exercised are dated in `local/pending/next-rekey-batch.md`.
 
 `/tmp` is tmpfs: export `TMPDIR` to disk before a large copy (scratch there
 is James's to delete). Never write to `/mnt/storage` (backup drive). Daemon
