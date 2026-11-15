@@ -20,13 +20,9 @@ use std::process::ExitCode;
 /// single line long enough to hold it is the length that gets spliced when
 /// many drivers share one fd.
 fn main() -> ExitCode {
-    let cwd = std::env::current_dir();
     let run = cli::run();
     let report = cli::report_pass();
     let run = run.and(report);
-    if let (Ok(()), Ok(cwd)) = (&run, &cwd) {
-        cli::after_run(cwd);
-    }
     match run {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

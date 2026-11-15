@@ -1118,7 +1118,8 @@ pub fn pass_report() -> std::io::Result<Option<String>> {
 
 /// Whether this process is a later pass (one that read earlier passes'
 /// task derivations).
-pub fn later_pass() -> bool {
+#[cfg(test)]
+fn later_pass() -> bool {
     PASS.lock()
         .unwrap()
         .as_ref()
