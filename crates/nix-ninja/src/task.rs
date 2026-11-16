@@ -3607,11 +3607,13 @@ impl Runner {
                 }
             }
             // For a compile (deps=gcc), a phony-EXPANDED order-only dep is
-            // only a real input if it is header-shaped: expansion of GN's
-            // inputdeps phonies otherwise drags generated OBJECTS and
-            // SOURCES (perfetto's entire .gen.o world, measured) into one
-            // TU's closure. Directly declared order-only deps (a generated
-            // buildflags header on the edge itself) are never filtered.
+            // dropped only when it is shaped like a compiled artifact and no
+            // translation unit includes it: expansion of GN's inputdeps
+            // phonies otherwise drags generated OBJECTS and SOURCES
+            // (perfetto's entire .gen.o world, measured) into one TU's
+            // closure, while generated data a TU includes must stay.
+            // Directly declared order-only deps (a generated buildflags
+            // header on the edge itself) are never filtered.
             if compile_filter_drops(
                 via_phony && is_gcc_task,
                 direct.contains(&fid),
@@ -37307,6 +37309,21 @@ mod compile_filter_tests {
             "one the unit names is kept"
         );
         assert!(!drops(true, false, Path::new("src/x.h"), &none));
+    }
+
+    /// A KEPT case only the artifact-shape guard can answer for. Every file
+    /// the arm above keeps is kept by another guard (declared, a direct
+    /// visit, a unit naming it, a header suffix), so a shape predicate that
+    /// also claimed data would still pass it. The names are the class's
+    /// (libid3tag, openal-soft), whose units do name the file and are kept
+    /// by `named_by_tu` today; the empty set here is the filter as it stood
+    /// when the class was found, before that guard existed.
+    #[test]
+    fn phony_reached_data_no_unit_names_is_kept() {
+        let none = Default::default();
+        for n in ["genre.dat", "default_hrtf.txt"] {
+            assert!(!drops(true, false, Path::new(n), &none), "{n}");
+        }
     }
 }
 
