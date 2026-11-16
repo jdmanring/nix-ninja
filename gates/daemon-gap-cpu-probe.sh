@@ -45,8 +45,10 @@ par()  { awk '{print $4}' "/proc/$1/stat" 2>/dev/null; }
 # to keep the listener's comm AND its argv: it is a fork WITHOUT exec, so it is
 # the listener's address space and matches every key the listener does. From
 # nix 48c45c9 its comm is `exe` and its argv0 `nix-daemon.worker[<client pid>]`
-# (the pid half is absent when peer info was never read, which is the
-# `--force-trusted` launch), so `pgrep -x nix-daemon` alone returns the listener
+# (the pid half is absent when the LISTENER never read peer info, which is a
+# launch that passes `--force-trusted` to the daemon itself; the flag a worker
+# carries in its own argv is unrelated), so `pgrep -x nix-daemon` alone returns
+# the listener
 # and reads an idle daemon over live work. A worker does not die with its
 # listener (reparented to init after a restart), so the listener's children
 # miss an orphan. The population is the listeners by comm (and old-naming

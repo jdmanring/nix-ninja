@@ -408,8 +408,10 @@ def find_daemon_pid() -> int:
     live build `pgrep -x` returned a whole family and a refusal on count would
     fire on a perfectly healthy system. From 48c45c9 a worker re-execs: its
     comm is `exe` and its argv0 `nix-daemon.worker` or
-    `nix-daemon.worker-<client pid>` (the pid half is absent when peer info was
-    never read, which is the `--force-trusted` launch), so `pgrep -x` returns
+    `nix-daemon.worker-<client pid>` (the pid half is absent when the LISTENER
+    never read peer info, which is a launch that passes `--force-trusted` to the
+    daemon itself; the flag a worker carries in its own argv is unrelated), so
+    `pgrep -x` returns
     listeners only and two hits are two listeners. Under either naming the
     listener is the hit that is not a child of another hit: workers are forked
     by it, so their PPID is in the set and the listener's (s6-supervise here,
