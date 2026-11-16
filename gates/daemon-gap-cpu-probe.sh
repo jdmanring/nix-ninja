@@ -40,11 +40,15 @@ life() { ps -o etimes=,times=,nlwp= -p "$1" 2>/dev/null | awk '
   $1 > 0 { printf "%.2fx over %ds, %d thr", $2/$1, $1, $3 }' ; }
 cpu()  { ps -o time= -p "$1" 2>/dev/null | tr -d ' '; }
 st()   { awk '{print $3}' "/proc/$1/stat" 2>/dev/null; }
+par()  { awk '{print $4}' "/proc/$1/stat" 2>/dev/null; }
 # THREE TERMS, BECAUSE NO ONE KEY COVERS BOTH NAMINGS AND ORPHANS. A worker used
-# to keep the listener's comm; from nix 48c45c9 its comm is `exe` and its argv0
-# `nix-daemon.worker-<client pid>`, so `pgrep -x nix-daemon` alone returns the
-# listener and reads an idle daemon over live work. A worker does not die with
-# its listener (reparented to init after a restart), so the listener's children
+# to keep the listener's comm AND its argv: it is a fork WITHOUT exec, so it is
+# the listener's address space and matches every key the listener does. From
+# nix 48c45c9 its comm is `exe` and its argv0 `nix-daemon.worker[<client pid>]`
+# (the pid half is absent when peer info was never read, which is the
+# `--force-trusted` launch), so `pgrep -x nix-daemon` alone returns the listener
+# and reads an idle daemon over live work. A worker does not die with its
+# listener (reparented to init after a restart), so the listener's children
 # miss an orphan. The population is the listeners by comm (and old-naming
 # workers), their children, and new-naming workers by argv0 wherever they sit.
 # pgrep exits 1 on no match; anything above 1 is a failed read, never absence.
@@ -52,7 +56,7 @@ daemon_pids() {
   local listeners argv kids k rc
   listeners=$(pgrep -x nix-daemon); rc=$?
   [ "$rc" -le 1 ] || { echo "pgrep -x nix-daemon failed ($rc)" >&2; return 2; }
-  argv=$(pgrep -f '^nix-daemon\.worker-'); rc=$?
+  argv=$(pgrep -f '^nix-daemon\.worker'); rc=$?
   [ "$rc" -le 1 ] || { echo "pgrep -f nix-daemon.worker failed ($rc)" >&2; return 2; }
   kids=
   for l in $listeners; do
@@ -61,7 +65,19 @@ daemon_pids() {
     kids="$kids $k"
   done
   printf '%s\n' $listeners $argv $kids | sort -un
+  # WHICH MATCH IS THE LISTENER IS UNDECIDABLE FOR THE OLD NAMING, and guessing
+  # reads a dead daemon as live. A `comm = nix-daemon` process parented to init
+  # is either a reparented old-naming worker or a listener whose supervisor also
+  # died; nothing an unprivileged probe can read tells them apart (the child
+  # closes the listening socket, and enumerating fds needs root). A listener
+  # under a live supervisor is a listener, since a worker's parent is the
+  # listener and the supervisor does not fork workers.
+  local amb=0 p
+  for p in $listeners; do
+    [ "$(par "$p")" = 1 ] && amb=1
+  done
   [ -n "$listeners" ] || return 3
+  [ "$amb" = 0 ] || return 4
 }
 
 echo "sampling nix-daemon workers every ${INTERVAL}s, $COUNT times"
@@ -80,13 +96,17 @@ CRASH_BEFORE=$(crashes); CRASH_BEFORE=${CRASH_BEFORE:-unreadable}
 
 # NO LISTENER IN ANY SAMPLE IS NO ANSWER, never an empty table, which reads as
 # idle: a restart between rounds removes the listener mid-run, so it is asked
-# every sample, and orphans are still printed when it is gone.
+# every sample, and orphans are still printed when it is gone. An AMBIGUOUS
+# population is NO ANSWER for the same reason: the rows may be orphans with no
+# daemon behind them, so the sample says so and the run cannot end clean.
 nolistener=0
+nodaemon=0
 for i in $(seq 1 "$COUNT"); do
   echo "--- sample $i  $(date +%H:%M:%S)"
   pids=$(daemon_pids); rc=$?
   [ "$rc" = 2 ] && { echo "NO ANSWER: reading the process table failed"; exit 2; }
   [ "$rc" = 3 ] && { echo "  NO LISTENER in this sample"; nolistener=1; }
+  [ "$rc" = 4 ] && { echo "  AMBIGUOUS: a nix-daemon match is parented to init; a reparented worker and a listener whose supervisor died read the same"; nodaemon=1; }
   printf '%s\n' "$pids" | while IFS= read -r p; do
     [ -n "$p" ] || continue
     s=$(st "$p")
@@ -135,3 +155,4 @@ echo
 echo "READ IT AS DELTAS, never as levels: a worker with hours of CPU may be"
 echo "idle now, and a worker with seconds may be the one burning the gap."
 [ "$nolistener" = 0 ] || { echo "NO ANSWER: no nix-daemon listener in at least one sample, so this window cannot read as idle"; exit 2; }
+[ "$nodaemon" = 0 ] || { echo "NO ANSWER: at least one sample could not tell a listener from a reparented worker, so no row here says a daemon is serving"; exit 2; }

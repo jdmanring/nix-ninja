@@ -404,13 +404,16 @@ def find_daemon_pid() -> int:
 
     More than one `nix-daemon` is NOT by itself a survivor. The daemon forks a
     worker per connection. Before nix 48c45c9 every worker kept the listener's
-    comm, so during any live build `pgrep -x` returned a whole family and a
-    refusal on count would fire on a perfectly healthy system. From 48c45c9 a
-    worker's comm is `exe` (argv0 `nix-daemon.worker-<client pid>`), so
-    `pgrep -x` returns listeners only and two hits are two listeners. Under
-    either naming the listener is the hit that is not a child of another hit:
-    workers are forked by it, so their PPID is in the set and the listener's
-    (s6-supervise here, init after a wedge) is not.
+    comm AND argv, because that worker is a fork WITHOUT exec, so during any
+    live build `pgrep -x` returned a whole family and a refusal on count would
+    fire on a perfectly healthy system. From 48c45c9 a worker re-execs: its
+    comm is `exe` and its argv0 `nix-daemon.worker` or
+    `nix-daemon.worker-<client pid>` (the pid half is absent when peer info was
+    never read, which is the `--force-trusted` launch), so `pgrep -x` returns
+    listeners only and two hits are two listeners. Under either naming the
+    listener is the hit that is not a child of another hit: workers are forked
+    by it, so their PPID is in the set and the listener's (s6-supervise here,
+    init after a wedge) is not.
 
     Two such roots IS ambiguous, and that is the case worth refusing on:
     aiming the instrument is not a tiebreak.
@@ -431,7 +434,7 @@ def find_daemon_pid() -> int:
         f"{len(roots)} nix-daemon listeners alive ({roots}) out of {len(pids)} "
         "processes; a survivor from an earlier round makes every reading "
         "ambiguous. Clear them (pkill -9 -x nix-daemon, and from nix 48c45c9 "
-        "also pkill -9 -f '^nix-daemon\\.worker-', since workers there are "
+        "also pkill -9 -f '^nix-daemon\\.worker', since workers there are "
         "comm `exe`), restart the daemon, and re-run."
     )
 
