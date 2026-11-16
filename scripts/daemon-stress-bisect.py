@@ -424,7 +424,20 @@ def find_daemon_pid() -> int:
     pids = [int(p) for p in r.stdout.split()]
     if not pids:
         raise SystemExit("no nix-daemon process found")
+    # A LONE MATCH IS NOT EVIDENCE OF A LIVE LISTENER. The one-pid case skips
+    # the parentage rule below, and under the old naming a reparented worker has
+    # the listener's comm, so a single init-parented match is exactly the dead
+    # daemon this script must not aim at. Under the new naming the listener's
+    # parent is its supervisor (s6-supervise here), never init.
     if len(pids) == 1:
+        if read_ppid(pids[0]) == 1:
+            raise SystemExit(
+                f"the only nix-daemon match ({pids[0]}) is parented to init, which "
+                "under the old naming is a reparented worker rather than a listener; "
+                "this window cannot be read. Clear it (pkill -9 -x nix-daemon, and "
+                "from nix 48c45c9 also pkill -9 -f '^nix-daemon\\.worker', since "
+                "workers there are comm `exe`), start the daemon, and re-run."
+            )
         return pids[0]
     alive = set(pids)
     roots = [p for p in pids if read_ppid(p) not in alive]
@@ -673,6 +686,37 @@ def selftest() -> int:
     # checked against the two answers the kernel already has for this process.
     assert read_ppid(os.getpid()) == os.getppid(), read_ppid(os.getpid())
     assert read_ppid(2**22) is None
+
+    # A LONE INIT-PARENTED MATCH IS NOT A LISTENER. The single-pid path used to
+    # return its pid without reading the parent, so an old-naming worker whose
+    # listener died (comm unchanged, reparented to init) was taken for the live
+    # daemon and the script aimed at its empty child population. The vacuity arm
+    # is here: a supervised match must still be returned, so a guard that raised
+    # on everything would fail. The REFUSAL is covered outside this function,
+    # because a process reparented to init cannot be built reliably from inside a
+    # selftest whose own pid is the parent: it was verified by hand against a
+    # double-forked comm=nix-daemon process, which the guard refused, and the
+    # refusal shares its wording with the ambiguity case exercised above.
+    import contextlib, io as _io, shutil as _shutil, tempfile as _tf
+
+    def _find_with(pgrep_body):
+        d = _tf.mkdtemp()
+        p = os.path.join(d, "pgrep")
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\n" + pgrep_body + "\n")
+        os.chmod(p, 0o755)
+        old = os.environ.get("PATH", "")
+        os.environ["PATH"] = d + ":" + old
+        try:
+            with contextlib.redirect_stderr(_io.StringIO()):
+                return find_daemon_pid()
+        finally:
+            os.environ["PATH"] = old
+            _shutil.rmtree(d, ignore_errors=True)
+
+    # THE ARM THAT STOPS THE GUARD BEING VACUOUS: a supervised match is returned.
+    live_body = f'case "$*" in *"-x nix-daemon"*) echo {os.getpid()};; *) exit 1;; esac'
+    assert _find_with(live_body) == os.getpid(), "a supervised match must be returned"
 
     # Count the assertions by PARSING this function rather than by carrying a
     # literal. The literal said 19 over 18 assertions and the documentation
