@@ -18,20 +18,30 @@
 # (the corpus lives in `local/`) is absent here by design. Both are why the
 # message names the row instead of asserting which repository it meant.
 #
-# Usage: changelog-citations.sh [REV]   (the file read, default HEAD)
+# Usage: changelog-citations.sh [REV]
+#   No argument reads the WORKING TREE, which is what catches a bad hash before
+#   it lands; a revision reads that revision's file, for asking what an older
+#   tree looked like. Reading only by revision was the first version and it
+#   passed a planted bad hash, because the edit was not committed yet.
 #   PASS  every cited hash in a row resolves in this repository
 #   FAIL  a hash does not resolve
 #   NO ANSWER  the changelog cannot be read
 set -u
-REV=${1:-HEAD}
+REV=${1:-}
 # SELF-LOCATING, the way the published gates are: walk up to the manifest rather
 # than assume a depth, because the private corpus reaches the same file through a
 # symlink one level deeper and a published copy sits at another depth again.
 REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 [ -f "$REPO/Cargo.toml" ] || { echo "NO ANSWER: no Cargo.toml above $0"; exit 2; }
 cd "$REPO" || exit 2
-doc=$(git show "$REV:CHANGELOG.md" 2>/dev/null) || { echo "NO ANSWER: no CHANGELOG.md at $REV"; exit 2; }
-[ -n "$doc" ] || { echo "NO ANSWER: CHANGELOG.md at $REV reads empty"; exit 2; }
+if [ -n "$REV" ]; then
+  doc=$(git show "$REV:CHANGELOG.md" 2>/dev/null) || { echo "NO ANSWER: no CHANGELOG.md at $REV"; exit 2; }
+  where=$REV
+else
+  doc=$(cat CHANGELOG.md 2>/dev/null) || { echo "NO ANSWER: cannot read CHANGELOG.md here"; exit 2; }
+  where="the working tree"
+fi
+[ -n "$doc" ] || { echo "NO ANSWER: CHANGELOG.md at $where reads empty"; exit 2; }
 
 rows=0 bad=0
 while IFS= read -r line; do
@@ -45,9 +55,9 @@ while IFS= read -r line; do
 done <<EOF
 $doc
 EOF
-[ "$rows" -gt 0 ] || { echo "NO ANSWER: no changelog rows found at $REV"; exit 2; }
+[ "$rows" -gt 0 ] || { echo "NO ANSWER: no changelog rows found in $where"; exit 2; }
 if [ "$bad" -eq 0 ]; then
-  echo "PASS: every hash cited by a changelog row resolves at $REV ($rows rows)"
+  echo "PASS: every hash cited by a changelog row resolves in $where ($rows rows)"
   exit 0
 fi
 echo "FAIL: $bad cited hash(es) do not resolve; a row naming one reads as checked"
