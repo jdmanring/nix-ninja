@@ -20,7 +20,7 @@ are met and `0.3` is in progress rather than finished, which is why its open
 classes are listed below. A reader should not take the number as a claim that
 the milestone it names is complete.
 
-The state of the tree TODAY, class by class, is a table of 198 rows. It is not in
+The state of the tree TODAY, class by class, is a table of 199 rows. It is not in
 this repository: it grew beside a private distribution and is development
 material rather than a public document, which is the same reason the gate corpus
 is not here (`0.5`). What this file carries is the part that is publishable now,
@@ -144,14 +144,14 @@ binary had to learn:
   edge is a compile or a link, and the rpath a link carries.
 
 Every one is closed against an instrument that fails on the revision before its
-fix. How many of those instruments are in THIS repository is a question the
-gate cell answers differently by how it is read: counting a row whose GATE cell
-names a file under `tests/` or a `*_tests` symbol gives 20 of 198, also allowing
-a unit test named in prose gives 24, and allowing "mutation-check" as well gives 40.
-These are read from the table, not from this paragraph, so they move when a row
-lands; re-derive them by parsing the gate cell rather than copying these
-numbers. Whichever predicate is used the answer is a minority, so the honest
-statement is that most classes are verified by the gate corpus, which is not
+fix. How many of those instruments are in THIS repository depends on how the
+GATE cell is read: counting only rows that name a file under `tests/` or a
+`*_tests` symbol, or also those naming a unit test in prose or a mutation
+check. No figure is printed here, because the cell is prose and two parsers of
+the same predicate have disagreed, and a number no gate checks has already
+drifted from its own definition once. Every reading gives a minority of the
+199 rows, so the honest statement is that most classes are verified by the
+gate corpus, which is not
 published yet, and a reader has this file's word rather than a test they can
 run; closing that is `0.5` and work item 1. The earlier form of this paragraph
 said "most of those instruments are covered by a test in this repository",
@@ -893,7 +893,7 @@ None is hypothetical: the first three are why upstream is dormant.
   distribution. `0.9` names adoption by someone else as the mitigation, which is
   also its exit criterion, so this risk and that milestone are the same problem
   seen from two directions.
-- **The verification apparatus is private.** The 198-row class table and the
+- **The verification apparatus is private.** The 199-row class table and the
   whole gate corpus, all 97 scripts, live outside this repository. `0.5` and
   work item 1 exist to publish them, and until they land, every claim here is
   checkable only by its

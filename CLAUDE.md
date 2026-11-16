@@ -639,4 +639,5 @@ handles or depsets are refuted fixes.
 | n2 patches, ledger | `local/upstream/`, `local/upstream-ledger.py` (run on `main`) |
 | fixture-shape sweep; opt-out triage | `local/audits/2026-09-03-fixture-shape-sweep.md`; `local/opt-out-triage.md` |
 | upstream todo (theirs); conventions; benchmarks | `docs/todo.md`; CONTRIBUTING's Conventions section; `bench/e2e.sh`, `crates/nix-ninja/benches/generate.rs` |
-| Saxum's record | `~/Projects/saxum/docs/nix-ninja-recovery.md`, `~/Projects/saxum/docs/hand-run-ledger.md` |
+| Saxum's record | `~/Projects/saxum/docs/hand-run-ledger.md`; the recovery ledger moved here as `local/history/nix-ninja-recovery.md` |
+| nix daemon patch stack (this tree authors it, the consumer builds it) | `local/pending/nix-daemon-stack-4d4c7633ab/`: the ten patches, `compile/` (the boundary drv), `vmtest/`, `upstream-findings.md` |
