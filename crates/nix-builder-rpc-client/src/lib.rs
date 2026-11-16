@@ -3449,6 +3449,12 @@ mod transient_error_tests {
         assert!(transient_daemon_error(
             "creating cgroup \"/sys/fs/cgroup/nixbuild/nix-daemon/nix-build-uid-939\": File exists"
         ));
+        // NAME-INDEPENDENT ON PURPOSE: from nix 48c45c9 the build cgroup is
+        // `nix-build@<drv hashPart>-<uid or pid>`, and the match is on the
+        // cgroupfs mount and the errno text, never the per-build name.
+        assert!(transient_daemon_error(
+            "opening file '/sys/fs/cgroup/nixbuild/nix-daemon/nix-build@mv5ywykr0p8kfr8d3xcq6v0s7ql1na2n-872415232/cgroup.kill': No such file or directory"
+        ));
         // Negative controls: real verdicts must stay terminal.
         assert!(!transient_daemon_error("builder failed with exit code 2"));
         assert!(!transient_daemon_error(
