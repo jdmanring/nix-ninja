@@ -94,7 +94,7 @@ jobs:
           # A row's hashes are its evidence, and rewriting history strands them:
           # one cited hash had resolved nowhere before this gate existed. Git
           # only, no nix, and `fetch-depth: 0` above is what lets it see them.
-          check changelog-citations.sh               '^PASS: every hash cited by a changelog row is reachable from a ref'
+          check changelog-citations.sh               '^PASS: every cited commit is on the default branch history'
           exit $fail
 
   integration-test:

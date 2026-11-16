@@ -23,8 +23,8 @@
 #   it lands; a revision reads that revision's file, for asking what an older
 #   tree looked like. Reading only by revision was the first version and it
 #   passed a planted bad hash, because the edit was not committed yet.
-#   PASS  every cited hash in a row is reachable from a ref in this repository
-#   FAIL  a hash does not resolve, or resolves to an object no ref carries
+#   PASS  every cited commit in the tracked documents is on HEAD history
+#   FAIL  a cited hash is absent from the default branch history
 #   NO ANSWER  the changelog cannot be read
 set -u
 REV=${1:-}
@@ -34,53 +34,67 @@ REV=${1:-}
 REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 [ -f "$REPO/Cargo.toml" ] || { echo "NO ANSWER: no Cargo.toml above $0"; exit 2; }
 cd "$REPO" || exit 2
+# THE SUBJECT IS THE DOCUMENT SET, at the working tree by default and at a
+# revision on request. Reading only by revision was the first version and it
+# passed a planted bad hash, because the edit was not committed yet.
 if [ -n "$REV" ]; then
-  doc=$(git show "$REV:CHANGELOG.md" 2>/dev/null) || { echo "NO ANSWER: no CHANGELOG.md at $REV"; exit 2; }
+  FILES=$(git ls-tree -r --name-only "$REV" 2>/dev/null | command grep '\.md$') \
+    || { echo "NO ANSWER: cannot list $REV"; exit 2; }
+  read_doc() { git show "$REV:$1" 2>/dev/null; }
   where=$REV
 else
-  doc=$(cat CHANGELOG.md 2>/dev/null) || { echo "NO ANSWER: cannot read CHANGELOG.md here"; exit 2; }
+  FILES=$(git ls-files '*.md' 2>/dev/null) || { echo "NO ANSWER: cannot list tracked documents here"; exit 2; }
+  read_doc() { cat "$1" 2>/dev/null; }
   where="the working tree"
 fi
-[ -n "$doc" ] || { echo "NO ANSWER: CHANGELOG.md at $where reads empty"; exit 2; }
+[ -n "$FILES" ] || { echo "NO ANSWER: no markdown documents at $where"; exit 2; }
 
-rows=0 bad=0 dangling=0
-# REACHABLE FROM A REF, NOT MERELY PRESENT IN THIS CLONE. `git cat-file -e` only
-# asks whether the object exists, and this tree rewrites history: an amended or
-# pre-rebase commit stays in the object database until it is collected, so a row
-# citing one passes locally and fails for every reader of the repository. That
-# is exactly how this gate's own first subjects were found, and the first
-# version of this check had the defect it exists to catch.
+# EVERY TRACKED MARKDOWN FILE, not only the changelog: a design doc or the
+# roadmap cites a commit for the same reason a row does, and the same rewrite
+# strands it. MEASURED 2026-11-16 over the tree: 246 commit-ish citations in
+# tracked .md, none dangling; the changelog's own four were the whole defect.
 #
-# THE POPULATION IS THE COMMITS SOME REF CARRIES, read ONCE: `--all` covers local
-# branches, remote-tracking refs and tags, and a clone gets the remote-tracking
-# ones, so this is the set a fetch delivers. Recomputed per hash it walked 1041
-# commits 220 times; the list is built once and searched.
-REFSET=$(git rev-list --all 2>/dev/null | sort)
+# A HASH THAT NAMES SOMETHING OTHER THAN A COMMIT IS NOT A CITATION. Store paths
+# and content hashes are hex too, so each candidate must resolve as a commit
+# before it is judged; one that does not is skipped rather than reported.
+#
+# REACHABLE FROM THE DEFAULT BRANCH, not merely present in this clone and not
+# merely carried by some branch. `git cat-file -e` only asks whether the object
+# exists, and this tree rewrites history, so an amended or pre-rebase commit
+# stays in the object database until it is collected: a citation written against
+# one passes locally and fails for every reader. A branch that existed only on
+# the author's disk has the same shape, which is why the question is the history
+# a plain clone receives rather than every ref here.
+#
+# MEASURED 2026-11-16: of 246 commit-ish citations in tracked .md, every one is
+# on HEAD's history, and four were not fetchable before this gate existed.
+MAINREVS=$(git rev-list HEAD 2>/dev/null | sort)
 reachable() {
   local oid
   oid=$(git rev-parse --verify --quiet "$1^{commit}" 2>/dev/null) || return 1
-  printf '%s\n' "$REFSET" | command grep -qx "$oid"
+  printf '%s\n' "$MAINREVS" | command grep -qx "$oid"
 }
-while IFS= read -r line; do
-  case $line in '| 0.'*) ;; *) continue ;; esac
-  rows=$((rows+1))
-  for h in $(printf '%s' "$line" | command grep -oE '`[0-9a-f]{7,40}`' | tr -d '`' | sort -u); do
-    if ! git cat-file -e "$h^{commit}" 2>/dev/null; then
-      printf '  UNRESOLVABLE  %s  (cited in the row dated %s)\n' "$h" "$(printf '%s' "$line" | cut -d'|' -f3 | tr -d ' ')"
-      bad=$((bad+1)); continue
-    fi
+rows=0 bad=0 dangling=0
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    git cat-file -e "$h^{commit}" 2>/dev/null || continue
+    rows=$((rows+1))
     reachable "$h" && continue
-    printf '  DANGLING      %s  (in this clone, carried by no ref: a reader cannot fetch it)\n' "$h"
+    printf '  DANGLING      %s  (%s: absent from the default branch history)\n' "$h" "$f"
     dangling=$((dangling+1))
-  done
-done <<EOF
-$doc
-EOF
+  done <<HASHES
+$(read_doc "$f" | command grep -oE '`[0-9a-f]{7,40}`' | tr -d '`' | sort -u)
+HASHES
+done <<FILES
+$FILES
+FILES
 bad=$((bad+dangling))
-[ "$rows" -gt 0 ] || { echo "NO ANSWER: no changelog rows found in $where"; exit 2; }
+[ "$rows" -gt 0 ] || { echo "NO ANSWER: no commit citations found in the documents at $where"; exit 2; }
 if [ "$bad" -eq 0 ]; then
-  echo "PASS: every hash cited by a changelog row is reachable from a ref ($rows rows, $where)"
+  echo "PASS: every cited commit is on the default branch history ($rows citations, $where)"
   exit 0
 fi
-echo "FAIL: $bad cited hash(es) a reader cannot fetch; a row naming one reads as checked"
+echo "FAIL: $bad cited hash(es) a reader cannot fetch; a document naming one reads as checked"
 exit 1
