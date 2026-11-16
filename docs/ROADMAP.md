@@ -242,7 +242,7 @@ the client's, or it fails with a message that blames the client.
 The project also keeps a wider corpus of gate scripts, one per closed class,
 each written to reproduce a defect so that it fails on the revision before the
 fix. That corpus is not yet in this repository: it grew beside a consumer
-distribution, and 11 of its 97 scripts reach into trees and paths that are
+distribution, and 11 of its 98 scripts reach into trees and paths that are
 private. Publishing it is tracked work rather than a claim, and the triage under
 [the next concrete work](#the-next-concrete-work-item-by-item), item 1, is what
 decides the order. What the wider corpus enforces is worth stating anyway,
@@ -500,7 +500,7 @@ provide: what to open, and how to know the change is right.
 ### 1. Publish the wider corpus, cheapest group first
 
 The instrument that verifies every closed class is not in this repository. A
-triage over the whole corpus, measured rather than asserted, splits 97 gate
+triage over the whole corpus, measured rather than asserted, splits 98 gate
 scripts three ways:
 
 1. **Gates that reach for a store path that can be collected.** ONE script,
@@ -511,7 +511,7 @@ scripts three ways:
    `round-intercept-sweep.sh`'s retained round's leaf log, which is NOT
    derivable: resolving the same subject by attribute returns a different
    derivation. It stays, and fails loud when the path is gone.
-2. **Gates that are self-contained.** 85 scripts. A copy into the repository,
+2. **Gates that are self-contained.** 86 scripts. A copy into the repository,
    plus the one path assumption in the runner, which resolves its own directory
    and then expects the gates beside it.
 3. **Gates coupled to a private tree on the executable path.** 11 scripts,
@@ -520,12 +520,12 @@ scripts three ways:
    turned into a fixture first. Two read a consumer shim by design and report
    NO ANSWER when it is absent, which is correct and stays.
 
-The split is exact and exhaustive: 1 + 85 + 11 = 97, and no script falls in two
+The split is exact and exhaustive: 1 + 86 + 11 = 98, and no script falls in two
 groups. The work is therefore almost entirely group 2, which is a copy and one
 runner assumption, and group 3, which is the real cost.
 
 **Publishing is a copy; RUNNING is the cost, and the two are not the same
-size.** Measured over the same corpus: 83 of the 97 scripts invoke nix at all
+size.** Measured over the same corpus: 84 of the 98 scripts invoke nix at all
 (a `build`, an `eval` or a `develop`), counting an invocation in CODE rather
 than any mention of the word, because one probe prints the words "nix builds at
 once" in an explanatory line and needs no nix whatsoever. Of the 14 that do not,
@@ -534,7 +534,7 @@ has none of it, and a gate that reads it FAILS SPURIOUSLY there rather than
 reporting an answer - measured by hiding the file and running one, which printed
 `grep: CLAUDE.md: No such file or directory` and then two FAIL lines.
 
-4 of the 97 EXECUTE in a clean clone, checked out with `git clone` and run
+4 of the 98 EXECUTE in a clean clone, checked out with `git clone` and run
 there with `local/` absent, no argument and nothing installed. Two of those 4
 assert about this repository's own source and are therefore worth publishing as
 corpus arms: `stdout-contract-sweep.sh` exits 0, and
@@ -562,9 +562,9 @@ needed no such change. CI runs the THREE that print a verdict, matching each
 gate's verdict text rather than its exit code, because the duplicate-predicate
 sweep exits non-zero by design.
 
-What remains is 93 scripts, and each carries its reason in the corpus rather
+What remains is 94 scripts, and each carries its reason in the corpus rather
 than in this repository: a `REASONS.md` beside the gates states one for every
-script, derived from the script itself rather than catalogued. The 83 that
+script, derived from the script itself rather than catalogued. The 84 that
 invoke nix need the experimental features in the daemon, a working store and
 time, which is the same prerequisite `nix flake check` has and the README
 states, and the other 10 need either an argument, a parent gate, a gitignored
@@ -894,7 +894,7 @@ None is hypothetical: the first three are why upstream is dormant.
   also its exit criterion, so this risk and that milestone are the same problem
   seen from two directions.
 - **The verification apparatus is private.** The 199-row class table and the
-  whole gate corpus, all 97 scripts, live outside this repository. `0.5` and
+  whole gate corpus, all 98 scripts, live outside this repository. `0.5` and
   work item 1 exist to publish them, and until they land, every claim here is
   checkable only by its
   author, which is the property that made upstream's work hard to continue.
