@@ -40,6 +40,29 @@ life() { ps -o etimes=,times=,nlwp= -p "$1" 2>/dev/null | awk '
   $1 > 0 { printf "%.2fx over %ds, %d thr", $2/$1, $1, $3 }' ; }
 cpu()  { ps -o time= -p "$1" 2>/dev/null | tr -d ' '; }
 st()   { awk '{print $3}' "/proc/$1/stat" 2>/dev/null; }
+# THREE TERMS, BECAUSE NO ONE KEY COVERS BOTH NAMINGS AND ORPHANS. A worker used
+# to keep the listener's comm; from nix 48c45c9 its comm is `exe` and its argv0
+# `nix-daemon.worker-<client pid>`, so `pgrep -x nix-daemon` alone returns the
+# listener and reads an idle daemon over live work. A worker does not die with
+# its listener (reparented to init after a restart), so the listener's children
+# miss an orphan. The population is the listeners by comm (and old-naming
+# workers), their children, and new-naming workers by argv0 wherever they sit.
+# pgrep exits 1 on no match; anything above 1 is a failed read, never absence.
+daemon_pids() {
+  local listeners argv kids k rc
+  listeners=$(pgrep -x nix-daemon); rc=$?
+  [ "$rc" -le 1 ] || { echo "pgrep -x nix-daemon failed ($rc)" >&2; return 2; }
+  argv=$(pgrep -f '^nix-daemon\.worker-'); rc=$?
+  [ "$rc" -le 1 ] || { echo "pgrep -f nix-daemon.worker failed ($rc)" >&2; return 2; }
+  kids=
+  for l in $listeners; do
+    k=$(pgrep -P "$l"); rc=$?
+    [ "$rc" -le 1 ] || { echo "pgrep -P $l failed ($rc)" >&2; return 2; }
+    kids="$kids $k"
+  done
+  printf '%s\n' $listeners $argv $kids | sort -un
+  [ -n "$listeners" ] || return 3
+}
 
 echo "sampling nix-daemon workers every ${INTERVAL}s, $COUNT times"
 echo "(a worker unreadable here is another user's and is reported as such,"
@@ -55,9 +78,17 @@ DLOG=${NN_DAEMON_LOG:-/var/log/nix-daemon/current}
 crashes() { grep -c 'daemon worker .* crashed' "$DLOG" 2>/dev/null || true; }
 CRASH_BEFORE=$(crashes); CRASH_BEFORE=${CRASH_BEFORE:-unreadable}
 
+# NO LISTENER IN ANY SAMPLE IS NO ANSWER, never an empty table, which reads as
+# idle: a restart between rounds removes the listener mid-run, so it is asked
+# every sample, and orphans are still printed when it is gone.
+nolistener=0
 for i in $(seq 1 "$COUNT"); do
   echo "--- sample $i  $(date +%H:%M:%S)"
-  pgrep -x nix-daemon | while IFS= read -r p; do
+  pids=$(daemon_pids); rc=$?
+  [ "$rc" = 2 ] && { echo "NO ANSWER: reading the process table failed"; exit 2; }
+  [ "$rc" = 3 ] && { echo "  NO LISTENER in this sample"; nolistener=1; }
+  printf '%s\n' "$pids" | while IFS= read -r p; do
+    [ -n "$p" ] || continue
     s=$(st "$p")
     if [ -z "$s" ]; then
       printf '  pid %-7s UNREADABLE (not ours)\n' "$p"
@@ -103,3 +134,4 @@ echo "nix builds at once. A quiet worker is not a free daemon."
 echo
 echo "READ IT AS DELTAS, never as levels: a worker with hours of CPU may be"
 echo "idle now, and a worker with seconds may be the one burning the gap."
+[ "$nolistener" = 0 ] || { echo "NO ANSWER: no nix-daemon listener in at least one sample, so this window cannot read as idle"; exit 2; }
