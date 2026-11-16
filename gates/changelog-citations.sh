@@ -51,10 +51,16 @@ rows=0 bad=0 dangling=0
 # is exactly how this gate's own first subjects were found, and the first
 # version of this check had the defect it exists to catch.
 #
-# THE POPULATION IS THE COMMITS SOME REF CARRIES. `--all` covers local branches,
-# remote-tracking refs and tags; a clone gets the remote-tracking ones, so the
-# reading here is about what a fetch delivers.
-reachable() { git rev-list --all 2>/dev/null | command grep -qx "$(git rev-parse --verify --quiet "$1^{commit}" 2>/dev/null)"; }
+# THE POPULATION IS THE COMMITS SOME REF CARRIES, read ONCE: `--all` covers local
+# branches, remote-tracking refs and tags, and a clone gets the remote-tracking
+# ones, so this is the set a fetch delivers. Recomputed per hash it walked 1041
+# commits 220 times; the list is built once and searched.
+REFSET=$(git rev-list --all 2>/dev/null | sort)
+reachable() {
+  local oid
+  oid=$(git rev-parse --verify --quiet "$1^{commit}" 2>/dev/null) || return 1
+  printf '%s\n' "$REFSET" | command grep -qx "$oid"
+}
 while IFS= read -r line; do
   case $line in '| 0.'*) ;; *) continue ;; esac
   rows=$((rows+1))
