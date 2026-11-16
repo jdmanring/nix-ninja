@@ -489,6 +489,16 @@ pub fn run() -> Result<()> {
         return subtool(&build_dir, &cli.store_dir, &tool, cli.targets.clone());
     }
 
+    // $out is the NAMED target's: with none named, `build` would take the
+    // `default` statements, resolve every edge they reach, and then refuse
+    // the count, or submit a lone default the caller never asked for.
+    if cli.is_output_derivation && cli.targets.is_empty() {
+        return Err(anyhow!(
+            "--is-output-derivation writes a single $out, but no target was \
+             named; name one target"
+        ));
+    }
+
     // BEFORE ANYTHING READS THE BUILD DIR, and held until this pass has
     // placed its outputs: a later pass resolves against the directory as
     // the first pass found it (configure_state).
@@ -849,15 +859,14 @@ fn subtool(
         }
         "drv" => {
             let cli = Cli::parse();
-            let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
-                resolved_connections(&cli, crate::task::available_gib()),
-            ))?);
-            let (derived_files, _all_outputs) = build(&cli, build_dir, &rpc_client)?;
             // `drv` prints ONE derivation: the one producing the NAMED target.
             // A target expands to its co-outputs, and an ExternalProject stamp
             // carries the source tree the earlier step wrote, which belongs to
             // a DIFFERENT derivation; counting the expansion refused a single
-            // named target. Several NAMED targets still refuse.
+            // named target. Several NAMED targets still refuse. Asked BEFORE
+            // `build`: with no target named, `build` takes the `default`
+            // statements and resolves every edge they reach, only for this
+            // guard to refuse afterwards.
             if cli.targets.len() != 1 {
                 return Err(anyhow!(
                     "subtool drv shows a single derivation, but {} targets were \
@@ -865,6 +874,10 @@ fn subtool(
                     cli.targets.len()
                 ));
             }
+            let rpc_client = Arc::new(BuilderRpcClient::connect_from_env(Some(
+                resolved_connections(&cli, crate::task::available_gib()),
+            ))?);
+            let (derived_files, _all_outputs) = build(&cli, build_dir, &rpc_client)?;
             // THE NAMED TARGET'S OWN FILE, OR A SINGLE DERIVATION, OR REFUSE.
             // A phony target resolves to files with other names, so a miss on
             // the name is not an error when everything it resolved to comes

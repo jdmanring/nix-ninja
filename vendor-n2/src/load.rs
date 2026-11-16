@@ -97,7 +97,10 @@ impl<'a> eval::Env for BuildImplicitVars<'a> {
 #[derive(Default)]
 pub struct Loader {
     pub graph: graph::Graph,
-    default: Vec<FileId>,
+    /// Public for the same reason as `pools` below: nix-ninja drives the
+    /// Loader directly, and with no target named it builds these, as ninja
+    /// does.
+    pub default: Vec<FileId>,
     /// rule name -> list of (key, val)
     rules: HashMap<String, SmallMap<String, eval::EvalString<String>>>,
     /// Public like `graph` above it: a consumer driving the Loader directly,

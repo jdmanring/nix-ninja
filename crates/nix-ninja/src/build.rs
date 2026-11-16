@@ -92,11 +92,8 @@ pub fn build(
     config: BuildConfig,
     rpc_client: &Arc<BuilderRpcClient>,
 ) -> Result<(Vec<DerivedFile>, HashMap<PathBuf, DerivedFile>)> {
-    if targets.is_empty() {
-        return Err(anyhow!("at least one target is required"));
-    }
-
     let mut loader = load_file(build_filename)?;
+    let targets = requested_targets(targets, &loader)?;
 
     let tools = task::Tools::new(&config.store_dir)?;
     // Kept because `config.store_dir` is moved into the runner below and
@@ -319,6 +316,41 @@ pub fn build(
         .map(|df| (df.build_path.clone(), df.clone()))
         .collect();
     Ok((outputs, all))
+}
+
+/// The targets a run builds: the ones named, else the file's `default`
+/// statements, as ninja does. Real ninja with no target and no default builds
+/// every root node; that case refuses instead.
+/// DEFER(an invocation with no target against a build.ninja that has no
+/// `default` statement): fall back to every root node, as ninja does.
+fn requested_targets(named: Vec<String>, loader: &load::Loader) -> Result<Vec<String>> {
+    if !named.is_empty() {
+        return Ok(named);
+    }
+    let defaults: Vec<String> = loader
+        .default
+        .iter()
+        .map(|id| loader.graph.file(*id).name.clone())
+        .collect();
+    if defaults.is_empty() {
+        return Err(anyhow!(
+            "no target was named and the build file has no `default` statement"
+        ));
+    }
+    // n2 makes a node for any name a `default` spells, where ninja refuses an
+    // unknown one at parse time; without this a typo surfaces only after
+    // every other default resolved, as an internal file id.
+    if let Some(id) = loader
+        .default
+        .iter()
+        .find(|id| loader.graph.file(**id).input.is_none())
+    {
+        return Err(anyhow!(
+            "`default` names {}, which no build statement produces",
+            loader.graph.file(*id).name
+        ));
+    }
+    Ok(defaults)
 }
 
 pub(crate) fn load_file(build_filename: &str) -> Result<load::Loader> {
@@ -948,5 +980,57 @@ mod deferred_input_tests {
         // Only Done shrinks.
         states.set(BuildId::from(0), BuildState::Done);
         assert!(!states.unfinished());
+    }
+}
+
+#[cfg(test)]
+mod requested_targets_tests {
+    use super::requested_targets;
+    use n2::load::Loader;
+    use std::path::PathBuf;
+
+    fn loader(ninja: &str) -> Loader {
+        let mut l = Loader::new();
+        let mut bytes = ninja.as_bytes().to_vec();
+        bytes.push(0); // the scanner's terminator, as read_file_with_nul adds it
+        l.parse(PathBuf::from("build.ninja"), &bytes).unwrap();
+        l
+    }
+
+    const GRAPH: &str = "rule cp\n  command = cp $in $out\n\
+                         build a: cp src\nbuild b: cp src\nbuild c: cp src\n";
+
+    /// With no target named, the `default` statements decide, in file
+    /// order, across statements; ninja does the same.
+    #[test]
+    fn no_target_builds_the_defaults() {
+        let l = loader(&format!("{GRAPH}default b a\ndefault c\n"));
+        assert_eq!(requested_targets(vec![], &l).unwrap(), ["b", "a", "c"]);
+    }
+
+    /// A named target wins over the defaults.
+    #[test]
+    fn a_named_target_ignores_the_defaults() {
+        let l = loader(&format!("{GRAPH}default b\n"));
+        assert_eq!(requested_targets(vec!["c".into()], &l).unwrap(), ["c"]);
+    }
+
+    /// No target and no default refuses, rather than guessing at roots.
+    #[test]
+    fn no_target_and_no_default_refuses() {
+        let l = loader(GRAPH);
+        let e = requested_targets(vec![], &l).unwrap_err().to_string();
+        assert!(e.contains("no `default` statement"), "{e}");
+    }
+
+    /// A default naming a file no edge produces (a typo, or an input) is
+    /// refused by name before anything resolves.
+    #[test]
+    fn a_default_no_edge_produces_refuses_by_name() {
+        for name in ["typo", "src"] {
+            let l = loader(&format!("{GRAPH}default a {name}\n"));
+            let e = requested_targets(vec![], &l).unwrap_err().to_string();
+            assert!(e.contains(&format!("names {name},")), "{e}");
+        }
     }
 }
