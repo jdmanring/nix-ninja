@@ -23,8 +23,8 @@
 #   it lands; a revision reads that revision's file, for asking what an older
 #   tree looked like. Reading only by revision was the first version and it
 #   passed a planted bad hash, because the edit was not committed yet.
-#   PASS  every cited hash in a row resolves in this repository
-#   FAIL  a hash does not resolve
+#   PASS  every cited hash in a row is reachable from a ref in this repository
+#   FAIL  a hash does not resolve, or resolves to an object no ref carries
 #   NO ANSWER  the changelog cannot be read
 set -u
 REV=${1:-}
@@ -43,22 +43,38 @@ else
 fi
 [ -n "$doc" ] || { echo "NO ANSWER: CHANGELOG.md at $where reads empty"; exit 2; }
 
-rows=0 bad=0
+rows=0 bad=0 dangling=0
+# REACHABLE FROM A REF, NOT MERELY PRESENT IN THIS CLONE. `git cat-file -e` only
+# asks whether the object exists, and this tree rewrites history: an amended or
+# pre-rebase commit stays in the object database until it is collected, so a row
+# citing one passes locally and fails for every reader of the repository. That
+# is exactly how this gate's own first subjects were found, and the first
+# version of this check had the defect it exists to catch.
+#
+# THE POPULATION IS THE COMMITS SOME REF CARRIES. `--all` covers local branches,
+# remote-tracking refs and tags; a clone gets the remote-tracking ones, so the
+# reading here is about what a fetch delivers.
+reachable() { git rev-list --all 2>/dev/null | command grep -qx "$(git rev-parse --verify --quiet "$1^{commit}" 2>/dev/null)"; }
 while IFS= read -r line; do
   case $line in '| 0.'*) ;; *) continue ;; esac
   rows=$((rows+1))
   for h in $(printf '%s' "$line" | command grep -oE '`[0-9a-f]{7,40}`' | tr -d '`' | sort -u); do
-    git cat-file -e "$h^{commit}" 2>/dev/null && continue
-    printf '  UNRESOLVABLE  %s  (cited in the row dated %s)\n' "$h" "$(printf '%s' "$line" | cut -d'|' -f3 | tr -d ' ')"
-    bad=$((bad+1))
+    if ! git cat-file -e "$h^{commit}" 2>/dev/null; then
+      printf '  UNRESOLVABLE  %s  (cited in the row dated %s)\n' "$h" "$(printf '%s' "$line" | cut -d'|' -f3 | tr -d ' ')"
+      bad=$((bad+1)); continue
+    fi
+    reachable "$h" && continue
+    printf '  DANGLING      %s  (in this clone, carried by no ref: a reader cannot fetch it)\n' "$h"
+    dangling=$((dangling+1))
   done
 done <<EOF
 $doc
 EOF
+bad=$((bad+dangling))
 [ "$rows" -gt 0 ] || { echo "NO ANSWER: no changelog rows found in $where"; exit 2; }
 if [ "$bad" -eq 0 ]; then
-  echo "PASS: every hash cited by a changelog row resolves in $where ($rows rows)"
+  echo "PASS: every hash cited by a changelog row is reachable from a ref ($rows rows, $where)"
   exit 0
 fi
-echo "FAIL: $bad cited hash(es) do not resolve; a row naming one reads as checked"
+echo "FAIL: $bad cited hash(es) a reader cannot fetch; a row naming one reads as checked"
 exit 1
