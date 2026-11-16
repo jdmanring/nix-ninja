@@ -91,6 +91,10 @@ jobs:
           check stdout-contract-sweep.sh              '^PASS: no stdout diagnostic added'
           check cmake-byproducts-target-expression.sh '^PASS: OUTPUT and BYPRODUCTS refuse'
           check duplicate-predicate-sweep.sh          '^(FAIL: [0-9]+ pair|PASS: no)'
+          # A row's hashes are its evidence, and rewriting history strands them:
+          # one cited hash had resolved nowhere before this gate existed. Git
+          # only, no nix, and `fetch-depth: 0` above is what lets it see them.
+          check changelog-citations.sh               '^PASS: every hash cited by a changelog row'
           exit $fail
 
   integration-test:
