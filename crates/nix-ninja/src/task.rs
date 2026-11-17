@@ -19185,7 +19185,28 @@ fn gtkdoc_dirs_to_carry(
         dirs.push(lexical_join(&abs(&src), Path::new(&sub)));
     }
     if let Some(h) = value("--headerdirs") {
-        dirs.extend(h.split("@@").filter(|d| !d.is_empty()).map(abs));
+        // A RELATIVE `--headerdirs` ENTRY IS RESOLVED AGAINST `--sourcedir`,
+        // because that is what meson does. `gtkdochelper.build_gtkdoc` builds
+        // `[join(source_root, d), join(build_root, d)]` for each entry, so
+        // `--headerdirs=src` names `<sourcedir>/src` FIRST and the build tree
+        // only as a fallback. Resolving against the build dir instead sent the
+        // reader to `<builddir>/src`, which does not exist, so the directory was
+        // dropped and the task materialised a tree without it: libpsl's gtkdoc
+        // edge died `FileNotFoundError: /build/source/src` (Saxum qtwebengine
+        // round, 2026-11-16, task r3y97n3i66njs2m9a803k7hybbj8vjp3).
+        //
+        // THE FIXTURE ONLY EVER USED ABSOLUTE ENTRIES, which is why the rule
+        // went untested; the arm beside it now carries a relative one.
+        let src_root = value("--sourcedir").map(|s| abs(&s));
+        dirs.extend(h.split("@@").filter(|d| !d.is_empty()).map(|d| {
+            if d.starts_with('/') {
+                abs(d)
+            } else if let Some(root) = &src_root {
+                lexical_join(root, Path::new(&rebase_post_cd(cd_dir, d)))
+            } else {
+                abs(d)
+            }
+        }));
     }
     dirs.extend(gtkdoc_cflags_include_dirs(build_dir, cd_dir, args));
     let mut out = Vec::new();
@@ -20839,6 +20860,44 @@ find_package(Ninja 1.7.2 REQUIRED)
             &build
         )
         .is_empty());
+    }
+
+    /// libpsl's gtkdoc edge died `FileNotFoundError: /build/source/src`, which
+    /// is the SOURCE tree's `src`, not a build-tree directory: meson writes
+    /// `--headerdirs=src@@include` for a doc module whose headers live in the
+    /// source tree, and `gtkdochelper.build_gtkdoc` joins each entry with
+    /// `source_root` before `build_root`. Resolving the relative entry against
+    /// the build dir named `<builddir>/src`, which does not exist, so it was
+    /// dropped and the task materialised a tree without it.
+    ///
+    /// Controls, each a way the fix could be too wide: the build-tree spelling
+    /// of the same relative name is not carried, an entry that exists in
+    /// NEITHER tree is not carried, and an absolute entry keeps its own meaning
+    /// rather than being joined with the source root.
+    #[test]
+    fn a_relative_gtkdoc_headerdir_resolves_against_the_source_root() {
+        let root = std::env::temp_dir().join(format!("nn-gtkdoc-rel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, build) = (root.join("libpsl-0.21.5"), root.join("libpsl-0.21.5/build"));
+        touch(&src.join("src/lookup_string_in_fixed_set.c"), "");
+        touch(&src.join("include/libpsl.h"), "");
+        touch(&build.join("src/libpsl.so.5.3.8.p"), "");
+        std::fs::create_dir_all(&src).unwrap();
+        let s = src.display();
+        let store = StoreDir::new(Path::new("/nix/store")).unwrap();
+        // The real command line, with meson's relative spellings.
+        let cmdline = format!(
+            "/nix/store/ngk0r7y1lcakcrkmx0nbflzd5dc7n5ha-meson-1.12.1/bin/meson --internal gtkdoc \
+             --sourcedir={s} --builddir={s}/build --subdir=docs/libpsl \
+             --headerdirs=src@@include --mainfile=libpsl-docs.sgml --modulename=libpsl \
+             --moduleversion= --mode=auto"
+        );
+        let a = shell_words::split(&rewrite_cmdline(&cmdline, &build)).unwrap();
+        let got = gtkdoc_dirs_to_carry(&build, &store, &rewritten_cd_dir(&a), &a);
+        let _ = std::fs::remove_dir_all(&root);
+        // Both relative entries resolve under the SOURCE tree, and the
+        // build-tree `src/<objdir>` of the same name is not what either names.
+        assert_eq!(got, vec![src.join("src"), src.join("include")]);
     }
 
     /// openblas's `genlapacke` and freerdp's `ct-*` custom targets, commands
