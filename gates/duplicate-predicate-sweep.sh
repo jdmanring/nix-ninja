@@ -42,7 +42,13 @@ MIN_OVERLAP=${NN_DUP_MIN_OVERLAP:-3}
 CONTROL_REV=${NN_DUP_CONTROL_REV:-ea1abcc^}
 
 sweep() {  # sweep <root>
-  python3 "$PYPROG" "$1" "$MIN_OVERLAP"
+  # `-I` IS LOAD-BEARING. The helper is written to a temp file, so without it the
+  # interpreter prepends that world-writable directory to `sys.path` and imports
+  # there resolve to whatever else sits beside the script. `-I` implies `-P`
+  # (Python 3.11+), which keeps the script's own directory off the path; the
+  # script imports nothing but the standard library, so a wider path buys it
+  # nothing and costs a code-execution hole in a checkout anyone can write to.
+  python3 -I "$PYPROG" "$1" "$MIN_OVERLAP"
 }
 
 root=.
@@ -56,8 +62,11 @@ if [ "${1:-}" = "--control" ]; then
   echo "control $rev"
 fi
 
-PYPROG=$(mktemp) || exit 2
-trap 'rm -f "$PYPROG"; [ -n "${tmp:-}" ] && rm -rf "$tmp"' EXIT
+# A PRIVATE DIRECTORY, NOT A NAMED TEMP FILE: `mktemp` makes it 0700, so the
+# helper cannot be replaced or shadowed between being written and being run.
+PYDIR=$(mktemp -d) || exit 2
+PYPROG=$PYDIR/sweep.py
+trap 'rm -rf "$PYDIR"; [ -n "${tmp:-}" ] && rm -rf "$tmp"' EXIT
 cat > "$PYPROG" <<'PY'
 import os, re, subprocess, sys
 from itertools import combinations
