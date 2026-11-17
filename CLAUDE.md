@@ -162,7 +162,13 @@ Dated readings go in `local/pending/next-rekey-batch.md`.
 
 **The pin floor.** `local/gates/pin-floor.sh` answers `SAFE` (0), `BAD PIN`
 (1: in the recorded-bad window, an ancestor of the floor, or DIVERGENT) or
-`NO ANSWER` (2); seconds, safe during a round. Run it before any pin
+`NO ANSWER` (2); seconds, safe during a round. It reads git ANCESTRY, so it
+`NO ANSWER`s outright in a shallow clone rather than reading the truncation
+as divergence (measured 2026-11-16: a 409-of-1082-commit clone reported the
+live pin `BAD PIN ... not on this line at all` where the full tree reads
+`SAFE`; the same shape made `gates/changelog-citations.sh` PASS over 61
+citations it could not see). A question that needs history must check it has
+one. Run it before any pin
 question and beside a boundary. `34038d2` and `e93c9da` MUST NOT BE PINNED
 (junk-tree `-B` reader; ungated in `e93c9da`); the consumer takes `425778a`
 or later. The consumer's `scripts/test_upstream_status.py`

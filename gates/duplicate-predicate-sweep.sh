@@ -59,7 +59,7 @@ fi
 PYPROG=$(mktemp) || exit 2
 trap 'rm -f "$PYPROG"; [ -n "${tmp:-}" ] && rm -rf "$tmp"' EXIT
 cat > "$PYPROG" <<'PY'
-import os, re, sys
+import os, re, subprocess, sys
 from itertools import combinations
 
 root, min_overlap = sys.argv[1], int(sys.argv[2])
@@ -71,8 +71,39 @@ def interesting(s):
     return 0 < len(s) <= 20 and not re.search(r'[\s/{}%\\:=]', s)
 
 clusters = []
+# ASSERTED ONCE, BEFORE THE WALK: no tracked Rust lives under a dot-directory,
+# so skipping those directories cannot hide source. This is the ratchet, not the
+# justification. REPRODUCED 2026-11-16 by audit: `os.path.isdir('.git')` is FALSE
+# in a linked worktree, where `.git` is a FILE, and this tree holds seven of those
+# - so the check was skipped in exactly the configuration that caused the bug it
+# guards. That half is fixed by asking git. THE OTHER HALF IS A `raise`, NOT AN
+# `assert`: `assert` is compiled out by `python3 -O` and PYTHONOPTIMIZE, where
+# the ratchet then went silent and the sweep reported 15922 pairs over seven
+# worktrees' source with no cause named. Reading git's STATUS also distinguishes
+# "nothing tracked there" from "git could not answer".
+try:
+    tracked = subprocess.run(['git', 'ls-files', '*.rs'], capture_output=True,
+                             text=True, check=True).stdout.split()
+except (OSError, subprocess.CalledProcessError):
+    tracked = None
+if tracked is not None:
+    bad = [p for p in tracked if any(s.startswith('.') for s in p.split('/'))]
+    if bad:
+        print("NO ANSWER: tracked Rust lives under a dot-directory, which the walk skips:",
+              file=sys.stderr)
+        for p in bad[:5]:
+            print("  " + p, file=sys.stderr)
+        sys.exit(2)
 for dirpath, dirnames, filenames in os.walk(root):
-    dirnames[:] = [d for d in dirnames if d not in ('target', 'vendor-n2', '.git')]
+    # A DOT-DIRECTORY IS NOT THIS TREE'S SOURCE. `.claude/worktrees/` holds one
+    # full checkout per agent, so a session that had spawned SEVEN of them made
+    # the sweep read 187 source files from those copies against this tree's 29,
+    # and report 15922 pairs where a pristine clone reports 421. The verdict was
+    # not wrong about the pairs it found, it was about a DIFFERENT POPULATION,
+    # which is the shape this project records for a gate whose tree is not the
+    # tree claimed.
+    dirnames[:] = [d for d in dirnames
+                   if d not in ('target', 'vendor-n2') and not d.startswith('.')]
     for fn in filenames:
         if not fn.endswith('.rs'):
             continue
@@ -185,6 +216,16 @@ if [ -z "$tmp" ]; then
   # The control's own signature: the eleven-suffix driver predicate against
   # the four-suffix placement rule.
   if ! printf '%s' "$ctl_out" | grep -q "'hxx'"; then
+    # THE CAUSE IS NAMED WHEN THE SWEEP ITSELF RAISED ONE, because the generic
+    # headline sent the operator to the wrong file. REPRODUCED 2026-11-16 by
+    # audit: the dot-directory ratchet firing printed "this sweep is blind" over
+    # a traceback, when the sweep could see perfectly well and the tree had a
+    # defect the ratchet exists to report.
+    if printf '%s' "$ctl_out" | grep -q 'tracked Rust lives under a dot-directory'; then
+      echo "NO ANSWER: the control cannot be judged while the ratchet is failing"
+      printf '%s\n' "$ctl_out" | grep 'tracked Rust lives under a dot-directory'
+      exit 2
+    fi
     echo "NO ANSWER: the control $CONTROL_REV does not name the header pair,"
     echo "so this sweep is blind and its verdict on this tree means nothing."
     printf '%s\n' "$ctl_out" | head -3

@@ -39,8 +39,13 @@ The following scripts run against a full clone and need no private tree:
 The first four print verdicts and run in CI. The daemon probe is a diagnostic,
 not a gate. Two of them read git history, so a full clone is required:
 `duplicate-predicate-sweep.sh` rebuilds a control from an older commit and
-reports NO ANSWER in a shallow one, and `changelog-citations.sh` needs the
-commits its citations name. CI checks out with full history for that reason.
+reports NO ANSWER when that commit is outside the history it has, and
+`changelog-citations.sh` asks whether each cited commit is on the default
+branch history, which it refuses to judge in a shallow repository. That last
+check is why a branch cannot cite a commit it has not pushed: a row pointing at
+an unpushed commit reports DANGLING until the commit is on the default branch,
+which is the same state a reader would meet. CI checks out with full history
+for the history-reading gates.
 
 The public repository also carries the workspace tests, format and lint checks,
 and the NixOS example tests. Their current result is not restated here: read
