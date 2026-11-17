@@ -20,11 +20,12 @@ are met and `0.3` is in progress rather than finished, which is why its open
 classes are listed below. A reader should not take the number as a claim that
 the milestone it names is complete.
 
-The state of the tree TODAY, class by class, is a table of 200 rows. It is not in
-this repository: it grew beside a private distribution and is development
-material rather than a public document, which is the same reason the gate corpus
-is not here (`0.5`). What this file carries is the part that is publishable now,
-the ladder and its criteria, and what each rung is worth.
+The state of the tree today, class by class, is a table of 200 rows. It remains
+in the private development repository, and the 99-script gate inventory is still
+being published. [`STATUS.md`](STATUS.md) summarizes the public checkout and
+marks private-only evidence explicitly. Work item 1 of milestone 0.5 is to
+publish the remaining self-contained gates first, then prepare fixtures for
+those coupled to private trees.
 
 ## Contents
 
@@ -143,21 +144,15 @@ binary had to learn:
 - **Compiler and linker resolution.** Which compiler, which flags, whether an
   edge is a compile or a link, and the rpath a link carries.
 
-Every one is closed against an instrument that fails on the revision before its
-fix. How many of those instruments are in THIS repository depends on how the
-GATE cell is read: counting only rows that name a file under `tests/` or a
-`*_tests` symbol, or also those naming a unit test in prose or a mutation
-check. No figure is printed here, because the cell is prose and two parsers of
-the same predicate have disagreed, and a number no gate checks has already
-drifted from its own definition once. Every reading gives a minority of the
-200 rows, so the honest statement is that most classes are verified by the
-gate corpus, which is not
-published yet, and a reader has this file's word rather than a test they can
-run; closing that is `0.5` and work item 1. The earlier form of this paragraph
-said "most of those instruments are covered by a test in this repository",
-which every reading of the count inverts. The trap that recurs: a reader
-emitting an absolute spelling is dropped in silence by the wiring filters, so
-it looks fixed and changes nothing.
+Each closed class has a recorded instrument or witness, but the detailed
+200-row class ledger is still private. [`STATUS.md`](STATUS.md) states that
+boundary for a public reader instead of restating the classes: it shows what a
+clone can check and says the class-by-class evidence is not here. Publishing the
+corpus, and turning private witnesses into public arms, remains work item 1 of
+milestone 0.5.
+The trap that recurs is still worth stating: a reader emitting an absolute
+spelling is dropped in silence by the wiring filters, so a fix can look active
+and change nothing.
 
 EXIT CRITERION: the corpus passes on both configurations, and every class
 carries a gate arm, a named reason it cannot, or a witness on a real package.
@@ -239,26 +234,10 @@ reason and not because the tree is broken. And `nix flake check` needs the
 experimental features the README lists, in the DAEMON's configuration as well as
 the client's, or it fails with a message that blames the client.
 
-The project also keeps a wider corpus of gate scripts, one per closed class,
-each written to reproduce a defect so that it fails on the revision before the
-fix. That corpus is not yet in this repository: it grew beside a consumer
-distribution, and 11 of its 99 scripts reach into trees and paths that are
-private. Publishing it is tracked work rather than a claim, and the triage under
-[the next concrete work](#the-next-concrete-work-item-by-item), item 1, is what
-decides the order. What the wider corpus enforces is worth stating anyway,
-because the disciplines apply to any test written for this project:
-
-- A negative control must FAIL, and its break must sit where the subject
-  executes. A control whose input the subject cannot fail on is not a control.
-- A count claim must be exact or not written: "every X" and "all three" are
-  counted, and the count is checked against the population.
-- A fixture must survive a garbage collection: no literal store paths.
-- A planted value must be DERIVED from the subject, or the arm goes stale at the
-  next change and the arm meant to catch staleness is itself stale.
-- An instrument that fails to BUILD is not a defect in the tree, and a runner
-  must score it apart from a FAIL.
-- The instrument's own negative must be reachable: a mutation ignoring the
-  reading must fail the self-test.
+The public current-state summary is `docs/STATUS.md`. Detailed class evidence
+and the per-class gate records remain in the private `local/` repository while
+work item 1 publishes the corpus. The status page says so rather than implying
+that a reader can audit a class from this repository today.
 
 EXIT CRITERION: `nix flake check` passes on a clean clone, and the wider corpus
 is either in the repository or each unported class carries a dated reason it is
@@ -511,7 +490,7 @@ scripts three ways:
    `round-intercept-sweep.sh`'s retained round's leaf log, which is NOT
    derivable: resolving the same subject by attribute returns a different
    derivation. It stays, and fails loud when the path is gone.
-2. **Gates that are self-contained.** 86 scripts. A copy into the repository,
+2. **Gates that are self-contained.** 87 scripts. A copy into the repository,
    plus the one path assumption in the runner, which resolves its own directory
    and then expects the gates beside it.
 3. **Gates coupled to a private tree on the executable path.** 11 scripts,
@@ -524,53 +503,33 @@ The split is exact and exhaustive: 1 + 87 + 11 = 99, and no script falls in two
 groups. The work is therefore almost entirely group 2, which is a copy and one
 runner assumption, and group 3, which is the real cost.
 
-**Publishing is a copy; RUNNING is the cost, and the two are not the same
-size.** Measured over the same corpus: 84 of the 99 scripts invoke nix at all
-(a `build`, an `eval` or a `develop`), counting an invocation in CODE rather
-than any mention of the word, because one probe prints the words "nix builds at
-once" in an explanatory line and needs no nix whatsoever. Of the 14 that do not,
-most read a file this tree does not carry: `CLAUDE.md` is gitignored, so a clone
-has none of it, and a gate that reads it FAILS SPURIOUSLY there rather than
-reporting an answer - measured by hiding the file and running one, which printed
-`grep: CLAUDE.md: No such file or directory` and then two FAIL lines.
+**Publishing is a copy; running is the cost.** Measured over the same corpus,
+84 of the 99 scripts invoke nix (`build`, `eval`, `develop`, or `shell`). The
+other 15 do not. Some of those 15 still cannot run in a public clone: several
+read files that only the private development tree carries, so they fail or
+answer NO ANSWER rather than proving their subject. The private reason list
+records that per script in the separate `local/` repository.
 
-5 of the 99 EXECUTE in a clean clone, checked out with `git clone` and run
-there with `local/` absent, no argument and nothing installed. Two of those 4
-assert about this repository's own source and are therefore worth publishing as
-corpus arms: `stdout-contract-sweep.sh` exits 0, and
-`duplicate-predicate-sweep.sh` returns its real verdict because a clone carries
-the git history it reads. The other two measure something else -
-`cmake-byproducts-target-expression.sh` asserts about CMAKE, and
-`daemon-gap-cpu-probe.sh` about the running machine - so they belong in the
-repository as tools rather than as corpus arms. The two are different KINDS of
-tool and that matters for CI: the cmake one prints a verdict and CI asserts on
-it, while the daemon probe samples live workers and prints none, so a runner
-can only run it by hand. TWO EARLIER COUNTS OF THIS FIGURE WERE
-WRONG and both are worth keeping: a grep for scripts containing no `nix` call
-said 13, and a probe that scored any non-zero exit as "ran" said 5. The second
-counted `round-intercept-sweep.sh`, which prints a usage line because it needs
-a round log and its live arm reads a retained leaf log from the store.
+5 of the 99 EXECUTE in a clean clone: `stdout-contract-sweep.sh`,
+`duplicate-predicate-sweep.sh`, `cmake-byproducts-target-expression.sh`,
+`daemon-gap-cpu-probe.sh`, and `changelog-citations.sh`. Two are corpus arms
+that assert about this source tree: stdout behavior and duplicate predicates.
+Three are public tools: the CMake target-expression check, the live daemon
+diagnostic, and the documentation citation check. Four of the five print a
+verdict; CI asserts those four by verdict text, because the duplicate-predicate
+sweep exits non-zero when it prints a candidate set. The daemon probe samples
+live workers and prints no verdict, so it is run by hand.
 
-DONE for the first four: `stdout-contract-sweep.sh`,
-`duplicate-predicate-sweep.sh`, `cmake-byproducts-target-expression.sh` and
-`daemon-gap-cpu-probe.sh` are tracked under `gates/` and each runs in a clone
-with nothing installed. The first two are self-locating, walking up to
-`Cargo.toml` rather than assuming a depth, because the private corpus reaches
-the same file through a symlink one level deeper, so there is one physical copy
-and no second version to diverge; the other two read nothing in the tree and
-needed no such change. CI runs the THREE that print a verdict, matching each
-gate's verdict text rather than its exit code, because the duplicate-predicate
-sweep exits non-zero by design.
+Two earlier clean-clone counts were wrong: a grep for scripts without a Nix
+call said 13, and a probe that scored any nonzero exit as "ran" said 5 without
+separating tools from corpus arms. The second counted `round-intercept-sweep.sh`,
+which needs a round log and reads a retained store path.
 
-What remains is 94 scripts, and each carries its reason in the corpus rather
-than in this repository: a `REASONS.md` beside the gates states one for every
-script, derived from the script itself rather than catalogued. The 84 that
-invoke nix need the experimental features in the daemon, a working store and
-time, which is the same prerequisite `nix flake check` has and the README
-states, and the other 10 need either an argument, a parent gate, a gitignored
-file, or a subject turned into a fixture. Those reasons are stated there and
-not here for the reason the whole corpus is: publishing it is work item 1, and
-a reason stated in this file would be a second copy to keep in step.
+Five of 99 development-corpus paths are now published under `gates/`; the
+private repository holds 94 real scripts and five symlinks to the published
+tools. Its `REASONS.md` has one row per private script. Work item 1 publishes
+the remaining self-contained gates first, then addresses the 11 private-tree
+coupled cases with fixtures.
 
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.

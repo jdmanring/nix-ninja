@@ -28,6 +28,8 @@ equivalent.*
 [Key features](#key-features) •
 [Getting started](#getting-started) •
 [Roadmap](docs/ROADMAP.md) •
+[Status](docs/STATUS.md) •
+[Release policy](docs/RELEASE_POLICY.md) •
 [Design notes][design notes] •
 [Ask a question](https://github.com/jdmanring/nix-ninja/discussions) •
 [Contributing](CONTRIBUTING.md)
@@ -165,6 +167,11 @@ Pull requests are welcome and reviewed. Please read [CONTRIBUTING](CONTRIBUTING.
 and the [design notes] so you understand the big picture and prior art.
 
 ## What works today
+
+The concise, checkable current-state summary lives in
+[docs/STATUS.md](docs/STATUS.md). The milestone criteria and open work remain in
+[docs/ROADMAP.md](docs/ROADMAP.md), and the version/tag distinction is in the
+[release policy](docs/RELEASE_POLICY.md).
 
 `0.1` and `0.2`, the two milestones this project inherited, are complete.
 

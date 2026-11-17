@@ -4,7 +4,11 @@ Contributions should be made via pull requests. Pull requests will be reviewed
 by one or more maintainers and merged when acceptable.
 
 Work is tracked in [the roadmap](./docs/ROADMAP.md), which lists the open items
-and what each one needs before it can be started. For a bug, [open an
+and what each one needs before it can be started. [Project status](./docs/STATUS.md)
+is the concise account of what a reader can verify from a public checkout. The
+detailed class ledger is private development material: it is not in a clone of
+this repository and nothing here requires it. [Release policy](./docs/RELEASE_POLICY.md)
+defines how milestone completion, version changes and tags relate. For a bug, [open an
 issue](https://github.com/jdmanring/nix-ninja/issues/new/choose); the template
 asks for the failing derivation and its leaf log, which is what turns a report
 into a fix. For a question, or a design space that is still wide, use
@@ -60,22 +64,24 @@ made to it.
 ### The checks that need nothing
 
 `gates/` holds checks that run against a clone with nothing installed, not even
-nix. Run them before opening a pull request; CI runs the three that print a
+nix. Run them before opening a pull request; CI runs the four that print a
 verdict and fails when one changes.
 
 ```sh
 gates/stdout-contract-sweep.sh               # stdout writes against the logging contract
 gates/duplicate-predicate-sweep.sh           # any predicate implemented twice
 gates/cmake-byproducts-target-expression.sh  # a cmake legality question
+gates/changelog-citations.sh                 # cited commits reachable from the default branch
 gates/daemon-gap-cpu-probe.sh                # samples a live daemon; no verdict, run by hand
 ```
 
-Each of the first three prints a verdict line. `duplicate-predicate-sweep.sh`
-exits non-zero when it finds pairs: they are a candidate set to READ, not a
-failure, which is why CI matches each gate's verdict text rather than its exit
-status. The fourth is a diagnostic tool, not a gate: it samples running
-nix-daemon workers and prints no verdict, so CI cannot judge it and does not
-try.
+The first four print a verdict line. `duplicate-predicate-sweep.sh` exits
+non-zero when it finds pairs: they are a candidate set to READ, not a failure,
+which is why CI matches each gate's verdict text rather than its exit status.
+The fifth is a diagnostic tool, not a gate: it samples running nix-daemon
+workers and prints no verdict, so CI cannot judge it and does not try. CI
+exercises the four verdict gates; `changelog-citations.sh` also covers every
+tracked Markdown document, so a stale commit citation fails before it lands.
 
 Everything else needs the experimental features, a store and time. The wider
 corpus is not published yet and the roadmap's work item 1 tracks what each
