@@ -95,6 +95,11 @@ jobs:
           # one cited hash had resolved nowhere before this gate existed. Git
           # only, no nix, and `fetch-depth: 0` above is what lets it see them.
           check changelog-citations.sh               '^PASS: every cited commit is on the default branch history'
+          # The status page was the last public document with no gate reading
+          # it. It asserts no number another gate owns, so this checks only
+          # what is its own: links, the version against Cargo.toml, the tag it
+          # names, and the gate scripts it promises a clone can run.
+          check status-contract.sh                   '^PASS: every claim on docs/STATUS.md agrees with the tree'
           exit $fail
 
   integration-test:

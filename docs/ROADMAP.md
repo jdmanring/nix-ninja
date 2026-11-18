@@ -479,7 +479,7 @@ provide: what to open, and how to know the change is right.
 ### 1. Publish the wider corpus, cheapest group first
 
 The instrument that verifies every closed class is not in this repository. A
-triage over the whole corpus, measured rather than asserted, splits 99 gate
+triage over the whole corpus, measured rather than asserted, splits 100 gate
 scripts three ways:
 
 1. **Gates that reach for a store path that can be collected.** ONE script,
@@ -490,7 +490,7 @@ scripts three ways:
    `round-intercept-sweep.sh`'s retained round's leaf log, which is NOT
    derivable: resolving the same subject by attribute returns a different
    derivation. It stays, and fails loud when the path is gone.
-2. **Gates that are self-contained.** 87 scripts. A copy into the repository,
+2. **Gates that are self-contained.** 88 scripts. A copy into the repository,
    plus the one path assumption in the runner, which resolves its own directory
    and then expects the gates beside it.
 3. **Gates coupled to a private tree on the executable path.** 11 scripts,
@@ -504,29 +504,30 @@ groups. The work is therefore almost entirely group 2, which is a copy and one
 runner assumption, and group 3, which is the real cost.
 
 **Publishing is a copy; running is the cost.** Measured over the same corpus,
-84 of the 99 scripts invoke nix (`build`, `eval`, `develop`, or `shell`). The
-other 15 do not. Some of those 15 still cannot run in a public clone: several
+84 of the 100 scripts invoke nix (`build`, `eval`, `develop`, or `shell`). The
+other 16 do not. Some of those 16 still cannot run in a public clone: several
 read files that only the private development tree carries, so they fail or
 answer NO ANSWER rather than proving their subject. The private reason list
 records that per script in the separate `local/` repository.
 
-5 of the 99 EXECUTE in a clean clone: `stdout-contract-sweep.sh`,
+6 of the 100 EXECUTE in a clean clone: `stdout-contract-sweep.sh`,
 `duplicate-predicate-sweep.sh`, `cmake-byproducts-target-expression.sh`,
-`daemon-gap-cpu-probe.sh`, and `changelog-citations.sh`. Two are corpus arms
-that assert about this source tree: stdout behavior and duplicate predicates.
-Three are public tools: the CMake target-expression check, the live daemon
-diagnostic, and the documentation citation check. Four of the five print a
-verdict; CI asserts those four by verdict text, because the duplicate-predicate
-sweep exits non-zero when it prints a candidate set. The daemon probe samples
-live workers and prints no verdict, so it is run by hand.
+`daemon-gap-cpu-probe.sh`, `changelog-citations.sh` and `status-contract.sh`.
+Two are corpus arms that assert about this source tree: stdout behavior and
+duplicate predicates. Four are public tools: the CMake target-expression check,
+the live daemon diagnostic, the documentation citation check, and the status
+page's own contract check. Five of the six print a verdict; CI asserts those
+five by verdict text, because the duplicate-predicate sweep exits non-zero when
+it prints a candidate set. The daemon probe samples live workers and prints no
+verdict, so it is run by hand.
 
 Two earlier clean-clone counts were wrong: a grep for scripts without a Nix
 call said 13, and a probe that scored any nonzero exit as "ran" said 5 without
 separating tools from corpus arms. The second counted `round-intercept-sweep.sh`,
 which needs a round log and reads a retained store path.
 
-Five of 99 development-corpus paths are now published under `gates/`; the
-private repository holds 94 real scripts and five symlinks to the published
+Six of 100 development-corpus paths are now published under `gates/`; the
+private repository holds 94 real scripts and six symlinks to the published
 tools. Its `REASONS.md` has one row per private script. Work item 1 publishes
 the remaining self-contained gates first, then addresses the 11 private-tree
 coupled cases with fixtures.
