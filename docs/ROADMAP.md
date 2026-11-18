@@ -535,23 +535,26 @@ call said 13, and a probe that scored any nonzero exit as "ran" said 5 without
 separating tools from corpus arms. The second counted `round-intercept-sweep.sh`,
 which needs a round log and reads a retained store path.
 
-82 of 101 development-corpus paths are published under `gates/`; the private
-repository holds 20 real scripts and 82 symlinks to the published tools. Its
-`REASONS.md` has one row per private script.
+81 of 101 development-corpus paths are symlinked to published tools under
+`gates/`; the private repository holds 20 scripts of its own and those 81
+symlinks. `gates/` carries 82, because `gate-repo-lookup.sh` was written in the
+public tree and has no private counterpart. Its `REASONS.md` has one row per
+private script.
 
 The published set is every private script that carries no consumer path, no
 home path, no private-run path and no resolvable store literal. Measured
-2026-11-18 over the 94 real scripts: 20 are held back, for a consumer path, a
+2026-11-18 over the 101-path corpus: 20 are held back, for a consumer path, a
 home path, a private-run path or a collected store path, with overlaps between
 those classes. Package names are not a reason to hold one back: the exclusion is
-paths and unpublished evidence, which is the line this file already draws. The two scripts an audit found carrying no
-marker at all, `x265-symlink-repro.sh` and `version-script-generated-repro.sh`,
-are published: their exclusion was unexplained rather than justified.
+paths and unpublished evidence, which is the line this file already draws. Two
+scripts an audit found carrying no marker at all, `x265-symlink-repro.sh` and
+`version-script-generated-repro.sh`, are published: their exclusion was
+unexplained rather than justified.
 
 Publishing is a copy and a symlink, and the copy is verified byte for byte. The
 standalone probe in `roadmap-numbers.sh` is unaffected by the new arrivals: it
 skips any gate that invokes nix or is an `-inner.sh` helper, and every one of
-the 71 added gates is one or the other.
+the 71 gates added by the bulk copy is one or the other.
 
 Work item 1 then addresses the 11 private-tree coupled cases with fixtures.
 
