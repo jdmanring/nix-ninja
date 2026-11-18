@@ -50,7 +50,8 @@
 set -uo pipefail
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
 HERE=$(cd "$(dirname "$0")" && pwd)
-REPO=$(cd "$HERE/../.." && pwd)
+ROOT=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
+REPO=$ROOT
 INNER="$HERE/emission-determinism-sandbox-inner.sh"
 [ -r "$INNER" ] || { echo "FAIL: inner script missing at $INNER"; exit 2; }
 

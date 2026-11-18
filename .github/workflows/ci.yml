@@ -104,6 +104,10 @@ jobs:
           # one and a row can sit out of sequence without any text changing.
           # This reads only the changelog, so it needs nothing but the file.
           check changelog-versions.sh                '^PASS: every changelog row carries its own version, in sequence'
+          # The corpus promised a reader can run it, and for a time it could
+          # not: most gates found the repository by the private tree's depth,
+          # so every one failed in a clone. This holds the property at a push.
+          check gate-repo-lookup.sh                  '^PASS: every published gate locates the repository from any depth'
           exit $fail
 
   integration-test:

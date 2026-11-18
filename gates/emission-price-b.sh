@@ -37,7 +37,8 @@
 set -uo pipefail
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
 HERE=$(cd "$(dirname "$0")" && pwd)
-REPO=$(cd "$HERE/../.." && pwd)
+ROOT=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
+REPO=$ROOT
 [ -f "$REPO/crates/nix-ninja-task/src/main.rs" ] || { echo "NO ANSWER: $REPO is not the nix-ninja tree"; exit 2; }
 INNER="$HERE/emission-price-b-inner.sh"
 [ -r "$INNER" ] || { echo "NO ANSWER: inner script missing at $INNER"; exit 2; }

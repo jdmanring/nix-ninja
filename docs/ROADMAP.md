@@ -24,7 +24,7 @@ is done and never that it is complete. A reader should not take any part of the
 number as a claim that the milestone it names is finished.
 
 The state of the tree today, class by class, is a table of 200 rows. It remains
-in the private development repository, and the gate inventory beyond the published 81 is still
+in the private development repository, and the gate inventory beyond the published 82 is still
 being published. [`STATUS.md`](STATUS.md) summarizes the public checkout and
 marks private-only evidence explicitly. Work item 1 of milestone 0.5 is to
 publish the remaining self-contained gates first, then prepare fixtures for
@@ -535,8 +535,8 @@ call said 13, and a probe that scored any nonzero exit as "ran" said 5 without
 separating tools from corpus arms. The second counted `round-intercept-sweep.sh`,
 which needs a round log and reads a retained store path.
 
-81 of 101 development-corpus paths are published under `gates/`; the private
-repository holds 20 real scripts and 81 symlinks to the published tools. Its
+82 of 101 development-corpus paths are published under `gates/`; the private
+repository holds 20 real scripts and 82 symlinks to the published tools. Its
 `REASONS.md` has one row per private script.
 
 The published set is every private script that carries no consumer path, no
