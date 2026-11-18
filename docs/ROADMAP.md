@@ -602,9 +602,21 @@ original environment before the second depends on it.
   link as an alias, so the copy rule grew a `.svg` arm rather than the
   generator being declared at fault. What remains is therefore a narrow
   decision with a precedent, not an open question: whether xkeyboard-config's
-  keyboard data belongs in that list, which needs its extension and its
-  generator's read in front of a reader. Until then the class is package-side,
-  and the driver is behaving as designed.
+  keyboard data belongs in that list.
+
+  MEASURED 2026-11-18, and it removes the precedent: the `.svg` arm works
+  because that data carries an extension, and this data carries none. Of the
+  295 files under `share/xkeyboard-config-2` in xkeyboard-config 2.49, 288 have
+  no dot in the filename at all; only the rules XML does (4 `.xml`, 2 `.lst`,
+  1 `.dtd`). So an extension arm cannot express this case, and adding one is
+  not the change the precedent suggests. The rule's other arms are the shapes
+  that could reach it: `header_like`, a `node_modules` component,
+  `copy_required`, and `origin_relative_executable`. What is still NOT
+  measured is the generator's own read: whether it opens the file by a path it
+  resolved itself, or by a name it was handed. That is the reading that decides
+  course, and it needs the failing round's build directory rather than the
+  package. Until then the class is package-side, and the driver is behaving as
+  designed.
 
 Not a fifth class: the preprocessor fallback is now skipped when the TU is a
 declared-but-unwritten generated file (the confirming `gcc -M` would die on
