@@ -13,15 +13,18 @@ complete. From `0.3` on, the numbering is this project's own, and is written
 here rather than proposed: it records how the work since has been organized, not
 a plan awaiting ratification.
 
-The tree is at **0.3.0** (`Cargo.toml`). The version names the milestone the
-work is currently toward, and it advances when the milestone before it is met
-and a gate says so, never because time passed. So `0.3.0` means `0.1` and `0.2`
-are met and `0.3` is in progress rather than finished, which is why its open
-classes are listed below. A reader should not take the number as a claim that
-the milestone it names is complete.
+The tree is at **0.3.105** (`Cargo.toml`, and the newest row of
+[the changelog](../CHANGELOG.md); a gate holds the two equal). The first two
+numbers name the milestone the work is currently toward, and they advance when
+the milestone before is met and a gate says so, never because time passed. So
+`0.3` means `0.1` and `0.2` are met and `0.3` is in progress rather than
+finished, which is why its open classes are listed below. The third number
+counts verified deliverables inside the milestone, so 105 says how much of `0.3`
+is done and never that it is complete. A reader should not take any part of the
+number as a claim that the milestone it names is finished.
 
 The state of the tree today, class by class, is a table of 200 rows. It remains
-in the private development repository, and the 99-script gate inventory is still
+in the private development repository, and the gate inventory beyond the published 80 is still
 being published. [`STATUS.md`](STATUS.md) summarizes the public checkout and
 marks private-only evidence explicitly. Work item 1 of milestone 0.5 is to
 publish the remaining self-contained gates first, then prepare fixtures for
@@ -499,13 +502,14 @@ scripts three ways:
    turned into a fixture first. Two read a consumer shim by design and report
    NO ANSWER when it is absent, which is correct and stays.
 
-The split is exact and exhaustive: 1 + 87 + 11 = 99, and no script falls in two
+The split is exact and exhaustive over the 101 paths: 1 + 89 + 11 = 101, and no
+script falls in two
 groups. The work is therefore almost entirely group 2, which is a copy and one
 runner assumption, and group 3, which is the real cost.
 
 **Publishing is a copy; running is the cost.** Measured over the same corpus,
 84 of the 101 scripts invoke nix (`build`, `eval`, `develop`, or `shell`). The
-other 17 do not. Some of those 16 still cannot run in a public clone: several
+other 17 do not. Some of those 17 still cannot run in a public clone: several
 read files that only the private development tree carries, so they fail or
 answer NO ANSWER rather than proving their subject. The private reason list
 records that per script in the separate `local/` repository.
@@ -527,21 +531,23 @@ call said 13, and a probe that scored any nonzero exit as "ran" said 5 without
 separating tools from corpus arms. The second counted `round-intercept-sweep.sh`,
 which needs a round log and reads a retained store path.
 
-78 of 101 development-corpus paths are published under `gates/`; the private
-repository holds 23 real scripts and 78 symlinks to the published tools. Its
+80 of 101 development-corpus paths are published under `gates/`; the private
+repository holds 21 real scripts and 80 symlinks to the published tools. Its
 `REASONS.md` has one row per private script.
 
 The published set is every private script that carries no consumer path, no
 home path, no private-run path and no resolvable store literal. Measured
-2026-11-17 over the 94 real scripts: 22 were held back, 17 for a consumer path,
-6 for a home path, 5 for a private-run path and 1 for a collected store path,
-with overlaps. Package names are NOT a reason to hold one back, since the
-public changelog and roadmap already name every one of them; the exclusion is
-paths and unpublished evidence, which is the line this file already draws.
+2026-11-18 over the 94 real scripts: 21 are held back, for a consumer path, a
+home path, a private-run path or a collected store path, with overlaps between
+those classes. Package names are not a reason to hold one back: the exclusion is
+paths and unpublished evidence, which is the line this file already draws. The two scripts an audit found carrying no
+marker at all, `x265-symlink-repro.sh` and `version-script-generated-repro.sh`,
+are published: their exclusion was unexplained rather than justified.
 
 Publishing is a copy and a symlink, and the copy is verified byte for byte. The
 standalone probe in `roadmap-numbers.sh` is unaffected by the new arrivals: it
-skips any gate that invokes nix, and every one of the 71 added gates does.
+skips any gate that invokes nix or is an `-inner.sh` helper, and every one of
+the 71 added gates is one or the other.
 
 Work item 1 then addresses the 11 private-tree coupled cases with fixtures.
 

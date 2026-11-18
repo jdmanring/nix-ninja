@@ -17,6 +17,9 @@
 #             n rows, so a renumbering that skips or repeats a number fails
 #   manifest  `Cargo.toml`'s version equals the newest row's, so the two cannot
 #             drift into answering a reader differently
+#   dates     a row's date equals the date of the newest commit it cites, which
+#             is the rule the changelog header states and nothing held until
+#             2026-11-18: three rows disagreed with their own commits
 #
 # THE MANIFEST IS COMPARED, and that is what makes the number mean something.
 # The newest row and `Cargo.toml` carry the same version, so a reader who opens
@@ -45,23 +48,42 @@ DOC=CHANGELOG.md
 dups=$(python3 - "$DOC" <<'PY'
 import re, sys
 from collections import Counter
-rows = [m.group(1) for l in open(sys.argv[1], errors='replace')
-        if (m := re.match(r'^\| (\d+\.\d+\.\d+) \|', l))]
+VER = re.compile(r'^\| (\d+\.\d+\.\d+) \|')
+# A ROW THIS CANNOT PARSE IS NOT A ROW IT MAY IGNORE. MEASURED 2026-11-18 by
+# audit: inserting `| 0.4.0-rc1 | ... |` above the newest row produced PASS,
+# because the strict pattern skipped it and "newest row" stayed 0.3.105. Every
+# table data row (a pipe line that is not a separator) is therefore counted,
+# and one that names no three-part version is reported rather than passed over.
+rows, unparsed = [], []
+for l in open(sys.argv[1], errors='replace'):
+    if not l.startswith('|'):
+        continue
+    if re.match(r'^\|[\s:|-]+\|?\s*$', l):   # separator row
+        continue
+    if re.match(r'^\|\s*version\s*\|\s*date\b', l, re.I):   # column header
+        continue
+    m = VER.match(l)
+    if m:
+        rows.append(m.group(1))
+    else:
+        unparsed.append(l.rstrip()[:70])
+for u in unparsed:
+    print('UNPARSED ' + u)
 c = Counter(rows)
 allowed = {'0.1.0', '0.2.0'}
-bad = sorted(v for v, n in c.items() if n > 1 and v not in allowed)
-print('\n'.join(bad))
+for v in sorted(v for v, n in c.items() if n > 1 and v not in allowed):
+    print('DUPLICATE ' + v)
 PY
 )
 if [ -n "$dups" ]; then
-  while IFS= read -r v; do
-    [ -n "$v" ] || continue
-    echo "FAIL duplicate version   $v appears on more than one row"
-  done <<DUP
-$dups
-DUP
+  printf '%s\n' "$dups" | while IFS= read -r line; do
+    case "$line" in
+      UNPARSED*)  printf 'FAIL unparseable row      %s\n' "${line#UNPARSED }" ;;
+      DUPLICATE*) printf 'FAIL duplicate version    %s appears on more than one row\n' "${line#DUPLICATE }" ;;
+    esac
+  done
   echo
-  echo "FAIL: $DOC carries duplicate version numbers."
+  echo "FAIL: $DOC carries a version row this gate cannot read, or a duplicate."
   exit 1
 fi
 
@@ -143,6 +165,44 @@ if [ "$newest" != "$cargo" ]; then
   exit 1
 fi
 echo "OK   manifest version    $cargo matches the newest row"
+
+# A ROW'S DATE IS ITS NEWEST CITED COMMIT'S DATE, which the changelog header
+# defines and nothing checked. Reproduced 2026-11-18 by audit: three rows
+# disagreed with their own commits (0.3.89, 0.3.54, 0.3.53), and the renumbering
+# rests on this definition, so a wrong date misplaces a deliverable in the only
+# ordering a reader has. Skipped when git cannot resolve a hash: that is the
+# citation gate's subject, and it refuses loudly there.
+datebad=$(python3 - "$DOC" <<'PY'
+import re, subprocess, sys
+rowre = re.compile(r'^\| (\d+\.\d+\.\d+) \| (\d{4}-\d{2}-\d{2}) \|')
+hashre = re.compile(r'`([0-9a-f]{7,40})`')
+out = []
+for n, l in enumerate(open(sys.argv[1], errors='replace'), 1):
+    m = rowre.match(l)
+    if not m:
+        continue
+    ver, date = m.group(1), m.group(2)
+    ds = []
+    for h in hashre.findall(l):
+        r = subprocess.run(['git', 'log', '-1', '--format=%ad', '--date=short', h],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            ds.append(r.stdout.strip())
+    if ds and max(ds) != date:
+        out.append(f"{ver}|{date}|{max(ds)}")
+print('\n'.join(out))
+PY
+)
+if [ -n "$datebad" ]; then
+  printf '%s\n' "$datebad" | while IFS='|' read -r ver said real; do
+    printf 'FAIL row date             %s says %s, its newest commit is %s\n' "$ver" "$said" "$real"
+  done
+  echo
+  echo "FAIL: a row's date is not its newest cited commit's date."
+  exit 1
+fi
+echo "OK   row dates           each equals its newest cited commit's date"
+
 echo
 echo "PASS: every changelog row carries its own version, in sequence."
 exit 0

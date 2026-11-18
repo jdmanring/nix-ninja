@@ -15,23 +15,26 @@
 # page had a reader's trust.
 #
 # WHAT IT CHECKS, derived from the page's own falsifiable claims:
-#   links       every relative link resolves to a tracked file
-#   version     the bolded version equals Cargo.toml's, and the milestone
-#               it names is the one the roadmap has open
-#   gates       every gates/<name>.sh the page names exists
+#   links       every relative link resolves to a file in this tree
+#   version     the bolded version equals Cargo.toml's
 #   tag         a referenced vX.Y.Z tag exists in this clone
+#   gates       every gates/<name>.sh the page names exists
+#   corpus size the count the page states for `gates/` equals the directory's
 #
-# A COUNT IS NOT DERIVED HERE: the page deliberately restates no number that
-# roadmap-numbers.sh already owns, and duplicating one would create the second
-# live record this corpus exists to prevent.
+# WHAT THIS DOES NOT CHECK, stated because an earlier version claimed it: the
+# page's sentence that a milestone is in progress is NOT compared against the
+# roadmap, and the gate never reads `docs/ROADMAP.md`. The roadmap's own
+# milestone claim is `roadmap-numbers.sh`'s subject, and duplicating it here
+# would be a second live record of the same fact.
 #
 # NO BUILD, NO DAEMON, NO MACHINE: seconds, safe during a round. It reads the
 # DOCUMENT, so a red result means fix the page, not do-not-spend-the-machine.
 #
 #   PASS       every link resolves and every derived value matches
 #   FAIL       a claim on the page disagrees with the tree
-#   NO ANSWER  the page, Cargo.toml or the roadmap is absent (a public clone
-#              without the roadmap is not this gate's subject)
+#   NO ANSWER  the page or Cargo.toml is absent, or a version or the stated
+#              corpus count cannot be read (a check that read nothing refuses
+#              rather than passing over an empty population)
 set -uo pipefail
 # SELF-LOCATING, not depth-dependent, and it must follow the symlink: this gate
 # is invoked from the tracked `gates/` directory and symlinked into the private
@@ -61,8 +64,15 @@ while IFS= read -r l; do
     http://*|https://*) ext=$((ext + 1)); continue ;;
   esac
   rel=$((rel + 1))
-  if [ ! -e "docs/$l" ]; then
+  # TRACKED, NOT MERELY PRESENT. `-e` asks the working tree, so a link to a
+  # file that exists only because it is untracked passes here and 404s for a
+  # reader who clones. `git ls-files` is the question a stranger's clone
+  # answers. Measured 2026-11-18 by audit.
+  if ! git ls-files --error-unmatch "docs/$l" >/dev/null 2>&1 && [ ! -e "docs/$l" ]; then
     bad "link resolves" "$l (from $PAGE)"
+    badlinks=$((badlinks + 1))
+  elif [ -e "docs/$l" ] && ! git ls-files --error-unmatch "docs/$l" >/dev/null 2>&1; then
+    bad "link tracked" "$l exists here but is untracked, so a clone 404s"
     badlinks=$((badlinks + 1))
   fi
 done <<LINKS
@@ -138,7 +148,13 @@ fi
 # derived it. The page's phrasing is the population: the count it states IS the
 # number of `gates/*.sh` in the tree.
 stated=$(command grep -oE '`gates/` carries [0-9]+ scripts' "$PAGE" | command grep -oE '[0-9]+' | head -1)
-if [ -n "$stated" ]; then
+if [ -z "$stated" ]; then
+  # A REWORDING MUST NOT SILENCE THE CHECK. An earlier version wrapped this in
+  # `if [ -n "$stated" ]` with no else, so changing "carries" to "holds" made
+  # the check vanish and the gate pass one check short. Measured 2026-11-18 by
+  # audit; the link and gate-population checks already refuse on "read nothing".
+  bad "corpus size" "the page states no \`gates/\` script count, so this check read nothing"
+else
   actual=$(command ls gates/*.sh 2>/dev/null | wc -l | tr -d ' ')
   if [ "$stated" = "$actual" ]; then
     ok "corpus size" "$stated script(s) under gates/, as stated"

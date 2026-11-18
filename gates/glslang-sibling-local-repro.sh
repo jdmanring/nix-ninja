@@ -33,7 +33,15 @@
 #
 #   PASS  the compile fails naming the includer at a /nix/store path
 #   FAIL  it builds, or fails some other way
+#   NO ANSWER  the keyed derivation is not in this store
 set -u
+# A DIAGNOSTIC KEYED ON ONE STORE DERIVATION, AND THAT PATH CAN BE COLLECTED.
+# The literal below is a specific glslang round's failing `ninja-build.drv`. It
+# is a property of the consumer's pin at the time, not of this tree, so a
+# garbage collection makes this gate answer NO ANSWER rather than prove
+# anything. It is published for the fixture shape, not as a runnable arm; give
+# `NN_GLSLANG_DRV` a derivation of your own to use it. `local/gates/REASONS.md`
+# records why it is not registered.
 DRV=${NN_GLSLANG_DRV:-/nix/store/547bxb2gri5ss5s0wcb79mci42z26f2p-ninja-build.drv}
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
 [ -e "$DRV" ] || { echo "NO ANSWER: $DRV is not in the store"; exit 2; }

@@ -57,7 +57,17 @@ if [ -n "${NN_GATE_SRC:-}" ] && [ -n "${NN_PROBE_REV:-}" ]; then
 fi
 [ -n "${NN_GATE_SRC:-}" ] && FLAKE=$NN_GATE_SRC
 
-DEPCML="$REPO/local/gates/fixtures/external-project-configure-CMakeLists.txt"
+# THE DEPENDENCY'S OWN CMakeLists IS INLINE, NOT A FILE IN THE PRIVATE TREE.
+# It used to be read from `local/gates/fixtures/`, which a clone does not
+# carry: the path reached `builtins.path` inside the derivation expression, so
+# a clone got a nix eval stack trace from constructing the expression, before
+# the NO ANSWER guard below could run. Measured 2026-11-18 by audit.
+DEPCML=$(mktemp -t nn-epsrc-depcml-XXXXXX); TMP_CLEAN+=("$DEPCML")
+cat > "$DEPCML" <<'DEPEOF'
+cmake_minimum_required(VERSION 3.20)
+project(dep C)
+file(WRITE ${CMAKE_BINARY_DIR}/seen2.txt "ninja=${CMAKE_MAKE_PROGRAM}")
+DEPEOF
 CML=$(mktemp -t nn-epsrc-cml-XXXXXX); TMP_CLEAN+=("$CML")
 cat > "$CML" <<'EOF'
 cmake_minimum_required(VERSION 3.20)

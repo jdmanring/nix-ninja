@@ -1,4 +1,22 @@
 #!/usr/bin/env bash
+# REFUTED HYPOTHESIS, PUBLISHED AS ONE. THIS GATE IS NOT EVIDENCE FOR THE MACRO
+# CLASS AND ITS PASS IS NOT A RESULT ABOUT THIS TREE.
+#
+# It was written to test whether the compiler drop-in's NIX_NINJA_NO_BUILD_DIR_SCAN
+# flag explains mesa, and the measurement REFUTED that. It is kept because the
+# fixture geometry is worth having: a bare `gcc -c` with `deps = gcc`, a header
+# in the translation unit's own directory, one level up.
+#
+# WHY ITS PASS PROVES NOTHING FOR THE CLASS: the real defect is a macro defined
+# once per `#if` arm where the compiler takes the first and the walk kept the
+# last. This fixture defines its macro ONCE, so there is no arm to lose. A
+# registered arm would therefore be a permanent false green, which is why
+# `local/gates/registered.sh` excludes it with this reason and CLAUDE.md lists it
+# as excluded rather than registered.
+#
+# Before it can become an arm: declare the `#if` arms in the fixture, then drive
+# a real macro-class package on the branch and confirm the old driver fails it.
+#
 # A MACRO-NAMED HEADER IN THE TU'S OWN DIRECTORY, UNDER THE COMPILER DROP-IN.
 #
 # mesa 25.x builds `src/mesa/glapi/shared-glapi/core.c`, which includes its own
