@@ -514,17 +514,21 @@ read files that only the private development tree carries, so they fail or
 answer NO ANSWER rather than proving their subject. The private reason list
 records that per script in the separate `local/` repository.
 
-7 of the 101 EXECUTE in a clean clone: `stdout-contract-sweep.sh`,
-`duplicate-predicate-sweep.sh`, `cmake-byproducts-target-expression.sh`,
-`daemon-gap-cpu-probe.sh`, `changelog-citations.sh`, `status-contract.sh` and
-`changelog-versions.sh`. Two are corpus arms that assert about this source tree:
-stdout behavior and duplicate predicates. Five are public tools: the CMake
-target-expression check, the live daemon diagnostic, the documentation citation
-check, the status page's own contract check, and the changelog's version
-sequence. Six of the seven print a verdict; CI asserts those six by verdict
-text, because the duplicate-predicate sweep exits non-zero when it prints a
-candidate set. The daemon probe samples live workers and prints no verdict, so
-it is run by hand.
+6 of the 101 EXECUTE in a clean clone and are counted by the probe that derives
+this number: `stdout-contract-sweep.sh`, `duplicate-predicate-sweep.sh`,
+`cmake-byproducts-target-expression.sh`, `changelog-citations.sh`,
+`status-contract.sh` and `changelog-versions.sh`. Two are corpus arms that
+assert about this source tree: stdout behavior and duplicate predicates. Four
+are public tools: the CMake target-expression check, the documentation citation
+check, the status page's own contract check, and the changelog version
+sequence. Five print a `PASS`-shaped verdict and CI asserts those five by
+verdict text; the duplicate-predicate sweep exits non-zero on purpose because
+its pairs are a candidate set to read, so it is asserted on a different pattern.
+
+`daemon-gap-cpu-probe.sh` is NOT in that count and is not a gate: with no daemon
+it answers `NO ANSWER` and exits 2, which the probe excludes, and with one it
+samples live workers and prints no verdict. It is published to run by hand
+during a watchdog gap.
 
 Two earlier clean-clone counts were wrong: a grep for scripts without a Nix
 call said 13, and a probe that scored any nonzero exit as "ran" said 5 without
@@ -585,10 +589,19 @@ original environment before the second depends on it.
   are found by driving real packages, so the action is a sweep of a round's
   failures for `command not found`, not a code change. Widening the emitted
   PATH has a measured re-key bill and is a batching decision, not a default.
-- **A generator reading data by its own location.** Package-side; whether the
-  copy rule should grow is the open question. First action: decide whether a
-  generator's own data directory is the driver's to carry, which is a design
-  question before it is a code one.
+- **A generator reading data by its own location.** The design question is
+  ANSWERED, and the answer is in the code already: a symlinked input stays a
+  link by design (`copy_not_link` is `!source_path.is_symlink()` first, in
+  `derived_file.rs`), so a generator seeing a link where it expects a file is
+  the placement rule working as written rather than a defect to route around.
+  The precedence for changing that is the same class one step over: Qt's icon
+  handling calls `QFileInfo::isSymLink` and treated every `.svg` placed as a
+  link as an alias, so the copy rule grew a `.svg` arm rather than the
+  generator being declared at fault. What remains is therefore a narrow
+  decision with a precedent, not an open question: whether xkeyboard-config's
+  keyboard data belongs in that list, which needs its extension and its
+  generator's read in front of a reader. Until then the class is package-side,
+  and the driver is behaving as designed.
 
 Not a fifth class: the preprocessor fallback is now skipped when the TU is a
 declared-but-unwritten generated file (the confirming `gcc -M` would die on
