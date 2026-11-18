@@ -86,13 +86,21 @@ LINKS
 # for a page that grows a third, as the changelog table's row count was.
 cargo=$(command grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
 [ -n "$cargo" ] || { echo "NO ANSWER: Cargo.toml names no version"; exit 2; }
-claimed=$(command grep -oE '\*\*[0-9]+\.[0-9]+\.[0-9]+\*\*' "$PAGE" | tr -d '*' | sort -u)
-if [ -z "$claimed" ]; then
-  bad "version" "the page states no bolded development version"
-elif [ "$claimed" != "$cargo" ]; then
-  bad "version" "the page says $claimed, Cargo.toml says $cargo"
+# THE COUNT IS THE DISCRIMINATOR, NOT THE TEXT. Two bolded versions with one of
+# them right would compare unequal as a joined string only by accident of
+# ordering, so the distinct values are counted first: exactly one is required,
+# and it must be the manifest's. An earlier version compared `sort -u` output as
+# a string, which is a list test pretending to be a set test.
+claimed_list=$(command grep -oE '\*\*[0-9]+\.[0-9]+\.[0-9]+\*\*' "$PAGE" | tr -d '*' | sort -u)
+claimed_n=$(printf '%s\n' "$claimed_list" | command grep -c . || true)
+if [ "$claimed_n" -eq 0 ]; then
+  bad "version" "the page states no bolded development version, so this check read nothing"
+elif [ "$claimed_n" -gt 1 ]; then
+  bad "version" "the page states $claimed_n different bolded versions ($(printf '%s' "$claimed_list" | tr '\n' ' ')); one is required"
+elif [ "$claimed_list" != "$cargo" ]; then
+  bad "version" "the page says $claimed_list, Cargo.toml says $cargo"
 else
-  ok "version" "$claimed matches Cargo.toml"
+  ok "version" "$claimed_list matches Cargo.toml"
 fi
 
 # A TAG THE PAGE NAMES MUST EXIST. The page's tag sentence is the one claim a

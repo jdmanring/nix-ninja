@@ -73,7 +73,7 @@ EOF
 PATHX="$CC/bin:$CU/bin:$BASH/bin:$PE/bin:$CY/bin:$TASK/bin:$NIXBIN/bin"
 # THE FLAG IS A PARAMETER BECAUSE THE SHIM DOES NOT ALWAYS SET IT, and this
 # gate asserted row 24 closed while only ever building the branch that does.
-# `nn-ninja-shim.sh` before consumer 62bf17c set
+# `nn-ninja-shim.sh` before a fix made in the consumer's tree set
 # NIX_NINJA_MATERIALIZE_ALL on its `test` and `install` branches only; meson-python's editable rebuild takes the PLAIN build branch
 # at the bottom of that script, which does not. Measured in the consumer's
 # 2026-10-03 round: the flag's own log line appears 28 times, for the packages
