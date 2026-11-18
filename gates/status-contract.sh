@@ -116,15 +116,32 @@ named=$(command grep -oE 'gates/[A-Za-z0-9._-]+\.sh' "$PAGE" | sort -u)
 if [ -z "$named" ]; then
   bad "gate population" "the page names no gates/<script>, so the check read nothing"
 else
-  g=0
+  g=0; badnamed=0
   while IFS= read -r s; do
     [ -n "$s" ] || continue
     g=$((g + 1))
-    [ -f "$s" ] || bad "gate exists" "$s is named on the page and is not in this tree"
+    [ -f "$s" ] || { bad "gate exists" "$s is named on the page and is not in this tree"; badnamed=$((badnamed + 1)); }
   done <<GATES
 $named
 GATES
-  [ "$fail" -eq 0 ] && ok "gates named" "$g script(s) exist"
+  # NOT gated on $fail: that counts every earlier check, so a broken link would
+  # silently suppress this line and the "gates named" reading would go missing
+  # rather than report. Each check carries its own count.
+  [ "$badnamed" -eq 0 ] && ok "gates named" "$g script(s) exist"
+fi
+
+# A COUNT THE PAGE STATES ABOUT ITS OWN CORPUS. `gates/` holds many scripts and
+# the page says how many; that number rots the moment one is added, and nothing
+# derived it. The page's phrasing is the population: the count it states IS the
+# number of `gates/*.sh` in the tree.
+stated=$(command grep -oE '`gates/` carries [0-9]+ scripts' "$PAGE" | command grep -oE '[0-9]+' | head -1)
+if [ -n "$stated" ]; then
+  actual=$(command ls gates/*.sh 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$stated" = "$actual" ]; then
+    ok "corpus size" "$stated script(s) under gates/, as stated"
+  else
+    bad "corpus size" "the page says $stated scripts under gates/, the tree has $actual"
+  fi
 fi
 
 echo

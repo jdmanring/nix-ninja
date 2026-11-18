@@ -527,11 +527,23 @@ call said 13, and a probe that scored any nonzero exit as "ran" said 5 without
 separating tools from corpus arms. The second counted `round-intercept-sweep.sh`,
 which needs a round log and reads a retained store path.
 
-Seven of 101 development-corpus paths are now published under `gates/`; the
-private repository holds 94 real scripts and seven symlinks to the published
-tools. Its `REASONS.md` has one row per private script. Work item 1 publishes
-the remaining self-contained gates first, then addresses the 11 private-tree
-coupled cases with fixtures.
+78 of 101 development-corpus paths are published under `gates/`; the private
+repository holds 23 real scripts and 78 symlinks to the published tools. Its
+`REASONS.md` has one row per private script.
+
+The published set is every private script that carries no consumer path, no
+home path, no private-run path and no resolvable store literal. Measured
+2026-11-17 over the 94 real scripts: 22 were held back, 17 for a consumer path,
+6 for a home path, 5 for a private-run path and 1 for a collected store path,
+with overlaps. Package names are NOT a reason to hold one back, since the
+public changelog and roadmap already name every one of them; the exclusion is
+paths and unpublished evidence, which is the line this file already draws.
+
+Publishing is a copy and a symlink, and the copy is verified byte for byte. The
+standalone probe in `roadmap-numbers.sh` is unaffected by the new arrivals: it
+skips any gate that invokes nix, and every one of the 71 added gates does.
+
+Work item 1 then addresses the 11 private-tree coupled cases with fixtures.
 
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.

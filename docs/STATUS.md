@@ -33,18 +33,27 @@ published at [github.com/jdmanring/nix-ninja](https://github.com/jdmanring/nix-n
 
 ## Public verification surface
 
-The following scripts run against a full clone and need no private tree:
+`gates/` carries 78 scripts. Most are per-class arms: each reproduces one
+driver defect and fails on the revision before its fix, which is why they are
+the evidence a closed class carries rather than prose about it. They build
+what they need, so they take minutes and a working nix, and they are meant to
+be run for the class being changed rather than all at once.
+
+Six run in CI, on a clone with nothing installed, and print a verdict:
 
 - `gates/stdout-contract-sweep.sh` checks the logging contract.
 - `gates/duplicate-predicate-sweep.sh` reports predicates implemented twice.
 - `gates/cmake-byproducts-target-expression.sh` checks a CMake output rule.
 - `gates/changelog-citations.sh` checks that tracked-document commit citations
   are reachable from the default branch.
-- `gates/daemon-gap-cpu-probe.sh` samples live daemon workers and prints no
-  verdict; run it by hand during a watchdog gap.
+- `gates/status-contract.sh` checks this page against the tree.
+- `gates/changelog-versions.sh` checks the changelog's version sequence.
 
-The first four print verdicts and run in CI. The daemon probe is a diagnostic,
-not a gate. Two of them read git history, so a full clone is required:
+`gates/daemon-gap-cpu-probe.sh` is a diagnostic rather than a gate: it samples
+live daemon workers, prints no verdict, and is run by hand during a watchdog
+gap.
+
+Two of the CI gates read git history, so a full clone is required:
 `duplicate-predicate-sweep.sh` rebuilds a control from an older commit and
 reports NO ANSWER when that commit is outside the history it has, and
 `changelog-citations.sh` asks whether each cited commit is on the default
