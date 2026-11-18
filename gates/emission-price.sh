@@ -50,7 +50,7 @@ F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
 # `local/` IS ITS OWN GIT REPOSITORY, so `rev-parse --show-toplevel` from this
 # script's directory answers about local/ and not about nix-ninja. The path is
 # derived from the script instead, then checked.
-REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd) || exit 2
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd) || exit 2
 [ -f "$REPO/crates/nix-ninja-task/src/main.rs" ] || { echo "NO ANSWER: $REPO is not the nix-ninja tree"; exit 2; }
 BASE_REV=${1:-HEAD}
 HEAD_REV=${2:-}

@@ -22,7 +22,8 @@
 # is seconds. With --build it builds every example first, which is minutes to
 # tens of minutes and is what a cold store needs.
 set -u
-cd "$(dirname "$0")/../.." || exit 2
+ROOT=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
+cd "$ROOT" || exit 2
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
 BUILD=0
 [ "${1:-}" = "--build" ] && BUILD=1
