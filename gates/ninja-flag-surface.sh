@@ -20,7 +20,7 @@
 # and `-t list` is used as the payload because it prints and exits without a
 # daemon.
 set -u
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 NINJA=${NINJA_BIN:-$(command -v ninja)}
 [ -x "$NINJA" ] || { echo "no ninja on PATH; set NINJA_BIN" >&2; exit 2; }
 NN=$(nix build --no-link --print-out-paths "$REPO#nix-ninja" 2>/dev/null) || { echo "NO ANSWER: the nix-ninja binary did not build for NN"; exit 2; }

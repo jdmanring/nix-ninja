@@ -18,7 +18,7 @@
 #   emission-price-outer-write.sh [BASE_REV]     default b40abd0
 set -u
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 BASE=${1:-b40abd0}
 say() { printf '%s\n' "$*"; }
 die() { say "NO ANSWER: $*"; say "  load $(cut -d' ' -f1-3 /proc/loadavg), $(nproc) threads"; exit 2; }

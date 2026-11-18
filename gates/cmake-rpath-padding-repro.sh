@@ -17,7 +17,7 @@ set -uo pipefail
 # BY ATTRIBUTE, NEVER A LITERAL STORE PATH: a literal is collected by the next
 # GC and the arm answers NO ANSWER from then on (2026-10-03).
 nnpkg() { nix build --no-link --print-out-paths --impure --expr \
-  "(builtins.getFlake \"$(cd "$(dirname "$0")/../.." && pwd)\").inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}.$1" | tail -1; }
+  "(builtins.getFlake \"$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)\").inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}.$1" | tail -1; }
 CMAKE=${CMAKE:-$(nnpkg cmakeMinimal)/bin/cmake}
 PATCHELF=${PATCHELF:-$(nnpkg patchelf)/bin/patchelf}
 echo "cmake: $("$CMAKE" --version | head -1)   patchelf: $("$PATCHELF" --version)"

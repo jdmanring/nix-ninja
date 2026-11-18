@@ -22,7 +22,7 @@
 # fixture that real ninja reads clean with no help from this driver.
 set -u
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 CTL=${NN_NINJA_STATE_CONTROL_REV:-c538753}
 b() { nice -n 10 nix build --cores "${NN_GATE_CORES:-8}" --extra-experimental-features "$F" \
         --no-link --print-out-paths "$@"; }

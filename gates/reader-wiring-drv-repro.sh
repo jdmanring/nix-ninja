@@ -37,7 +37,7 @@ store_find() {  # store_find NAME_PATTERN [SUBPATH]
 }
 
 FEAT='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 b() { nice -n 10 nix build --cores 8 --extra-experimental-features "$FEAT" \
         --no-link --print-out-paths "$@"; }
 # THE CONTROL IS A REVISION WITHOUT THE READERS (`0a35a39`), built by revision.

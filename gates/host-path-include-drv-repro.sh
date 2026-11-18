@@ -53,7 +53,7 @@ store_find() {  # store_find NAME_PATTERN [SUBPATH]
 }
 
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 SRC=${NN_GATE_SRC:-$REPO}
 
 b() { nice -n 10 nix build --extra-experimental-features "$F" \

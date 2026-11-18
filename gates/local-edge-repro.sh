@@ -22,7 +22,7 @@
 #   NN_PROBE_REV=<rev>  or from that revision
 set -u
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 FLAKE=$REPO
 if [ -n "${NN_PROBE_REV:-}" ]; then
   W=$(mktemp -d -t nn-localedge-wt-XXXXXX)

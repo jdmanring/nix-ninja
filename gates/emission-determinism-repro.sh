@@ -27,7 +27,7 @@
 # one session attributing the other's numbers to this cause.
 set -uo pipefail
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 b(){ nix build --extra-experimental-features "$F" --no-link --print-out-paths "$@" 2>/dev/null; }
 NN=$(b "$REPO#nix-ninja") || { echo "FAIL: no driver"; exit 2; }
 TASK=$(b "$REPO#nix-ninja-task") || { echo "FAIL: no task binary"; exit 2; }

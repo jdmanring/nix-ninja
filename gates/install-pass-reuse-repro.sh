@@ -44,7 +44,7 @@
 # the scratch dir on a PASS
 set -u
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 DSD=${NN_DEVSTORE:-$HOME/.cache/nn-scratch/ds-stock}
 if [ "${1:-}" != --in-ns ]; then
   [ -d "$DSD/store/nix/store" ] || { echo "NO ANSWER: no devstore at $DSD"; exit 2; }

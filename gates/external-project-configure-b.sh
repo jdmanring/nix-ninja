@@ -44,7 +44,7 @@ set -u
 TMP_CLEAN=()
 trap 'rm -rf "${TMP_CLEAN[@]}" 2>/dev/null || true' EXIT
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 FLAKE=$REPO
 if [ -n "${NN_PROBE_REV:-}" ]; then
   W=$(mktemp -d -t nn-epsrc-wt-XXXXXX); TMP_CLEAN+=("$W")

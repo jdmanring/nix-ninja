@@ -447,7 +447,7 @@ nothing is outstanding.
   measured. Until then the honest statement is that the granularity is per
   translation unit by construction, which is a fact about the design, and that
   no measurement here says what that is worth.
-- **Four open classes in `0.3`**, whose first actions item 2 below names, and
+- **Three open classes in `0.3`**, whose first actions item 2 below names, and
   **three inherited items** carried with no diagnosis, in item 6.
 - **The driver has never been run at distribution scale on hardware it owns.**
   The two slopes in item 6, `dyn` at 0.084 s per task and retention at 0.074 MiB
@@ -554,7 +554,7 @@ Work item 1 then addresses the 11 private-tree coupled cases with fixtures.
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
 
-### 2. Close the four open classes
+### 2. Close the three open classes
 
 - **A macro arm.** CLOSED, and it took four axes rather than the one this item
   named. The reader now accepts the delimiter a body is spelled with
@@ -568,11 +568,15 @@ original environment before the second depends on it.
   two arms because its author reasoned "one arm is the ordinary case", which is
   the shape that passes rather than the shape production has. A control written
   to the passing shape asserts nothing.
-- **An alias output read at its store path.** What aborts is the include
-  scanner's read, and the row says which task is still unknown. First action:
-  keep the build directory of a failing drive and read `build.ninja` for the
-  edge that consumes the alias. The fix is not in the outputs-into-one-path
-  code, which is correct by design.
+- **An alias output read at its store path.** CLOSED as NOT A DRIVER DEFECT.
+  All three named packages were driven on configuration B on 2026-11-06 and the
+  edge never runs: libdatachannel built 81 of 81, libvpl built, and the alias
+  dump was header-only, so the include scanner never made the read the row
+  described. editorconfig-core-c compiles and fails on an unrelated install
+  defect. A class whose only evidence is an error text, with no package that
+  reaches the code, is a hypothesis rather than an open defect, and it is closed
+  here rather than carried. Reopening it needs one concrete thing: a failing
+  round whose kept build directory shows an edge consuming the alias.
 - **An encoded entry that is not an absolute store path.** Two mechanisms print
   the same text and the derivation name cannot tell them apart. First action:
   read the RAW value, not the message. Then it is either the split already fixed

@@ -19,7 +19,7 @@
 #   NN_VALUE_A=...   a value a plain stdenv build holds
 #   NN_VALUE_B=...   a value a build using the feature holds
 set -u
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 VAR=${NN_VAR:-XDG_DATA_DIRS}
 F='nix-command flakes'
 nb() { nix build --extra-experimental-features "$F" --no-link --print-out-paths "$@" 2>/dev/null; }

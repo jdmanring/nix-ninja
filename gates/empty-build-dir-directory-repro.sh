@@ -14,7 +14,7 @@
 # tree's empty directories.
 set -u
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd); SRC=$REPO
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd); SRC=$REPO
 if [ "${1:-}" = --control ]; then
   W=$(mktemp -d -t nn-ebd-wt-XXXXXX); rmdir "$W"
   git -C "$REPO" worktree add -q --detach "$W" "${2:?rev}" || exit 2

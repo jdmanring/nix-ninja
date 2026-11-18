@@ -29,7 +29,7 @@
 # with it.
 set -u
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 CORES=${NN_GATE_CORES:-8}
 PIN=${NN_PIN_REV:-}
 [ -n "$PIN" ] || { echo "NO ANSWER: NN_PIN_REV unset; the control arm is mandatory"; exit 2; }

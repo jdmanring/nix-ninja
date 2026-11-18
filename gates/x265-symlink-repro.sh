@@ -26,7 +26,7 @@
 # invocation rather than machine-wide. Run from a checkout.
 set -euo pipefail
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 b() { nice -n 10 nix build --extra-experimental-features "$F" --no-link --print-out-paths "$@"; }
 NN=$(b "$REPO#nix-ninja"); TASK=$(b "$REPO#nix-ninja-task")
 px() { b --impure --expr "let f = builtins.getFlake \"$REPO\"; p = f.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}; in p.$1" | tail -1; }

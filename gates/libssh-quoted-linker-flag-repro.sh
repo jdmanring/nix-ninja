@@ -23,7 +23,7 @@
 # Needs a builder-rpc-v0 daemon. Run from a checkout.
 set -euo pipefail
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 CORES=${NN_GATE_CORES:-8}
 b() { nice -n 10 nix build --cores "$CORES" --extra-experimental-features "$F" \
         --no-link --print-out-paths "$@"; }

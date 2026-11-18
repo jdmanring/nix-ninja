@@ -32,7 +32,7 @@
 #   FAIL  undefined reference, or the linker cannot find libinner.so.1
 set -uo pipefail
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 b(){ nix build --extra-experimental-features "$F" --no-link --print-out-paths "$@" 2>/dev/null; }
 if [ -n "${NN_PROBE_REV:-}" ]; then
   W=$(mktemp -d -t nn-dtn-wt-XXXXXX)

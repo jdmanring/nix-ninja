@@ -14,7 +14,7 @@
 # been uploaded: `-t drv` must name a store copy with a store-path shebang.
 set -u
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd); SRC=$REPO
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd); SRC=$REPO
 expect=none
 if [ "${1:-}" = --control ]; then
   W=$(mktemp -d -t nn-utc-wt-XXXXXX); rmdir "$W"

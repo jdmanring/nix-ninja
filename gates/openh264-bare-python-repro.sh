@@ -23,7 +23,7 @@
 #   local/gates/openh264-bare-python-repro.sh <driver-bin>
 set -euo pipefail
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 NN=${1:?usage: openh264-bare-python-repro.sh <driver-bin>}
 [ -x "$NN" ] || { echo "not executable: $NN" >&2; exit 2; }
 

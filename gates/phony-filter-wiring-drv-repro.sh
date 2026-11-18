@@ -30,7 +30,7 @@ store_find() {  # NEVER GLOB /nix/store; stream it and stop at the first hit
 }
 
 FEAT='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 b() { nice -n 10 nix build --cores 8 --extra-experimental-features "$FEAT" \
         --no-link --print-out-paths "$@"; }
 px() { b --impure --expr "let f = builtins.getFlake \"$REPO\"; p = f.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}; in p.$1" | tail -1; }

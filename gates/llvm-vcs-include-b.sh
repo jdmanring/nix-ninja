@@ -39,11 +39,11 @@
 #                        (3301b15 is the last revision before the fix)
 set -u
 F='nix-command flakes dynamic-derivations ca-derivations recursive-nix'
-REPO=$(cd "$(dirname "$0")/../.." && pwd)
+REPO=$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)
 # BY ATTRIBUTE, NEVER A LITERAL STORE PATH: a literal is collected by the next
 # GC and the arm answers NO ANSWER from then on (2026-10-03).
 nnpkg() { nix build --no-link --print-out-paths --impure --expr \
-  "(builtins.getFlake \"$(cd "$(dirname "$0")/../.." && pwd)\").inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}.$1" | tail -1; }
+  "(builtins.getFlake \"$(cd "$(dirname "$0")" && while [ ! -f Cargo.toml ] && [ "$PWD" != / ]; do cd ..; done; pwd)\").inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}.$1" | tail -1; }
 LLVM=${NN_LLVM_SRC:-$(nnpkg llvmPackages_22.llvm.src)}
 MODULES=$LLVM/llvm/cmake/modules
 for m in GenerateVersionFromVCS.cmake VersionFromVCS.cmake; do
