@@ -15,13 +15,14 @@ deliverable, and the highest number in the table is the newest. A row is added
 only after its work is verified, and it names the commit and the gate, test or
 measured run that supports it.
 
-**The point-release number is not `Cargo.toml`'s, and that separation is
-deliberate.** `Cargo.{toml,lock}` sit inside `nix-ninja-task`'s fileset, so an
-edit to the manifest version moves the task binary and re-keys every banked
-compile in the consumer's store. Measured 2026-11-17 by `emission-price.sh`: a
-one-line version edit read `GLOBAL RE-KEY`. The manifest therefore moves at a
-milestone boundary and in a batch that prices it, never to keep pace with a
-changelog row.
+**The point-release number is `Cargo.toml`'s.** The manifest and the newest
+changelog row carry the same version, so a reader who opens `Cargo.toml` learns
+where the tree actually is. `Cargo.{toml,lock}` sit inside `nix-ninja-task`'s
+fileset, so the bump is not free: measured 2026-11-17 by `emission-price.sh` on
+a one-line version edit, `GLOBAL RE-KEY`, with all five emission shapes byte
+identical. The bump is therefore batched with other re-keying work and taken
+when the consumer is not mid-build, and it is priced each time rather than
+assumed from that measurement.
 
 Tags mark intentional releases, not every version change in the working tree.
 Do not tag a milestone while its criterion is open. Before a release, run the

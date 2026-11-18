@@ -21,15 +21,15 @@ stability before 1.0. The third number is a POINT RELEASE: it counts
 deliverables inside the milestone, so every row here carries its own version
 and a row can be found by it.
 
-THE THIRD NUMBER IS NOT `Cargo.toml`'s. The manifest names the milestone and
-moves only at its exit criterion, which is a separate and far more expensive
-event: `Cargo.{toml,lock}` are inside `nix-ninja-task`'s fileset, so a version
-edit there moves the task binary and re-keys every banked compile in the
-consumer's store. MEASURED 2026-11-17 by `emission-price.sh`: `GLOBAL RE-KEY`,
-task `drvPath` from `wn9raz1m` to `zhb1yhdr` for the one-line edit, with all
-five emission shapes byte identical. The manifest therefore stays at the
-milestone version while rows here advance by point release, and the two are
-reconciled at a batch boundary rather than on a documentation edit.
+THE THIRD NUMBER IS `Cargo.toml`'s TOO, and the two move together. Keeping the
+manifest behind the table cost more than it saved: a reader checking
+`Cargo.toml` got a stale answer about where the tree is, and the "deliberately
+different" state needed a paragraph of explanation everywhere it was mentioned.
+`Cargo.{toml,lock}` sit inside `nix-ninja-task`'s fileset, so the bump is not
+free: MEASURED 2026-11-17 by `emission-price.sh` on the same one-line edit,
+`GLOBAL RE-KEY` with the task `drvPath` moving while all five emission shapes
+stayed byte identical. It is therefore a BATCHED change, landable whenever the
+consumer is not mid-build, and it is priced each time rather than assumed.
 
 `0.1` and `0.2` are `pdtpartners/nix-ninja`'s, defined as correctness and as
 performance in that repository's README. `0.3` and after are this project's own.

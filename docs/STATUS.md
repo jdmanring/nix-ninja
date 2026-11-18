@@ -9,17 +9,12 @@ remains deliberately outside it. Milestone criteria and ordered work live in
 
 ## Current direction
 
-The milestone version is **0.3.0**, the one `Cargo.toml` carries. The inherited
-`0.1` correctness and `0.2` performance milestones are complete; `0.3`
-real-package resilience is in progress. A version number names the milestone
-currently being worked toward, not a completed milestone. The tagged release is
-`v0.3.0`; the tree may carry commits after that tag.
-
-Deliverables inside the milestone are counted separately: the
-[changelog](../CHANGELOG.md) gives each verified deliverable its own point
-release, so the table describes 105 of them under `0.3`. Those numbers are not
-`Cargo.toml`'s: the manifest sits in the task binary's fileset, so moving it
-re-keys every banked compile and happens at a milestone boundary instead. See
+The development version is **0.3.105**, the one `Cargo.toml` carries and the
+newest changelog row. The inherited `0.1` correctness and `0.2` performance
+milestones are complete; `0.3` real-package resilience is in progress. The
+first two numbers name the milestone and the third counts verified deliverables
+inside it, so 105 says how much of `0.3` is done, not that `0.3` is met. The
+tagged release is `v0.3.0`; the tree carries commits after it. See
 [the release policy](RELEASE_POLICY.md).
 
 The public command for an end-to-end check is:

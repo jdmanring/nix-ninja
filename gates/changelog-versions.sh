@@ -15,12 +15,15 @@
 #             asserted
 #   gap-free  the highest point release under the in-progress milestone is n for
 #             n rows, so a renumbering that skips or repeats a number fails
+#   manifest  `Cargo.toml`'s version equals the newest row's, so the two cannot
+#             drift into answering a reader differently
 #
-# THE MANIFEST VERSION IS NOT COMPARED HERE. `Cargo.{toml,lock}` sit inside the
-# task binary's fileset, so `Cargo.toml` names the MILESTONE and stays put until
-# its exit criterion, while rows advance by point release. MEASURED 2026-11-17:
-# a one-line manifest version edit reads GLOBAL RE-KEY under emission-price.sh.
-# Comparing the two would demand that expensive edit for every row.
+# THE MANIFEST IS COMPARED, and that is what makes the number mean something.
+# The newest row and `Cargo.toml` carry the same version, so a reader who opens
+# the manifest learns where the tree is. The bump re-keys (the manifest is in
+# the task binary's fileset; measured GLOBAL RE-KEY), which is why it is batched,
+# not why it is skipped: an earlier version of this gate documented a split,
+# and the cost of that was a manifest that answered a reader wrongly.
 #
 # NO BUILD, NO DAEMON, NO MACHINE: seconds, safe during a round.
 #
@@ -116,6 +119,30 @@ rc=$?
 if [ "$rc" -ne 0 ]; then
   exit "$rc"
 fi
+
+# THE MANIFEST AND THE NEWEST ROW ARE ONE NUMBER. Read as text rather than
+# parsed, since the field is a single quoted string in both places.
+newest=$(python3 - "$DOC" <<'PY'
+import re, sys
+for l in open(sys.argv[1], errors='replace'):
+    m = re.match(r'^\| (\d+\.\d+\.\d+) \|', l)
+    if m:
+        print(m.group(1)); break
+PY
+)
+cargo=$(command grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+if [ -z "$newest" ] || [ -z "$cargo" ]; then
+  echo "NO ANSWER: cannot read both versions (newest row '${newest}', Cargo.toml '${cargo}')"
+  exit 2
+fi
+if [ "$newest" != "$cargo" ]; then
+  echo "FAIL manifest version    Cargo.toml says $cargo, the newest row is $newest"
+  echo "  (the bump re-keys: batch it, price it, and land both in one change)"
+  echo
+  echo "FAIL: the manifest and the changelog disagree."
+  exit 1
+fi
+echo "OK   manifest version    $cargo matches the newest row"
 echo
 echo "PASS: every changelog row carries its own version, in sequence."
 exit 0
