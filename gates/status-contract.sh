@@ -98,8 +98,11 @@ tag=$(command grep -oE '\bv[0-9]+\.[0-9]+\.[0-9]+\b' "$PAGE" | head -1)
 if [ -n "$tag" ]; then
   anytag=$(git tag -l | head -1)
   if [ -z "$anytag" ]; then
-    echo "NO ANSWER: $PAGE names $tag, but this clone carries no tags at all"
-    echo "  (a depth-1 or --no-tags clone); fetch them and re-run: git fetch --tags"
+    echo "NO ANSWER: $PAGE names $tag, but this working copy carries no tags at all."
+    echo "  A depth-1 or --no-tags clone is the usual cause, and so is a fresh"
+    echo "  'git clone', which fetches none by default. This is not a stale page:"
+    echo "  the check cannot see a tag, so it refuses rather than blame the text."
+    echo "  Fetch them and re-run:  git fetch --tags"
     exit 2
   fi
   if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null 2>&1; then
