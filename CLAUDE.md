@@ -498,8 +498,10 @@ the poisoned-lock signature); arm one `local/gates/registered.sh` (a gate's
 verdict text and its registration change together). NO ANSWER is scored
 apart from FAIL; a runner must not re-decide a gate's precondition. A
 discovery-mechanism gate switches off every other route
-(`NIX_NINJA_IMPLICIT_INPUTS_LIMIT=0`). `run_gate` scores verdict TEXT, so
-gates must also exit non-zero on failure; the B half FAILS a non-executable
+(`NIX_NINJA_IMPLICIT_INPUTS_LIMIT=0`). Both scorers read the exit status
+before the verdict text, so a gate that prints its PASS line and then fails
+scores FAIL; the text still has to match when the gate succeeded. Gates must
+therefore also exit non-zero on failure; the B half FAILS a non-executable
 arm. An arm whose control does not FAIL on the defect is excluded, not
 registered (`mesa-macro-include-ccshim-repro.sh`); so is a RED-BY-DESIGN
 gate.
