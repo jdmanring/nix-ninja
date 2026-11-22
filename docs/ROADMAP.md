@@ -535,9 +535,9 @@ call said 13, and a probe that scored any nonzero exit as "ran" said 5 without
 separating tools from corpus arms. The second counted `round-intercept-sweep.sh`,
 which needs a round log and reads a retained store path.
 
-81 of 101 development-corpus paths are symlinked to published tools under
-`gates/`; the private repository holds 20 scripts of its own and those 81
-symlinks. `gates/` carries 82, because `gate-repo-lookup.sh` was written in the
+82 of 101 development-corpus paths are symlinked to published tools under
+`gates/`; the private repository holds 19 scripts of its own and those 82
+symlinks. `gates/` carries 83, because `gate-repo-lookup.sh` was written in the
 public tree and has no private counterpart. Its `REASONS.md` has one row per
 private script.
 
@@ -549,7 +549,10 @@ those classes. Package names are not a reason to hold one back: the exclusion is
 paths and unpublished evidence, which is the line this file already draws. Two
 scripts an audit found carrying no marker at all, `x265-symlink-repro.sh` and
 `version-script-generated-repro.sh`, are published: their exclusion was
-unexplained rather than justified.
+unexplained rather than justified. On 2026-11-22
+`discovery-merge-two-claimants-b.sh` followed: its only private-run path was
+a comment, and its repository lookup climbed a fixed depth, so it was fixed
+and published, and 19 are held back.
 
 Publishing is a copy and a symlink, and the copy is verified byte for byte. The
 standalone probe in `roadmap-numbers.sh` is unaffected by the new arrivals: it
