@@ -11,13 +11,10 @@ mod validations;
 use anyhow::anyhow;
 
 pub fn n2_binary() -> std::path::PathBuf {
-    std::env::current_exe()
-        .expect("test binary path")
-        .parent()
-        .expect("test binary directory")
-        .parent()
-        .expect("binary directory")
-        .join("n2")
+    // Cargo's own path to the bin target. Walking up from the test binary
+    // assumed `target/debug/deps/`, which newer cargo does not use for
+    // integration tests, and every e2e test then failed to find n2.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_n2"))
 }
 
 pub fn n2_command(args: Vec<&str>) -> std::process::Command {
