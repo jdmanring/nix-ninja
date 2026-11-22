@@ -69,8 +69,16 @@ for v in NN TASK CC CU BASH PE; do
 done
 echo "driver $NN (rev ${REV:0:12})"
 mkdir -p "$D/pristine" && cd "$D/pristine" || exit 2
-printf '#include "x.h"\nint foo(void){return X;}\n' > foo.c
-printf 'int foo(void); int main(void){return foo()==1?0:1;}\n' > main.c
+# A NONCE PER INVOCATION, SHARED BY EVERY RUN IN IT. The devstore persists,
+# so a fixed fixture emits the derivations an earlier invocation already
+# built whenever the task binary has not moved, run 1 builds nothing, and
+# the gate can only refuse. Measured 2026-11-22: foo.o, main.o and app were
+# registered 2026-11-18 and every corpus run since read NO ANSWER here.
+# The nonce sits in both sources so all three tasks are new; it is the same
+# in every run below, so run 2 still faces run 1's derivations.
+N=${D##*/}
+printf '#include "x.h"\n/* %s */\nint foo(void){return X;}\n' "$N" > foo.c
+printf '/* %s */\nint foo(void); int main(void){return foo()==1?0:1;}\n' "$N" > main.c
 printf '#define X 1\n' > x.h
 cat > build.ninja <<'NINJA'
 rule cc
