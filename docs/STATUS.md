@@ -28,7 +28,7 @@ published at [github.com/jdmanring/nix-ninja](https://github.com/jdmanring/nix-n
 
 ## Public verification surface
 
-`gates/` carries 86 scripts. Most are per-class arms: each reproduces one
+`gates/` carries 87 scripts. Most are per-class arms: each reproduces one
 driver defect and fails on the revision before its fix, which is why they are
 the evidence a closed class carries rather than prose about it. They build
 what they need, so they take minutes and a working nix, and they are meant to
