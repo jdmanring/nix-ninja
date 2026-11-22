@@ -495,8 +495,11 @@ a pin bump must satisfy: builds both binaries once, runs A arms then B arms
 inside recursive-nix, one tally; never run A alone and read it as the
 tree's state. Arm zero `cargo test --workspace` (re-run single-threaded on
 the poisoned-lock signature); arm one `local/gates/registered.sh` (a gate's
-verdict text and its registration change together). NO ANSWER is scored
-apart from FAIL; a runner must not re-decide a gate's precondition. A
+verdict text and its registration change together); then the runner's own
+`--self-test` (both scorers, the arm count, the guard and the verdict
+against literal stub outcomes, seconds, no nix). NO ANSWER is scored apart
+from FAIL and exits non-zero in both configurations; a skip does not. A
+runner must not re-decide a gate's precondition. A
 discovery-mechanism gate switches off every other route
 (`NIX_NINJA_IMPLICIT_INPUTS_LIMIT=0`). Both scorers read the exit status
 before the verdict text, so a gate that prints its PASS line and then fails
