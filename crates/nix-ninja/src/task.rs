@@ -11224,8 +11224,9 @@ fn undeclared_trees(outputs: &[PathBuf]) -> Vec<PathBuf> {
 /// directory trees, plus Qt's FINAL .prl FILE. QtPrlHelpers.cmake says in
 /// as many words that the final prl "should not be specified as a
 /// BYPRODUCT": the step2 edge's script writes it as a side effect, to the
-/// path recorded in the edge's own `-DIN_META_FILE` as
-/// `FINAL_PRL_FILE_PATH = <abs>`, and `qt_install(FILES)` then installs it
+/// path the edge passes as `-DFINAL_PRL_FILE_PATH=<abs>` (Qt 6.12) or
+/// records in its own `-DIN_META_FILE` as `FINAL_PRL_FILE_PATH = <abs>`
+/// (earlier), and `qt_install(FILES)` then installs it
 /// ("file INSTALL cannot find .../lib/libQt6Svg.prl", 2026-08-23). The
 /// meta file is configure-time content in the build dir, so it is readable
 /// at planning. One function for both the planning and the result paths.
@@ -12690,27 +12691,33 @@ fn undeclared_outputs(
     let mut v = undeclared_trees(declared);
     if let Some(c) = cmdline {
         if c.contains("QtFinishPrlFile.cmake") {
-            if let Some(meta) = c
-                .split_whitespace()
-                .find_map(|t| t.strip_prefix("-DIN_META_FILE="))
-            {
-                let meta = meta.trim_matches('"');
-                let meta_path = if Path::new(meta).is_absolute() {
-                    PathBuf::from(meta)
+            // Qt 6.12 passes the final path on the command line
+            // (`-DFINAL_PRL_FILE_PATH=`); earlier releases record it in the
+            // `-DIN_META_FILE` the command names.
+            let arg = |key: &str| {
+                c.split_whitespace()
+                    .find_map(|t| t.trim_matches('"').strip_prefix(key).map(str::to_owned))
+            };
+            let mut finals: Vec<String> = arg("-DFINAL_PRL_FILE_PATH=").into_iter().collect();
+            if let Some(meta) = arg("-DIN_META_FILE=") {
+                let meta_path = if Path::new(&meta).is_absolute() {
+                    PathBuf::from(&meta)
                 } else {
-                    build_dir.join(meta)
+                    build_dir.join(&meta)
                 };
                 if let Ok(text) = fs::read_to_string(&meta_path) {
-                    for line in text.lines() {
-                        if let Some(p) = line.strip_prefix("FINAL_PRL_FILE_PATH = ") {
-                            let p = p.trim();
-                            let rel = relative_from(Path::new(p), build_dir)
-                                .unwrap_or_else(|| PathBuf::from(p));
-                            if !v.contains(&rel) {
-                                v.push(rel);
-                            }
-                        }
-                    }
+                    finals.extend(
+                        text.lines()
+                            .filter_map(|l| l.strip_prefix("FINAL_PRL_FILE_PATH = "))
+                            .map(|p| p.trim().to_owned()),
+                    );
+                }
+            }
+            for p in finals {
+                let rel =
+                    relative_from(Path::new(&p), build_dir).unwrap_or_else(|| PathBuf::from(&p));
+                if !v.contains(&rel) {
+                    v.push(rel);
                 }
             }
         }
@@ -32269,6 +32276,54 @@ mod external_project_extract_tests {
     /// An ExternalProject step declares only its stamp; the consumer must
     /// walk the chain to reach the tree, or the build step names only the
     /// configure stamp and the source tree is absent.
+    #[test]
+    fn the_final_prl_a_qt_step2_edge_writes_is_an_output() {
+        let d = Scratch::new(format!("nn-qt-prl-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(bd.join("src/corelib")).unwrap();
+        let want = PathBuf::from("lib/libQt6Core.prl");
+        // Qt 6.12 as CMake's Ninja generator emits it: the final path is an
+        // unquoted argument, list-valued arguments are quoted whole.
+        let qt612 = format!(
+            "cd {b}/src/corelib && /x/bin/cmake -DIN_FILE={b}/src/corelib/preliminary_prl_for_Core_step1_Release.prl -DOUT_FILE={b}/src/corelib/preliminary_prl_for_Core_step2_Release.prl -DFINAL_PRL_FILE_PATH={b}/lib/libQt6Core.prl \"-DLIBRARY_PREFIXES=lib;lib\" \"-DLIBRARY_SUFFIXES=.so;.a\" -DLINK_LIBRARY_FLAG=-l -P /src/cmake/QtFinishPrlFile.cmake",
+            b = bd.display()
+        );
+        let v = undeclared_outputs(&[], Some(&qt612), &bd);
+        assert!(v.contains(&want), "6.12 command-line spelling: {v:?}");
+        let quoted = qt612.replace(
+            &format!("-DFINAL_PRL_FILE_PATH={}/lib/libQt6Core.prl", bd.display()),
+            &format!(
+                "\"-DFINAL_PRL_FILE_PATH={}/lib/libQt6Core.prl\"",
+                bd.display()
+            ),
+        );
+        assert!(
+            undeclared_outputs(&[], Some(&quoted), &bd).contains(&want),
+            "a token quoted whole"
+        );
+        // Earlier Qt: the path is a line of the meta file the edge names.
+        std::fs::write(
+            bd.join("src/corelib/Core.meta"),
+            format!(
+                "FINAL_PRL_FILE_PATH = {}/lib/libQt6Core.prl\n",
+                bd.display()
+            ),
+        )
+        .unwrap();
+        let meta = "cd src/corelib && cmake -DIN_FILE=a.prl -DIN_META_FILE=src/corelib/Core.meta -DOUT_FILE=b.prl -P /src/cmake/QtFinishPrlFile.cmake";
+        assert!(
+            undeclared_outputs(&[], Some(meta), &bd).contains(&want),
+            "meta-file spelling"
+        );
+        // Control: the same script with neither spelling names no prl.
+        let neither = "cmake -DIN_FILE=a.prl -DOUT_FILE=b.prl -P /src/cmake/QtFinishPrlFile.cmake";
+        let v = undeclared_outputs(&[], Some(neither), &bd);
+        assert!(
+            !v.iter().any(|p| p.extension().is_some_and(|e| e == "prl")),
+            "{v:?}"
+        );
+    }
+
     #[test]
     fn external_project_steps_are_stamps() {
         assert!(external_project_step(
