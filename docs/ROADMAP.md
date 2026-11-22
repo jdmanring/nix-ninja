@@ -493,16 +493,16 @@ scripts three ways:
    `round-intercept-sweep.sh`'s retained round's leaf log, which is NOT
    derivable: resolving the same subject by attribute returns a different
    derivation. It stays, and fails loud when the path is gone.
-2. **Gates that are self-contained.** 89 scripts. A copy into the repository,
+2. **Gates that are self-contained.** 91 scripts. A copy into the repository,
    plus the one path assumption in the runner, which resolves its own directory
    and then expects the gates beside it.
-3. **Gates coupled to a private tree on the executable path.** 11 scripts,
+3. **Gates coupled to a private tree on the executable path.** 9 scripts,
    judged on the code rather than on a comment, since a gate that merely
    mentions a consumer path in a comment is not coupled. Each needs its subject
    turned into a fixture first. Two read a consumer shim by design and report
    NO ANSWER when it is absent, which is correct and stays.
 
-The split is exact and exhaustive over the 101 paths: 1 + 89 + 11 = 101, and no
+The split is exact and exhaustive over the 101 paths: 1 + 91 + 9 = 101, and no
 script falls in two
 groups. The work is therefore almost entirely group 2, which is a copy and one
 runner assumption, and group 3, which is the real cost.
@@ -535,9 +535,9 @@ call said 13, and a probe that scored any nonzero exit as "ran" said 5 without
 separating tools from corpus arms. The second counted `round-intercept-sweep.sh`,
 which needs a round log and reads a retained store path.
 
-83 of 101 development-corpus paths are symlinked to published tools under
-`gates/`; the private repository holds 18 scripts of its own and those 83
-symlinks. `gates/` carries 84, because `gate-repo-lookup.sh` was written in the
+85 of 101 development-corpus paths are symlinked to published tools under
+`gates/`; the private repository holds 16 scripts of its own and those 85
+symlinks. `gates/` carries 86, because `gate-repo-lookup.sh` was written in the
 public tree and has no private counterpart. Its `REASONS.md` has one row per
 private script.
 
@@ -554,14 +554,21 @@ unexplained rather than justified. On 2026-11-22
 a comment, and its repository lookup climbed a fixed depth, so it was fixed
 and published. `generator-edge-execution-probe.sh` followed the same day:
 its only barriers were comments naming a consumer-side request and the
-private wrapper that runs it. 18 are held back.
+private wrapper that runs it. `krb5-dotdot-include-repro.sh` and
+`mtime-rebuild-repro.sh` followed: each copied the consumer's compiler
+drop-in only to turn a `gcc -c` into a one-edge build file, so each now
+writes that file itself. A recorder standing in for the driver received the
+same edge, arguments and environment both ways, apart from the drop-in's
+own marker variable, which only a `ninja` program word reads. 16 are held
+back.
 
 Publishing is a copy and a symlink, and the copy is verified byte for byte. The
 standalone probe in `roadmap-numbers.sh` is unaffected by the new arrivals: it
 skips any gate that invokes nix or is an `-inner.sh` helper, and every one of
 the 71 gates added by the bulk copy is one or the other.
 
-Work item 1 then addresses the 11 private-tree coupled cases with fixtures.
+Work item 1 then addresses the remaining private-tree coupled cases with
+fixtures.
 
 Do them in that order: the first group proves the corpus can run outside its
 original environment before the second depends on it.
