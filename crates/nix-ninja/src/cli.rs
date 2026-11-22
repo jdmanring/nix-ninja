@@ -430,6 +430,53 @@ pub fn report_pass() -> Result<()> {
     Ok(())
 }
 
+/// Set on the real ninja this binary hands a test suite's build to. Seeing it
+/// on entry means the "real" ninja led back here, which would loop forever.
+pub const HANDED_OFF_VAR: &str = "NIX_NINJA_HANDED_TO_REAL_NINJA";
+
+/// The real ninja to hand this invocation to, when it is a TEST SUITE's own
+/// build rather than the derivation's.
+///
+/// A drop-in that shadows `ninja` on PATH for a whole derivation also
+/// catches the projects a check phase builds for itself. meson-python's
+/// tests configure meson projects under pytest's temporary directory, break
+/// them on purpose, and assert on real ninja's behaviour: its `ninja: build
+/// stopped: subcommand failed.` line, and the manifest regeneration that
+/// makes an edited `meson.build` fail the next build. Nothing of such a
+/// build is banked, so it gains nothing from this driver and loses the
+/// behaviour it tests.
+///
+/// The discriminator is `PYTEST_CURRENT_TEST`, which pytest sets for each
+/// stage of a test and removes when the stage ends. A build phase sees it
+/// only if something sets it by hand; that package then builds through real
+/// ninja, giving up resumability, and the hand-off line says so in its log.
+/// `$out` existing was rejected: a package can write its own output during
+/// the build (nss), which would send its own build to real ninja and give up
+/// resumability without a word. `NN_REAL_NINJA` is the real ninja the
+/// consumer's drop-in resolved before shadowing PATH; without it there is
+/// nothing to hand to, and the build stays here.
+pub fn test_suite_real_ninja(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Option<PathBuf>> {
+    let set = |k: &str| var(k).filter(|v| !v.is_empty());
+    let (Some(_), Some(real)) = (set("PYTEST_CURRENT_TEST"), set("NN_REAL_NINJA")) else {
+        return Ok(None);
+    };
+    if !Path::new(&real).is_absolute() {
+        return Err(anyhow!(
+            "NN_REAL_NINJA must be an absolute path, got {}; a bare name resolves through PATH, where the drop-in is",
+            Path::new(&real).display()
+        ));
+    }
+    if set(HANDED_OFF_VAR).is_some() {
+        return Err(anyhow!(
+            "NN_REAL_NINJA ({}) led back to nix-ninja; refusing to hand off again",
+            Path::new(&real).display()
+        ));
+    }
+    Ok(Some(PathBuf::from(real)))
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     warn_ignored_flags(&cli);
