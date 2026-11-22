@@ -493,8 +493,10 @@ task; bash/stdenv = the package's own phase).
 driver edit and before any pin bump. `local/gates/run-all.sh` is THE corpus
 a pin bump must satisfy: builds both binaries once, runs A arms then B arms
 inside recursive-nix, one tally; never run A alone and read it as the
-tree's state. Arm zero `cargo test --workspace` (re-run single-threaded on
-the poisoned-lock signature); arm one `local/gates/registered.sh` (a gate's
+tree's state. Arm zero `cargo test --workspace` in the pinned dev shell, as
+CI runs it, re-run single-threaded on the poisoned-lock signature; a host
+cargo can lay test binaries out differently, and n2's e2e harness finds `n2`
+by that layout (`n2_binary`); arm one `local/gates/registered.sh` (a gate's
 verdict text and its registration change together); then the runner's own
 `--self-test` (both scorers, the arm count, the guard and the verdict
 against literal stub outcomes, seconds, no nix). NO ANSWER is scored apart
@@ -527,7 +529,8 @@ or the status table run `local/gates/roadmap-numbers.sh`.
 ## Commands
 
     cargo check -p nix-ninja / -p nix-ninja-task        seconds, warm cache
-    cargo test --workspace                              count it, never quote
+    nix develop --command cargo test --workspace        PINNED cargo, as CI;
+                                                        count it, never quote
     cargo test -p nix-ninja --test include_dir_shadow
     cargo clippy --all-targets -- --deny warnings       what the gate applies
     nix develop --command cargo fmt --all               the PINNED rustfmt
