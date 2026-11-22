@@ -35,7 +35,8 @@ SRC=${NN_GATE_SRC:-$REPO}
 if [ -n "$CONTROL_REV" ]; then
   W=$(mktemp -d -t nn-vers-wt-XXXXXX)
   git -C "$REPO" worktree add -q --detach "$W" "$CONTROL_REV" || exit 1
-  trap 'git -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
+  GIT=$(command -v git)
+  trap '"$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
   SRC=$W; echo "control: driver and task binary built from $CONTROL_REV"
 fi
 
@@ -45,7 +46,11 @@ CU=$(px coreutils); BASH=$(px bash); PE=$(px patchelf); CC=$(px gcc); GR=$(px gn
 NIXP=$(b --impure --expr "(builtins.getFlake \"$REPO\").inputs.nix.packages.\${builtins.currentSystem}.default" | tail -1)
 
 D=$(mktemp -d -t nn-vers-XXXXXX); S=$D/src; mkdir -p "$S" "$D/build/lib/nsan"
-[ "${KEEP:-}" = 1 ] || trap 'rm -rf "$D"' EXIT
+# ONE EXIT TRAP CARRIES BOTH CLEANUPS: bash keeps only the last one armed, so a
+# second trap here once dropped the control worktree removal armed above. Each
+# action ends `|| true` because errexit applies inside the trap, and git is the
+# path resolved above because PATH no longer holds it when the trap runs.
+trap '[ "${KEEP:-}" = 1 ] || rm -rf "$D" || true; [ -z "${W:-}" ] || "$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
 printf 'int nsan_init(void){return 0;}\n' > "$S/nsan.c"
 # The generator writes the version script. Its content must be a real
 # version script or ld rejects it for a different reason than the one
@@ -121,7 +126,8 @@ echo "generator rc=$grc, version script on disk: $present"
 # stops a red run meaning do not spend the machine. TRIGGER: move it into the
 # verdict in the commit that closes the class, on the strength of a B run.
 D2=$(mktemp -d -t nn-vers2-XXXXXX)
-[ "${KEEP:-}" = 1 ] || trap 'rm -rf "$D" "$D2"' EXIT
+# Re-armed to cover D2 as well, so it carries the worktree removal again.
+trap '[ "${KEEP:-}" = 1 ] || rm -rf "$D" "$D2" || true; [ -z "${W:-}" ] || "$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
 S2=$D2/src; mkdir -p "$S2"
 cp "$S/nsan.c" "$S/genvers.sh" "$S2/"
 printf 'int nsan_dummy(void){return 0;}\n' > "$S2/dummy.c"

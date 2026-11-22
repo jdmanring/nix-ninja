@@ -54,7 +54,8 @@ b(){ nice -n 10 nix build --extra-experimental-features "$F" --no-link --print-o
 if [ -n "${NN_PROBE_REV:-}" ]; then
   W=$(mktemp -d -t nn-dirarg-wt-XXXXXX)
   git -C "$REPO" worktree add -q --detach "$W" "$NN_PROBE_REV" || { echo "NO ANSWER: cannot check out $NN_PROBE_REV"; exit 2; }
-  trap 'git -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
+  GIT=$(command -v git)
+  trap '"$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
   SRC=$W; echo "driver from $NN_PROBE_REV"
 else SRC=${NN_GATE_SRC:-$REPO}; fi
 NN=$(b "$SRC#nix-ninja");        [ -x "$NN/bin/nix-ninja" ]           || { echo "NO ANSWER: no driver"; exit 2; }
@@ -72,7 +73,11 @@ for t in nix-ninja sh python3 nix nix-ninja-task patchelf; do
   [ -n "$found" ] || { echo "NO ANSWER: $t is not on the gate PATH, so this arm would assert nothing"; exit 2; }
 done
 
-D=$(mktemp -d -t nn-dirarg-XXXXXX); trap 'chmod -R u+w "$D" 2>/dev/null; rm -rf "$D"' EXIT
+# ONE EXIT TRAP CARRIES BOTH CLEANUPS: bash keeps only the last one armed, so a
+# second trap here once dropped the control worktree removal armed above. Each
+# action ends `|| true` because errexit applies inside the trap, and git is the
+# path resolved above because PATH no longer holds it when the trap runs.
+D=$(mktemp -d -t nn-dirarg-XXXXXX); trap 'chmod -R u+w "$D" 2>/dev/null || true; rm -rf "$D" || true; [ -z "${W:-}" ] || "$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
 mkdir -p "$D/build" "$D/data/annotations" "$D/data/scanner"
 # Over the cap by construction, and PROVE it below rather than assume it.
 python3 - "$D/data" <<'PY'

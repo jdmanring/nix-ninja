@@ -37,7 +37,8 @@ SRC=${NN_GATE_SRC:-$REPO}
 if [ -n "$CONTROL_REV" ]; then
   W=$(mktemp -d -t nn-gres-wt-XXXXXX)
   git -C "$REPO" worktree add -q --detach "$W" "$CONTROL_REV" || exit 1
-  trap 'git -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
+  GIT=$(command -v git)
+  trap '"$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
   SRC=$W; echo "control: driver and task binary built from $CONTROL_REV"
 fi
 
@@ -50,7 +51,11 @@ GCR=$GLIB/bin/glib-compile-resources
 [ -x "$GCR" ] || { echo "FAIL: no glib-compile-resources, nothing measured" >&2; exit 2; }
 
 D=$(mktemp -d -t nn-gres-XXXXXX); S=$D/glib-src; mkdir -p "$S/gio/tests" "$D/build/gio/tests"
-[ "${KEEP:-}" = 1 ] || trap 'rm -rf "$D"' EXIT
+# ONE EXIT TRAP CARRIES BOTH CLEANUPS: bash keeps only the last one armed, so a
+# second trap here once dropped the control worktree removal armed above. Each
+# action ends `|| true` because errexit applies inside the trap, and git is the
+# path resolved above because PATH no longer holds it when the trap runs.
+trap '[ "${KEEP:-}" = 1 ] || rm -rf "$D" || true; [ -z "${W:-}" ] || "$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
 # The data file exists in the SOURCE tree only, which is the whole point.
 printf 'digits\n' > "$S/gio/tests/test1.txt"
 cat > "$S/gio/tests/111_digit_test.gresource.xml" <<'GRES'

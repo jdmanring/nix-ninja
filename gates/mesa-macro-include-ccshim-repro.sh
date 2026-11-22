@@ -74,7 +74,8 @@ SRC=${NN_GATE_SRC:-$REPO}
 if [ -n "$CONTROL_REV" ]; then
   W=$(mktemp -d -t nn-mesa-ccshim-wt-XXXXXX)
   git -C "$REPO" worktree add -q --detach "$W" "$CONTROL_REV" || exit 1
-  trap 'git -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
+  GIT=$(command -v git)
+  trap '"$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
   SRC=$W; echo "control: driver and task binary built from $CONTROL_REV"
 fi
 
@@ -84,7 +85,11 @@ CU=$(px coreutils); BASH=$(px bash); PE=$(px patchelf); CC=$(px gcc); GR=$(px gn
 NIXP=$(b --impure --expr "(builtins.getFlake \"$REPO\").inputs.nix.packages.\${builtins.currentSystem}.default" | tail -1)
 
 D=$(mktemp -d -t nn-mesa-ccshim-XXXXXX)
-[ "${KEEP:-}" = 1 ] || trap 'rm -rf "$D"' EXIT
+# ONE EXIT TRAP CARRIES BOTH CLEANUPS: bash keeps only the last one armed, so a
+# second trap here once dropped the control worktree removal armed above. Each
+# action ends `|| true` because errexit applies inside the trap, and git is the
+# path resolved above because PATH no longer holds it when the trap runs.
+trap '[ "${KEEP:-}" = 1 ] || rm -rf "$D" || true; [ -z "${W:-}" ] || "$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
 # The real geometry, one directory deep exactly as mesa has it.
 mkdir -p "$D/src/lib/glapi" "$D/build"
 printf '#ifndef GLAPI_PRIV_H\n#define GLAPI_PRIV_H\n#define ENTRY_TLS_H "glapi/entry_x86_tls.h"\n#include ENTRY_TLS_H\nint glapi_priv_seed(void);\n#endif\n' > "$D/src/lib/glapi_priv.h"

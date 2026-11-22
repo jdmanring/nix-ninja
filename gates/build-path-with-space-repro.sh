@@ -56,7 +56,8 @@ SRC=$REPO
 if [ -n "$CONTROL_REV" ]; then
   W=$(mktemp -d -t nn-space-wt-XXXXXX)
   git -C "$REPO" worktree add -q --detach "$W" "$CONTROL_REV" || exit 2
-  trap 'git -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
+  GIT=$(command -v git)
+  trap '"$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
   SRC=$W; echo "control: driver and task binary built from $CONTROL_REV"
 fi
 
@@ -70,7 +71,11 @@ D=$(mktemp -d -t nn-space-XXXXXX); S=$D/src
 # THE SPACE IS IN THE DIRECTORY NAME, as meson writes it.
 DIR='khronos typedefs.p'
 mkdir -p "$S" "$D/build/test/$DIR"
-[ "${KEEP:-}" = 1 ] || trap 'rm -rf "$D"' EXIT
+# ONE EXIT TRAP CARRIES BOTH CLEANUPS: bash keeps only the last one armed, so a
+# second trap here once dropped the control worktree removal armed above. Each
+# action ends `|| true` because errexit applies inside the trap, and git is the
+# path resolved above because PATH no longer holds it when the trap runs.
+trap '[ "${KEEP:-}" = 1 ] || rm -rf "$D" || true; [ -z "${W:-}" ] || "$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
 printf '#ifndef SEEDH\n#define SEEDH\nint seed(void);\n#endif\n' > "$D/build/test/$DIR/seed.h"
 printf '#include "seed.h"\nint user(void){ return seed(); }\n' > "$S/khronos_typedefs.c"
 

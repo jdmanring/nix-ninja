@@ -79,7 +79,8 @@ SRC=${NN_GATE_SRC:-$REPO}
 if [ -n "$CONTROL_REV" ]; then
   W=$(mktemp -d -t nn-scipy-wt-XXXXXX)
   git -C "$REPO" worktree add -q --detach "$W" "$CONTROL_REV" || exit 1
-  trap 'git -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
+  GIT=$(command -v git)
+  trap '"$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
   SRC=$W; echo "control: task binary built from $CONTROL_REV"
 fi
 
@@ -89,7 +90,11 @@ TASKBIN="$TASK/bin/nix-ninja-task"
 CC=$(px gcc); CU=$(px coreutils); BASH=$(px bash)
 
 D=$(mktemp -d -t nn-scipy-XXXXXX)
-[ "${KEEP:-}" = 1 ] || trap 'rm -rf "$D"' EXIT
+# ONE EXIT TRAP CARRIES BOTH CLEANUPS: bash keeps only the last one armed, so a
+# second trap here once dropped the control worktree removal armed above. Each
+# action ends `|| true` because errexit applies inside the trap, and git is the
+# path resolved above because PATH no longer holds it when the trap runs.
+trap '[ "${KEEP:-}" = 1 ] || rm -rf "$D" || true; [ -z "${W:-}" ] || "$GIT" -C "$REPO" worktree remove --force "$W" >/dev/null 2>&1 || true' EXIT
 
 # The source tree mirrors scipy's geometry: the header is checked in at
 # scipy/optimize/Zeros/, the includer is GENERATED under the build dir at
