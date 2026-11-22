@@ -83,15 +83,20 @@ corpus beside other nix work. The implicit-input blanket is gated
 `!is_gcc_task`, so a change confined to it never moves a compile. Never put
 an unpriced cost clause in a commit body.
 
-**A pin bump pays two bills; only one is large.** Package derivations
-re-derive (`nnCcHook` embeds the driver path as CONTENT;
-`ccWireAlways`/`withNixNinjaAttrs` add both binaries as inputs). The stable
-mount `/nn-driver` would remove both carriers (driver support since
-`779a742`), but landing it changes hook content and re-keys every cc-route
-package including the banked server, and James's order is that the server
-is NOT rebuilt (`local/pending/stable-cc-hook-proposal.md`). Its toolchain
-half (`nnWireToolchain`) is WITHDRAWN by measurement (5 to 1594 refusals);
-do not re-propose it. Dynamic task derivations key on the DRIVER; plain
+**What a pin bump re-keys in the consumer is read from the CONSUMER.** A
+package derivation re-derives on a bump only if it names a fork store path,
+as hook content or as an input. The consumer's hooks (`nnCcHook`,
+`nixNinjaHook`) export the stable mounts `/nn-driver` and `/nn-task`
+(driver support since `779a742`) and `withNixNinjaAttrs` adds only the nix
+package, so a bump moves the daemon mapping (both halves) and any task
+derivation the knob does not protect. Check before pricing a bump: the
+DECIDING reading is one hook-carrying package's `drvPath` unchanged under
+`--override-input nix-ninja <rev>`; a move means a carrier is back and every
+cc-route package re-derives. A search for `${nixNinja}` or
+`${nixNinjaTask}` under `~/Projects/saxum/site` only screens: a carrier
+added through another wrapper passes it. The toolchain half of the stable hook (`nnWireToolchain`) is
+WITHDRAWN by measurement (5 to 1594 refusals); do not re-propose it.
+Dynamic task derivations key on the DRIVER; plain
 ones on the task binary and EMITTED BYTES, so an emission-free driver bump
 costs a re-derivation whose expensive half substitutes (0.11% dynamic, by
 BUILDER, not name). `nix derivation show` on these needs
@@ -199,8 +204,8 @@ By revision from GitHub (`github:jdmanring/nix-ninja/<rev>`), never `path:`:
 commit, push to `origin`, bump the rev in Saxum's flake. Unpushed work does
 not exist to the consumer.
 
-THE PIN PROTOCOL (2026-10-03; every driver bump re-keys the cc route via
-`nnCcHook`): (a) the consumer bumps only at a CAMPAIGN BOUNDARY, never
+THE PIN PROTOCOL (2026-10-03, written while every driver bump re-keyed
+the cc route; what a bump costs now is read as above): (a) the consumer bumps only at a CAMPAIGN BOUNDARY, never
 mid-build, except for a fix to a failure inside the running build; (b)
 before any hours-long build it asks for the complete in-flight list
 (`git log <pin>..origin/main`, `git status` of both trees, the queue in
@@ -246,8 +251,8 @@ up resumability). `shared-mime-info` (store-path ITS datadir dropped by the
 wiring) and `harfbuzz` (typelib abort, unmeasured) are not cleared by any
 pin bump. A rerouted package is MASKED: a green round over it, or a fix
 for what it hits on its NEW route, says nothing about the defect that
-rerouted it. `withNixNinjaAttrs` appends `[ nixNinja nixNinjaTask nixPkg ]`
-to every routed package (cc branch: `pkgs-gaming.nix`), so a failing nix
+rerouted it. `withNixNinjaAttrs` appends the nix package (`nixPkg`) to
+every routed package (cc branch: `pkgs-gaming.nix`), so a failing nix
 build kills every routed package and surfaces under an unrelated name:
 read a nix-shaped failure first. The nix
 boost-URL patch wiring and the consumer resumability gate's reading traps
