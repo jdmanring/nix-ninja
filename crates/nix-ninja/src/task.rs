@@ -637,7 +637,37 @@ pub struct BuildResult {
     /// ran and found an indexed miss, so every other task's result is
     /// what it was before this field existed.
     pub defer: Option<DeferMiss>,
+    /// A phony edge's result. The schedule's total counts only edges with
+    /// a command, so `wait` must not count this one as a completion.
+    pub phony: bool,
     pub err: Option<Error>,
+}
+
+impl BuildResult {
+    /// A phony edge's result: nothing built, nothing to place.
+    pub fn phony(bid: BuildId, label: String) -> Self {
+        BuildResult {
+            bid,
+            label,
+            derived_path: None,
+            derived_files: Vec::new(),
+            undeclared_dirs: Vec::new(),
+            undeclared_files: Vec::new(),
+            defer: None,
+            phony: true,
+            err: None,
+        }
+    }
+
+    /// Whether `wait` counts this result as a finished build: only where
+    /// the schedule's total counts one, an edge with a command, once. A
+    /// phony is not in the total, and a deferred result is counted when
+    /// its re-run finishes. Counting both let `completed` pass `total` on
+    /// a GN graph with many phony edges, and let a deferral loop read as
+    /// progress to a consumer that takes the count as liveness.
+    pub fn is_completion(&self) -> bool {
+        !self.phony && self.defer.is_none()
+    }
 }
 
 #[derive(Clone)]
@@ -1697,7 +1727,6 @@ pub struct Runner {
     /// tree, for one). Such an edge is built once more with no index,
     /// exactly as it would be without deferral.
     no_defer: HashSet<BuildId>,
-
     tx: mpsc::Sender<BuildResult>,
     rx: mpsc::Receiver<BuildResult>,
     /// Every edge with a thread outstanding: (id, grep-able label, start).
@@ -2220,6 +2249,7 @@ impl Runner {
                 undeclared_dirs: Vec::new(),
                 undeclared_files: Vec::new(),
                 defer: None,
+                phony: false,
                 err,
             });
         });
@@ -2265,21 +2295,13 @@ impl Runner {
                 }
                 self.phony_aliases.insert(*fid, ins.clone());
             }
-            tx.send(BuildResult {
-                bid,
-                label: build
-                    .outs()
-                    .first()
-                    .map(|fid| files.by_id[*fid].name.clone())
-                    .unwrap_or_else(|| format!("{bid:?}")),
-                derived_path: None,
-                derived_files: Vec::new(),
-                undeclared_dirs: Vec::new(),
-                undeclared_files: Vec::new(),
-                defer: None,
-                err: None,
-            })
-            .context("completing phony build")?;
+            let label = build
+                .outs()
+                .first()
+                .map(|fid| files.by_id[*fid].name.clone())
+                .unwrap_or_else(|| format!("{bid:?}"));
+            tx.send(BuildResult::phony(bid, label))
+                .context("completing phony build")?;
             return Ok(());
         }
 
@@ -2833,6 +2855,7 @@ impl Runner {
                 undeclared_dirs,
                 undeclared_files,
                 defer: defer_out,
+                phony: false,
                 err,
             };
             let _ = tx.send(result);
@@ -3097,6 +3120,7 @@ impl Runner {
         // each real output of the same rule puts it exactly where the public
         // forwarding headers already travel - which is how they reach a
         // translation unit's input list today.
+        let completion = result.is_completion();
         let mut fids: Vec<FileId> = Vec::new();
         let mut tree_fids: Vec<FileId> = Vec::new();
         for derived_file in result.derived_files {
@@ -3142,17 +3166,18 @@ impl Runner {
         // proves the wait loop is delivering, then every 50th bounds the
         // volume (a 15k-task build gains ~300 lines, not 15k). The timeout
         // arm covers the zero-completion spin; this covers the live build.
-        let completed = note_build_completed();
-        if completed == 1 || completed.is_multiple_of(50) {
-            eprintln!(
-                "{}",
-                Self::progress_line(
-                    completed,
-                    TOTAL_TASKS.load(std::sync::atomic::Ordering::Relaxed),
-                    self.in_flight.len(),
-                    0,
-                )
-            );
+        if let Some(completed) = completion.then(note_build_completed) {
+            if completed == 1 || completed.is_multiple_of(50) {
+                eprintln!(
+                    "{}",
+                    Self::progress_line(
+                        completed,
+                        TOTAL_TASKS.load(std::sync::atomic::Ordering::Relaxed),
+                        self.in_flight.len(),
+                        0,
+                    )
+                );
+            }
         }
         Ok((result.bid, true, result.defer))
     }
@@ -6086,6 +6111,26 @@ fn progress_line_names_counts_and_idle() {
     assert!(line.contains("total=100"), "{line}");
     assert!(line.contains("active=3"), "{line}");
     assert!(line.contains("idle_for_s=42"), "{line}");
+}
+
+#[test]
+fn only_a_command_edge_finishing_is_a_completion() {
+    let phony = BuildResult::phony(BuildId::from(0usize), "p".into());
+    assert!(phony.phony && !phony.is_completion(), "phony");
+    let built = BuildResult {
+        phony: false,
+        ..BuildResult::phony(BuildId::from(1usize), "b".into())
+    };
+    assert!(built.is_completion(), "a command edge");
+    let deferred = BuildResult {
+        defer: Some(DeferMiss {
+            fids: Vec::new(),
+            header: "h.h".into(),
+            at: PathBuf::from("h.h"),
+        }),
+        ..built
+    };
+    assert!(!deferred.is_completion(), "deferred");
 }
 
 #[test]
