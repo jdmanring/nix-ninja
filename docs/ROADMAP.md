@@ -482,7 +482,7 @@ provide: what to open, and how to know the change is right.
 ### 1. Publish the wider corpus, cheapest group first
 
 The instrument that verifies every closed class is not in this repository. A
-triage over the whole corpus, measured rather than asserted, splits 101 gate
+triage over the whole corpus, measured rather than asserted, splits 102 gate
 scripts three ways:
 
 1. **Gates that reach for a store path that can be collected.** ONE script,
@@ -493,7 +493,7 @@ scripts three ways:
    `round-intercept-sweep.sh`'s retained round's leaf log, which is NOT
    derivable: resolving the same subject by attribute returns a different
    derivation. It stays, and fails loud when the path is gone.
-2. **Gates that are self-contained.** 92 scripts. A copy into the repository,
+2. **Gates that are self-contained.** 93 scripts. A copy into the repository,
    plus the one path assumption in the runner, which resolves its own directory
    and then expects the gates beside it.
 3. **Gates coupled to a private tree on the executable path.** 8 scripts,
@@ -502,19 +502,24 @@ scripts three ways:
    turned into a fixture first. Two read a consumer shim by design and report
    NO ANSWER when it is absent, which is correct and stays.
 
-The split is exact and exhaustive over the 101 paths: 1 + 92 + 8 = 101, and no
+The split is exact and exhaustive over the 102 paths: 1 + 93 + 8 = 102, and no
 script falls in two
 groups. The work is therefore almost entirely group 2, which is a copy and one
 runner assumption, and group 3, which is the real cost.
 
 **Publishing is a copy; running is the cost.** Measured over the same corpus,
-84 of the 101 scripts invoke nix (`build`, `eval`, `develop`, or `shell`). The
-other 17 do not. Some of those 17 still cannot run in a public clone: several
+85 of the 102 scripts invoke nix (`build`, `eval`, `develop`, `shell`, or
+`nix-store --realise`). The other 17 do not, though 2 of those 17 query the
+store without building:
+`round-intercept-sweep.sh` reads `nix derivation show` and `nix log`, and
+`qt-cmake-script-census.sh` reads `nix path-info` and `nix derivation show`, so
+each needs a nix client and resident derivations. Some of the 17 still cannot
+run in a public clone: several
 read files that only the private development tree carries, so they fail or
 answer NO ANSWER rather than proving their subject. The private reason list
 records that per script in the separate `local/` repository.
 
-6 of the 101 EXECUTE in a clean clone and are counted by the probe that derives
+6 of the 102 EXECUTE in a clean clone and are counted by the probe that derives
 this number: `stdout-contract-sweep.sh`, `duplicate-predicate-sweep.sh`,
 `cmake-byproducts-target-expression.sh`, `changelog-citations.sh`,
 `status-contract.sh` and `changelog-versions.sh`. Two are corpus arms that
@@ -535,9 +540,9 @@ call said 13, and a probe that scored any nonzero exit as "ran" said 5 without
 separating tools from corpus arms. The second counted `round-intercept-sweep.sh`,
 which needs a round log and reads a retained store path.
 
-86 of 101 development-corpus paths are symlinked to published tools under
-`gates/`; the private repository holds 15 scripts of its own and those 86
-symlinks. `gates/` carries 87, because `gate-repo-lookup.sh` was written in the
+87 of 102 development-corpus paths are symlinked to published tools under
+`gates/`; the private repository holds 15 scripts of its own and those 87
+symlinks. `gates/` carries 88, because `gate-repo-lookup.sh` was written in the
 public tree and has no private counterpart. Its `REASONS.md` has one row per
 private script.
 
@@ -559,8 +564,10 @@ private wrapper that runs it. `krb5-dotdot-include-repro.sh`,
 drop-in only to turn a `gcc -c` into a one-edge build file, so each now
 writes that file itself. A recorder standing in for the driver received the
 same edge, arguments and environment both ways, apart from the drop-in's
-own marker variable, which only a `ninja` program word reads. 15 are held
-back.
+own marker variable, which only a `ninja` program word reads.
+`qt-cmake-script-census.sh` was written for publication: it reads a target
+derivation named on its command line and carries no path of its own. 15 are
+held back.
 
 Publishing is a copy and a symlink, and the copy is verified byte for byte. The
 standalone probe in `roadmap-numbers.sh` is unaffected by the new arrivals: it
