@@ -8278,14 +8278,19 @@ fn build_task_derivation(
     // does not exist - a dangling reference rather than a missing header.
     // For a task that is not syncqt the rule declares a directory holding
     // exactly its own declared outputs, which is redundant and correct.
-    // A Qt step2 edge whose final .prl cannot be named is refused here,
-    // naming the command, rather than emitted without the file it writes.
-    qt_final_prl_paths(cmdline, &task.build_dir).with_context(|| {
-        format!(
-            "refused command: {}",
-            cmdline.chars().take(400).collect::<String>()
-        )
-    })?;
+    // An edge whose undeclared write a reader recognises and cannot name is
+    // refused here, naming the command, rather than emitted without it.
+    // It reads the command `undeclared_outputs` reads below, not the
+    // rewritten one: the outer mirror appends arguments a tail-reading reader
+    // would take as its own.
+    if let Some(c) = task.cmdline.as_deref() {
+        undeclared_output_refusal(c, &task.build_dir).with_context(|| {
+            format!(
+                "refused command: {}",
+                c.chars().take(400).collect::<String>()
+            )
+        })?;
+    }
     for dir in undeclared_outputs(&task_outputs, task.cmdline.as_deref(), &task.build_dir)
         .into_iter()
         .chain(copy_writes_not_inputs(
@@ -11280,7 +11285,20 @@ fn extract_destination(script_text: &str) -> Option<PathBuf> {
 /// destination in its own first statement,
 /// `get_filename_component(directory "<abs>" ABSOLUTE)`, so the target is
 /// read from the file CMake generated rather than inferred from the name.
-fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+fn external_project_extract_dirs_checked(cmdline: &str, build_dir: &Path) -> Result<Vec<PathBuf>> {
+    match external_project_extract_dirs_all(cmdline, build_dir) {
+        (_, Some(e)) => Err(e),
+        (out, None) => Ok(out),
+    }
+}
+
+/// Every SOURCE_DIR read, and the first script that could not be read. One
+/// unreadable script must not discard its siblings on the unchecked path.
+fn external_project_extract_dirs_all(
+    cmdline: &str,
+    build_dir: &Path,
+) -> (Vec<PathBuf>, Option<anyhow::Error>) {
+    let mut first_err: Option<anyhow::Error> = None;
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
     // THE SCRIPT PATH IS RELATIVE TO THE LEADING `cd`, NOT THE BUILD DIR.
     // CMake emits `cd deps/src && cmake -P ../../<name>-prefix/.../extract-
@@ -11327,12 +11345,19 @@ fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf
             } else {
                 cwd.join(stamp_dir)
             };
+            // ExternalProject writes this script only for an archive
+            // download; a git or svn download has none, and every step's
+            // stamp touch reaches here, so absence is not a failure.
             let Ok(text) = fs::read_to_string(stamp_abs.join(format!("extract-{name}.cmake")))
             else {
                 continue;
             };
+            // The script exists, so its destination line must too.
             let Some(src) = extract_destination(&text) else {
-                continue;
+                first_err.get_or_insert(anyhow!(
+                    "extract-{name}.cmake names no `get_filename_component(directory \"...\" ABSOLUTE)` line, so the SOURCE_DIR this step writes cannot be named"
+                ));
+                break;
             };
             if normalize_build_path_lexical(&cwd) == normalize_build_path_lexical(&src) {
                 if let Some(rel) = relative_from(&src, build_dir)
@@ -11363,10 +11388,42 @@ fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf
         } else {
             cwd.join(script)
         };
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
+        // ExternalProject writes `<stamp_dir>/extract-<name>.cmake` from a
+        // template that names the archive in a
+        // `get_filename_component(filename ...)` line. A script of this name
+        // that is neither in a stamp dir nor from the template is a
+        // project's own and not this reader's.
+        let in_stamp_dir = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with("-stamp"));
+        // Generated at configure time, so unreadable or without a
+        // destination the parse failed, and the SOURCE_DIR it extracts would
+        // be dropped in silence.
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if in_stamp_dir => {
+                first_err.get_or_insert(anyhow!(e).context(format!(
+                    "reading ExternalProject extract script {}",
+                    path.display()
+                )));
+                continue;
+            }
+            Err(_) => continue,
         };
+        let from_template = text.lines().any(|l| {
+            l.trim_start()
+                .starts_with("get_filename_component(filename ")
+        });
+        if !in_stamp_dir && !from_template {
+            continue;
+        }
         let Some(dir) = extract_destination(&text) else {
+            first_err.get_or_insert(anyhow!(
+                "{} names no `get_filename_component(directory \"...\" ABSOLUTE)` line, so the SOURCE_DIR it extracts into cannot be named",
+                path.display()
+            ));
             continue;
         };
         let rel = if dir.is_absolute() {
@@ -11385,7 +11442,11 @@ fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf
             out.push(rel);
         }
     }
-    out
+    (out, first_err)
+}
+
+fn external_project_extract_dirs(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    external_project_extract_dirs_all(cmdline, build_dir).0
 }
 
 /// The BINARY_DIR a `cmake -B <dir>` CONFIGURE step writes, relative to the
@@ -11580,24 +11641,42 @@ fn input_shipping(store_dir: &StoreDir, inputs: &[StorePath], rel: &str) -> Opti
 /// declared files only, so opencv 4.13.0's core compiles died
 /// `opencl_kernels_core.hpp: No such file or directory` (task `7i8rilmf`).
 /// Build-dir relative, from the script's own `-DOUTPUT=`.
-fn cl2cpp_header(cmdline: &str, build_dir: &Path) -> Option<PathBuf> {
+fn cl2cpp_header_checked(cmdline: &str, build_dir: &Path) -> Result<Option<PathBuf>> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
     let script = toks
         .windows(2)
         .find(|w| w[0] == "-P")
-        .map(|w| w[1].trim_matches('"'))?;
-    if Path::new(script).file_name()? != "cl2cpp.cmake" {
-        return None;
+        .map(|w| w[1].trim_matches('"'));
+    if script.and_then(|s| Path::new(s).file_name()) != Some(std::ffi::OsStr::new("cl2cpp.cmake")) {
+        return Ok(None);
     }
+    // `-DOUTPUT=<x>.cpp`, joined as CMake emits it or separated (`-D OUTPUT=`).
     let out = toks
         .iter()
-        .find_map(|t| t.strip_prefix("-DOUTPUT="))?
-        .trim_matches('"');
-    let hpp = format!("{}.hpp", out.strip_suffix(".cpp")?);
+        .enumerate()
+        .find_map(|(i, t)| {
+            t.trim_matches('"').strip_prefix("-DOUTPUT=").or_else(|| {
+                (*t == "-D")
+                    .then(|| toks.get(i + 1))
+                    .flatten()
+                    .and_then(|n| n.trim_matches('"').strip_prefix("OUTPUT="))
+            })
+        })
+        .map(|o| o.trim_matches('"'));
+    let Some(stem) = out.and_then(|o| o.strip_suffix(".cpp")) else {
+        return Err(anyhow!(
+            "cl2cpp.cmake writes <OUTPUT minus .cpp>.hpp, and this edge names no -DOUTPUT=<file>.cpp, so the header cannot be named"
+        ));
+    };
+    let hpp = format!("{stem}.hpp");
     // CMake writes OUTPUT absolute; on A the command arrives respelled
     // relative to its leading `cd` target, so that spelling is rebased.
     let rel = if Path::new(&hpp).is_absolute() {
-        relative_from(Path::new(&hpp), build_dir)?
+        // Read, and outside the build tree: not this task's to store.
+        let Some(r) = relative_from(Path::new(&hpp), build_dir) else {
+            return Ok(None);
+        };
+        r
     } else {
         let cd = match toks.as_slice() {
             ["cd", dir, "&&", ..] if !dir.starts_with('/') => Path::new(*dir),
@@ -11605,7 +11684,11 @@ fn cl2cpp_header(cmdline: &str, build_dir: &Path) -> Option<PathBuf> {
         };
         rebase_post_cd(cd, &hpp)
     };
-    (rel.is_relative() && !rel.starts_with("..")).then_some(rel)
+    Ok((rel.is_relative() && !rel.starts_with("..")).then_some(rel))
+}
+
+fn cl2cpp_header(cmdline: &str, build_dir: &Path) -> Option<PathBuf> {
+    cl2cpp_header_checked(cmdline, build_dir).ok().flatten()
 }
 
 /// The directory syntax-highlighting's `katehighlightingindexer <index>
@@ -11614,7 +11697,10 @@ fn cl2cpp_header(cmdline: &str, build_dir: &Path) -> Option<PathBuf> {
 /// files under `<dir>`, and the rcc edge, which depends on the index, found
 /// none of them (syntax-highlighting 6.30.0, KDE round 2026-10-19, task
 /// hkr2k8zp). Declared as a tree it rides the index's co-outputs.
-pub fn katehighlightingindexer_trees(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+pub fn katehighlightingindexer_trees_checked(
+    cmdline: &str,
+    build_dir: &Path,
+) -> Result<Vec<PathBuf>> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
     let Some(at) = (0..toks.len()).find(|&i| {
         (i == 0 || matches!(toks[i - 1], "&&" | ";"))
@@ -11623,7 +11709,7 @@ pub fn katehighlightingindexer_trees(cmdline: &str, build_dir: &Path) -> Vec<Pat
                 .and_then(|n| n.to_str())
                 == Some("katehighlightingindexer")
     }) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let args: Vec<&str> = toks[at + 1..]
         .iter()
@@ -11631,14 +11717,17 @@ pub fn katehighlightingindexer_trees(cmdline: &str, build_dir: &Path) -> Vec<Pat
         .copied()
         .collect();
     let [_, _, _, dir] = args.as_slice() else {
-        return Vec::new();
+        return Err(anyhow!(
+            "katehighlightingindexer takes <index> <xsd> <qrc> <dir>, and this edge passes {} argument(s), so the directory it writes cannot be named",
+            args.len()
+        ));
     };
     let cwd = match toks.as_slice() {
         ["cd", d, "&&", ..] if d.starts_with('/') => PathBuf::from(d),
         ["cd", d, "&&", ..] => build_dir.join(d),
         _ => build_dir.to_path_buf(),
     };
-    relative_from(
+    Ok(relative_from(
         &normalize_build_path_lexical(&cwd.join(dir.trim_matches('"'))),
         build_dir,
     )
@@ -11648,7 +11737,11 @@ pub fn katehighlightingindexer_trees(cmdline: &str, build_dir: &Path) -> Vec<Pat
             .is_some_and(|c| matches!(c, std::path::Component::Normal(_)))
     })
     .into_iter()
-    .collect()
+    .collect())
+}
+
+pub fn katehighlightingindexer_trees(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    katehighlightingindexer_trees_checked(cmdline, build_dir).unwrap_or_default()
 }
 
 /// The `--srcdir` a `meinproc6`/`meinproc5` run is given, joined or
@@ -11685,7 +11778,7 @@ fn meinproc_srcdir(args: &[String]) -> Option<String> {
 /// .../src/customization/xsl/all-l10n.xml` (kdoctools 6.30.0, KDE round
 /// 2026-10-19, task ssjpy476) and, written, the file would have stayed in
 /// the sandbox.
-pub fn docbookl10nhelper_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+pub fn docbookl10nhelper_writes_checked(cmdline: &str, build_dir: &Path) -> Result<Vec<PathBuf>> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
     // In COMMAND position: the link before it names the same file as `-o`.
     let Some(at) = (0..toks.len()).find(|&i| {
@@ -11695,15 +11788,19 @@ pub fn docbookl10nhelper_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf>
                 .and_then(|n| n.to_str())
                 == Some("docbookl10nhelper")
     }) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let args: Vec<&str> = toks[at + 1..]
         .iter()
         .take_while(|t| !matches!(**t, "&&" | ";" | "|"))
         .copied()
         .collect();
+    // The tool itself refuses any other count (`arguments.count() != 4`).
     let [_, _, dest] = args.as_slice() else {
-        return Vec::new();
+        return Err(anyhow!(
+            "docbookl10nhelper takes <docbook> <custom> <dest>, and this edge passes {} argument(s), so the all-l10n.xml it writes cannot be named",
+            args.len()
+        ));
     };
     let cwd = match toks.as_slice() {
         ["cd", d, "&&", ..] if d.starts_with('/') => PathBuf::from(d),
@@ -11711,10 +11808,14 @@ pub fn docbookl10nhelper_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf>
         _ => build_dir.to_path_buf(),
     };
     let file = normalize_build_path_lexical(&cwd.join(dest.trim_matches('"')).join("all-l10n.xml"));
-    relative_from(&file, build_dir)
+    Ok(relative_from(&file, build_dir)
         .filter(|rel| rel.is_relative() && !rel.starts_with(".."))
         .into_iter()
-        .collect()
+        .collect())
+}
+
+pub fn docbookl10nhelper_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    docbookl10nhelper_writes_checked(cmdline, build_dir).unwrap_or_default()
 }
 
 /// The build-tree directories a breeze-icons `qrcAlias -o <qrc> <dir>...`
@@ -11818,16 +11919,24 @@ pub fn particleshadergen_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf>
 /// from its argv (`<ts> <debug> <target> <srcDir> <targetGenDir> <files>`).
 /// No edge declares it, and a ts_library edge reads it through `--deps`
 /// (TS6053, qtwebengine 6.11.2, task khfkv2p6).
-pub fn css_js_tsconfig_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+pub fn css_js_tsconfig_writes_checked(cmdline: &str, build_dir: &Path) -> Result<Vec<PathBuf>> {
     let toks: Vec<&str> = cmdline.split_whitespace().collect();
     let Some(at) = toks
         .iter()
         .position(|t| t.trim_matches('"').ends_with("generate_css_js_files.js"))
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let (Some(target), Some(gen_dir)) = (toks.get(at + 3), toks.get(at + 5)) else {
-        return Vec::new();
+    // argv is <ts> <debug> <target> <srcDir> <targetGenDir> <files>; the
+    // debug flag pins the positions, so a shifted argv is refused rather
+    // than read one place off.
+    let debug_flag = toks.get(at + 2).map(|t| t.trim_matches('"'));
+    let (Some(target), Some(gen_dir), Some("true" | "false")) =
+        (toks.get(at + 3), toks.get(at + 5), debug_flag)
+    else {
+        return Err(anyhow!(
+            "generate_css_js_files.js takes <ts> <debug> <target> <srcDir> <targetGenDir> <files>, and this edge's arguments do not have that shape, so the tsconfig it writes cannot be named"
+        ));
     };
     let cwd = match toks.as_slice() {
         ["cd", d, "&&", ..] if d.starts_with('/') => PathBuf::from(d),
@@ -11838,10 +11947,14 @@ pub fn css_js_tsconfig_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
         &cwd.join(gen_dir.trim_matches('"'))
             .join(format!("{}-tsconfig.json", target.trim_matches('"'))),
     );
-    relative_from(&file, build_dir)
+    Ok(relative_from(&file, build_dir)
         .filter(|rel| rel.is_relative() && !rel.starts_with(".."))
         .into_iter()
-        .collect()
+        .collect())
+}
+
+pub fn css_js_tsconfig_writes(cmdline: &str, build_dir: &Path) -> Vec<PathBuf> {
+    css_js_tsconfig_writes_checked(cmdline, build_dir).unwrap_or_default()
 }
 
 /// The headers a C++ `bison` run writes beside its `-o` output and no edge
@@ -12702,7 +12815,19 @@ mod doxygen_output_tests {
 /// later as qtbase's `file INSTALL cannot find .../lib/libQt6Core.prl`.
 /// The next interface change refuses the edge instead, naming it.
 pub fn qt_final_prl_paths(cmdline: &str, build_dir: &Path) -> Result<Vec<PathBuf>> {
-    if !cmdline.contains("QtFinishPrlFile.cmake") {
+    // The script is the edge's only when cmake RUNS it (`-P <script>`); a
+    // command that merely names it writes no .prl.
+    let runs = cmdline
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| {
+            w[0].trim_matches('"') == "-P"
+                && Path::new(w[1].trim_matches('"'))
+                    .file_name()
+                    .is_some_and(|n| n == "QtFinishPrlFile.cmake")
+        });
+    if !runs {
         return Ok(Vec::new());
     }
     let arg = |key: &str| {
@@ -12734,6 +12859,21 @@ pub fn qt_final_prl_paths(cmdline: &str, build_dir: &Path) -> Result<Vec<PathBuf
         .iter()
         .map(|p| relative_from(Path::new(p), build_dir).unwrap_or_else(|| PathBuf::from(p)))
         .collect())
+}
+
+/// Every reader of an undeclared write that RECOGNISES its tool on this
+/// command and cannot read the path it writes, as an error. Each reader's
+/// `*_checked` form answers Ok(empty) when its tool is absent and Err when
+/// it is present and the argument shape is not the one it knows: the shape
+/// that let Qt 6.12's prl interface change drop a file in silence.
+pub fn undeclared_output_refusal(cmdline: &str, build_dir: &Path) -> Result<()> {
+    qt_final_prl_paths(cmdline, build_dir)?;
+    cl2cpp_header_checked(cmdline, build_dir)?;
+    katehighlightingindexer_trees_checked(cmdline, build_dir)?;
+    docbookl10nhelper_writes_checked(cmdline, build_dir)?;
+    css_js_tsconfig_writes_checked(cmdline, build_dir)?;
+    external_project_extract_dirs_checked(cmdline, build_dir)?;
+    Ok(())
 }
 
 fn undeclared_outputs(
@@ -32353,6 +32493,15 @@ mod external_project_extract_tests {
         assert!(qt_final_prl_paths(&meta.replace("Core.meta", "Gone.meta"), &bd).is_err());
         std::fs::write(bd.join("src/corelib/Empty.meta"), "OTHER = x\n").unwrap();
         assert!(qt_final_prl_paths(&meta.replace("Core.meta", "Empty.meta"), &bd).is_err());
+        // A command that names the script without running it refuses nothing.
+        assert_eq!(
+            qt_final_prl_paths(
+                "install -m644 /src/cmake/QtFinishPrlFile.cmake lib/cmake/",
+                &bd
+            )
+            .unwrap(),
+            Vec::<PathBuf>::new()
+        );
         // Any other command is not a prl edge and refuses nothing.
         assert_eq!(
             qt_final_prl_paths("cmake -P /src/cmake/QtGenerateLibPri.cmake", &bd).unwrap(),
@@ -32363,6 +32512,127 @@ mod external_project_extract_tests {
             vec![want.clone()],
             "the shared answer"
         );
+    }
+
+    #[test]
+    fn a_recognised_writer_with_an_unreadable_shape_is_refused() {
+        let d = Scratch::new(format!("nn-checked-readers-{}", std::process::id()));
+        let bd = d.join("build");
+        std::fs::create_dir_all(&bd).unwrap();
+        let ok = |c: &str| undeclared_output_refusal(c, &bd).is_ok();
+
+        // No recognised writer: nothing to refuse.
+        assert!(ok("cc -c a.c -o a.o"));
+
+        // kdoctools POST_BUILD, as its CMakeLists writes it: three paths.
+        let doc = format!(
+            "cd {b}/src && /x/bin/docbookl10nhelper /s/docbook /s/src/customization/xsl {b}/src/customization/xsl",
+            b = bd.display()
+        );
+        assert_eq!(
+            docbookl10nhelper_writes_checked(&doc, &bd).unwrap(),
+            vec![PathBuf::from("src/customization/xsl/all-l10n.xml")]
+        );
+        assert!(ok(&doc));
+        assert!(
+            !ok(&format!("{doc} extra")),
+            "a fourth argument is a new interface"
+        );
+
+        // syntax-highlighting: <index> <xsd> <qrc> <dir>.
+        let kate = format!(
+            "/x/bin/katehighlightingindexer {b}/index.katesyntax /s/language.xsd {b}/syntax-data.qrc {b}/syntax",
+            b = bd.display()
+        );
+        assert_eq!(
+            katehighlightingindexer_trees_checked(&kate, &bd).unwrap(),
+            vec![PathBuf::from("syntax")]
+        );
+        assert!(!ok("/x/bin/katehighlightingindexer a.katesyntax s.xsd"));
+
+        // devtools: <ts> <debug> <target> <srcDir> <targetGenDir> <files>.
+        let css = "/x/python3 ../src/third_party/node/node.py ../src/devtools/scripts/build/generate_css_js_files.js 1757221200 false css_files ../src/devtools/front_end/ui/input gen/fe/ui/input checkbox.css";
+        assert!(!css_js_tsconfig_writes_checked(css, &bd).unwrap().is_empty());
+        let shifted = css.replace(" false ", " --new-flag false ");
+        assert!(
+            !ok(&shifted),
+            "a shifted argv is refused, not read one place off"
+        );
+
+        // cl2cpp: joined and separated -DOUTPUT, then neither.
+        let cl = "cmake -DMODULE_NAME=core -DCL_DIR=/s/opencl -DOUTPUT=/b/x/opencl_kernels_core.cpp -P /s/cmake/cl2cpp.cmake";
+        let cl = cl.replace("/b", &bd.display().to_string());
+        assert!(cl2cpp_header_checked(&cl, &bd).unwrap().is_some());
+        let sep = cl.replace("-DOUTPUT=", "-D OUTPUT=");
+        assert_eq!(
+            cl2cpp_header_checked(&sep, &bd).unwrap(),
+            cl2cpp_header_checked(&cl, &bd).unwrap(),
+            "the separated -D spelling names the same header"
+        );
+        assert!(!ok("cmake -DMODULE_NAME=core -P /s/cmake/cl2cpp.cmake"));
+
+        // ExternalProject: a generated extract script with and without its
+        // destination line, and one that is not there at all.
+        let stamp = bd.join("dep-prefix/src/dep-stamp");
+        std::fs::create_dir_all(&stamp).unwrap();
+        std::fs::write(
+            stamp.join("extract-dep.cmake"),
+            format!(
+                "get_filename_component(filename \"{s}/x.zip\" ABSOLUTE)\nget_filename_component(directory \"{b}/deps/src/dep\" ABSOLUTE)\n",
+                s = stamp.display(),
+                b = bd.display()
+            ),
+        )
+        .unwrap();
+        let ep = format!("cmake -P {}/extract-dep.cmake", stamp.display());
+        assert_eq!(
+            external_project_extract_dirs_checked(&ep, &bd).unwrap(),
+            vec![PathBuf::from("deps/src/dep")]
+        );
+        std::fs::write(stamp.join("extract-bad.cmake"), "message(STATUS hi)\n").unwrap();
+        assert!(!ok(&format!(
+            "cmake -P {}/extract-bad.cmake",
+            stamp.display()
+        )));
+        assert!(!ok(&format!(
+            "cmake -P {}/extract-gone.cmake",
+            stamp.display()
+        )));
+        // A bad sibling refuses the edge, and on the unchecked path does not
+        // discard the good script's tree.
+        let both = format!(
+            "cmake -P {s}/extract-bad.cmake && cmake -P {s}/extract-dep.cmake",
+            s = stamp.display()
+        );
+        assert!(!ok(&both));
+        assert_eq!(
+            external_project_extract_dirs(&both, &bd),
+            vec![PathBuf::from("deps/src/dep")]
+        );
+        // A project's own script of the same name, outside a stamp dir and
+        // not from the template, is not ExternalProject's: read or absent,
+        // it refuses nothing.
+        let own = bd.join("cmake");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join("extract-version.cmake"), "file(READ v.txt V)\n").unwrap();
+        assert!(ok(&format!(
+            "cmake -P {}/extract-version.cmake",
+            own.display()
+        )));
+        assert!(ok(&format!(
+            "cmake -P {}/extract-gone.cmake",
+            own.display()
+        )));
+        // The template's statement outside a stamp dir still marks it.
+        std::fs::write(
+            own.join("extract-moved.cmake"),
+            "get_filename_component(filename \"/s/x.zip\" ABSOLUTE)\n",
+        )
+        .unwrap();
+        assert!(!ok(&format!(
+            "cmake -P {}/extract-moved.cmake",
+            own.display()
+        )));
     }
 
     #[test]
