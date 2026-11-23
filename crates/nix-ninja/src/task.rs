@@ -32442,9 +32442,9 @@ mod alias_symlink_tests {
 mod external_project_extract_tests {
     use super::*;
 
-    /// An ExternalProject step declares only its stamp; the consumer must
-    /// walk the chain to reach the tree, or the build step names only the
-    /// configure stamp and the source tree is absent.
+    /// A Qt step2 edge declares its preliminary `.prl` and writes the final
+    /// one undeclared; every spelling of the final path must come back as
+    /// an output, and an edge that names none must be an error.
     #[test]
     fn the_final_prl_a_qt_step2_edge_writes_is_an_output() {
         let d = Scratch::new(format!("nn-qt-prl-{}", std::process::id()));
@@ -32635,6 +32635,9 @@ mod external_project_extract_tests {
         )));
     }
 
+    /// An ExternalProject step declares only its stamp; the consumer must
+    /// walk the chain to reach the tree, or the build step names only the
+    /// configure stamp and the source tree is absent.
     #[test]
     fn external_project_steps_are_stamps() {
         assert!(external_project_step(
