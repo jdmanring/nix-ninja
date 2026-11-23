@@ -1365,6 +1365,47 @@ drive "$NN" "$TASK" "$S25B/build" docs/docs.stamp > "$D/doxyout.no.json" \
 O_NOHTML=$(carries "$D/doxyout.no.json" 'docs/html')
 echo "doxygen-output html-off control=$O_NOHTML (must be 0)"
 
+# ---- ARM 28: the final .prl a Qt step2 edge writes, and its refusal --------
+# Qt 6.12's `QtFinishPrlFile.cmake` writes `lib/libQt6<M>.prl` beside the
+# declared step2 file and names it only as `-DFINAL_PRL_FILE_PATH=` on the
+# command line; earlier releases named it in a `-DIN_META_FILE`. The pin
+# reads only the meta-file spelling, so on this edge it emits the
+# derivation without the `.prl` and qtbase's install fails a stage later.
+# Two halves: the 6.12 edge must carry the `.prl` in NIX_NINJA_OUTPUTS, and
+# an edge that runs the script with NEITHER spelling must be REFUSED
+# (`undeclared_output_refusal` in `build_task_derivation`), never emitted.
+# The argv is the unit test's, which is CMake's Ninja generator output for
+# qtbase 6.12 corelib. MUTATION CHECK: delete the `-DFINAL_PRL_FILE_PATH=`
+# lookup in `qt_final_prl_paths` and the 6.12 edge itself is refused, so the
+# arm answers NO ANSWER at its first drive (caught, as no answer rather than
+# FAIL); delete the `undeclared_output_refusal` call and PR_REFUSED reads 0.
+S28=$D/qtprl; mkdir -p "$S28/build/src/corelib" "$S28/build/lib" "$S28/src/cmake"
+printf '# stand-in\n' > "$S28/src/cmake/QtFinishPrlFile.cmake"
+printf 'QMAKE_PRL_BUILD_DIR = x\n' > "$S28/build/src/corelib/preliminary_prl_for_Core_step1_Release.prl"
+prl_ninja() {  # prl_ninja <build root> <extra -D args>
+  cat <<EOF
+rule prl
+  command = cd $1/build/src/corelib && $CMAKE_BIN -DIN_FILE=$1/build/src/corelib/preliminary_prl_for_Core_step1_Release.prl -DOUT_FILE=$1/build/src/corelib/preliminary_prl_for_Core_step2_Release.prl $2 "-DLIBRARY_PREFIXES=lib;lib" "-DLIBRARY_SUFFIXES=.so;.a" -DLINK_LIBRARY_FLAG=-l -P $1/src/cmake/QtFinishPrlFile.cmake
+build src/corelib/preliminary_prl_for_Core_step2_Release.prl: prl src/corelib/preliminary_prl_for_Core_step1_Release.prl
+EOF
+}
+prl_ninja "$S28" "-DFINAL_PRL_FILE_PATH=$S28/build/lib/libQt6Core.prl" > "$S28/build/build.ninja"
+drive "$NN" "$TASK" "$S28/build" src/corelib/preliminary_prl_for_Core_step2_Release.prl > "$D/qtprl.json" \
+  || { echo "NO ANSWER: the Qt step2 drive did not emit a derivation"; tail -3 "$S28/build/drive.err"; exit 2; }
+PR_STEP2=$(carries_outputs "$D/qtprl.json" 'preliminary_prl_for_Core_step2_Release.prl')
+PR_OUT=$(carries_outputs "$D/qtprl.json" 'lib/libQt6Core.prl')
+S28B=$D/qtprlno; mkdir -p "$S28B/build/src/corelib" "$S28B/src/cmake"
+cp "$S28/src/cmake/QtFinishPrlFile.cmake" "$S28B/src/cmake/"
+cp "$S28/build/src/corelib/preliminary_prl_for_Core_step1_Release.prl" "$S28B/build/src/corelib/"
+prl_ninja "$S28B" "" > "$S28B/build/build.ninja"
+if drive "$NN" "$TASK" "$S28B/build" src/corelib/preliminary_prl_for_Core_step2_Release.prl > "$D/qtprlno.json"; then
+  PR_REFUSED=0
+else
+  # Refused by name, not failed for another reason.
+  PR_REFUSED=$(command grep -c 'refused command:.*QtFinishPrlFile\|neither as -DFINAL_PRL_FILE_PATH=' "$S28B/build/drive.err" || true)
+fi
+echo "qtprl step2(floor)=$PR_STEP2 final-prl=$PR_OUT refused-without-path=$PR_REFUSED"
+
 # ---- THE PIN CONTROLS: the same fixtures against the pin's driver -------
 if [ -x "$PIN_DRV/bin/nix-ninja" ] && [ -x "$PIN_TASK/bin/nix-ninja-task" ]; then
   drive "$PIN_DRV" "$PIN_TASK" "$S1/build" nvme_wrap.c > "$D/swig.pin.json" 2>/dev/null || true
@@ -1498,6 +1539,18 @@ print(int(any('$XS_NAME/bin' in p for v in d.values() for p in v['env'].get('PAT
   drive "$PIN_DRV" "$PIN_TASK" "$S25/build" docs/docs.stamp > "$D/doxyout.pin.json" 2>/dev/null || true
   O_PIN_STAMP=$(carries "$D/doxyout.pin.json" 'docs/docs\.stamp')
   O_PIN_HTML=$(carries_outputs "$D/doxyout.pin.json" 'docs/html')
+  # ARM 28's control: the pin emits the 6.12 edge WITHOUT the .prl, and
+  # emits the no-path edge rather than refusing it. Each reading counts only
+  # when its drive emitted: a pin drive that broke for another reason is no
+  # answer, never the "does not carry" or "refuses" the arm wants.
+  if drive "$PIN_DRV" "$PIN_TASK" "$S28/build" src/corelib/preliminary_prl_for_Core_step2_Release.prl > "$D/qtprl.pin.json" 2>/dev/null \
+     && [ -s "$D/qtprl.pin.json" ]; then
+    PR_PIN_OUT=$(carries_outputs "$D/qtprl.pin.json" 'lib/libQt6Core.prl')
+  fi
+  if drive "$PIN_DRV" "$PIN_TASK" "$S28B/build" src/corelib/preliminary_prl_for_Core_step2_Release.prl > "$D/qtprlno.pin.json" 2>/dev/null \
+     && [ -s "$D/qtprlno.pin.json" ]; then
+    PR_PIN_EMITS=1
+  fi
   ( cd "$S10/build"
     PATH="$PIN_DRV/bin:$PIN_TASK/bin:$NIXP/bin:$CC/bin:$CU/bin:$BASH/bin:$PE/bin:$GR/bin:$CMAKE_BIN_DIR" \
     NIX_NINJA_TASK="$PIN_TASK/bin/nix-ninja-task" \
@@ -1978,4 +2031,24 @@ if [ "${O_PIN_HTML:-0}" -ge 1 ]; then
   echo "FAIL: the pin already carries the doxygen html tree, so the fixture does not model the class"
   exit 1
 fi
-echo "PASS: every reader's targets reach the emitted derivation, both ExternalProject arms fire, no non-step edge declares a tree, the scanner carries its compiler, composed cmake includes ride the task, a script's tools land on PATH, the vapigen .vapi is declared, qrc climbs ride make_dirs and on-disk generated members defer-then-bind with no self-deferral, generated qrcs bind through deferral, the copy directory and the EP source_dir are carried, and the doxygen html tree is declared"
+# ARM 28: the declared step2 file is the floor; the final .prl rides HERE and
+# not at the pin; the no-path edge is refused HERE and emitted at the pin.
+if [ "${PR_STEP2:-0}" -lt 1 ]; then
+  echo "NO ANSWER: the Qt step2 fixture does not carry its DECLARED step2 file, so it is broken"; exit 2
+fi
+if [ "${PR_OUT:-0}" -lt 1 ]; then
+  echo "FAIL: the final .prl a Qt 6.12 step2 edge writes did not reach NIX_NINJA_OUTPUTS - qtbase's install will not find lib/libQt6Core.prl"
+  exit 1
+fi
+if [ "${PR_REFUSED:-0}" -lt 1 ]; then
+  echo "FAIL: a QtFinishPrlFile edge that names no final .prl was not refused by name - the next interface change drops the file in silence"
+  exit 1
+fi
+if [ -z "${PR_PIN_OUT:-}" ] || [ -z "${PR_PIN_EMITS:-}" ]; then
+  echo "NO ANSWER: the pin's Qt step2 control did not emit (pin outs=${PR_PIN_OUT:-unread} no-path=${PR_PIN_EMITS:-did not emit}), so the class is unmodelled"; exit 2
+fi
+if [ "$PR_PIN_OUT" -ge 1 ]; then
+  echo "FAIL: the pin already carries the .prl, so the fixture does not model the class"
+  exit 1
+fi
+echo "PASS: every reader's targets reach the emitted derivation, both ExternalProject arms fire, no non-step edge declares a tree, the scanner carries its compiler, composed cmake includes ride the task, a script's tools land on PATH, the vapigen .vapi is declared, qrc climbs ride make_dirs and on-disk generated members defer-then-bind with no self-deferral, generated qrcs bind through deferral, the copy directory and the EP source_dir are carried, the doxygen html tree is declared, and a Qt step2 edge declares its final .prl or is refused"
