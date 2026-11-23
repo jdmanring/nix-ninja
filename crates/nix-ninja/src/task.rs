@@ -1996,45 +1996,26 @@ impl Runner {
         })?;
         let rpc_client = self.rpc_client.clone();
         let build_dir = self.config.build_dir.clone();
-        // Bounded like `new_opaque_files`: 8 uploads in flight, chunk by
-        // chunk, not one thread per file. A build dir holding thousands of
+        // Bounded like `new_opaque_files`: 8 uploads in flight on 8 threads,
+        // not one thread per file. A build dir holding thousands of
         // undeclared files would otherwise spawn thousands of threads here.
-        let mut derived_files: Vec<DerivedFile> = Vec::with_capacity(plan.uploads.len());
-        for chunk in plan.uploads.chunks(PER_TASK_ADDS) {
-            let results: Vec<Result<Option<DerivedFile>>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = chunk
-                    .iter()
-                    .map(|p| {
-                        let rpc_client = rpc_client.clone();
-                        let build_dir = build_dir.clone();
-                        let p = p.clone();
-                        scope.spawn(move || match new_opaque_file(&rpc_client, &build_dir, p) {
-                            Ok(d) => Ok(Some(d)),
-                            Err(e)
-                                if e.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                                    io.kind() == std::io::ErrorKind::NotFound
-                                }) =>
-                            {
-                                Ok(None)
-                            }
-                            Err(e) => Err(e),
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join()
-                            .unwrap_or_else(|_| Err(anyhow!("upload thread panicked")))
-                    })
-                    .collect()
-            });
-            for r in results {
-                if let Some(d) = r? {
-                    derived_files.push(d);
+        // A file gone since the walk is skipped, not an error.
+        let derived_files: Vec<DerivedFile> =
+            in_order_by_workers(&plan.uploads, PER_TASK_ADDS, |p| {
+                match new_opaque_file(&rpc_client, &build_dir, p.clone()) {
+                    Ok(d) => Ok(Some(d)),
+                    Err(e)
+                        if e.downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        Ok(None)
+                    }
+                    Err(e) => Err(e),
                 }
-            }
-        }
+            })?
+            .into_iter()
+            .flatten()
+            .collect();
 
         for derived_file in derived_files {
             let fid = self.add_derived_file(files, derived_file.clone());
@@ -6131,6 +6112,71 @@ fn only_a_command_edge_finishing_is_a_completion() {
         ..built
     };
     assert!(!deferred.is_completion(), "deferred");
+}
+
+#[test]
+fn workers_keep_order_width_and_the_first_error() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let items: Vec<usize> = (0..100).collect();
+    let (live, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let threads = std::sync::Mutex::new(std::collections::HashSet::new());
+    let got = in_order_by_workers(&items, 8, |i| {
+        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        threads.lock().unwrap().insert(std::thread::current().id());
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        live.fetch_sub(1, Ordering::SeqCst);
+        Ok(i * 2)
+    })
+    .unwrap();
+    assert_eq!(got, items.iter().map(|i| i * 2).collect::<Vec<_>>());
+    assert!(peak.load(Ordering::SeqCst) <= 8);
+    assert!(threads.lock().unwrap().len() <= 8, "a thread per item");
+
+    // The width is REACHED: each item holds its slot until eight are live
+    // (bounded wait), so a serial or narrower implementation reads below 8.
+    let (live, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    in_order_by_workers(&items[..16], 8, |i| {
+        let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while peak.load(Ordering::SeqCst) < 8 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        live.fetch_sub(1, Ordering::SeqCst);
+        Ok(*i)
+    })
+    .unwrap();
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        8,
+        "eight workers never ran at once"
+    );
+    assert_eq!(
+        in_order_by_workers(&items[..3], 0, |i| Ok(*i)).unwrap(),
+        vec![0, 1, 2]
+    );
+
+    let attempted = AtomicUsize::new(0);
+    let err = in_order_by_workers(&items, 8, |i| {
+        attempted.fetch_add(1, Ordering::SeqCst);
+        match i {
+            70 => Err(anyhow!("late")),
+            30 => Err(anyhow!("early")),
+            _ => Ok(*i),
+        }
+    })
+    .unwrap_err();
+    assert_eq!(err.to_string(), "early");
+    // Every item runs after a failure, as the helper's doc and the commit
+    // state; an early stop would change what a failing batch uploads.
+    assert_eq!(attempted.load(Ordering::SeqCst), items.len());
+
+    assert!(in_order_by_workers(&Vec::<usize>::new(), 8, |i| Ok(*i))
+        .unwrap()
+        .is_empty());
+    let panicked = in_order_by_workers(&[1usize], 8, |_| -> Result<usize> { panic!("boom") });
+    assert!(panicked.unwrap_err().to_string().contains("panicked"));
 }
 
 #[test]
@@ -10522,26 +10568,46 @@ pub(crate) fn new_opaque_files_because(
         // silent for the round's whole length.
         resolve_section("upload");
     }
-    let mut out = Vec::with_capacity(paths.len());
-    for chunk in paths.chunks(PER_TASK_ADDS) {
-        let results: Vec<Result<DerivedFile>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = chunk
-                .iter()
-                .map(|p| scope.spawn(move || new_opaque_file(rpc_client, build_dir, p.clone())))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err(anyhow!("upload thread panicked")))
-                })
-                .collect()
-        });
-        for r in results {
-            out.push(r?);
+    in_order_by_workers(&paths, PER_TASK_ADDS, |p| {
+        new_opaque_file(rpc_client, build_dir, p.clone())
+    })
+}
+
+/// `f` over `items` on at most `width` threads, results in input order and
+/// the first error IN INPUT ORDER returned. A thread per item paid a
+/// thread creation for every upload, and on a wide edge nearly all of them
+/// are stamp-cache hits that need none (a qtwebengine host-route drive:
+/// about 1,400 NAR calls per task, 99.5% hits). Every item runs even after
+/// one fails, and only the first error is returned; the old per-chunk loop
+/// stopped at the first failing chunk, so a failing batch now does more work
+/// before it returns the same error. A width of 0 is taken as 1.
+pub(crate) fn in_order_by_workers<T: Sync, R: Send>(
+    items: &[T],
+    width: usize,
+    f: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<Result<R>>>> =
+        items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..width.max(1).min(items.len()) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(item) = items.get(i) else { break };
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(item)))
+                    .unwrap_or_else(|_| Err(anyhow!("worker thread panicked")));
+                *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            });
         }
-    }
-    Ok(out)
+    });
+    slots
+        .into_iter()
+        .map(|s| {
+            s.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(|| Err(anyhow!("upload slot left unfilled")))
+        })
+        .collect()
 }
 
 /// The store name for an opaque upload, taken from the SOURCE SPELLING.
