@@ -8278,6 +8278,14 @@ fn build_task_derivation(
     // does not exist - a dangling reference rather than a missing header.
     // For a task that is not syncqt the rule declares a directory holding
     // exactly its own declared outputs, which is redundant and correct.
+    // A Qt step2 edge whose final .prl cannot be named is refused here,
+    // naming the command, rather than emitted without the file it writes.
+    qt_final_prl_paths(cmdline, &task.build_dir).with_context(|| {
+        format!(
+            "refused command: {}",
+            cmdline.chars().take(400).collect::<String>()
+        )
+    })?;
     for dir in undeclared_outputs(&task_outputs, task.cmdline.as_deref(), &task.build_dir)
         .into_iter()
         .chain(copy_writes_not_inputs(
@@ -12683,6 +12691,51 @@ mod doxygen_output_tests {
     }
 }
 
+/// The final `.prl` a Qt step2 edge writes beside its declared output, as
+/// build-dir-relative paths; empty for any other command.
+///
+/// Qt 6.12 passes the path on the command line (`-DFINAL_PRL_FILE_PATH=`);
+/// earlier releases record it in the `-DIN_META_FILE` the command names. AN
+/// EDGE THAT RUNS THE SCRIPT AND YIELDS NO PATH IS AN ERROR, not an empty
+/// answer: when 6.12 dropped the meta file this returned nothing, the task
+/// placed only its declared step2 file, and the failure surfaced one pass
+/// later as qtbase's `file INSTALL cannot find .../lib/libQt6Core.prl`.
+/// The next interface change refuses the edge instead, naming it.
+pub fn qt_final_prl_paths(cmdline: &str, build_dir: &Path) -> Result<Vec<PathBuf>> {
+    if !cmdline.contains("QtFinishPrlFile.cmake") {
+        return Ok(Vec::new());
+    }
+    let arg = |key: &str| {
+        cmdline
+            .split_whitespace()
+            .find_map(|t| t.trim_matches('"').strip_prefix(key).map(str::to_owned))
+    };
+    let mut finals: Vec<String> = arg("-DFINAL_PRL_FILE_PATH=").into_iter().collect();
+    if let Some(meta) = arg("-DIN_META_FILE=") {
+        let meta_path = if Path::new(&meta).is_absolute() {
+            PathBuf::from(&meta)
+        } else {
+            build_dir.join(&meta)
+        };
+        let text = fs::read_to_string(&meta_path)
+            .with_context(|| format!("reading Qt prl meta file {}", meta_path.display()))?;
+        finals.extend(
+            text.lines()
+                .filter_map(|l| l.strip_prefix("FINAL_PRL_FILE_PATH = "))
+                .map(|p| p.trim().to_owned()),
+        );
+    }
+    if finals.is_empty() {
+        return Err(anyhow!(
+            "QtFinishPrlFile.cmake writes a final .prl this edge does not declare, and the command names it neither as -DFINAL_PRL_FILE_PATH= nor through -DIN_META_FILE"
+        ));
+    }
+    Ok(finals
+        .iter()
+        .map(|p| relative_from(Path::new(p), build_dir).unwrap_or_else(|| PathBuf::from(p)))
+        .collect())
+}
+
 fn undeclared_outputs(
     declared: &[PathBuf],
     cmdline: Option<&str>,
@@ -12690,35 +12743,11 @@ fn undeclared_outputs(
 ) -> Vec<PathBuf> {
     let mut v = undeclared_trees(declared);
     if let Some(c) = cmdline {
-        if c.contains("QtFinishPrlFile.cmake") {
-            // Qt 6.12 passes the final path on the command line
-            // (`-DFINAL_PRL_FILE_PATH=`); earlier releases record it in the
-            // `-DIN_META_FILE` the command names.
-            let arg = |key: &str| {
-                c.split_whitespace()
-                    .find_map(|t| t.trim_matches('"').strip_prefix(key).map(str::to_owned))
-            };
-            let mut finals: Vec<String> = arg("-DFINAL_PRL_FILE_PATH=").into_iter().collect();
-            if let Some(meta) = arg("-DIN_META_FILE=") {
-                let meta_path = if Path::new(&meta).is_absolute() {
-                    PathBuf::from(&meta)
-                } else {
-                    build_dir.join(&meta)
-                };
-                if let Ok(text) = fs::read_to_string(&meta_path) {
-                    finals.extend(
-                        text.lines()
-                            .filter_map(|l| l.strip_prefix("FINAL_PRL_FILE_PATH = "))
-                            .map(|p| p.trim().to_owned()),
-                    );
-                }
-            }
-            for p in finals {
-                let rel =
-                    relative_from(Path::new(&p), build_dir).unwrap_or_else(|| PathBuf::from(&p));
-                if !v.contains(&rel) {
-                    v.push(rel);
-                }
+        // An unreadable step2 edge is refused at planning
+        // (`build_task_derivation`), so here it contributes nothing.
+        for rel in qt_final_prl_paths(c, build_dir).unwrap_or_default() {
+            if !v.contains(&rel) {
+                v.push(rel);
             }
         }
         if let Some(hpp) = cl2cpp_header(c, build_dir) {
@@ -32315,12 +32344,24 @@ mod external_project_extract_tests {
             undeclared_outputs(&[], Some(meta), &bd).contains(&want),
             "meta-file spelling"
         );
-        // Control: the same script with neither spelling names no prl.
+        // The script with neither spelling is the next interface change: an
+        // error naming what is missing, never an empty answer.
         let neither = "cmake -DIN_FILE=a.prl -DOUT_FILE=b.prl -P /src/cmake/QtFinishPrlFile.cmake";
-        let v = undeclared_outputs(&[], Some(neither), &bd);
-        assert!(
-            !v.iter().any(|p| p.extension().is_some_and(|e| e == "prl")),
-            "{v:?}"
+        let err = qt_final_prl_paths(neither, &bd).unwrap_err().to_string();
+        assert!(err.contains("-DFINAL_PRL_FILE_PATH="), "{err}");
+        // A meta file that is named and absent, or names no path, is the same.
+        assert!(qt_final_prl_paths(&meta.replace("Core.meta", "Gone.meta"), &bd).is_err());
+        std::fs::write(bd.join("src/corelib/Empty.meta"), "OTHER = x\n").unwrap();
+        assert!(qt_final_prl_paths(&meta.replace("Core.meta", "Empty.meta"), &bd).is_err());
+        // Any other command is not a prl edge and refuses nothing.
+        assert_eq!(
+            qt_final_prl_paths("cmake -P /src/cmake/QtGenerateLibPri.cmake", &bd).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            qt_final_prl_paths(&qt612, &bd).unwrap(),
+            vec![want.clone()],
+            "the shared answer"
         );
     }
 
