@@ -23,7 +23,7 @@ counts verified deliverables inside the milestone, so 105 says how much of `0.3`
 is done and never that it is complete. A reader should not take any part of the
 number as a claim that the milestone it names is finished.
 
-The state of the tree today, class by class, is a table of 200 rows. It remains
+The state of the tree today, class by class, is a table of 202 rows. It remains
 in the private development repository, and the gate inventory beyond the published 82 is still
 being published. [`STATUS.md`](STATUS.md) summarizes the public checkout and
 marks private-only evidence explicitly. Work item 1 of milestone 0.5 is to
@@ -148,7 +148,7 @@ binary had to learn:
   edge is a compile or a link, and the rpath a link carries.
 
 Each closed class has a recorded instrument or witness, but the detailed
-200-row class ledger is still private. [`STATUS.md`](STATUS.md) states that
+202-row class ledger is still private. [`STATUS.md`](STATUS.md) states that
 boundary for a public reader instead of restating the classes: it shows what a
 clone can check and says the class-by-class evidence is not here. Publishing the
 corpus, and turning private witnesses into public arms, remains work item 1 of
@@ -922,7 +922,7 @@ None is hypothetical: the first three are why upstream is dormant.
   distribution. `0.9` names adoption by someone else as the mitigation, which is
   also its exit criterion, so this risk and that milestone are the same problem
   seen from two directions.
-- **The verification apparatus is private.** The 200-row class table and the
+- **The verification apparatus is private.** The 202-row class table and the
   whole gate corpus, all 99 scripts, live outside this repository. `0.5` and
   work item 1 exist to publish them, and until they land, every claim here is
   checkable only by its

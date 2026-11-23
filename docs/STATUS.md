@@ -72,7 +72,7 @@ narrative level. The class-by-class table, its per-class gates and their round
 logs are not in this repository, so a reader cannot audit an individual closed
 class here yet. Nothing on this page should be read as a per-class verdict.
 
-The private ledger is currently 200 rows. It includes closed classes, classes
+The private ledger is currently 202 rows. It includes closed classes, classes
 under investigation, and inherited issues. It is not copied into this page
 because copying it would create a second live record with different test
 preconditions, round logs and consumer details.
