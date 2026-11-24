@@ -3831,6 +3831,8 @@ impl Runner {
             let msgfmt_dirs = msgfmt_invocation(&args);
             let swig_i = swig_invocation(&args);
             let flatc = flatc_invocation(&args);
+            let licenses = licenses_invocation(&args);
+            let licenses_args = args.clone();
             let gir_filelists = gir_filelist_invocation(&args);
             // A `g-ir-scanner` RUN NAMES ITS SOURCES POSITIONALLY when the edge
             // carries no `--filelist`: meson emits them as bare names after the
@@ -4540,6 +4542,26 @@ impl Runner {
             if let Some((incs, files)) = &flatc {
                 for p in flatc_referenced_paths(&self.config.build_dir, &cd_dir, incs, files) {
                     referenced.push(p);
+                }
+            }
+            // A CREDITS RUN WALKS THE CHROMIUM ROOT for third_party metadata
+            // and opens every README and license file it finds. The sandbox
+            // holds only declared inputs, so an incomplete declaration either
+            // fails on `<root>/LICENSE` or ships a short credits page with
+            // exit 0: a missing README or license file is skipped SILENTLY by
+            // licenses.py. The witness files carry the SPECIAL_CASES dirs a
+            // strace of the opened files alone misses.
+            if let Some(script) = &licenses {
+                let source_root = script_path_source_root(&cmd_cwd, script);
+                for p in licenses_resolve(
+                    &source_root,
+                    &cmd_cwd,
+                    &self.config.build_dir,
+                    &cd_dir,
+                    script,
+                    &licenses_args,
+                )? {
+                    referenced.push(p.to_string_lossy().into_owned());
                 }
             }
             if let Some(dirs) = &msgfmt_dirs {
@@ -15986,6 +16008,670 @@ fn flatc_invocation(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
         return None;
     }
     Some((incs, files))
+}
+
+/// The modelled `licenses.py credits` options: every one is accepted in `=`
+/// and space forms, and anything else is refused. Shared by the trigger,
+/// which must skip a value that could be mistaken for the `credits`
+/// subcommand, and by the option check, which refuses what is not modelled.
+const LICENSES_VALUE_OPTS: [&str; 5] = [
+    "--file-template",
+    "--entry-template",
+    "--reciprocal-template",
+    "--target-os",
+    "--depfile",
+];
+
+/// The script path of a Chromium `licenses.py credits` run with no
+/// `--gn-target`. Other subcommands and the GN-driven form take a different
+/// scan path and are left unrecognised. Options outside the modelled set are
+/// not silently ignored: the resolver rejects them once it can name the hash.
+///
+/// `credits` is the SUBCOMMAND, the first positional after the options and
+/// their values (argparse takes the first `command` choice positionally), not
+/// any token anywhere: a `license_file` edge writing an output named
+/// `credits` is a different walk.
+fn licenses_invocation(args: &[String]) -> Option<String> {
+    let script = args
+        .iter()
+        .find(|a| a.ends_with("tools/licenses/licenses.py"))?;
+    // The interpreter and the script spelling are not option parsing: the
+    // subcommand is the first positional after them.
+    let mut it = args
+        .iter()
+        .filter(|a| *a != &args[0] && !a.ends_with("tools/licenses/licenses.py"));
+    while let Some(a) = it.next() {
+        if LICENSES_VALUE_OPTS.iter().any(|o| a == o) {
+            it.next();
+        } else if a.starts_with("--") || a.contains('=') {
+            continue;
+        } else {
+            return if a == "credits"
+                && !args
+                    .iter()
+                    .any(|b| b == "--gn-target" || b.starts_with("--gn-target="))
+            {
+                Some(script.clone())
+            } else {
+                None
+            };
+        }
+    }
+    None
+}
+
+/// Options that change what `licenses.py credits` reads. Unmodelled ones
+/// refuse the edge; accepting them silently would ship a short credits page.
+fn licenses_check_options(args: &[String]) -> Result<()> {
+    // Template overrides are NOT modelled: changing either changes the
+    // bytes the script writes. Every option that reaches this check except
+    // the explicit Linux target-os arm is therefore refused.
+    const KNOWN: [&str; 3] = ["--target-os=linux", "--enable-warnings", "--format=txt"];
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a.starts_with("--") {
+            let (opt, value) = match a.split_once('=') {
+                Some((o, v)) => (o, Some(v)),
+                None if LICENSES_VALUE_OPTS.contains(&a.as_str()) => {
+                    (a.as_str(), it.next().map(|v| v.as_str()))
+                }
+                None => (a.as_str(), None),
+            };
+            if LICENSES_VALUE_OPTS.contains(&opt) {
+                // A modelled option still refuses an unknown value: only the
+                // explicit Linux target-os arm is carried.
+                if opt != "--depfile"
+                    && !KNOWN.contains(&format!("{opt}={}", value.unwrap_or_default()).as_str())
+                {
+                    return Err(anyhow!(
+                        "unmodelled licenses.py option {a}; refusing credits edge"
+                    ));
+                }
+            } else if !KNOWN.contains(&a.as_str()) {
+                return Err(anyhow!(
+                    "unmodelled licenses.py option {a}; refusing credits edge"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The sha256 of `tools/licenses/licenses.py` in the pinned Chromium. The
+/// reader replicates this script's walk; a different script can read a
+/// different set, so a drift is a loud refusal that names the new hash.
+const KNOWN_LICENSES_PY: [&str; 1] =
+    ["4ecf0783c702888071708c8860247c6d39d05df407075a4ffaa788c67fac99d6"];
+
+/// The modules `licenses.py` imports beside the standard library, relative to
+/// the Chromium root: `spdx_writer` from its own directory, then
+/// `action_helpers` (and its `gn_helpers` import) from `build`, which the
+/// script adds to `sys.path`. Listed beside the hash they were traced under:
+/// a new import means a new script hash, and without these in the declared
+/// set the sandbox run dies on `ModuleNotFoundError`.
+const LICENSES_PY_IMPORTS: [&str; 3] = [
+    "tools/licenses/spdx_writer.py",
+    "build/action_helpers.py",
+    "build/gn_helpers.py",
+];
+
+const LICENSES_METADATA_FILE_NAMES: [&str; 5] = [
+    "README.chromium",
+    "README.crashpad",
+    "README.v8",
+    "README.pdfium",
+    "README.angle",
+];
+const LICENSES_PRUNE_PATHS: [&str; 45] = [
+    "third_party/adobe",
+    "third_party/android_tools_internal",
+    "third_party/widevine",
+    "third_party/valgrind",
+    "components/variations/test_data/cipd",
+    "build/secondary",
+    "third_party/bison",
+    "third_party/chromite",
+    "third_party/clang-format",
+    "third_party/cygwin",
+    "third_party/gnu_binutils",
+    "third_party/gold",
+    "third_party/gperf",
+    "third_party/lighttpd",
+    "third_party/llvm",
+    "third_party/llvm-build",
+    "third_party/mingw-w64",
+    "third_party/nacl_sdk_binaries",
+    "third_party/pefile",
+    "third_party/perl",
+    "third_party/psyco_win32",
+    "third_party/pyelftools",
+    "third_party/pylib",
+    "third_party/pywebsocket",
+    "third_party/syzygy",
+    "third_party/amd",
+    "third_party/clear_cache",
+    "third_party/gnu",
+    "third_party/googlemac",
+    "third_party/pcre",
+    "third_party/psutils",
+    "third_party/sawbuck",
+    "third_party/wix",
+    "chrome/browser/resources/chromeos/quickoffice",
+    "clank",
+    "third_party/barhopper",
+    "components/optimization_guide/internal/third_party",
+    "third_party/devtools-frontend-internal",
+    "third_party/directxsdk",
+    "isolate_deps_dir",
+    "tools/binary_size/libsupersize/testdata",
+    "third_party/webrtc_overrides",
+    "buildtools/third_party/libc++",
+    "buildtools/third_party/libc++abi",
+    "buildtools/third_party/libunwind",
+];
+const LICENSES_PRUNE_DIRS: [&str; 3] = [".svn", ".git", "layout_tests"];
+/// `_ContainsFiles` removes only these, not `layout_tests`.
+const LICENSES_VCS_METADATA_DIRS: [&str; 2] = [".svn", ".git"];
+const LICENSES_ADDITIONAL_PATHS: [&str; 12] = [
+    "chrome/test/chromeos/autotest",
+    "chrome/test/data",
+    "native_client",
+    "third_party/android_deps/autorolled",
+    "third_party/boringssl/src/third_party/fiat",
+    "third_party/devtools-frontend/src/front_end/third_party",
+    "third_party/devtools-frontend-internal/front_end/third_party",
+    "tools/page_cycler/acid3",
+    "url/third_party/mozilla",
+    "v8",
+    "v8/strongtalk",
+    "v8/fdlibm",
+];
+const LICENSES_ADDITIONAL_PATHS_FILENAME: &str = "additional_readme_paths.json";
+
+/// (directory, comma-separated License File values, or None when the entry
+/// has no License File key). The other fields matter only to the script's
+/// validation, which already passed upstream; the reader needs the paths.
+const LICENSES_SPECIAL_CASES: [(&str, Option<&str>); 22] = [
+    ("native_client", Some("//native_client/LICENSE")),
+    ("third_party/angle", None),
+    ("third_party/cros_system_api", Some("//LICENSE.chromium_os")),
+    ("third_party/ipcz", Some("//third_party/ipcz/LICENSE")),
+    ("third_party/lss", Some("//third_party/lss/LICENSE")),
+    (
+        "third_party/openscreen/src/third_party/abseil",
+        Some("//third_party/abseil-cpp/LICENSE"),
+    ),
+    (
+        "third_party/openscreen/src/third_party/boringssl",
+        Some("//third_party/boringssl/src/LICENSE"),
+    ),
+    (
+        "third_party/openscreen/src/third_party/jsoncpp",
+        Some("//third_party/jsoncpp/LICENSE"),
+    ),
+    (
+        "third_party/openscreen/src/third_party/mozilla",
+        Some("LICENSE.txt"),
+    ),
+    ("third_party/pdfium", None),
+    ("third_party/ppapi", None),
+    (
+        "third_party/crashpad/crashpad/third_party/getopt",
+        Some("//third_party/crashpad/crashpad/third_party/getopt/LICENSE"),
+    ),
+    (
+        "third_party/crashpad/crashpad/third_party/xnu",
+        Some("APPLE_LICENSE"),
+    ),
+    ("third_party/v8-i18n", None),
+    (
+        "third_party/blink",
+        Some("//third_party/blink/LICENSE_FOR_ABOUT_CREDITS"),
+    ),
+    ("v8", None),
+    ("v8/strongtalk", Some("//v8/LICENSE.strongtalk")),
+    ("v8/fdlibm", Some("//v8/LICENSE.fdlibm")),
+    (
+        "third_party/swiftshader",
+        Some("//third_party/swiftshader/LICENSE.txt"),
+    ),
+    (
+        "third_party/swiftshader/third_party/SPIRV-Tools",
+        Some("//third_party/swiftshader/third_party/SPIRV-Tools/LICENSE"),
+    ),
+    (
+        "third_party/swiftshader/third_party/SPIRV-Headers",
+        Some("//third_party/swiftshader/third_party/SPIRV-Headers/LICENSE"),
+    ),
+    (
+        "third_party/dawn/third_party/khronos",
+        Some("//third_party/dawn/third_party/khronos/LICENSE"),
+    ),
+];
+
+/// The comma-separated `License File` values of one SPECIAL_CASES entry, or
+/// the default `LICENSE` where the entry names none.
+fn licenses_special_file_list(files: Option<&str>) -> Vec<String> {
+    let mut names: Vec<String> = files
+        .unwrap_or("LICENSE")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+    if names.is_empty() {
+        names.push("LICENSE".to_string());
+    }
+    names
+}
+
+/// sha256 of a file whose hash the drift guard names on refusal. Kept apart
+/// from the resolver so fixtures can bypass the guard with their own script
+/// text.
+pub fn licenses_py_hash(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+fn licenses_path_string(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+fn licenses_abs(root: &Path, dir: &str, filename: &str) -> PathBuf {
+    let rel = if filename.starts_with('/') {
+        // Any leading slash is root-relative, the way AbsolutePath strips
+        // every one before joining under the root.
+        PathBuf::from(filename.trim_start_matches('/'))
+    } else {
+        Path::new(dir).join(filename)
+    };
+    // os.path.normpath semantics, the way `py_path_eval` normalises: a `..`
+    // that climbs past the start survives as a leading `..`, and AbsolutePath
+    // joins that under the root and checks existence.
+    lexical_join(root, &lexical_join(Path::new(""), &rel))
+}
+
+/// The first regular file in `_ContainsFiles` walk order, skipping VCS
+/// metadata dirs the way licenses.py does. A kept directory with no README,
+/// license or JSON carries this witness so its existence still decides
+/// whether the SPECIAL_CASES entry contributes an entry.
+fn licenses_witness(dir: &Path) -> Option<PathBuf> {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        let mut entries: Vec<_> = fs::read_dir(&d).ok()?.filter_map(Result::ok).collect();
+        entries.sort_by_key(|e| e.file_name());
+        let mut dirs = Vec::new();
+        for e in entries {
+            // os.walk without followlinks: an entry that is a directory
+            // through a link is listed but not entered, and every other
+            // entry, a link or a dangling one included, is a file.
+            let Ok(ty) = e.file_type() else { continue };
+            if e.path().is_dir() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if !ty.is_symlink() && !LICENSES_VCS_METADATA_DIRS.contains(&name.as_ref()) {
+                    dirs.push(e.path());
+                }
+            } else {
+                return Some(e.path());
+            }
+        }
+        // os.walk is depth-first in directory order; push reversed so the
+        // first sibling is visited first.
+        pending.extend(dirs.into_iter().rev());
+    }
+    None
+}
+
+/// `_MaybeAddThirdPartyPath`: the walk keeps a directory only when it holds a
+/// file, then follows `additional_readme_paths.json` recursively. Both the
+/// walk and this function mutate a seen set, which makes a cycle terminate.
+/// A pruned path returns before the witness is taken: the real walk never
+/// descends into one, so nothing under it is declared.
+fn licenses_maybe_add_dir(
+    root: &Path,
+    dir: &str,
+    seen: &mut HashSet<String>,
+    declared: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if seen.contains(dir) || LICENSES_PRUNE_PATHS.contains(&dir) {
+        return Ok(());
+    }
+    seen.insert(dir.to_string());
+    let full = root.join(dir);
+    let Some(witness) = licenses_witness(&full) else {
+        return Ok(());
+    };
+    declared.push(witness);
+    // The metadata READMEs are read by ParseDir for every kept dir, whether
+    // or not it carries an additional_readme_paths.json: the JSON only adds
+    // more dirs. Reading them after the JSON early-return would drop the
+    // README of every leaf dir (mitt, parsel, rxjs in production). A
+    // SPECIAL_CASES dir is the exception: ParseDir returns its table entry
+    // without opening a README, so parsing one here could refuse an edge
+    // the script runs cleanly.
+    let special = LICENSES_SPECIAL_CASES.iter().any(|(d, _)| *d == dir);
+    for name in LICENSES_METADATA_FILE_NAMES {
+        let readme = full.join(name);
+        if !special && readme.is_file() {
+            declared.push(readme.clone());
+            licenses_parse_readme(dir, &readme, root, declared)?;
+        }
+    }
+    let json_path = full.join(LICENSES_ADDITIONAL_PATHS_FILENAME);
+    if !json_path.is_file() {
+        return Ok(());
+    }
+    declared.push(json_path.clone());
+    let text = fs::read_to_string(&json_path)
+        .with_context(|| format!("reading {}", json_path.display()))?;
+    let paths: Vec<String> =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", json_path.display()))?;
+    for p in paths {
+        let sub = licenses_path_string(&lexical_join(Path::new(""), &Path::new(dir).join(&p)));
+        licenses_maybe_add_dir(root, &sub, seen, declared)?;
+    }
+    Ok(())
+}
+
+fn licenses_find_dirs(root: &Path, declared: &mut Vec<PathBuf>) -> Result<()> {
+    let mut walked: HashSet<PathBuf> = HashSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        if !walked.insert(dir.clone()) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut children: Vec<_> = entries.filter_map(Result::ok).collect();
+        children.sort_by_key(|e| e.file_name());
+        let base = licenses_path_string(dir.strip_prefix(root).unwrap_or(&dir));
+        // The real walk stops at a pruned path, an `out`-prefixed tree, or
+        // an ADDITIONAL_PATHS member: the members below an additional root
+        // arrive only through its `additional_readme_paths.json`, handled
+        // after this walk, never by descending into it.
+        if LICENSES_PRUNE_PATHS.contains(&base.as_str())
+            || base.starts_with("out")
+            || LICENSES_ADDITIONAL_PATHS.contains(&base.as_str())
+        {
+            continue;
+        }
+        let is_third_party = dir.file_name().is_some_and(|n| n == "third_party");
+        let mut dirs = Vec::new();
+        for e in children {
+            let Ok(ty) = e.file_type() else { continue };
+            // os.walk without followlinks lists a `third_party` child that is
+            // a symlink to a directory in `dirs` (so a kept one is offered)
+            // but does not descend into it.
+            if !ty.is_dir() && !e.path().is_dir() {
+                continue;
+            }
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if LICENSES_PRUNE_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            let sub = if base.is_empty() {
+                name.into_owned()
+            } else {
+                format!("{base}/{name}")
+            };
+            if is_third_party || LICENSES_SPECIAL_CASES.iter().any(|(d, _)| *d == sub) {
+                let mut claimed = HashSet::new();
+                let mut added = Vec::new();
+                licenses_maybe_add_dir(root, &sub, &mut claimed, &mut added)?;
+                declared.extend(added);
+                // Keep walking BELOW a kept third_party child: nested
+                // `third_party` dirs below it are found by the same walk. A
+                // child reached through a link is offered but not entered,
+                // the way os.walk without followlinks lists it in `dirs`
+                // without descending.
+                if !ty.is_symlink() {
+                    dirs.push(e.path());
+                }
+            } else if !LICENSES_PRUNE_PATHS.contains(&sub.as_str())
+                && !LICENSES_ADDITIONAL_PATHS.contains(&sub.as_str())
+                && !ty.is_symlink()
+            {
+                dirs.push(e.path());
+            }
+        }
+        pending.extend(dirs.into_iter().rev());
+    }
+    for extra in LICENSES_ADDITIONAL_PATHS {
+        if !root.join(extra).is_dir() {
+            continue;
+        }
+        // A kept extra dir carries its files through `licenses_maybe_add_dir`
+        // below; no separate witness is needed before it.
+        let mut claimed = HashSet::new();
+        let mut added = Vec::new();
+        licenses_maybe_add_dir(root, extra, &mut claimed, &mut added)?;
+        declared.extend(added);
+    }
+    Ok(())
+}
+
+/// `ParseMetadataFile` plus `ProcessMetadata`'s license-path resolution.
+/// Fields the script does not recognise are ignored the same way. A DUPLICATE
+/// field is an `InvalidMetadata` upstream, which only omits that dependency
+/// with exit 0; refusing the edge instead is the safe choice, since a partial
+/// declaration would otherwise be a silent short page.
+///
+/// A divider is exactly `^-{20} DEPENDENCY DIVIDER -{20}$`, the script's
+/// PATTERN_DEPENDENCY_DIVIDER: twenty dashes each side, nothing more.
+const LICENSES_DIVIDER: &str = "-------------------- DEPENDENCY DIVIDER --------------------";
+fn licenses_parse_readme(
+    dir: &str,
+    path: &Path,
+    root: &Path,
+    declared: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let known = [
+        "name",
+        "url",
+        "license",
+        "license file",
+        "shipped",
+        "shipped in chromium",
+    ];
+    let mut fields: HashMap<String, String> = HashMap::new();
+    let mut finish = |fields: &mut HashMap<String, String>| -> Result<()> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        // `Shipped in Chromium` wins over `Shipped`, the way the script's
+        // ALIAS_FIELDS overwrite the field: `metadata[field] = metadata[alias]`
+        // unconditionally.
+        if let Some(v) = fields.remove("shipped in chromium") {
+            fields.insert("shipped".to_string(), v);
+        }
+        let files = fields.entry("license file".to_string()).or_default();
+        if files.is_empty() {
+            files.push_str("LICENSE");
+        }
+        let files: Vec<String> = files.split(',').map(|s| s.trim().to_string()).collect();
+        let mut resolved = false;
+        for f in &files {
+            if f == "NOT_SHIPPED" {
+                continue;
+            }
+            let abs = licenses_abs(root, dir, f);
+            if abs.is_file() {
+                if !declared.contains(&abs) {
+                    declared.push(abs);
+                }
+                resolved = true;
+            }
+        }
+        if !resolved {
+            let abs = licenses_abs(root, dir, "COPYING");
+            if abs.is_file() && !declared.contains(&abs) {
+                declared.push(abs);
+            }
+        }
+        fields.clear();
+        Ok(())
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == LICENSES_DIVIDER {
+            finish(&mut fields)?;
+            continue;
+        }
+        if let Some((key, value)) = line.split_once(": ") {
+            let lower = key.to_ascii_lowercase();
+            if known.contains(&lower.as_str()) && fields.insert(lower, value.to_string()).is_some()
+            {
+                return Err(anyhow!(
+                    "duplicate field in {}: {} (licenses.py omits this dependency; refusing the edge is safer)",
+                    path.display(),
+                    key
+                ));
+            }
+        }
+    }
+    finish(&mut fields)?;
+    Ok(())
+}
+
+/// The Chromium source root is two levels above `tools/licenses`.
+fn script_path_source_root(cmd_cwd: &Path, script: &str) -> PathBuf {
+    let script = Path::new(script);
+    let absolute = if script.is_absolute() {
+        script.to_path_buf()
+    } else {
+        lexical_join(cmd_cwd, script)
+    };
+    let licenses_dir = absolute.parent().unwrap_or(&absolute);
+    lexical_join(licenses_dir, Path::new("../.."))
+}
+
+/// The declared set for the production `licenses.py credits` edge. Root and
+/// cmd_cwd are absolute; the script can itself be spelled relatively to the
+/// command's cwd.
+///
+/// Spellings are relative to the command's run directory (`build_dir` joined
+/// with the edge's `cd`, like the swig and flatc readers emit): that is what
+/// the post-`cd` cwd resolves, which is what `referenced_file_rel` rebases.
+/// `build_dir` is the directory the edge runs in (the GN out dir in
+/// production, which is also the command cwd). The read-only resolver takes
+/// the source root and the script directly so its fixtures need no graph.
+fn licenses_resolve(
+    root: &Path,
+    cmd_cwd: &Path,
+    build_dir: &Path,
+    cd_dir: &Path,
+    script: &str,
+    args: &[String],
+) -> Result<Vec<PathBuf>> {
+    licenses_check_options(args)?;
+    let script_path = if Path::new(script).is_absolute() {
+        PathBuf::from(script)
+    } else {
+        lexical_join(cmd_cwd, Path::new(script))
+    };
+    let hash = licenses_py_hash(&script_path)?;
+    if !KNOWN_LICENSES_PY.contains(&hash.as_str()) {
+        return Err(anyhow!(
+            "unknown licenses.py sha256 {hash}; refusing credits edge"
+        ));
+    }
+    let mut declared = Vec::new();
+    licenses_resolved_paths(root, &mut declared)?;
+    Ok(licenses_emit_spellings(&declared, build_dir, cd_dir))
+}
+
+/// Spellings relative to the command's run directory, extracted so the
+/// wiring test drives the same code the resolver does rather than a copy.
+fn licenses_emit_spellings(declared: &[PathBuf], build_dir: &Path, cd_dir: &Path) -> Vec<PathBuf> {
+    let run_dir = lexical_join(build_dir, cd_dir);
+    let mut out = Vec::new();
+    for p in declared {
+        // Every declared path is absolute under the root. Relativise against
+        // the run directory the way the swig and flatc readers do; the wiring
+        // rebases the rest onto the command's directory.
+        let Some(rel) = relative_from(p, &run_dir) else {
+            continue;
+        };
+        if !out.contains(&rel) {
+            out.push(rel);
+        }
+    }
+    out
+}
+
+/// The declared set as ABSOLUTE paths under the Chromium root. No layout
+/// string lives here: the single caller relativises each one against the
+/// build dir with `relative_from`, the helper the other readers use, so the
+/// spelling is right for whatever build dir the edge ran under. Separate
+/// from `licenses_resolve` so a synthetic root can exercise the walk
+/// without the sha256 drift guard.
+pub fn licenses_resolved_paths(root: &Path, declared: &mut Vec<PathBuf>) -> Result<()> {
+    let license = root.join("LICENSE");
+    if !license.is_file() {
+        return Err(anyhow!("no root LICENSE at {}", license.display()));
+    }
+    declared.push(license);
+    // The hashed script and the modules it imports: without them the
+    // sandbox run dies on ModuleNotFoundError, and a new import changes the
+    // script hash, so the drift guard re-pins this list with it.
+    for m in ["tools/licenses/licenses.py"]
+        .into_iter()
+        .chain(LICENSES_PY_IMPORTS)
+    {
+        let p = root.join(m);
+        if !p.is_file() {
+            return Err(anyhow!("no licenses.py import at {}", p.display()));
+        }
+        declared.push(p);
+    }
+    for t in [
+        "components/webui/about/resources/about_credits.tmpl",
+        "components/webui/about/resources/about_credits_entry.tmpl",
+        "components/webui/about/resources/about_credits_reciprocal.tmpl",
+    ] {
+        let p = root.join(t);
+        if !p.is_file() {
+            return Err(anyhow!("no credits template at {}", p.display()));
+        }
+        declared.push(p);
+    }
+    licenses_find_dirs(root, declared)?;
+    // Single pass over the kept set: outside licenses and witnesses for the
+    // SPECIAL_CASES dirs the walk never reaches. READMEs and their licenses
+    // arrived during the walk itself, in `licenses_maybe_add_dir`; every kept
+    // dir already carries at least its witness, which is what keeps it
+    // visible to the script's `_ContainsFiles`.
+    for (special, files) in LICENSES_SPECIAL_CASES {
+        let mut resolved = false;
+        for f in licenses_special_file_list(files) {
+            let target = licenses_abs(root, special, &f);
+            if target.is_file() {
+                resolved = true;
+                if !declared.contains(&target) {
+                    declared.push(target);
+                }
+            }
+        }
+        // The script's COPYING fallback applies to a special case too
+        // (`process_license_files` runs for every dependency).
+        if !resolved {
+            let copying = licenses_abs(root, special, "COPYING");
+            if copying.is_file() && !declared.contains(&copying) {
+                declared.push(copying);
+            }
+        }
+        if let Some(w) = licenses_witness(&root.join(special)) {
+            if !declared.contains(&w) {
+                declared.push(w);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A `g-ir-scanner` RUN READS ITS SOURCES FROM A FILE IT NAMES ON THE COMMAND
@@ -38141,5 +38827,779 @@ mod stamp_record_covers_tests {
         };
         assert!(!run([(2, &d), (1, &u)]));
         assert!(run([(1, &u), (2, &d)]));
+    }
+}
+
+#[cfg(test)]
+mod licenses_reader_tests {
+    use super::{
+        licenses_check_options, licenses_emit_spellings, licenses_invocation, licenses_py_hash,
+        licenses_resolve, licenses_resolved_paths, referenced_file_rel, script_path_source_root,
+    };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "nn-licenses-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+
+    fn basic_root(root: &Path) {
+        // A directory named `third_party` is scanned by Python's walk and
+        // every child is then required to carry metadata. A synthetic root
+        // must satisfy that rule at every level it creates.
+        for p in [
+            "chrome/test/chromeos/autotest",
+            "chrome/test/data",
+            "native_client",
+            "third_party/android_deps/autorolled",
+            "third_party/boringssl/src/third_party/fiat",
+            "third_party/devtools-frontend/src/front_end/third_party",
+            "tools/page_cycler/acid3",
+            "url/third_party/mozilla",
+        ] {
+            write(root, &format!("{p}/LICENSE"), "additional\n");
+            write(
+                root,
+                &format!("{p}/README.chromium"),
+                "Name: additional\nLicense File: LICENSE\n",
+            );
+        }
+        for p in [
+            "third_party/android_deps",
+            "third_party/boringssl",
+            "third_party/boringssl/src",
+            "third_party/devtools-frontend",
+            "third_party/devtools-frontend/src",
+            "third_party/devtools-frontend/src/front_end",
+            "third_party/openscreen",
+            "third_party/openscreen/src",
+            "third_party/openscreen/src/third_party",
+            "url/third_party",
+        ] {
+            write(root, &format!("{p}/LICENSE"), "parent\n");
+            write(
+                root,
+                &format!("{p}/README.chromium"),
+                "Name: parent\nLicense File: LICENSE\n",
+            );
+        }
+        write(root, "LICENSE", "root license\n");
+        for t in [
+            "about_credits.tmpl",
+            "about_credits_entry.tmpl",
+            "about_credits_reciprocal.tmpl",
+        ] {
+            write(
+                root,
+                &format!("components/webui/about/resources/{t}"),
+                "template\n",
+            );
+        }
+        // The hashed script and the modules it imports ride every declared
+        // set, so every synthetic root carries them.
+        for m in [
+            "tools/licenses/licenses.py",
+            "tools/licenses/spdx_writer.py",
+            "build/action_helpers.py",
+            "build/gn_helpers.py",
+        ] {
+            write(root, m, "# synthetic\n");
+        }
+    }
+
+    /// The production argv, byte for byte: the qtwebengine edge in
+    /// `src/core/Release/x86_64` spells `--depfile` apart from its path.
+    #[test]
+    fn production_argv_triggers_only_the_credits_walk() {
+        let real = args(&[
+            "python3.14",
+            "../../../../../src/3rdparty/chromium/tools/licenses/licenses.py",
+            "--target-os=linux",
+            "--depfile",
+            "gen/components/resources/about_credits.d",
+            "credits",
+            "gen/components/resources/about_credits.html",
+        ]);
+        assert_eq!(
+            licenses_invocation(&real),
+            Some("../../../../../src/3rdparty/chromium/tools/licenses/licenses.py".into())
+        );
+        let line = args(&[
+            "python3.14",
+            "tools/licenses/licenses.py",
+            "license_file",
+            "gen/LICENSE",
+        ]);
+        assert_eq!(licenses_invocation(&line), None);
+        let gn = args(&[
+            "python3.14",
+            "tools/licenses/licenses.py",
+            "--gn-target=:QtWebEngineCore",
+            "credits",
+            "out.html",
+        ]);
+        assert_eq!(licenses_invocation(&gn), None);
+        let other = args(&["python3.14", "tools/check.py", "credits", "out.html"]);
+        assert_eq!(licenses_invocation(&other), None);
+        // `credits` is the SUBCOMMAND, the first positional after the options
+        // and their values: a `license_file` edge whose output is named
+        // `credits` must not trigger. The old any-token test said yes here,
+        // and a license_file run would have been read as the credits walk.
+        let named_credits = args(&[
+            "python3.14",
+            "tools/licenses/licenses.py",
+            "license_file",
+            "credits",
+        ]);
+        assert_eq!(licenses_invocation(&named_credits), None);
+        let separated = args(&[
+            "python3.14",
+            "tools/licenses/licenses.py",
+            "--target-os",
+            "linux",
+            "credits",
+            "out.html",
+        ]);
+        assert!(licenses_invocation(&separated).is_some());
+    }
+
+    #[test]
+    fn hash_guard_names_the_unknown_hash() {
+        let d = scratch("hash");
+        write(&d, "licenses.py", "print('unknown')\n");
+        let got = licenses_py_hash(&d.join("licenses.py")).unwrap();
+        assert_eq!(
+            got,
+            "67e2cc8d1413fd15985c2ddd7e6b4e45ef0aa91b26f5c6a3e0949692be25ca17"
+        );
+        let root = d.join("root");
+        basic_root(&root);
+        let err = licenses_resolve(
+            &root,
+            &d,
+            &d.join("build"),
+            Path::new(""),
+            "licenses.py",
+            &args(&["python3.14", "licenses.py", "credits", "out.html"]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(&got), "{err}");
+        assert!(err.contains("unknown licenses.py sha256"), "{err}");
+    }
+
+    #[test]
+    fn unmodelled_options_refuse() {
+        // Every `=` spelling of an unmodelled option, plus the space form of
+        // each value option: the trigger consumes the value, so the check
+        // must see the pair too. The production edge spells `--depfile`
+        // apart from its path (toolchain.ninja line 39817 of the kept tree).
+        let bad_cases: &[&[&str]] = &[
+            &["--extra-third-party-dirs=//x"],
+            &["--gn-out-dir=out"],
+            &["--file-template=x.tmpl"],
+            &["--file-template", "x.tmpl"],
+            &["--target-os=ios"],
+            &["--target-os", "ios"],
+        ];
+        for bad in bad_cases {
+            let mut v = vec!["python3.14", "licenses.py"];
+            v.extend(*bad);
+            v.extend(["credits", "out.html"]);
+            let err = licenses_check_options(&args(&v)).unwrap_err().to_string();
+            assert!(err.contains("unmodelled licenses.py option"), "{err}");
+            assert!(err.contains(bad[0]), "{err}");
+        }
+        let good_cases: &[&[&str]] = &[
+            &["--enable-warnings"],
+            &["--target-os=linux"],
+            &["--target-os", "linux"],
+            &["--depfile=gen/x.d"],
+            &["--depfile", "gen/x.d"],
+        ];
+        for good in good_cases {
+            let mut v = vec!["python3.14", "licenses.py"];
+            v.extend(*good);
+            v.extend(["credits", "out.html"]);
+            assert!(licenses_check_options(&args(&v)).is_ok(), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn unparseable_readme_refuses() {
+        let d = scratch("readme");
+        let root = d.join("src");
+        basic_root(&root);
+        write(&root, "third_party/x/LICENSE", "x\n");
+        write(
+            &root,
+            "third_party/x/README.chromium",
+            "Name: X\nName: duplicate\n",
+        );
+        let mut declared = Vec::new();
+        let err = licenses_resolved_paths(&root, &mut declared)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate field"), "{err}");
+        assert!(err.contains("README.chromium"), "{err}");
+    }
+
+    /// The option check lives inside `licenses_resolve`: an unmodelled option
+    /// must refuse there too. Deleting the call resolves unknown options
+    /// silently and this turns green-to-red.
+    #[test]
+    fn resolve_refuses_an_unmodelled_option() {
+        let d = scratch("resolve-opts");
+        let root = d.join("src");
+        basic_root(&root);
+        let err = licenses_resolve(
+            &root,
+            &d,
+            &d.join("build"),
+            Path::new(""),
+            "licenses.py",
+            &args(&[
+                "python3.14",
+                "licenses.py",
+                "--target-os=ios",
+                "credits",
+                "out.html",
+            ]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unmodelled licenses.py option"), "{err}");
+    }
+
+    /// The emitted spellings must survive the real wiring: every one fed
+    /// through `referenced_file_rel` has to resolve, both with an empty
+    /// `cd_dir` and with a `cd` prologue. Emitting build-dir-relative
+    /// spellings while the edge runs behind a `cd` rebases every file one
+    /// level too deep and the inputs vanish. Uses the wiring function
+    /// itself, not a copy of its logic.
+    #[test]
+    fn emitted_spellings_survive_the_wiring_with_and_without_a_cd() {
+        let d = scratch("wiring");
+        let root = d.join("src");
+        basic_root(&root);
+        write(&root, "third_party/w/LICENSE", "w\n");
+        write(
+            &root,
+            "third_party/w/README.chromium",
+            "Name: W\nLicense File: LICENSE\n",
+        );
+        let store = super::StoreDir::new(Path::new("/nix/store")).unwrap();
+        for cd in [PathBuf::new(), PathBuf::from("sub/dir")] {
+            let build_dir = root.join("build");
+            let cmd_cwd = build_dir.join(&cd);
+            fs::create_dir_all(&cmd_cwd).unwrap();
+            // Through the resolver's own emit step, not a copy of it: the
+            // option and hash guards live in `licenses_resolve` and are
+            // pinned by their own tests, since a synthetic script cannot
+            // carry the production hash.
+            let mut declared = Vec::new();
+            licenses_resolved_paths(&root, &mut declared).unwrap();
+            let got = licenses_emit_spellings(&declared, &build_dir, &cd);
+            assert!(!got.is_empty());
+            for p in &got {
+                let s = p.to_string_lossy().into_owned();
+                assert!(
+                    referenced_file_rel(&build_dir, &store, &cd, &s).is_some(),
+                    "cd={cd:?} dropped {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arbitrary_license_name_double_slash_and_copying_fallback() {
+        let d = scratch("names");
+        let root = d.join("src");
+        write(&root, "third_party/a/LICENSE.custom", "a\n");
+        write(
+            &root,
+            "third_party/a/README.chromium",
+            "Name: A\nLicense File: LICENSE.custom\n",
+        );
+        write(&root, "third_party/b/COPYING", "b\n");
+        write(
+            &root,
+            "third_party/b/README.chromium",
+            "Name: B\nLicense File: //third_party/shared/LICENSE\n",
+        );
+        write(&root, "third_party/shared/LICENSE", "shared\n");
+        write(
+            &root,
+            "third_party/shared/README.chromium",
+            "Name: shared\nLicense File: LICENSE\n",
+        );
+        write(&root, "third_party/c/COPYING", "c\n");
+        write(
+            &root,
+            "third_party/c/README.chromium",
+            "Name: C\nLicense File: absent\n",
+        );
+        basic_root(&root);
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join("third_party/a/LICENSE.custom")),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&root.join("third_party/shared/LICENSE")),
+            "{got:?}"
+        );
+        assert!(got.contains(&root.join("third_party/c/COPYING")), "{got:?}");
+    }
+
+    /// AbsolutePath strips EVERY leading slash before joining under the root:
+    /// a License File of `/third_party/foo/LICENSE` (single slash) is
+    /// root-relative, not host-absolute. Handling only `//` leaves a host path
+    /// the wiring drops, and the page comes out short with exit 0.
+    #[test]
+    fn special_case_without_its_license_falls_back_to_copying() {
+        // pdfium's table entry names no License File, so the default LICENSE
+        // is asked for; absent, the script falls back to COPYING, and a
+        // skeleton without it prints an empty license body with exit 0.
+        let d = scratch("special-copying");
+        let root = d.join("src");
+        basic_root(&root);
+        write(&root, "third_party/pdfium/BUILD.gn", "gn\n");
+        write(&root, "third_party/pdfium/COPYING", "copying\n");
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join("third_party/pdfium/COPYING")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn special_case_readme_is_never_parsed() {
+        // ParseDir answers a SPECIAL_CASES dir from the table and never opens
+        // its README, so a README the reader would refuse (a duplicate field)
+        // must not refuse the edge.
+        let d = scratch("special-readme");
+        let root = d.join("src");
+        basic_root(&root);
+        write(&root, "third_party/angle/LICENSE", "angle\n");
+        write(
+            &root,
+            "third_party/angle/README.chromium",
+            "Name: A\nName: B\nLicense File: LICENSE\n",
+        );
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join("third_party/angle/LICENSE")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn single_slash_license_file_is_root_relative() {
+        let d = scratch("slash");
+        let root = d.join("src");
+        // Outside every third_party dir, so the walk never keeps it: only
+        // the root-relative `License File` can declare it.
+        write(&root, "licensed/elsewhere/LICENSE", "elsewhere\n");
+        write(&root, "third_party/s/LOCAL", "local\n");
+        write(
+            &root,
+            "third_party/s/README.chromium",
+            "Name: S\nLicense File: /licensed/elsewhere/LICENSE\n",
+        );
+        basic_root(&root);
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join("licensed/elsewhere/LICENSE")),
+            "{got:?}"
+        );
+    }
+
+    /// A 21-dash run is NOT a divider: the script anchors both sides at
+    /// exactly twenty. Folding it would merge two dependencies into one,
+    /// reading the wrong License File for the first.
+    #[test]
+    fn twenty_one_dashes_is_not_a_divider() {
+        let d = scratch("divider");
+        let root = d.join("src");
+        basic_root(&root);
+        write(&root, "third_party/d/LICENSE.first", "first\n");
+        write(&root, "third_party/d/LICENSE.second", "second\n");
+        write(
+            &root,
+            "third_party/d/README.chromium",
+            "Name: first\nLicense File: LICENSE.first\n--------------------- DEPENDENCY DIVIDER ----------------------\nName: second\nLicense File: LICENSE.second\n",
+        );
+        let mut got = Vec::new();
+        let err = licenses_resolved_paths(&root, &mut got)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate field"), "{err}");
+    }
+
+    /// The matching positive: exactly twenty dashes split two dependencies,
+    /// and both License Files land in the declared set.
+    #[test]
+    fn twenty_dashes_split_two_dependencies() {
+        let d = scratch("divider-ok");
+        let root = d.join("src");
+        basic_root(&root);
+        write(&root, "third_party/d/LICENSE.first", "first\n");
+        write(&root, "third_party/d/LICENSE.second", "second\n");
+        write(
+            &root,
+            "third_party/d/README.chromium",
+            "Name: first\nLicense File: LICENSE.first\n-------------------- DEPENDENCY DIVIDER --------------------\nName: second\nLicense File: LICENSE.second\n",
+        );
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join("third_party/d/LICENSE.first")),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&root.join("third_party/d/LICENSE.second")),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn additional_paths_recursion_and_prune_exclusion() {
+        let d = scratch("additional");
+        let root = d.join("src");
+        basic_root(&root);
+        write(&root, "third_party/a/LICENSE", "a\n");
+        write(
+            &root,
+            "third_party/a/README.chromium",
+            "Name: A\nLicense File: LICENSE\n",
+        );
+        write(
+            &root,
+            "third_party/a/additional_readme_paths.json",
+            r#"["nested_dep"]"#,
+        );
+        write(&root, "third_party/a/nested_dep/LICENSE", "nested\n");
+        write(
+            &root,
+            "third_party/a/nested_dep/additional_readme_paths.json",
+            "[]\n",
+        );
+        write(
+            &root,
+            "third_party/a/nested_dep/README.chromium",
+            "Name: nested\nLicense File: LICENSE\n---\n",
+        );
+        write(&root, "third_party/adobe/LICENSE", "pruned\n");
+        write(&root, "third_party/adobe/README.chromium", "Name: adobe\n");
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join("third_party/a/additional_readme_paths.json")),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&root.join("third_party/a/nested_dep/README.chromium")),
+            "{got:?}"
+        );
+        assert!(
+            !got.iter().any(|p| p
+                .strip_prefix(&root)
+                .unwrap()
+                .starts_with("third_party/adobe")),
+            "{got:?}"
+        );
+    }
+
+    /// The production shape: `front_end/third_party` is itself an
+    /// ADDITIONAL_PATHS member, so the walk never descends into it and the
+    /// nested `puppeteer/third_party/mitt` arrives only through the JSON
+    /// recursion. Dropping the recursion loses the entry in silence.
+    #[test]
+    fn json_reaches_a_dir_below_an_additional_root_the_walk_never_enters() {
+        let d = scratch("json-below-additional");
+        let root = d.join("src");
+        let extra = "third_party/devtools-frontend/src/front_end/third_party";
+        basic_root(&root);
+        write(
+            &root,
+            &format!("{extra}/additional_readme_paths.json"),
+            r#"["puppeteer/third_party/mitt"]"#,
+        );
+        write(
+            &root,
+            &format!("{extra}/puppeteer/third_party/mitt/LICENSE"),
+            "mitt\n",
+        );
+        write(
+            &root,
+            &format!("{extra}/puppeteer/third_party/mitt/README.chromium"),
+            "Name: mitt\nLicense File: LICENSE\n",
+        );
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join(format!(
+                "{extra}/puppeteer/third_party/mitt/README.chromium"
+            ))),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&root.join(format!("{extra}/puppeteer/third_party/mitt/LICENSE"))),
+            "{got:?}"
+        );
+    }
+
+    /// os.walk without followlinks lists a `third_party` child that is a
+    /// symlink in `dirs` but never descends into it: the entry is kept, and
+    /// the target's files are declared under the link's spelling, the path
+    /// licenses.py itself opens. Without the link check the child vanishes
+    /// from the declaration entirely.
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_third_party_child_is_kept_but_not_entered() {
+        use std::os::unix::fs::symlink;
+        let d = scratch("symlink");
+        let root = d.join("src");
+        let target = d.join("elsewhere/foo");
+        write(
+            &target,
+            "README.chromium",
+            "Name: foo\nLicense File: LICENSE\n",
+        );
+        write(&target, "LICENSE", "foo\n");
+        write(&target, "sub/inner.txt", "inner\n");
+        fs::create_dir_all(root.join("third_party")).unwrap();
+        symlink(&target, root.join("third_party/foo")).unwrap();
+        write(&root, "third_party/bar/LICENSE", "bar\n");
+        write(
+            &root,
+            "third_party/bar/README.chromium",
+            "Name: bar\nLicense File: LICENSE\n",
+        );
+        basic_root(&root);
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join("third_party/foo/README.chromium")),
+            "linked child unread: {got:?}"
+        );
+        assert!(
+            got.contains(&root.join("third_party/foo/LICENSE")),
+            "{got:?}"
+        );
+        assert!(
+            !got.iter().any(|p| p
+                .strip_prefix(&root)
+                .unwrap()
+                .starts_with("third_party/foo/sub")),
+            "walked below the link: {got:?}"
+        );
+    }
+
+    /// The script prunes any root-relative path starting with `out`,
+    /// including `output/` and `out_dir/`, not just `out/`.
+    #[test]
+    fn out_prefixed_trees_are_pruned_from_the_walk() {
+        let d = scratch("outprefix");
+        let root = d.join("src");
+        basic_root(&root);
+        for t in ["out/x", "output/x", "out_dir/x", "kept/x"] {
+            write(&root, &format!("{t}/third_party/z/LICENSE"), "z\n");
+            write(
+                &root,
+                &format!("{t}/third_party/z/README.chromium"),
+                "Name: z\nLicense File: LICENSE\n",
+            );
+        }
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join("kept/x/third_party/z/README.chromium")),
+            "control: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|p| {
+                let r = p
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                r.starts_with("out") && r.contains("third_party/z")
+            }),
+            "{got:?}"
+        );
+    }
+
+    /// The walk's descent prunes `layout_tests` (PRUNE_DIRS), unlike
+    /// `_ContainsFiles`, so a third_party tree below one is never reached.
+    /// The same tree elsewhere is the control: it must be found.
+    #[test]
+    fn layout_tests_trees_are_pruned_from_the_walk() {
+        let d = scratch("layoutprune");
+        let root = d.join("src");
+        basic_root(&root);
+        for t in ["a/layout_tests", "b"] {
+            write(&root, &format!("{t}/third_party/z/LICENSE"), "z\n");
+            write(
+                &root,
+                &format!("{t}/third_party/z/README.chromium"),
+                "Name: z\nLicense File: LICENSE\n",
+            );
+        }
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join("b/third_party/z/README.chromium")),
+            "control: {got:?}"
+        );
+        assert!(
+            !got.iter()
+                .any(|p| p.starts_with(root.join("a/layout_tests"))),
+            "{got:?}"
+        );
+    }
+
+    /// A `License File` value that climbs out of its dir resolves the way
+    /// AbsolutePath does: normpath keeps the leading `..`, and the join
+    /// puts it under the parent.
+    #[test]
+    fn license_file_climbing_out_of_its_dir_resolves_under_the_parent() {
+        let d = scratch("climb");
+        let root = d.join("src");
+        basic_root(&root);
+        write(&root, "third_party/shared/LICENSE", "shared\n");
+        write(
+            &root,
+            "third_party/shared/README.chromium",
+            "Name: shared\nLicense File: LICENSE\n",
+        );
+        write(&root, "third_party/deep/LICENSE", "deep\n");
+        write(
+            &root,
+            "third_party/deep/README.chromium",
+            "Name: deep\nLicense File: ../shared/LICENSE\n",
+        );
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join("third_party/shared/LICENSE")),
+            "{got:?}"
+        );
+    }
+
+    /// The measured trap: the five entries lost when only the 704 opened
+    /// files are staged. Their dirs are kept by `_ContainsFiles`, but their
+    /// License File names a file OUTSIDE the dir.
+    #[test]
+    fn special_case_witness_keeps_an_empty_dir_in_the_declaration() {
+        let d = scratch("witness");
+        let root = d.join("src");
+        write(&root, "third_party/pdfium/placeholder.txt", "witness\n");
+        basic_root(&root);
+        let mut got = Vec::new();
+        licenses_resolved_paths(&root, &mut got).unwrap();
+        assert!(
+            got.contains(&root.join("third_party/pdfium/placeholder.txt")),
+            "the witness rule did not fire: {got:?}"
+        );
+    }
+
+    #[test]
+    fn witness_is_the_first_file_in_walk_order_and_skips_vcs_dirs() {
+        let d = scratch("witness-order");
+        let root = d.join("src");
+        write(&root, "third_party/x/.git/HEAD", "git\n");
+        write(&root, "third_party/x/a/z.txt", "z\n");
+        write(&root, "third_party/x/a.txt", "a\n");
+        let got = super::licenses_witness(&root.join("third_party/x")).unwrap();
+        assert_eq!(got, root.join("third_party/x/a.txt"));
+    }
+
+    /// `_ContainsFiles` prunes only VCS dirs, so a file under `layout_tests`
+    /// keeps a dir; the walk's wider prune list must not apply here.
+    #[test]
+    fn witness_counts_a_file_under_layout_tests() {
+        let d = scratch("witness-layout");
+        let root = d.join("src");
+        write(&root, "third_party/y/layout_tests/t.html", "t\n");
+        let got = super::licenses_witness(&root.join("third_party/y"));
+        assert_eq!(got, Some(root.join("third_party/y/layout_tests/t.html")));
+    }
+
+    #[test]
+    fn source_root_comes_from_the_script_two_levels_up() {
+        let got = script_path_source_root(
+            Path::new("/build/source/build/src/core/Release/x86_64"),
+            "../../../../../src/3rdparty/chromium/tools/licenses/licenses.py",
+        );
+        assert_eq!(got, Path::new("/build/source/src/3rdparty/chromium"));
+    }
+
+    /// Byte-identity oracle. Read-only against NN_LICENSES_SOURCE; all
+    /// outputs go under NN_LICENSES_OUT. Run from
+    /// `local/gates/licenses-credits-identity.sh`, not by the normal suite.
+    ///
+    /// The build dir is the GN out dir, which is also the command cwd,
+    /// exactly as production runs it: the task log reads `Setup source
+    /// directory in /build/source/build/src/core/Release/x86_64`.
+    #[test]
+    #[ignore]
+    fn production_credits_are_byte_identical_in_the_declared_skeleton() {
+        let source =
+            PathBuf::from(std::env::var("NN_LICENSES_SOURCE").expect("NN_LICENSES_SOURCE"));
+        let out = PathBuf::from(std::env::var("NN_LICENSES_OUT").expect("NN_LICENSES_OUT"));
+        let chromium = source.join("src/3rdparty/chromium");
+        let script = chromium
+            .join("tools/licenses/licenses.py")
+            .to_string_lossy()
+            .into_owned();
+        let cmd_cwd = source.join("build/src/core/Release/x86_64");
+        let declared = licenses_resolve(
+            &chromium,
+            &cmd_cwd,
+            &cmd_cwd,
+            Path::new(""),
+            &script,
+            &args(&[
+                "python3.14",
+                &script,
+                "--target-os=linux",
+                "--depfile=gen/components/resources/about_credits.d",
+                "credits",
+                "gen/components/resources/about_credits.html",
+            ]),
+        )
+        .unwrap();
+        let bytes: Vec<u8> = declared
+            .iter()
+            .map(|p| format!("{}\n", p.to_string_lossy()))
+            .collect::<String>()
+            .into_bytes();
+        fs::write(&out, bytes).unwrap();
     }
 }
