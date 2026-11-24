@@ -16097,11 +16097,13 @@ fn licenses_check_options(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// The sha256 of `tools/licenses/licenses.py` in the pinned Chromium. The
+/// The body sha256 (`licenses_py_hash`: past the `#!` line) of
+/// `tools/licenses/licenses.py` in qtwebengine 6.11.2's Chromium. The same
+/// for the tarball's copy and the patchShebangs copy a build runs. The
 /// reader replicates this script's walk; a different script can read a
 /// different set, so a drift is a loud refusal that names the new hash.
 const KNOWN_LICENSES_PY: [&str; 1] =
-    ["4ecf0783c702888071708c8860247c6d39d05df407075a4ffaa788c67fac99d6"];
+    ["fe3dcbef5407126f86e969e04ff55badc859295b07712610695d9727a4de2f97"];
 
 /// The modules `licenses.py` imports beside the standard library, relative to
 /// the Chromium root: `spdx_writer` from its own directory, then
@@ -16263,12 +16265,26 @@ fn licenses_special_file_list(files: Option<&str>) -> Vec<String> {
     names
 }
 
-/// sha256 of a file whose hash the drift guard names on refusal. Kept apart
-/// from the resolver so fixtures can bypass the guard with their own script
-/// text.
+/// sha256 of the script's BODY: every byte after a leading `#!` line, or
+/// the whole file when it has none. The drift guard names it on refusal.
+/// Kept apart from the resolver so fixtures can bypass the guard with their
+/// own script text.
+///
+/// THE INTERPRETER LINE IS NOT THE SCRIPT. nixpkgs' patchShebangs rewrites
+/// line 1 to the build's python store path, so a whole-file hash keyed the
+/// reader on the consumer's python env (`4ecf0783...` was the patched file,
+/// not Chromium's `eafbddd2...`): any python bump refused the edge with
+/// Chromium unchanged. The walk never reads line 1.
 pub fn licenses_py_hash(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    let body = match bytes.strip_prefix(b"#!") {
+        Some(rest) => rest
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(&[][..], |nl| &rest[nl + 1..]),
+        None => &bytes[..],
+    };
+    Ok(format!("{:x}", Sha256::digest(body)))
 }
 
 fn licenses_path_string(p: &Path) -> String {
@@ -39006,6 +39022,42 @@ mod licenses_reader_tests {
         .to_string();
         assert!(err.contains(&got), "{err}");
         assert!(err.contains("unknown licenses.py sha256"), "{err}");
+    }
+
+    /// patchShebangs rewrites line 1 to the build's python; the key must not
+    /// move with it. A file with no `#!` line hashes whole, so the three agree.
+    #[test]
+    fn the_interpreter_line_is_not_part_of_the_hash() {
+        let d = scratch("shebang");
+        write(&d, "upstream.py", "#!/usr/bin/env python3\nprint('x')\n");
+        write(
+            &d,
+            "patched.py",
+            "#!/nix/store/x57zgq7xmy32xdb662fh7hs5rd0rrkvw-python3-3.14.10-env/bin/python3\nprint('x')\n",
+        );
+        write(&d, "bare.py", "print('x')\n");
+        let up = licenses_py_hash(&d.join("upstream.py")).unwrap();
+        assert_eq!(up, licenses_py_hash(&d.join("patched.py")).unwrap());
+        assert_eq!(up, licenses_py_hash(&d.join("bare.py")).unwrap());
+    }
+
+    /// The other side of the same guard: only line 1 is skipped, so a change
+    /// anywhere in the body still refuses, and a lone `#!` line is the empty
+    /// body rather than the whole file.
+    #[test]
+    fn a_change_after_the_interpreter_line_moves_the_hash() {
+        let d = scratch("body");
+        write(&d, "a.py", "#!/usr/bin/env python3\nprint('x')\n");
+        write(&d, "b.py", "#!/usr/bin/env python3\nprint('y')\n");
+        write(&d, "only.py", "#!/usr/bin/env python3");
+        assert_ne!(
+            licenses_py_hash(&d.join("a.py")).unwrap(),
+            licenses_py_hash(&d.join("b.py")).unwrap()
+        );
+        assert_eq!(
+            licenses_py_hash(&d.join("only.py")).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]
