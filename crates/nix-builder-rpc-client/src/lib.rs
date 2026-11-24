@@ -47,7 +47,7 @@ const CONNECT_RETRIES: u32 = CONNECT_BACKOFF_S.len() as u32;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("daemon error: {0}")]
+    #[error("daemon error: {}", daemon_error_text(.0))]
     Daemon(#[from] DaemonError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -104,6 +104,30 @@ pub enum Error {
         connect_failures: u32,
         last_allowance_s: u64,
     },
+}
+
+/// A daemon error with the daemon's TRACE lines kept.
+///
+/// harmonia receives nix's traces (`RemoteError::traces`) but displays only
+/// the message, so `could not start program "..."` reached the build log
+/// without the trace naming the errno (`... could not exec program:
+/// Argument list too long`), which the daemon had sent. The traces follow
+/// the message, in the order the daemon sent them.
+fn daemon_error_text(e: &DaemonError) -> String {
+    let DaemonErrorKind::Remote(remote) = e.kind() else {
+        return e.to_string();
+    };
+    let traces: Vec<String> = remote
+        .traces
+        .iter()
+        .map(|t| String::from_utf8_lossy(&t.hint).trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if traces.is_empty() {
+        e.to_string()
+    } else {
+        format!("{e} (trace: {})", traces.join("; "))
+    }
 }
 
 /// The OTHER failures in the same batch, named.
@@ -3431,6 +3455,68 @@ fn transient_daemon_error(msg: &str) -> bool {
     (msg.contains("/sys/fs/cgroup/")
         && (msg.contains("No such file") || msg.contains("File exists")))
         || (msg.contains("should not be a member of") && msg.contains("Nix user"))
+}
+
+#[cfg(test)]
+mod daemon_error_text_tests {
+    use super::Error;
+    use harmonia_protocol::daemon_wire::logger::TraceLine;
+    use harmonia_protocol::de::{NixRead, NixReader};
+    use harmonia_protocol::log::Verbosity;
+    use harmonia_protocol::types::{DaemonError, RemoteError};
+
+    /// A trace line as the daemon writes it: a zero `havePos` word, then the
+    /// hint as a length-prefixed string padded to 8 bytes. Decoded through
+    /// harmonia's own reader, the path a real STDERR_ERROR frame takes.
+    fn trace(hint: &str) -> TraceLine {
+        let mut wire = 0u64.to_le_bytes().to_vec();
+        wire.extend_from_slice(&(hint.len() as u64).to_le_bytes());
+        wire.extend_from_slice(hint.as_bytes());
+        wire.resize(wire.len().next_multiple_of(8), 0);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            NixReader::new(std::io::Cursor::new(wire))
+                .read_value::<TraceLine>()
+                .await
+                .unwrap()
+        })
+    }
+
+    fn remote(msg: &str, traces: Vec<TraceLine>) -> Error {
+        Error::Daemon(DaemonError::from(RemoteError {
+            level: Verbosity::Error,
+            msg: msg.as_bytes().to_vec().into(),
+            exit_status: 1,
+            traces,
+        }))
+    }
+
+    /// The case that needed ftrace: a hook the daemon could not exec. The
+    /// errno is only in the trace; the report must carry it.
+    #[test]
+    fn a_remote_errors_traces_reach_the_report() {
+        let e = remote(
+            "could not start program \"/etc/nix/post-build-hook.sh\"",
+            vec![trace(
+                "spawn helper process failed: could not exec program: Argument list too long",
+            )],
+        );
+        let text = e.to_string();
+        assert!(text.contains("could not start program"), "{text}");
+        assert!(text.contains("Argument list too long"), "{text}");
+    }
+
+    /// Negative control: without traces the text is exactly what it was.
+    #[test]
+    fn a_remote_error_without_traces_reads_as_before() {
+        let e = remote("builder failed with exit code 2", vec![]);
+        assert_eq!(
+            e.to_string(),
+            "daemon error: remote error: builder failed with exit code 2"
+        );
+    }
 }
 
 #[cfg(test)]
