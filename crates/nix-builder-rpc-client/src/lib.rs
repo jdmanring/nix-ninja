@@ -351,14 +351,18 @@ fn upload_allowance() -> std::time::Duration {
 ///
 /// The other fields: the `now_ms` of the latest release, which the reaper
 /// reads; the count of releases; the release quota after which a
-/// connection is closed rather than parked (0 for never); and whether the
-/// pool is reaped, which is also whether `acquire_retrying` retries.
+/// connection is closed rather than parked (0 for never); whether the
+/// pool is reaped, which is also whether `acquire_retrying` retries; the
+/// derivation bytes realised through the pool; and the byte quota after
+/// which a connection is closed rather than parked (0 for never).
 struct BoundedPool(
     ConnectionPool,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
     u64,
     bool,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    u64,
 );
 
 /// Close the connections parked idle in POOL, stopping as soon as a release
@@ -456,6 +460,16 @@ const REAP_QUIET: std::time::Duration = std::time::Duration::from_secs(2);
 /// connections every time.
 const RECYCLE_EVERY: u64 = 499;
 
+/// Every this many bytes of derivations realised on the host route, the
+/// released connection is closed rather than parked. The count is
+/// pool-wide and retires whichever connection is released as it crosses,
+/// so a worker serves about one quota on average, more under uneven load,
+/// and one release retires at most one connection. A count quota cannot
+/// bound what a worker keeps per realise when derivations are large; a
+/// pool of small derivations reaches the count quota first and is
+/// unchanged.
+const RECYCLE_DRV_BYTES: u64 = 128 << 20;
+
 /// The host route's pool configuration for a reaper with quiet spell QUIET.
 /// A trickle of exchanges never lets the pool go quiet. Expiring a parked
 /// connection idle past twice the quiet spell on pop trims the pool under a
@@ -476,13 +490,26 @@ fn host_route_config(max_size: usize, quiet: std::time::Duration) -> PoolConfig 
 
 /// A pooled connection that stamps the pool's release time when dropped,
 /// and closes the connection instead of parking it on every quota-th
-/// release.
+/// release, or on the release that carries the pool's realised derivation
+/// bytes past a multiple of its byte quota. The last three fields are the
+/// pool's byte counter and quota, and the bytes this lease was charged.
 struct Lease(
     Option<PooledConnectionGuard>,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
     u64,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+    u64,
+    u64,
 );
+
+impl Lease {
+    /// Counts BYTES of derivations this exchange realised against the
+    /// pool's byte quota.
+    fn charge(&mut self, bytes: u64) {
+        self.6 += bytes;
+    }
+}
 
 impl std::ops::Deref for Lease {
     type Target = PooledConnectionGuard;
@@ -505,8 +532,10 @@ impl Drop for Lease {
         // pops this connection (see `close_idle`).
         self.1.store(now_ms(), Relaxed);
         let n = self.2.fetch_add(1, Relaxed) + 1;
+        let before = self.4.fetch_add(self.6, Relaxed);
+        let crossed = self.5 > 0 && before.saturating_add(self.6) / self.5 > before / self.5;
         match self.0.take() {
-            Some(guard) if self.3 > 0 && n.is_multiple_of(self.3) => {
+            Some(guard) if (self.3 > 0 && n.is_multiple_of(self.3)) || crossed => {
                 guard.mark_broken();
                 RECYCLED.fetch_add(1, Relaxed);
             }
@@ -523,22 +552,28 @@ impl BoundedPool {
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             0,
             false,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            0,
         )
     }
 
     /// A pool whose parked connections are closed once no lease has been
-    /// released for QUIET, and whose every EVERY-th released connection is
-    /// closed. The reaper runs on RT for the pool's lifetime.
+    /// released for QUIET, whose every EVERY-th released connection is
+    /// closed, and whose released connection is closed each time the
+    /// derivation bytes realised through it pass a multiple of BYTES. The
+    /// reaper runs on RT for the pool's lifetime.
     fn new_reaped(
         path: &Path,
         config: PoolConfig,
         rt: &Runtime,
         quiet: std::time::Duration,
         every: u64,
+        bytes: u64,
     ) -> Self {
         let mut pool = Self::new(path, config);
         pool.3 = every;
         pool.4 = true;
+        pool.6 = bytes;
         let (inner, last) = (pool.0.clone(), pool.1.clone());
         let tick = (quiet / 2).max(std::time::Duration::from_millis(50));
         rt.spawn(async move {
@@ -566,7 +601,17 @@ impl BoundedPool {
     async fn acquire(&self, what: &str, allowance: std::time::Duration) -> Result<Lease> {
         match tokio::time::timeout(allowance, self.0.acquire()).await {
             Ok(out) => out
-                .map(|g| Lease(Some(g), self.1.clone(), self.2.clone(), self.3))
+                .map(|g| {
+                    Lease(
+                        Some(g),
+                        self.1.clone(),
+                        self.2.clone(),
+                        self.3,
+                        self.5.clone(),
+                        self.6,
+                        0,
+                    )
+                })
                 .map_err(Error::from),
             Err(_elapsed) => {
                 eprintln!(
@@ -819,7 +864,7 @@ mod bounded_exchange_tests {
         // The only reaper with a short quiet spell on a live socket, so
         // nothing else moves REAPED while this arm reads it; the route
         // test's reaper points at a missing socket and has nothing parked.
-        let pool = BoundedPool::new_reaped(socket, host_route_config(2, quiet), &rt, quiet, 0);
+        let pool = BoundedPool::new_reaped(socket, host_route_config(2, quiet), &rt, quiet, 0, 0);
         rt.block_on(async {
             let (a, b) = match (
                 pool.acquire("probe", Duration::from_secs(30)).await,
@@ -923,6 +968,7 @@ mod bounded_exchange_tests {
             &rt,
             Duration::from_secs(600),
             0,
+            0,
         );
         let got = rt.block_on(async {
             tokio::time::timeout(
@@ -942,11 +988,29 @@ mod bounded_exchange_tests {
         let path = std::path::Path::new("/nonexistent/nn-no-daemon.sock");
         let in_build = super::BuilderRpcClient::connect_unix_sized(path, true, 2).unwrap();
         let host = super::BuilderRpcClient::connect_unix_sized(path, false, 2).unwrap();
-        assert!(!in_build.pool.4 && in_build.pool.3 == 0, "inside a build");
         assert!(
-            host.pool.4 && host.pool.3 == super::RECYCLE_EVERY,
+            !in_build.pool.4 && in_build.pool.3 == 0 && in_build.pool.6 == 0,
+            "inside a build"
+        );
+        assert!(
+            host.pool.4
+                && host.pool.3 == super::RECYCLE_EVERY
+                && host.pool.6 == super::RECYCLE_DRV_BYTES,
             "host route"
         );
+    }
+
+    /// THE REALISE CHARGES ITS LEASE. The pool tests prove a charged lease
+    /// retires; this is the arm that fails if the charge at the realise
+    /// site is deleted, which leaves every pool test green. Needles
+    /// assembled at run time so this test's own text is not a match.
+    #[test]
+    fn the_realise_charges_its_lease() {
+        let src = include_str!("lib.rs");
+        let site = ["guard.charge(", "drv_bytes);"].concat();
+        let computed = ["let drv_bytes = ", "realised_drv_bytes(store_dir, paths);"].concat();
+        assert_eq!(src.matches(&site).count(), 1, "charge sites");
+        assert_eq!(src.matches(&computed).count(), 1, "byte reads");
     }
 
     /// THE FLAG IS NOT DECORATION: a client built with retention off must not
@@ -1008,6 +1072,7 @@ mod bounded_exchange_tests {
             &rt,
             Duration::from_secs(600),
             3,
+            0,
         );
         rt.block_on(async {
             for n in 1..=9u64 {
@@ -1022,6 +1087,56 @@ mod bounded_exchange_tests {
                 let (idle, active, _) = pool.0.stats().await;
                 let want = if n % 3 == 0 { 0 } else { 1 };
                 assert_eq!((idle, active), (want, 0), "release {n} of quota 3");
+            }
+        });
+    }
+
+    /// THE RELEASE THAT CARRIES THE POOL'S REALISED BYTES PAST A MULTIPLE
+    /// OF THE BYTE QUOTA CLOSES ITS CONNECTION. Quota 100, 60 bytes a
+    /// lease: 60, 120, 180, 240 cross at the second and fourth release
+    /// only; an uncharged lease never retires.
+    #[test]
+    fn a_connection_is_retired_after_its_byte_quota() {
+        use super::BoundedPool;
+        use harmonia_store_remote::PoolConfig;
+        use std::time::Duration;
+
+        let socket = std::path::Path::new("/nix/var/nix/daemon-socket/socket");
+        if !socket.exists() {
+            eprintln!("SKIP: no daemon socket");
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = BoundedPool::new_reaped(
+            socket,
+            PoolConfig {
+                max_size: 1,
+                ..PoolConfig::default()
+            },
+            &rt,
+            Duration::from_secs(600),
+            0,
+            100,
+        );
+        rt.block_on(async {
+            for (n, charge, want) in [(1, 60, 1), (2, 60, 0), (3, 60, 1), (4, 60, 0), (5, 0, 1)] {
+                match pool.acquire("probe", Duration::from_secs(30)).await {
+                    Ok(mut lease) => {
+                        lease.charge(charge);
+                        drop(lease)
+                    }
+                    Err(e) if n == 1 => {
+                        eprintln!("SKIP: daemon not answering ({e:?})");
+                        return;
+                    }
+                    Err(e) => panic!("release {n}: acquire failed after the first: {e:?}"),
+                }
+                let (idle, active, _) = pool.0.stats().await;
+                assert_eq!((idle, active), (want, 0), "release {n} of byte quota 100");
             }
         });
     }
@@ -1366,6 +1481,29 @@ fn built_drv(store_dir: &StoreDir, p: &SingleDerivedPath) -> Option<String> {
     }
 }
 
+/// The bytes of the derivations PATHS asks to realise, each derivation
+/// counted once however many of its outputs are asked for: what a request
+/// costs a worker grows with the derivations it realises, not with the
+/// outputs named, and one request can name hundreds of outputs of one
+/// derivation. Read from the local store; a derivation that cannot be
+/// read counts nothing.
+fn realised_drv_bytes(store_dir: &StoreDir, paths: &[SingleDerivedPath]) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    paths
+        .iter()
+        .filter_map(|p| match p {
+            SingleDerivedPath::Built { drv_path, .. } => match drv_path.as_ref() {
+                SingleDerivedPath::Opaque(sp) => Some(sp),
+                SingleDerivedPath::Built { .. } => None,
+            },
+            SingleDerivedPath::Opaque(_) => None,
+        })
+        .filter(|sp| seen.insert(*sp))
+        .filter_map(|sp| std::fs::metadata(sp.to_absolute_path(store_dir)).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
 fn split_by_derivation(store_dir: &StoreDir, paths: &[SingleDerivedPath]) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -1599,6 +1737,37 @@ mod split_by_derivation_tests {
         assert_eq!(all, vec![0, 1, 2, 3], "a partition of the request");
     }
 
+    /// A DERIVATION IS CHARGED ONCE HOWEVER MANY OUTPUTS ARE ASKED FOR: two
+    /// outputs of a 10-byte derivation and one of a 7-byte one charge 17,
+    /// an opaque path nothing, and a derivation absent from the store
+    /// nothing.
+    #[test]
+    fn a_derivation_is_charged_once() {
+        let dir = std::env::temp_dir().join(format!("nn-drv-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sd = StoreDir::new(dir.to_str().unwrap()).unwrap();
+        let a = dir.join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv");
+        let b = dir.join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv");
+        let gone = dir.join("dddddddddddddddddddddddddddddddd-gone.drv");
+        std::fs::write(&a, [0u8; 10]).unwrap();
+        std::fs::write(&b, [0u8; 7]).unwrap();
+        let (a, b, gone) = (
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            gone.to_str().unwrap(),
+        );
+        let paths = vec![
+            built(&sd, a, "out"),
+            built(&sd, a, "dev"),
+            built(&sd, b, "out"),
+            built(&sd, gone, "out"),
+            SingleDerivedPath::Opaque(sd.parse(a).unwrap()),
+        ];
+        let got = super::realised_drv_bytes(&sd, &paths);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(got, 17);
+    }
+
     /// THE COMMON CASE IS ONE GROUP, and the caller keeps the single
     /// request for it, so a per-task realise is unchanged by the split.
     #[test]
@@ -1748,6 +1917,7 @@ impl BuilderRpcClient {
                 &runtime,
                 REAP_QUIET,
                 RECYCLE_EVERY,
+                RECYCLE_DRV_BYTES,
             )
         };
         Ok(Self {
@@ -2423,6 +2593,7 @@ impl BuilderRpcClient {
                 first
             }
         };
+        let drv_bytes = realised_drv_bytes(store_dir, paths);
         let results = self.runtime.block_on(async {
             // Two counters, deliberately not one: with a shared budget,
             // COUNTS THIS CALL, NOT THIS RUN, and the message now says so.
@@ -2550,6 +2721,7 @@ impl BuilderRpcClient {
                 let others = IN_FLIGHT.fetch_sub(1, Relaxed).saturating_sub(1);
                 match outcome {
                     Ok(Ok(res)) => {
+                        guard.charge(drv_bytes);
                         // Recovery success was silent before this line, so
                         // the only readable verdict on a retry policy was
                         // the absence of the next timeout - a weak signal.
