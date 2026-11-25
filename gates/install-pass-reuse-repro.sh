@@ -118,6 +118,9 @@ build app: exe main.o libfoo.so.1 | libfoo.so
 build sync.h: sync
 build meta/d/meta.json: metagen sync.h
 build all: phony libfoo.so app meta/d/meta.json
+rule sleeper
+  command = sleep 60 && echo NONCE > $out
+build slow: sleeper
 default all
 NINJA
 sed -i "s/NONCE/$NONCE/" build.ninja
@@ -128,6 +131,8 @@ sed -i "s/NONCE/$NONCE/" build.ninja
 # pass 1 places the producer's output over the placeholder. Without the
 # upload, cat fails and so does pass 1.
 mkdir -p meta/d && : > meta/d/meta.json && echo '-binaryDir meta/d' > sync.args
+# The killed arm starts from the fixture as configure left it.
+cp -a "$D/build" "$D/killed"
 run() { env -i HOME="$D" NIX_REMOTE="$NIX_REMOTE" NIX_NINJA_RESOLVE_CACHE=0 PATH="$NN/bin:$CC/bin:$CU/bin:$BASH/bin:$NIXP/bin:$TASK/bin:$PE/bin:$CM/bin" NIX_NINJA_TASK="$TASK/bin/nix-ninja-task" NIX_CONFIG="experimental-features = $F" "$@"; }
 mkdir -p "$LOGS"
 pass() {  # pass <arm> <n> <env...>: run, then count build logs newer than the marker
@@ -275,6 +280,43 @@ run "$NN/bin/nix-ninja" no-such-target >> "$D/ninja.log" 2>&1 && { echo "  ninja
 [ "$(command grep -a -c 'later-pass reused' "$D/ninja.log")" -eq $((c + 1)) ] \
   || { echo "  ninja: an error exit printed no later-pass line"; fails=$((fails + 1)); }
 
+# A FIRST PASS KILLED BEFORE ITS EXIT leaves configure's record and no task
+# record (the walk saves the first before anything is placed; every exit,
+# failed ones included, writes the second). The pass after it runs as the
+# first, and the pass after that reuses what it recorded. The kill is a real
+# SIGKILL of the driver once configure's record exists (the slow edge keeps
+# the driver alive past it), so the state is what a signal leaves; a state
+# with no configure record or with a task record is NO ANSWER.
+cd "$D/killed" || exit 2
+run "$NN/bin/nix-ninja" slow >> "$D/killed.log" 2>&1 &
+kbg=$!
+timeout 120 sh -c 'until [ -n "$(find .nix-ninja-state -name configure.v1 2>/dev/null)" ]; do sleep 0.2; done' \
+  && sleep 3
+# The driver is the job's child (the function's env execs it), or the job
+# itself where the shell exec'd it; matched by pid and exact name only. The
+# job alone is waited on: the private daemon is this script's child too.
+kpid=$(pgrep -P "$kbg" -x nix-ninja)
+[ -z "$kpid" ] && [ "$(cat "/proc/$kbg/comm" 2>/dev/null)" = nix-ninja ] && kpid=$kbg
+[ -n "$kpid" ] || { echo "NO ANSWER: the killed arm's driver was not running when the kill was due"; exit 2; }
+kill -9 $kpid
+wait "$kbg"
+kst=$(find .nix-ninja-state -mindepth 1 -maxdepth 1 -type d -print -quit)
+if [ -z "$kst" ] || [ ! -e "$kst/configure.v1" ] || [ -e "$kst/emitted.v1" ]; then
+  echo "NO ANSWER: the kill did not land between configure's record and the exit (state: $(ls "$kst" 2>/dev/null | tr '\n' ' '))"; exit 2
+fi
+run "$NN/bin/nix-ninja" all >> "$D/killed.log" 2>&1 \
+  || { echo "  killed: the pass after a killed first pass failed: $(command grep -a 'nix-ninja:' "$D/killed.log" | tail -1)"; fails=$((fails + 1)); }
+command grep -aq 'has no task record (a first pass killed before its exit): this pass runs as the first' "$D/killed.log" \
+  || { echo "  killed: the pass after the kill did not say it runs as the first"; fails=$((fails + 1)); }
+[ -e "$kst/emitted.v1" ] || { echo "  killed: the pass after the kill wrote no task record"; fails=$((fails + 1)); }
+run "$NN/bin/nix-ninja" all >> "$D/killed.log" 2>&1 || { echo "  killed: the pass after that failed"; fails=$((fails + 1)); }
+l=$(command grep -a 'later-pass reused' "$D/killed.log" | tail -1)
+case $l in
+  *"later-pass reused "[1-9]*" task(s), derived 0 fresh, 0 fallback, 0 stale: "*) ;;
+  *) echo "  killed: the pass after the rerun is not a clean reuse: $l"; fails=$((fails + 1)) ;;
+esac
+echo "killed arm: $(command grep -a -c 'runs as the first' "$D/killed.log") rerun line(s); last: ${l:-<no later-pass line>}" | cut -c1-200
+
 # THE CMAKE ARM: what CMake really writes, which a hand-written manifest does
 # not reach. A custom command writes a header tree as byproducts of a stamp
 # (include/Foo/*.h and a versioned private dir), the library names the
@@ -325,5 +367,5 @@ cm_arm cmake '${GEN}/a.h ${GEN}/b.h ${GEN}/c.h ${GEN}/1.0/Foo/private/p.h'
 # placed tree's files on disk, which qtbase's install pass uploaded one by
 # one in place of the tree.
 cm_arm qt '${GEN}/FooVersion'
-if [ "$fails" -eq 0 ]; then echo "PASS: install and check passes reused every build-pass task, every arm"; [ -n "${NN_IPR_KEEP:-}" ] && echo "kept $D" || rm -rf "$D"; exit 0; fi
+if [ "$fails" -eq 0 ]; then echo "PASS: install and check passes reused every build-pass task, every arm, and a killed first pass's successor ran as the first"; [ -n "${NN_IPR_KEEP:-}" ] && echo "kept $D" || rm -rf "$D"; exit 0; fi
 echo "FAIL: $fails finding(s) after the build pass; kept $D"; exit 1
