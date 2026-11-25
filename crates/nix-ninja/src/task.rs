@@ -3924,6 +3924,7 @@ impl Runner {
             // extension: any schema arg to compiler.py implies its schema
             // directory.
             let pdl_refs = pdl_baselines(&self.config.build_dir, &cd_dir, &args);
+            let bundle_impl = schema_bundle_impl_headers(&self.config.build_dir, &cd_dir, &args);
             let (node_files, node_pkgs) =
                 node_script_requires(&self.config.build_dir, &cd_dir, &args);
             let ts_refs = ts_library_imports(&self.config.build_dir, &cd_dir, &args);
@@ -4596,6 +4597,12 @@ impl Runner {
             // unresolved and the check failed (qtwebengine 6.11.2, task
             // `m9yqpy10`).
             referenced.extend(pdl_refs);
+            // json_schema_compiler's registration bundle includes each
+            // namespace's implementation header only if it exists, by
+            // convention, so a missing one is either an error or a dropped
+            // include (qtwebengine 6.140, task q7xqxkl8: 44 headers, none
+            // declared).
+            referenced.extend(bundle_impl);
             referenced.extend(node_files);
             referenced.extend(ts_refs);
             for pkg in &node_pkgs {
@@ -15453,6 +15460,96 @@ pub fn pdl_baselines(build_dir: &Path, cd_dir: &Path, args: &[String]) -> Vec<St
     out
 }
 
+/// The implementation headers json_schema_compiler's `cpp-bundle-registration`
+/// generator tests for. `cpp_bundle_generator.py` `_APICCGenerator` includes a
+/// namespace's header only if it EXISTS under `--root`: the schema's
+/// `implemented_in` compiler option, else `<impl-dir>/<ns>/<ns>_api.h`. A
+/// missing `implemented_in` header raises; a missing default drops the include
+/// in silence while the namespace's registry entries stay. It only stats them,
+/// so each existing one is declared and nothing it includes. Both spellings
+/// are tried for every schema and each one that exists is declared: a default
+/// declared beside its `implemented_in` header changes nothing the generator
+/// writes.
+pub fn schema_bundle_impl_headers(build_dir: &Path, cd_dir: &Path, args: &[String]) -> Vec<String> {
+    if !args
+        .iter()
+        .any(|a| a.ends_with("json_schema_compiler/compiler.py"))
+    {
+        return Vec::new();
+    }
+    // optparse: `--long=v`, `--long v`, `-s v`, `-sv`; the last one wins.
+    let opt = |long: &str, short: &str| -> Option<String> {
+        let mut v = None;
+        for (i, a) in args.iter().enumerate() {
+            if a == long || a == short {
+                v = args.get(i + 1).cloned();
+            } else if let Some(x) = a.strip_prefix(long).and_then(|r| r.strip_prefix('=')) {
+                v = Some(x.to_string());
+            } else if let Some(x) = a.strip_prefix(short).filter(|_| !a.starts_with("--")) {
+                v = Some(x.to_string());
+            }
+        }
+        v
+    };
+    if opt("--generator", "-g").as_deref() != Some("cpp-bundle-registration") {
+        return Vec::new();
+    }
+    let Some(impl_dir) = opt("--impl-dir", "-i") else {
+        return Vec::new();
+    };
+    let root = opt("--root", "-r").unwrap_or_else(|| ".".into());
+    let mut out = Vec::new();
+    for a in args.iter().filter(|a| {
+        !a.starts_with('-')
+            && Path::new(a.as_str())
+                .extension()
+                .is_some_and(|e| e == "json" || e == "idl" || e == "webidl")
+    }) {
+        let schema = rebase_post_cd(cd_dir, a);
+        // shortcut: the namespace is read as the file stem, which matches the
+        // model's unix_name for 126 of 126 schemas over the 9 registration
+        // bundles of qtwebengine 6.140; a schema named otherwise (a dotted
+        // `os.diagnostics` in `diagnostics.idl`) loses its default header,
+        // which fails the registration .cc's compile. Parse `namespace` when
+        // one does.
+        let Some(stem) = schema.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let ns = stem.replace("experimental_", "");
+        let mut headers = vec![format!("{impl_dir}/{ns}/{ns}_api.h")];
+        if let Ok(text) = fs::read_to_string(build_dir.join(&schema)) {
+            // `"implemented_in": "x"` (json) and `implemented_in="x"` (idl).
+            for (at, _) in text.match_indices("implemented_in") {
+                let rest = text[at + "implemented_in".len()..]
+                    .trim_start_matches('"')
+                    .trim_start();
+                let Some(rest) = rest.strip_prefix([':', '=']) else {
+                    continue;
+                };
+                if let Some(v) = rest
+                    .trim_start()
+                    .strip_prefix('"')
+                    .and_then(|r| r.split_once('"'))
+                {
+                    headers.push(v.0.to_string());
+                }
+            }
+        }
+        for h in headers {
+            let rel = rebase_post_cd(
+                cd_dir,
+                &lexical_join(Path::new(&root), Path::new(&h)).to_string_lossy(),
+            );
+            if build_dir.join(&rel).is_file() {
+                out.push(rel.to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// `protoc_wrapper.py`'s import roots, separated and `=` spellings: the
 /// `--proto-in-dir` (also the dir the positional protos are joined to) and
 /// every `--import-dir`, returned as (proto-in-dir, all roots).
@@ -17684,6 +17781,83 @@ mod its_and_swig_reader_tests {
         let mut not = args.clone();
         not[1] = "../tools/other.py".into();
         assert!(super::pdl_baselines(&bd, Path::new(""), &not).is_empty());
+    }
+
+    /// A registration bundle carries each namespace's implementation header
+    /// that exists under `--root`: the default `<impl>/<ns>/<ns>_api.h`, an
+    /// `implemented_in` header from json or idl, never one that is absent.
+    /// Another generator, or another tool, carries nothing. The argv is the
+    /// qtwebengine core graph's shape (`=` spellings, a five-level root).
+    #[test]
+    fn a_registration_bundle_carries_its_implementation_headers() {
+        use super::Scratch;
+        let d = Scratch::new(format!("nn-schema-bundle-{}", std::process::id()));
+        let bd = d.join("build/src/core/Release/x86_64");
+        let c = d.join("src/chromium");
+        let api = c.join("extensions/common/api");
+        let imp = c.join("extensions/browser/api");
+        for dir in [&bd, &api, &imp.join("alarms"), &imp.join("declarative")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(api.join("alarms.webidl"), b"").unwrap();
+        std::fs::write(api.join("dns.idl"), b"namespace dns {};").unwrap();
+        std::fs::write(
+            api.join("events.json"),
+            br#"[{"namespace": "events", "compiler_options": {"implemented_in": "extensions/browser/api/declarative/declarative_api.h"}}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            api.join("printer_provider_internal.idl"),
+            br#"[implemented_in="extensions/browser/api/printer_provider/printer_provider_internal_api.h"] namespace printerProviderInternal {};"#,
+        )
+        .unwrap();
+        std::fs::write(imp.join("alarms/alarms_api.h"), b"").unwrap();
+        std::fs::write(imp.join("declarative/declarative_api.h"), b"").unwrap();
+        let args: Vec<String> = [
+            "python3",
+            "../../../../../src/chromium/tools/json_schema_compiler/compiler.py",
+            "--root=../../../../../src/chromium/",
+            "--destdir=gen",
+            "--generator=cpp-bundle-registration",
+            "--impl-dir=extensions/browser/api",
+            "../../../../../src/chromium/extensions/common/api/alarms.webidl",
+            "../../../../../src/chromium/extensions/common/api/dns.idl",
+            "../../../../../src/chromium/extensions/common/api/events.json",
+            "../../../../../src/chromium/extensions/common/api/printer_provider_internal.idl",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = super::schema_bundle_impl_headers(&bd, Path::new(""), &args);
+        // Neither absent header is carried: dns's default (the generator
+        // drops its include in silence) and printer_provider_internal's
+        // implemented_in (the generator raises on it).
+        assert_eq!(
+            got,
+            vec![
+                "../../../../../src/chromium/extensions/browser/api/alarms/alarms_api.h"
+                    .to_string(),
+                "../../../../../src/chromium/extensions/browser/api/declarative/declarative_api.h"
+                    .to_string(),
+            ]
+        );
+        std::fs::create_dir_all(imp.join("printer_provider")).unwrap();
+        std::fs::write(
+            imp.join("printer_provider/printer_provider_internal_api.h"),
+            b"",
+        )
+        .unwrap();
+        assert!(
+            super::schema_bundle_impl_headers(&bd, Path::new(""), &args).contains(
+                &"../../../../../src/chromium/extensions/browser/api/printer_provider/printer_provider_internal_api.h".to_string()
+            )
+        );
+        let mut schema = args.clone();
+        schema[4] = "--generator=cpp-bundle-schema".into();
+        assert!(super::schema_bundle_impl_headers(&bd, Path::new(""), &schema).is_empty());
+        let mut other = args.clone();
+        other[1] = "../../../../../src/chromium/tools/other.py".into();
+        assert!(super::schema_bundle_impl_headers(&bd, Path::new(""), &other).is_empty());
     }
 
     /// The store paths a carried tree's files name, existing ones only. The
