@@ -188,8 +188,11 @@ fn task_key(outputs: &[PathBuf]) -> Option<String> {
 
 /// Decides, before anything is read, whether this is a later pass (a record
 /// of configure exists) and loads the task derivations earlier passes
-/// wrote. AN ERROR on a later pass whose task record is missing or
-/// unreadable: deriving every edge again is what reuse exists to prevent.
+/// wrote. AN ERROR on a later pass whose task record is unreadable: deriving
+/// every edge again is what reuse exists to prevent. Configure's and the
+/// invocation's records with no task record at all are a first pass that
+/// never recorded its tasks (killed before its exit), and this pass runs as
+/// the first.
 ///
 /// ONLY WHERE EARLIER RUNS ARE NOT TRUSTED (`reuse_allowed`: inside a nix
 /// build, where passes are the phases of one build of one tree). Outside
@@ -203,10 +206,36 @@ fn task_key(outputs: &[PathBuf]) -> Option<String> {
 pub fn begin_pass(build_dir: &Path, reuse_allowed: bool, invocation: &str) -> std::io::Result<()> {
     let state = state_dir(build_dir);
     STRICT.store(reuse_allowed, std::sync::atomic::Ordering::Relaxed);
-    let later = reuse_allowed && read_lines(&state.join("configure.v1"), build_dir)?.is_some();
+    let recorded = reuse_allowed && read_lines(&state.join("configure.v1"), build_dir)?.is_some();
+    // A FIRST PASS KILLED BEFORE ITS EXIT. A first pass writes the invocation
+    // record here, then the walk saves configure's record before anything is
+    // placed, and every return of the run writes the task record
+    // (`pass_report`) unless that write itself fails. So both records with no
+    // task record is a first pass that never recorded its tasks: a signal in
+    // a kept tree, or a failed record write. Every later pass used to stop on
+    // it, and nothing recovered the tree. This pass runs as the first
+    // instead; the walk still answers from configure's record, which is true,
+    // and the invocation is this run's. A configure record with no invocation
+    // record (the output-derivation route walks without a pass) still stops.
+    // DEFER(a successor's derivation binds a file the killed pass placed,
+    // read by path): what the killed pass placed before journaling (a local
+    // edge places the outputs it orders after mid-run) stays where it is, so
+    // listings skip it and a read by path does not; journaling a local
+    // edge's placements as they land would let `Rewind` set them aside.
+    let interrupted = recorded
+        && read_lines(&state.join("emitted.v1"), build_dir)?.is_none()
+        && read_lines(&state.join("invocation.v1"), build_dir)?.is_some();
+    let later = recorded && !interrupted;
     let inv = state.join("invocation.v1");
     let mut driver_moved = false;
-    if reuse_allowed {
+    if interrupted {
+        eprintln!(
+            "nix-ninja: configure's record in {} has no task record (a first pass \
+             killed before its exit): this pass runs as the first",
+            state.display()
+        );
+        write_lines(&inv, build_dir, &[invocation.to_string()], false)?;
+    } else if reuse_allowed {
         match read_lines(&inv, build_dir)? {
             // A DIFFERENT DRIVER ALONE derives every edge again rather than
             // stop: a kept tree swept with a fixed driver must build what
@@ -3143,8 +3172,8 @@ mod tests {
     /// prints nothing; pass 2, after an edit to a source, refuses the edited
     /// edge and derives it again (a recorded task gone from the store is a
     /// fallback, derived again) and records the edge it derived fresh; pass 3
-    /// reuses that edge too. A later pass whose task record is missing stops
-    /// rather than deriving everything again.
+    /// reuses that edge too. A configure record with no task record is a
+    /// first pass killed before its exit, and the next pass runs as the first.
     #[test]
     fn later_passes_reuse_what_earlier_passes_wrote() {
         let _g = super::PASS_TEST_LOCK.lock().unwrap();
@@ -3240,9 +3269,53 @@ mod tests {
         assert!(super::later_pass());
         assert_eq!(super::reuse(&out("a.o"), |_| true), None);
         assert!(super::begin_pass(&bd, true, "v=true driver=1.2").is_err());
-        // A later pass with no task record stops.
+        // A configure record with no task record is a first pass killed
+        // before its exit: the next pass, under another driver, runs as the
+        // first, records its own invocation and tasks, and the pass after it
+        // reuses them under that driver.
         std::fs::remove_file(state.join("emitted.v1")).unwrap();
-        assert!(super::begin_pass(&bd, true, "v=false").is_err());
+        reset();
+        super::begin_pass(&bd, true, "v=false driver=2.0").unwrap();
+        assert!(
+            !super::later_pass(),
+            "an interrupted first pass runs as the first"
+        );
+        assert!(
+            std::fs::read_to_string(state.join("invocation.v1"))
+                .unwrap()
+                .ends_with("v=false driver=2.0\n"),
+            "the invocation is this run's, not the killed one's"
+        );
+        assert_eq!(super::reuse(&out("a.o"), |_| true), None);
+        super::note_task(&out("a.o"), "/nix/store/aaa3-a.drv", vec!["src/a.c".into()]);
+        assert_eq!(
+            super::pass_report().unwrap(),
+            None,
+            "a first pass says nothing"
+        );
+        reset();
+        super::begin_pass(&bd, true, "v=false driver=2.0").unwrap();
+        assert!(super::later_pass());
+        assert_eq!(
+            super::reuse(&out("a.o"), |_| true).as_deref(),
+            Some("/nix/store/aaa3-a.drv"),
+            "the pass after it reuses what it recorded"
+        );
+        // A configure record with no invocation record and no task record (the
+        // output-derivation route walks without a pass) still stops.
+        std::fs::remove_file(state.join("emitted.v1")).unwrap();
+        std::fs::remove_file(state.join("invocation.v1")).unwrap();
+        assert!(super::begin_pass(&bd, true, "v=false driver=2.0").is_err());
+        super::write_lines(
+            &state.join("invocation.v1"),
+            &bd,
+            &["v=false driver=2.0".to_string()],
+            false,
+        )
+        .unwrap();
+        // An unreadable task record still stops a later pass.
+        write(&state.join("emitted.v1"), "not this configure's header\n");
+        assert!(super::begin_pass(&bd, true, "v=false driver=2.0").is_err());
         *super::PASS.lock().unwrap() = None;
         super::STRICT.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = std::fs::remove_dir_all(&state);

@@ -458,11 +458,14 @@ binding rule; the long form is the detail file's mechanism notes.
   (`replaced_outputs`). Every later-pass exit prints `nix-ninja:
   later-pass reused R task(s), derived M fresh, F fallback, S stale: ...;
   re-derived N: ...`, counting recorded edges derived AGAIN (in neither R
-  nor M). The tripwire stops on F>0 or S>0. A missing, corrupt or
-  other-configure record, or another invocation (`-v`, builder knobs), is a
-  hard error; a record differing ONLY in `driver=` reuses NOTHING
-  (`driver_moved`). Gate `install-pass-reuse-repro.sh`; open gaps in the
-  queue (2026-10-18 14:40).
+  nor M). The tripwire stops on F>0 or S>0. A corrupt or other-configure
+  record, or another invocation (`-v`, builder knobs), is a hard error; a
+  record differing ONLY in `driver=` reuses NOTHING (`driver_moved`);
+  configure's and the invocation's records with no task record are a first
+  pass killed before its exit, and the next pass runs as the first
+  (`begin_pass`); configure's record without the invocation's (the
+  output-derivation route) still stops. Gate `install-pass-reuse-repro.sh`;
+  open gaps in the queue (2026-10-18 14:40).
 - **Daemon exchanges** are bounded (`bounded`; `BuilderRpcClient::pool` is
   a `BoundedPool`, deadline-only acquire). The host route (`in_drv` false,
   or `NIX_NINJA_RPC_HOST_ROUTE=1`) uses `new_reaped` (`reaped`/`recycled`
