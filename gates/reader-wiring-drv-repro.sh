@@ -1406,6 +1406,41 @@ else
 fi
 echo "qtprl step2(floor)=$PR_STEP2 final-prl=$PR_OUT refused-without-path=$PR_REFUSED"
 
+# ---- ARM 29: json_schema_compiler's registration bundle headers ---------
+# MEASURED on qtwebengine 6.140 (task `q7xqxkl8...-ninja-build.drv`, single-
+# target `knqpd3l2...`): the cpp-bundle-registration edge stats each
+# namespace's implementation header under `--root` (`implemented_in`, else
+# `<impl-dir>/<ns>/<ns>_api.h`) and none is declared, so the run raised on
+# events' `declarative_api.h`; a missing DEFAULT header drops its include in
+# silence. The fixture carries one of each. The tool is a stub: the drive
+# parses argv, and the trigger is the `compiler.py` argument. The root is over
+# DIR_UPLOAD_CAP with a python package, as chromium's is, so the dir-arg
+# route cannot carry the headers at the pin (the ARM 26 lesson).
+S29=$D/schemabundle; A29=$S29/chromium/extensions
+mkdir -p "$S29/build/tools" "$S29/chromium/tools/json_schema_compiler" "$A29/common/api" \
+  "$A29/browser/api/alarms" "$A29/browser/api/declarative" "$S29/chromium/pkg" "$S29/chromium/filler"
+printf '#!/bin/sh\nexit 0\n' > "$S29/build/tools/python3"; chmod +x "$S29/build/tools/python3"
+: > "$S29/chromium/tools/json_schema_compiler/compiler.py"
+: > "$S29/chromium/pkg/__init__.py"
+( cd "$S29/chromium/filler" && seq 1 1100 | xargs touch )
+printf '[{"namespace": "alarms"}]\n' > "$A29/common/api/alarms.json"
+printf '[{"namespace": "events", "compiler_options": {"implemented_in": "extensions/browser/api/declarative/declarative_api.h"}}]\n' \
+  > "$A29/common/api/events.json"
+: > "$A29/browser/api/alarms/alarms_api.h"
+: > "$A29/browser/api/declarative/declarative_api.h"
+cat > "$S29/build/build.ninja" <<EOF
+rule schema
+  command = $S29/build/tools/python3 ../chromium/tools/json_schema_compiler/compiler.py --root=../chromium/ --destdir=gen --namespace=extensions::api --generator=cpp-bundle-registration --impl-dir=extensions/browser/api ../chromium/extensions/common/api/alarms.json ../chromium/extensions/common/api/events.json
+build gen/extensions/browser/api/generated_api_registration.cc: schema ../chromium/extensions/common/api/alarms.json ../chromium/extensions/common/api/events.json
+EOF
+SB_T=gen/extensions/browser/api/generated_api_registration.cc
+drive "$NN" "$TASK" "$S29/build" "$SB_T" > "$D/schemabundle.json" || {
+  echo "NO ANSWER: the schema bundle drive did not emit a derivation"; tail -3 "$S29/build/drive.err"; exit 2; }
+SB_DECL=$(carries_inputs "$D/schemabundle.json" 'common/api/events.json')
+SB_DEF=$(carries_inputs "$D/schemabundle.json" 'browser/api/alarms/alarms_api.h')
+SB_IMPL=$(carries_inputs "$D/schemabundle.json" 'browser/api/declarative/declarative_api.h')
+echo "schema bundle events.json(floor)=$SB_DECL default=$SB_DEF implemented_in=$SB_IMPL"
+
 # ---- THE PIN CONTROLS: the same fixtures against the pin's driver -------
 if [ -x "$PIN_DRV/bin/nix-ninja" ] && [ -x "$PIN_TASK/bin/nix-ninja-task" ]; then
   drive "$PIN_DRV" "$PIN_TASK" "$S1/build" nvme_wrap.c > "$D/swig.pin.json" 2>/dev/null || true
@@ -1609,6 +1644,10 @@ print(int(any(l.split(':')[1]=='deps/build/dep' for v in d.values() for l in v['
   # revision but `425778a`'s parent, which the gate cannot build by default.
   # So this arm asserts only the HEAD direction and says so rather than
   # claiming a control it does not have.
+  drive "$PIN_DRV" "$PIN_TASK" "$S29/build" "$SB_T" > "$D/schemabundle.pin.json" 2>/dev/null || true
+  [ -s "$D/schemabundle.pin.json" ] || { echo "NO ANSWER: the pin emitted no derivation for the schema bundle fixture, so its 0 is not a reading"; exit 2; }
+  SB_PIN_DEF=$(carries_inputs "$D/schemabundle.pin.json" 'browser/api/alarms/alarms_api.h')
+  SB_PIN_IMPL=$(carries_inputs "$D/schemabundle.pin.json" 'browser/api/declarative/declarative_api.h')
 else
   echo "NO ANSWER: the pin's binaries are not resident, so the control cannot run"; exit 2
 fi
@@ -2051,4 +2090,18 @@ if [ "$PR_PIN_OUT" -ge 1 ]; then
   echo "FAIL: the pin already carries the .prl, so the fixture does not model the class"
   exit 1
 fi
-echo "PASS: every reader's targets reach the emitted derivation, both ExternalProject arms fire, no non-step edge declares a tree, the scanner carries its compiler, composed cmake includes ride the task, a script's tools land on PATH, the vapigen .vapi is declared, qrc climbs ride make_dirs and on-disk generated members defer-then-bind with no self-deferral, generated qrcs bind through deferral, the copy directory and the EP source_dir are carried, the doxygen html tree is declared, and a Qt step2 edge declares its final .prl or is refused"
+# ARM 29: the declared schema is the floor; both headers ride HERE and
+# neither at the pin.
+if [ "${SB_DECL:-0}" -lt 1 ]; then
+  echo "NO ANSWER: the schema bundle fixture does not carry its DECLARED schema, so it is broken"; exit 2
+fi
+if [ "${SB_DEF:-0}" -lt 1 ] || [ "${SB_IMPL:-0}" -lt 1 ]; then
+  echo "FAIL: a registration bundle's implementation header did not reach the emitted derivation (default=${SB_DEF:-?}, implemented_in=${SB_IMPL:-?})"
+  exit 1
+fi
+echo "schema bundle pin default=${SB_PIN_DEF:-unread} implemented_in=${SB_PIN_IMPL:-unread}"
+if [ "${SB_PIN_DEF:-0}" -ge 1 ] || [ "${SB_PIN_IMPL:-0}" -ge 1 ]; then
+  echo "FAIL: the pin already carries a registration bundle header, so the fixture does not model the class"
+  exit 1
+fi
+echo "PASS: every reader's targets reach the emitted derivation, both ExternalProject arms fire, no non-step edge declares a tree, the scanner carries its compiler, composed cmake includes ride the task, a script's tools land on PATH, the vapigen .vapi is declared, qrc climbs ride make_dirs and on-disk generated members defer-then-bind with no self-deferral, generated qrcs bind through deferral, the copy directory and the EP source_dir are carried, the doxygen html tree is declared, a Qt step2 edge declares its final .prl or is refused, and a registration bundle declares its implementation headers"
